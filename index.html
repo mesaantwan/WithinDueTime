@@ -899,7 +899,7 @@ function updateOrbs(dt){
         // Stretch sphere along orbit tangent direction as streakT grows
         if(streakT > 0.001){
           var stretchAmt = 1.0 + streakT * 12.0; // up to ~2.8x at threshold
-          var squishAmt = 1.0 / Math.sqrt(stretchAmt); // preserve volume
+          var squishAmt = 1.0 / Math.pow(stretchAmt, 0.7); // thin out moderately
           // Build tangent from orbital path (finite difference, same as curve geo)
           var tAng1 = totalAngle - spinDir * 0.01;
           var tAng2 = totalAngle + spinDir * 0.01;
@@ -1000,7 +1000,11 @@ function updateOrbs(dt){
           // Blend between sphere and pill based on how stretched we are
           var profileBlend = Math.min(streakT * 1.5, 1.0); // pill takes over gradually
           var profile = sphereProfile * (1.0 - profileBlend) + pillProfile * profileBlend;
-          var segR = orbR * Math.max(profile, 0.02);
+          // Scale radius to match the sphere-stretch thinning at the transition point
+          // At streakT=0.15 the sphere was squished to ~0.46x, ramp to 1.0 by streakT=0.6
+          var rampT = Math.min(Math.max((streakT - 0.15) / 0.45, 0.0), 1.0); // 0 at 0.15, 1 at 0.6
+          var radiusScale = 0.46 + rampT * 0.54;
+          var segR = orbR * Math.max(profile, 0.02) * radiusScale;
           // Squash vertically (binormal axis) as it stretches — elliptical cross-section
           // Delay squash so initial morph matches sphere shape
           var squashT = Math.max(streakT - 0.1, 0.0) / 0.9; // no squash until streakT > 0.1
