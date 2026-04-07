@@ -40,8 +40,19 @@ var previousMouseX = 0, previousMouseY = 0, previousTime = 0;
 // Camera mouse tilt
 var camMouseX = 0, camMouseY = 0;
 var camTiltX = 0, camTiltY = 0;
+var CAM_ORBIT_RADIUS_BASE = 9.4;
 var CAM_ORBIT_RADIUS = 9.4;
 var CAM_TILT_STRENGTH = 0.015;
+
+function updateCamRadius() {
+  var aspect = window.innerWidth / window.innerHeight;
+  // On narrow screens (portrait), push camera back so orbs aren't clipped
+  if (aspect < 1.0) {
+    CAM_ORBIT_RADIUS = CAM_ORBIT_RADIUS_BASE * (1.0 / aspect) * 0.75;
+  } else {
+    CAM_ORBIT_RADIUS = CAM_ORBIT_RADIUS_BASE;
+  }
+}
 
 // Face tracking state
 var faceTrack = {
@@ -1637,6 +1648,7 @@ function updateShootingStars(dt) {
 function init(){
   scene=new THREE.Scene();scene.background=new THREE.Color(0xf0f0f5);scene.fog=new THREE.FogExp2(0xf0f0f5,0.018);
   camera=new THREE.PerspectiveCamera(75,window.innerWidth/window.innerHeight,0.1,200);
+  updateCamRadius();
   camera.position.set(0,0,CAM_ORBIT_RADIUS);camera.lookAt(0,0,0);
   renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
   renderer.setSize(window.innerWidth,window.innerHeight);renderer.setPixelRatio(Math.min(window.devicePixelRatio,1.5));renderer.sortObjects=true;
@@ -1989,7 +2001,7 @@ function resizePostFBO(){
   }
 }
 
-function onResize(){camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);resizePostFBO();resizeGodRays();}
+function onResize(){camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);resizePostFBO();resizeGodRays();updateCamRadius();}
 
 init();
 
