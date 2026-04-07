@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>CHRISOLIN - Coming Soon</title>
+<title>Chrysolin</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -236,7 +236,7 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
     // Pre-build a curved tube geometry for high-speed deformation
     // The orb's own geometry gets swapped to this at speed
     var CURVE_SEGS = 32;
-    var CURVE_RING = 8;
+    var CURVE_RING = 16;
     var curveVerts = new Float32Array(CURVE_SEGS * CURVE_RING * 3);
     var curveNorms = new Float32Array(CURVE_SEGS * CURVE_RING * 3);
     var curveGeo = new THREE.BufferGeometry();
@@ -267,7 +267,7 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
   // High momentum: very low friction, high sensitivity, no braking
   g.userData.rotationSpeed=0.0025;
   g.userData.label=label;g.userData.yPosition=y;g.userData.velocity=0;
-  g.userData.friction=0.9995;g.userData.sensitivity=0.0003;g.userData.brakingForce=0.0002;
+  g.userData.friction=0.9998;g.userData.sensitivity=0.0002;g.userData.brakingForce=0.0002;
   g.userData.isDamping=false;g.userData.centerStar=sg;
   scene.add(g);
 
@@ -886,27 +886,68 @@ function updateOrbs(dt){
 
       orb.mesh.material.emissiveIntensity = 0.15 + streakT * 1.5;
 
-      if(streakT < 0.01){
-        // Normal sphere — swap back if needed
+      if(streakT < 0.15){
+        // Normal sphere with scale-based stretching for early phase
         if(orb.isCurved){
           orb.mesh.geometry = orb.sphereGeo;
           orb.isCurved = false;
         }
+        orb.mesh.matrixAutoUpdate = true;
         orb.mesh.rotation.x+=orb.spinSpeed*(1+intensity*5);
         orb.mesh.rotation.y+=orb.spinSpeed*0.7*(1+intensity*5);
-        orb.mesh.scale.set(1,1,1);
+
+        // Stretch sphere along orbit tangent direction as streakT grows
+        if(streakT > 0.001){
+          var stretchAmt = 1.0 + streakT * 12.0; // up to ~2.8x at threshold
+          var squishAmt = 1.0 / Math.sqrt(stretchAmt); // preserve volume
+          // Build tangent from orbital path (finite difference, same as curve geo)
+          var tAng1 = totalAngle - spinDir * 0.01;
+          var tAng2 = totalAngle + spinDir * 0.01;
+          var tp1 = orbPos(tAng1);
+          var tp2 = orbPos(tAng2);
+          var tangX = tp2.x - tp1.x, tangY = tp2.y - tp1.y, tangZ = tp2.z - tp1.z;
+          var tangLen = Math.sqrt(tangX*tangX + tangY*tangY + tangZ*tangZ) || 1;
+          tangX /= tangLen; tangY /= tangLen; tangZ /= tangLen;
+          // Radial = outward from center
+          var px = orb.mesh.position.x, py = orb.mesh.position.y, pz = orb.mesh.position.z;
+          var radLen = Math.sqrt(px*px + py*py + pz*pz) || 1;
+          var radX = px/radLen, radY = py/radLen, radZ = pz/radLen;
+          // Binormal = tangent × radial
+          var binX = tangY*radZ - tangZ*radY;
+          var binY = tangZ*radX - tangX*radZ;
+          var binZ = tangX*radY - tangY*radX;
+          var binLen = Math.sqrt(binX*binX + binY*binY + binZ*binZ) || 1;
+          binX /= binLen; binY /= binLen; binZ /= binLen;
+          // Build rotation matrix: X=radial, Y=binormal, Z=tangent (stretch axis)
+          var m = orb.mesh.matrix;
+          m.set(
+            radX*squishAmt,  binX*squishAmt,  tangX*stretchAmt, px,
+            radY*squishAmt,  binY*squishAmt,  tangY*stretchAmt, py,
+            radZ*squishAmt,  binZ*squishAmt,  tangZ*stretchAmt, pz,
+            0, 0, 0, 1
+          );
+          orb.mesh.matrixAutoUpdate = false;
+          orb.mesh.matrixWorldNeedsUpdate = true;
+        } else {
+          orb.mesh.matrixAutoUpdate = true;
+          orb.mesh.scale.set(1,1,1);
+        }
+
         orb.mesh.material.opacity = 0.7;
-        orb.edges.visible = true;
-        orb.edges.position.copy(orb.mesh.position);
-        orb.edges.rotation.copy(orb.mesh.rotation);
-        orb.edges.scale.set(1,1,1);
-        orb.edges.material.opacity = 0.25;
+        orb.edges.visible = streakT < 0.02;
+        if(orb.edges.visible){
+          orb.edges.position.copy(orb.mesh.position);
+          orb.edges.rotation.copy(orb.mesh.rotation);
+          orb.edges.scale.set(1,1,1);
+          orb.edges.material.opacity = 0.25;
+        }
       } else {
         // Swap to curved tube geometry — the orb physically morphs
         if(!orb.isCurved){
           orb.mesh.geometry = orb.curveGeo;
           orb.isCurved = true;
         }
+        orb.mesh.matrixAutoUpdate = true;
         orb.mesh.position.set(0, 0, 0);
         orb.mesh.rotation.set(0, 0, 0);
         orb.mesh.scale.set(1, 1, 1);
@@ -957,11 +998,13 @@ function updateOrbs(dt){
           var pillProfile = distFromCenter > (1.0 - capZone) ?
             Math.cos((distFromCenter - (1.0 - capZone)) / capZone * Math.PI * 0.5) : 1.0;
           // Blend between sphere and pill based on how stretched we are
-          var profileBlend = Math.min(streakT * 3.0, 1.0); // pill takes over quickly
+          var profileBlend = Math.min(streakT * 1.5, 1.0); // pill takes over gradually
           var profile = sphereProfile * (1.0 - profileBlend) + pillProfile * profileBlend;
           var segR = orbR * Math.max(profile, 0.02);
           // Squash vertically (binormal axis) as it stretches — elliptical cross-section
-          var vertSquash = 1.0 - streakT * 0.6; // down to 40% height at max
+          // Delay squash so initial morph matches sphere shape
+          var squashT = Math.max(streakT - 0.1, 0.0) / 0.9; // no squash until streakT > 0.1
+          var vertSquash = 1.0 - squashT * squashT * 0.6; // quadratic ease-in to squash
 
           for(var ri2=0;ri2<rv;ri2++){
             var ra = (ri2/rv)*Math.PI*2;
@@ -1753,8 +1796,8 @@ function animate(){
       if(fl2.group.userData.centerStar){fl2.group.userData.centerStar.rotation.y=-fl2.group.rotation.y;fl2.group.userData.centerStar.rotation.x+=fl2.group.userData.velocity*0.5;}
       // Speed-dependent friction: linear buildup then plateaus
       var absVel=Math.abs(fl2.group.userData.velocity);
-      var dragCap = 0.003; // max drag amount — the plateau
-      var linearDrag = Math.min(absVel * 0.008, dragCap);
+      var dragCap = 0.002; // max drag amount — the plateau
+      var linearDrag = Math.min(absVel * 0.005, dragCap);
       fl2.group.userData.velocity*=fl2.group.userData.friction;
       if(fl2.group.userData.velocity>0){fl2.group.userData.velocity=Math.max(0,fl2.group.userData.velocity-linearDrag);}
       else if(fl2.group.userData.velocity<0){fl2.group.userData.velocity=Math.min(0,fl2.group.userData.velocity+linearDrag);}
