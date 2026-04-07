@@ -1,0 +1,2023 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CHRISOLIN - Coming Soon</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: Arial, sans-serif; background:#0a0a0a; overflow: hidden; margin:0; padding:0; width:100%; height:100%; }
+html { width:100%; height:100%; overflow:hidden; }
+#canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: default; }
+#canvas-container.dragging { cursor: grabbing; }
+#canvas-container.clickable { cursor: pointer; }
+#canvas-container.grabbable { cursor: grab; }
+</style>
+</head>
+<body>
+<div id="canvas-container"></div>
+<video id="faceVideo" autoplay playsinline style="display:none;"></video>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script>
+// ══════════════════════════════════════════════
+// GLOBALS
+// ══════════════════════════════════════════════
+var scene, camera, renderer;
+var floors = [];
+var FLOOR_SPACING = 6.5, TOTAL_FLOORS = 1;
+var PLANE_WIDTH = 2.5, PLANE_SPACING = 0.8;
+var LARGE_RADIUS = (10 * (PLANE_WIDTH + PLANE_SPACING) / (2 * Math.PI)) + 0.25;
+var SMALL_RADIUS = LARGE_RADIUS * 0.6;
+var VW_RADIUS_MULT = 0.62;
+
+var raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
+var isDragging = false, selectedFloor = null;
+var mouseDownX = 0, mouseDownY = 0, mouseDownTime = 0;
+var previousMouseX = 0, previousMouseY = 0, previousTime = 0;
+
+// Camera mouse tilt
+var camMouseX = 0, camMouseY = 0;
+var camTiltX = 0, camTiltY = 0;
+var CAM_ORBIT_RADIUS = 9.4;
+var CAM_TILT_STRENGTH = 0.015;
+
+// Face tracking state
+var faceTrack = {
+  active: false, ready: false, enabled: false,
+  rawX: 0, rawY: 0, rawZ: 1,
+  x: 0, y: 0, z: 1,
+  calX: 0, calY: 0, calZ: 1, calibrated: false,
+  smooth: 0.55, sensitivity: 1.2,
+  cam2: null, fd: null
+};
+
+function toggleFaceTracking(){
+  var btn=document.getElementById('face-toggle');
+  if(!faceTrack.enabled){
+    faceTrack.enabled=true;
+    btn.style.background='rgba(100,180,130,0.25)';
+    btn.style.borderColor='rgba(80,160,120,0.4)';
+    if(!faceTrack.ready) startFaceTracking();
+    else if(faceTrack.cam2) faceTrack.cam2.start();
+  } else {
+    faceTrack.enabled=false;
+    faceTrack.active=false;
+    btn.style.background='rgba(150,160,180,0.15)';
+    btn.style.borderColor='rgba(120,130,160,0.25)';
+  }
+}
+
+function startFaceTracking(){
+  if(!window.FaceDetection){setTimeout(startFaceTracking,500);return;}
+  var video=document.getElementById('faceVideo');
+  faceTrack.fd=new FaceDetection({locateFile:function(f){return'https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/'+f;}});
+  faceTrack.fd.setOptions({model:'short',minDetectionConfidence:0.5});
+  faceTrack.fd.onResults(function(r){
+    if(!faceTrack.enabled)return;
+    if(r.detections&&r.detections.length>0){
+      var det=r.detections[0];
+      if(det.landmarks&&det.landmarks.length>=3){
+        var mx=(det.landmarks[0].x+det.landmarks[1].x)/2;
+        var my=(det.landmarks[0].y+det.landmarks[1].y)/2;
+        faceTrack.rawX=-(mx*2-1);
+        faceTrack.rawY=-(my*2-1);
+        if(det.boundingBox){var fw=det.boundingBox.width||0.2;faceTrack.rawZ=0.18/Math.max(fw,0.05);}
+      }
+      var sm=1-faceTrack.smooth;
+      faceTrack.x+=(faceTrack.rawX-faceTrack.x)*sm;
+      faceTrack.y+=(faceTrack.rawY-faceTrack.y)*sm;
+      faceTrack.z+=(faceTrack.rawZ-faceTrack.z)*sm;
+      if(!faceTrack.calibrated){faceTrack.calX=faceTrack.rawX;faceTrack.calY=faceTrack.rawY;faceTrack.calZ=faceTrack.rawZ;faceTrack.calibrated=true;}
+      faceTrack.active=true;
+    }
+  });
+  navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:320,height:240}}).then(function(stream){
+    video.srcObject=stream;video.onloadedmetadata=function(){video.play();};
+    faceTrack.cam2=new Camera(video,{onFrame:async function(){if(faceTrack.enabled)await faceTrack.fd.send({image:video});},width:320,height:240});
+    faceTrack.cam2.start();faceTrack.ready=true;
+  }).catch(function(err){console.log('Face tracking unavailable:',err.message);faceTrack.enabled=false;
+    var btn=document.getElementById('face-toggle');if(btn)btn.style.opacity='0.3';});
+}
+
+var envMap, cubeRenderTarget, cubeCamera, ringMaterialsToUpdate = [];
+var targetCameraY = 0;
+
+var introAnim = { revealed:[], progress:[], animating:[], offsets:[] };
+for(var i=0;i<TOTAL_FLOORS;i++){introAnim.revealed.push(false);introAnim.progress.push(0);introAnim.animating.push(false);}
+
+// ══════════════════════════════════════════════
+// EASING
+// ══════════════════════════════════════════════
+function eOQ2(t){return 1-(1-t)*(1-t);}
+function eOQ(t){return 1-Math.pow(1-t,4);}
+function eIO(t){return t<0.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;}
+
+// ══════════════════════════════════════════════
+// OPACITY
+// ══════════════════════════════════════════════
+function setFloorAlpha(fl, a) {
+  var mo=0.01;
+  fl.panels.forEach(function(p){
+    if(p.mesh.material){p.mesh.material.opacity=Math.max(mo,a*0.7);p.mesh.material.transparent=true;}
+    if(p.edges.material){p.edges.material.opacity=Math.max(mo,a*0.4);p.edges.material.transparent=true;}
+  });
+  fl.group.children.forEach(function(c){if(c.type==='Group'&&c.children.length>0){c.children.forEach(function(sp){if(sp.material&&sp.geometry&&sp.geometry.type==='OctahedronGeometry'){sp.material.opacity=Math.max(mo,a);sp.material.transparent=true;}});}});
+}
+
+// ══════════════════════════════════════════════
+// FLOOR CREATION (orb floor only)
+// ══════════════════════════════════════════════
+function createFloors() {
+  var numOrbs = 3;
+  var y = 0; // centered at y=0
+  floors.push(createOrbFloor(y, SMALL_RADIUS, 'Gallery', numOrbs, 0));
+
+  // Setup intro
+  floors.forEach(function(fl, fi) {
+    var pd = [];
+    fl.panels.forEach(function(panel, pi) {
+      var oy = panel.mesh.position.y;
+      var dd = 1.5+Math.random()*0.8;
+      pd.push({oy:oy, dd:dd, delay:pi*0.06, prog:0});
+      panel.mesh.position.y = oy-dd;
+      panel.edges.position.y = panel.mesh.position.y;
+    });
+    introAnim.offsets.push(pd);
+    setFloorAlpha(fl,0);
+    // Intro offset for orbs
+    if(fl.orbs){
+      fl.orbs.forEach(function(orb,oi){
+        orb.mesh.userData.oy=orb.mesh.position.y;
+        orb.mesh.position.y-=1.5+Math.random()*0.8;
+        orb.edges.position.y=orb.mesh.position.y;
+        orb.mesh.material.opacity=0.01;
+      });
+    }
+    fl.group.children.forEach(function(c){
+      if(c.type==='Group'&&c.children.length>0){
+        c.children.forEach(function(sp){
+          if(sp.geometry&&sp.geometry.type==='OctahedronGeometry'){c.userData.oy=c.position.y;c.position.y-=1.5;}
+        });
+      }
+    });
+  });
+}
+
+function createOrbFloor(y, radius, label, numOrbs, fi) {
+  var g = new THREE.Group(); g.position.y = y;
+
+  // Center star
+  var sg = new THREE.Group();
+  sg.add(new THREE.Mesh(new THREE.OctahedronGeometry(0.8,1), new THREE.MeshStandardMaterial({color:0x9a9aa2, metalness:1, roughness:0.03, envMap:cubeRenderTarget.texture, envMapIntensity:1.8, flatShading:true})));
+  g.add(sg); g.userData.centerStar = sg;
+
+  var centerLight=new THREE.PointLight(0x88aaee,0.2,20);
+  centerLight.position.set(0,y,0);
+  scene.add(centerLight);
+
+  g.userData.centerLight=centerLight;
+  g.userData.orbTiltX=0;
+  g.userData.orbTiltZ=0;
+  g.userData.lastAngle=0;
+  g.userData.rpm=0;
+  g.userData.rpmSmooth=0;
+
+  var ringGroups = {top:[],bottom:[]};
+
+  // Orbs — glass spheres orbiting at the ring radius
+  var orbs = [];
+  var orbRadius = 0.35;
+  var as = (Math.PI*2)/numOrbs;
+  for(var i=0;i<numOrbs;i++){
+    var angle = i*as;
+    var orbGeo = new THREE.SphereGeometry(orbRadius, 24, 16);
+    var orbMat = new THREE.MeshStandardMaterial({
+      color:0x8899bb, transparent:true, opacity:0.7,
+      roughness:0.05, metalness:0.6,
+      emissive:0x334466, emissiveIntensity:0.15,
+      envMap:cubeRenderTarget.texture, envMapIntensity:1.2,
+      side:THREE.DoubleSide
+    });
+    var orbMesh = new THREE.Mesh(orbGeo, orbMat);
+    orbMesh.position.x = Math.sin(angle)*radius;
+    orbMesh.position.z = Math.cos(angle)*radius;
+    orbMesh.userData.baseAngle = angle;
+    orbMesh.userData.orbRadius = orbRadius;
+    orbMesh.userData.orbitR = radius;
+    orbMesh.userData.fIdx = fi;
+    orbMesh.userData.pIdx = i;
+    g.add(orbMesh);
+
+    // Outline ring around each orb
+    var edgePoints = [];
+    for(var ei=0;ei<=64;ei++){
+      var ea=(ei/64)*Math.PI*2;
+      edgePoints.push(Math.cos(ea)*orbRadius, Math.sin(ea)*orbRadius, 0);
+    }
+    var edgeGeo = new THREE.BufferGeometry();
+    edgeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(edgePoints),3));
+    var orbEdge = new THREE.Line(edgeGeo, new THREE.LineBasicMaterial({color:0x667788, transparent:true, opacity:0.25}));
+    orbEdge.position.copy(orbMesh.position);
+    g.add(orbEdge);
+
+    // Pre-build a curved tube geometry for high-speed deformation
+    // The orb's own geometry gets swapped to this at speed
+    var CURVE_SEGS = 32;
+    var CURVE_RING = 8;
+    var curveVerts = new Float32Array(CURVE_SEGS * CURVE_RING * 3);
+    var curveNorms = new Float32Array(CURVE_SEGS * CURVE_RING * 3);
+    var curveGeo = new THREE.BufferGeometry();
+    curveGeo.setAttribute('position', new THREE.BufferAttribute(curveVerts, 3));
+    curveGeo.setAttribute('normal', new THREE.BufferAttribute(curveNorms, 3));
+    var curveIdx = [];
+    for(var ci=0;ci<CURVE_SEGS-1;ci++){
+      for(var cri=0;cri<CURVE_RING;cri++){
+        var ca=ci*CURVE_RING+cri, cb=ci*CURVE_RING+((cri+1)%CURVE_RING);
+        var cc=(ci+1)*CURVE_RING+cri, cd=(ci+1)*CURVE_RING+((cri+1)%CURVE_RING);
+        curveIdx.push(ca,cc,cb, cb,cc,cd);
+      }
+    }
+    curveGeo.setIndex(curveIdx);
+
+    orbs.push({mesh:orbMesh, edges:orbEdge, angle:angle, spinSpeed:0.01+Math.random()*0.01,
+      sphereGeo:orbGeo, curveGeo:curveGeo, curveSegs:CURVE_SEGS, curveRing:CURVE_RING, isCurved:false});
+  }
+
+  // Invisible drag plane
+  var dragPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(radius*4, PLANE_WIDTH*2),
+    new THREE.MeshBasicMaterial({transparent:true, opacity:0, side:THREE.DoubleSide, depthWrite:false})
+  );
+  dragPlane.userData.isDragPlane=true;
+  g.add(dragPlane);
+
+  // High momentum: very low friction, high sensitivity, no braking
+  g.userData.rotationSpeed=0.0025;
+  g.userData.label=label;g.userData.yPosition=y;g.userData.velocity=0;
+  g.userData.friction=0.9995;g.userData.sensitivity=0.0003;g.userData.brakingForce=0.0002;
+  g.userData.isDamping=false;g.userData.centerStar=sg;
+  scene.add(g);
+
+  var floorObj = {group:g, rings:ringGroups, panels:[], hasRings:false, radius:radius, vRadius:radius*VW_RADIUS_MULT, orbs:orbs, isOrbFloor:true};
+  return floorObj;
+}
+
+// ══════════════════════════════════════════════
+// LIGHT RAYS FROM CENTER
+// ══════════════════════════════════════════════
+var lightRays = [];
+var NUM_RAYS = 14;
+var rayGlowSprite = null; // central glow billboard
+
+function createLightRays() {
+  // ── Central glow sprite — bright billboard at the gem ──
+  var glowCanvas = document.createElement('canvas');
+  glowCanvas.width = 128; glowCanvas.height = 128;
+  var gCtx = glowCanvas.getContext('2d');
+  var grad = gCtx.createRadialGradient(64,64,0,64,64,64);
+  grad.addColorStop(0, 'rgba(255,240,220,1)');
+  grad.addColorStop(0.15, 'rgba(200,210,240,0.7)');
+  grad.addColorStop(0.5, 'rgba(140,160,220,0.2)');
+  grad.addColorStop(1, 'rgba(80,100,180,0)');
+  gCtx.fillStyle = grad;
+  gCtx.fillRect(0,0,128,128);
+  var glowTex = new THREE.CanvasTexture(glowCanvas);
+  var glowMat = new THREE.SpriteMaterial({
+    map: glowTex, color: 0xaabbee, transparent: true, opacity: 0.4,
+    blending: THREE.AdditiveBlending, depthWrite: false
+  });
+  rayGlowSprite = new THREE.Sprite(glowMat);
+  rayGlowSprite.scale.set(3, 3, 1);
+  rayGlowSprite.raycast = function(){}; // exclude from raycaster
+  scene.add(rayGlowSprite);
+
+  // ── Volumetric ray beams — wide quads that taper from center ──
+  for(var i=0;i<NUM_RAYS;i++){
+    var angle = (i/NUM_RAYS)*Math.PI*2;
+    // Each ray is a quad: 2 verts at center (narrow), 2 at tip (tapered to 0)
+    // We use a PlaneGeometry subdivided along its length for smooth falloff
+    var segs = 12;
+    var rayVerts = new Float32Array((segs+1)*2*3);
+    var rayUVs = new Float32Array((segs+1)*2*2);
+    var rayIndices = [];
+    var baseWidth = 0.12 + Math.random()*0.08; // slight width variation per ray
+    for(var s=0;s<=segs;s++){
+      var t = s/segs; // 0=center, 1=tip
+      var w = baseWidth * (1.0 - t*t); // quadratic taper
+      var dist = t; // normalized distance, scaled by uniform in shader
+      // Left vertex
+      rayVerts[(s*2)*3+0] = -w;
+      rayVerts[(s*2)*3+1] = 0;
+      rayVerts[(s*2)*3+2] = dist;
+      // Right vertex
+      rayVerts[(s*2+1)*3+0] = w;
+      rayVerts[(s*2+1)*3+1] = 0;
+      rayVerts[(s*2+1)*3+2] = dist;
+      // UVs: u=left/right, v=distance along ray
+      rayUVs[(s*2)*2+0] = 0; rayUVs[(s*2)*2+1] = t;
+      rayUVs[(s*2+1)*2+0] = 1; rayUVs[(s*2+1)*2+1] = t;
+      if(s<segs){
+        var a=s*2, b=s*2+1, c=(s+1)*2, d=(s+1)*2+1;
+        rayIndices.push(a,c,b, b,c,d);
+      }
+    }
+    var rayGeo = new THREE.BufferGeometry();
+    rayGeo.setAttribute('position', new THREE.BufferAttribute(rayVerts, 3));
+    rayGeo.setAttribute('uv', new THREE.BufferAttribute(rayUVs, 2));
+    rayGeo.setIndex(rayIndices);
+
+    var rayMat = new THREE.ShaderMaterial({
+      uniforms: {
+        rayLength: {value: 3.0},
+        rayColor: {value: new THREE.Color(0.4, 0.5, 0.7)},
+        opacity: {value: 0.2},
+        time: {value: 0}
+      },
+      vertexShader: [
+        'uniform float rayLength;',
+        'varying vec2 vUV;',
+        'void main(){',
+        '  vUV = uv;',
+        '  vec3 pos = position;',
+        '  pos.z *= rayLength;', // scale length
+        '  gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);',
+        '}'
+      ].join('\n'),
+      fragmentShader: [
+        'uniform vec3 rayColor;',
+        'uniform float opacity;',
+        'uniform float time;',
+        'varying vec2 vUV;',
+        'void main(){',
+        '  float dist = vUV.y;', // 0 at center, 1 at tip
+        '  float centerX = abs(vUV.x - 0.5) * 2.0;', // 0 at center of width, 1 at edge
+        '  // Bright at source, fades along length',
+        '  float lengthFade = 1.0 - dist;',
+        '  lengthFade = pow(lengthFade, 1.5);',
+        '  // Soft edges across width',
+        '  float widthFade = 1.0 - centerX;',
+        '  widthFade = pow(widthFade, 0.8);',
+        '  // Combine',
+        '  float a = lengthFade * widthFade * opacity;',
+        '  // Shimmer',
+        '  a *= 0.85 + 0.15 * sin(time * 3.0 + dist * 8.0);',
+        '  gl_FragColor = vec4(rayColor, a);',
+        '}'
+      ].join('\n'),
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending
+    });
+
+    var rayMesh = new THREE.Mesh(rayGeo, rayMat);
+    rayMesh.rotation.y = angle;
+    // Slight vertical tilt variation so rays aren't all in one plane
+    rayMesh.rotation.x = (Math.random()-0.5)*0.6;
+    rayMesh.userData.baseAngle = angle;
+    rayMesh.userData.phaseOffset = Math.random()*Math.PI*2;
+    rayMesh.userData.baseWidth = baseWidth;
+    rayMesh.raycast = function(){}; // exclude from raycaster
+    scene.add(rayMesh);
+    lightRays.push(rayMesh);
+  }
+}
+
+function updateLightRays(rpmNorm, time) {
+  // Three-stage for light rays
+  var s1 = Math.min(rpmNorm / 0.5, 1.0);
+  s1 = s1 * s1;
+  var s2 = Math.max(Math.min((rpmNorm - 0.5) / 0.35, 1.0), 0.0);
+  var s3 = Math.max((rpmNorm - 0.85) / 0.15, 0.0);
+
+  // Central glow sprite — light blue in stage 2
+  if(rayGlowSprite){
+    var glowSize = 2.0 + s1 * 3.0 + s2 * 6.0 + s3 * 20.0;
+    rayGlowSprite.scale.set(glowSize, glowSize, 1);
+    // Shift to light blue in stage 2, white in stage 3
+    var gr = 0.45 + s1*0.1 + s2*0.1 + s3*0.35;
+    var gg = 0.5 + s1*0.1 + s2*0.2 + s3*0.2;
+    var gb = 0.7 + s2*0.2 + s3*0.1;
+    rayGlowSprite.material.color.setRGB(gr, gg, gb);
+    rayGlowSprite.material.opacity = 0.08 + s1 * 0.15 + s2 * 0.4 + s3 * 0.6;
+  }
+
+  // Ray rotation speed increases in stage 3
+  var raySpinMult = 1.0 + s3 * 8.0;
+
+  for(var i=0;i<lightRays.length;i++){
+    var ray = lightRays[i];
+    var phase = ray.userData.phaseOffset;
+
+    ray.rotation.y = ray.userData.baseAngle + time*0.08*raySpinMult + Math.sin(time*0.4+phase)*0.15;
+
+    var pulse = 0.5 + 0.5*Math.sin(time*2.0+phase);
+    // Light blue tinted rays in stage 2
+    var baseOpacity = 0.02 + s1*0.06 + s2*0.25 + s3*1.5;
+    ray.material.uniforms.opacity.value = baseOpacity * (0.7 + pulse*0.3);
+
+    var baseLen = 1.5 + s1 * 2.0 + s2 * 5.0 + s3 * 25.0;
+    ray.material.uniforms.rayLength.value = baseLen + Math.sin(time*1.5+phase)*1.0;
+
+    // Blue-gray -> light blue (stage 2) -> white (stage 3)
+    var r = 0.35 + s1*0.1 + s2*0.15 + s3*0.4;
+    var g = 0.45 + s1*0.1 + s2*0.2 + s3*0.25;
+    var b = 0.65 + s1*0.05 + s2*0.25 + s3*0.05;
+    ray.material.uniforms.rayColor.value.setRGB(r, g, b);
+
+    ray.material.uniforms.time.value = time;
+  }
+}
+
+// ══════════════════════════════════════════════
+// ORB TRAIL PARTICLES
+// ══════════════════════════════════════════════
+var orbParticles = null;
+var MAX_ORB_PARTICLES = 500;
+var orbPData = [];
+
+function createOrbParticles() {
+  var positions = new Float32Array(MAX_ORB_PARTICLES*3);
+  var alphas = new Float32Array(MAX_ORB_PARTICLES);
+  var sizes = new Float32Array(MAX_ORB_PARTICLES);
+
+  for(var i=0;i<MAX_ORB_PARTICLES;i++){
+    positions[i*3]=0;positions[i*3+1]=-999;positions[i*3+2]=0;
+    alphas[i]=0;
+    sizes[i]=1.0;
+    orbPData.push({alive:false, vx:0, vy:0, vz:0, life:0, maxLife:1, size:1.0});
+  }
+
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+  geo.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+  var mat = new THREE.ShaderMaterial({
+    uniforms: {
+      pixelRatio: {value: Math.min(window.devicePixelRatio, 1.5)}
+    },
+    vertexShader: [
+      'attribute float alpha;',
+      'attribute float size;',
+      'uniform float pixelRatio;',
+      'varying float vA;',
+      'varying float vSize;',
+      'void main(){',
+      '  vA = alpha;',
+      '  vSize = size;',
+      '  vec4 mvPos = modelViewMatrix * vec4(position, 1.0);',
+      '  gl_PointSize = size * pixelRatio * (300.0 / -mvPos.z);',
+      '  gl_PointSize = clamp(gl_PointSize, 1.0, 32.0);',
+      '  gl_Position = projectionMatrix * mvPos;',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'varying float vA;',
+      'varying float vSize;',
+      'void main(){',
+      '  float d = length(gl_PointCoord - 0.5) * 2.0;',
+      '  if(d > 1.0) discard;',
+      '  float glow = 1.0 - d;',
+      '  glow = pow(glow, 1.5);',
+      // Hot core fades to blue-white at edges
+      '  vec3 hotCore = vec3(1.0, 0.85, 0.6);',
+      '  vec3 outerGlow = vec3(0.5, 0.65, 1.0);',
+      '  vec3 col = mix(outerGlow, hotCore, glow);',
+      '  gl_FragColor = vec4(col, glow * vA);',
+      '}'
+    ].join('\n'),
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+
+  orbParticles = new THREE.Points(geo, mat);
+  scene.add(orbParticles);
+}
+
+function updateOrbParticles(dt, rpm, orbPositions, orbVelocities) {
+  if(!orbParticles) return;
+  var pos = orbParticles.geometry.attributes.position.array;
+  var alphas = orbParticles.geometry.attributes.alpha.array;
+  var sizes = orbParticles.geometry.attributes.size.array;
+
+  // Spawn sparks when spinning fast
+  var rpmThreshold = 4;
+  if(rpm > rpmThreshold && orbPositions.length > 0) {
+    var excess = rpm - rpmThreshold;
+    var spawnRate = excess * 1.5; // aggressive spawn rate
+    var spawnsThisFrame = Math.min(Math.floor(spawnRate * dt * 60 + Math.random()), 12);
+    for(var s=0;s<spawnsThisFrame;s++){
+      // Find dead particle
+      for(var fi=0;fi<MAX_ORB_PARTICLES;fi++){
+        if(!orbPData[fi].alive){
+          var orbIdx = Math.floor(Math.random()*orbPositions.length);
+          var op = orbPositions[orbIdx];
+          var ov = orbVelocities[orbIdx];
+          var speed = Math.sqrt(ov.x*ov.x + ov.y*ov.y + ov.z*ov.z);
+          if(speed < 0.5) break; // orb not moving fast enough
+          orbPData[fi].alive = true;
+          orbPData[fi].life = 0;
+          orbPData[fi].maxLife = 0.4 + Math.random()*1.2;
+          // Spawn at orb surface with slight random offset
+          var offR = 0.35; // orb radius
+          var rndAng = Math.random()*Math.PI*2;
+          pos[fi*3] = op.x + Math.cos(rndAng)*offR*(Math.random()*0.3);
+          pos[fi*3+1] = op.y + (Math.random()-0.5)*offR*0.5;
+          pos[fi*3+2] = op.z + Math.sin(rndAng)*offR*(Math.random()*0.3);
+          // Fling tangentially — multiply velocity for dramatic spark effect
+          var flingMult = 1.5 + Math.random()*2.0;
+          var rpmBoost = Math.min(rpm/30, 3.0); // extra boost at high RPM
+          orbPData[fi].vx = ov.x * flingMult * rpmBoost + (Math.random()-0.5)*2.0;
+          orbPData[fi].vy = ov.y * flingMult * rpmBoost + (Math.random()-0.3)*1.5;
+          orbPData[fi].vz = ov.z * flingMult * rpmBoost + (Math.random()-0.5)*2.0;
+          // Vary size — mix of tiny sparks and larger embers
+          var sz = Math.random() < 0.7 ? 1.0+Math.random()*2.0 : 3.0+Math.random()*3.0;
+          orbPData[fi].size = sz;
+          sizes[fi] = sz;
+          break;
+        }
+      }
+    }
+  }
+
+  // Update alive particles
+  for(var i=0;i<MAX_ORB_PARTICLES;i++){
+    if(!orbPData[i].alive){
+      alphas[i] = 0;
+      continue;
+    }
+    orbPData[i].life += dt;
+    if(orbPData[i].life >= orbPData[i].maxLife){
+      orbPData[i].alive = false;
+      alphas[i] = 0;
+      pos[i*3+1] = -999;
+      continue;
+    }
+    // Move
+    pos[i*3] += orbPData[i].vx * dt;
+    pos[i*3+1] += orbPData[i].vy * dt;
+    pos[i*3+2] += orbPData[i].vz * dt;
+    // Light gravity — sparks arc gently
+    orbPData[i].vy -= 0.8 * dt;
+    // Very light drag so sparks fly far
+    orbPData[i].vx *= 0.995;
+    orbPData[i].vy *= 0.998;
+    orbPData[i].vz *= 0.995;
+    // Fade — quick flash in, gradual fade out
+    var lifeT = orbPData[i].life / orbPData[i].maxLife;
+    var fadeIn = Math.min(lifeT * 20.0, 1.0); // instant flash in
+    var fadeOut = 1.0 - lifeT * lifeT; // quadratic fade out (lingers then dies)
+    alphas[i] = fadeIn * fadeOut;
+    // Shrink over time
+    sizes[i] = orbPData[i].size * (1.0 - lifeT * 0.5);
+  }
+
+  orbParticles.geometry.attributes.position.needsUpdate = true;
+  orbParticles.geometry.attributes.alpha.needsUpdate = true;
+  orbParticles.geometry.attributes.size.needsUpdate = true;
+}
+
+// ══════════════════════════════════════════════
+// WELDING SPARKS — bright white streaking lines (Doctor Strange portal style)
+// ══════════════════════════════════════════════
+var MAX_SPARKS = 80;
+var SPARK_TRAIL_LEN = 8; // positions remembered per spark
+var sparkData = [];
+var sparkLines = null;
+
+function createWeldingSparks(){
+  for(var i=0;i<MAX_SPARKS;i++){
+    var trail = [];
+    for(var j=0;j<SPARK_TRAIL_LEN;j++) trail.push({x:0,y:-999,z:0});
+    sparkData.push({alive:false, trail:trail, vx:0,vy:0,vz:0, life:0, maxLife:1, head:0});
+  }
+  // Each spark = SPARK_TRAIL_LEN-1 line segments = (SPARK_TRAIL_LEN-1)*2 vertices
+  var totalVerts = MAX_SPARKS * (SPARK_TRAIL_LEN - 1) * 2;
+  var positions = new Float32Array(totalVerts * 3);
+  var alphas = new Float32Array(totalVerts);
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+
+  var mat = new THREE.ShaderMaterial({
+    vertexShader:[
+      'attribute float alpha;',
+      'varying float vA;',
+      'void main(){',
+      '  vA=alpha;',
+      '  gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);',
+      '}'
+    ].join('\n'),
+    fragmentShader:[
+      'varying float vA;',
+      'void main(){',
+      '  gl_FragColor=vec4(1.0, 0.97, 0.92, vA);',
+      '}'
+    ].join('\n'),
+    transparent:true,
+    depthWrite:false,
+    blending:THREE.AdditiveBlending
+  });
+
+  sparkLines = new THREE.LineSegments(geo, mat);
+  sparkLines.frustumCulled = false;
+  scene.add(sparkLines);
+}
+
+function updateWeldingSparks(dt, rpm, orbPositions, orbVelocities){
+  if(!sparkLines) return;
+  var pos = sparkLines.geometry.attributes.position.array;
+  var alp = sparkLines.geometry.attributes.alpha.array;
+
+  // Only spawn at near-top RPM (stage 2+)
+  var rpmNormSpark = Math.min(rpm/200, 1.0);
+  var sparkPhase = Math.max((rpmNormSpark - 0.45) / 0.55, 0.0); // starts at ~45% RPM range
+
+  if(sparkPhase > 0.01 && orbPositions.length > 0){
+    var spawnRate = sparkPhase * sparkPhase * 8.0;
+    var spawns = Math.min(Math.floor(spawnRate * dt * 60 + Math.random()), 6);
+    for(var s=0;s<spawns;s++){
+      for(var fi=0;fi<MAX_SPARKS;fi++){
+        if(!sparkData[fi].alive){
+          var orbIdx = Math.floor(Math.random()*orbPositions.length);
+          var op = orbPositions[orbIdx];
+          var ov = orbVelocities[orbIdx];
+          var speed = Math.sqrt(ov.x*ov.x+ov.y*ov.y+ov.z*ov.z);
+          if(speed < 1.0) break;
+          sparkData[fi].alive = true;
+          sparkData[fi].life = 0;
+          sparkData[fi].maxLife = 0.3 + Math.random()*0.6;
+          // Tangential velocity with some spread
+          var fling = 2.0 + Math.random()*3.0;
+          var spread = 0.8;
+          sparkData[fi].vx = ov.x*fling + (Math.random()-0.5)*speed*spread;
+          sparkData[fi].vy = ov.y*fling + (Math.random()-0.3)*speed*spread;
+          sparkData[fi].vz = ov.z*fling + (Math.random()-0.5)*speed*spread;
+          // Init all trail positions to spawn point
+          for(var ti=0;ti<SPARK_TRAIL_LEN;ti++){
+            sparkData[fi].trail[ti].x = op.x + (Math.random()-0.5)*0.1;
+            sparkData[fi].trail[ti].y = op.y + (Math.random()-0.5)*0.1;
+            sparkData[fi].trail[ti].z = op.z + (Math.random()-0.5)*0.1;
+          }
+          sparkData[fi].head = 0;
+          break;
+        }
+      }
+    }
+  }
+
+  // Update alive sparks
+  for(var i=0;i<MAX_SPARKS;i++){
+    var sp = sparkData[i];
+    var segBase = i * (SPARK_TRAIL_LEN-1) * 2;
+    if(!sp.alive){
+      // Zero out all verts
+      for(var z=0;z<(SPARK_TRAIL_LEN-1)*2;z++){
+        pos[(segBase+z)*3+1] = -999;
+        alp[segBase+z] = 0;
+      }
+      continue;
+    }
+    sp.life += dt;
+    if(sp.life >= sp.maxLife){
+      sp.alive = false;
+      continue;
+    }
+    // Advance head position
+    var h = sp.head;
+    var prevH = (h - 1 + SPARK_TRAIL_LEN) % SPARK_TRAIL_LEN;
+    var newX = sp.trail[prevH].x + sp.vx * dt;
+    var newY = sp.trail[prevH].y + sp.vy * dt;
+    var newZ = sp.trail[prevH].z + sp.vz * dt;
+    sp.trail[h].x = newX;
+    sp.trail[h].y = newY;
+    sp.trail[h].z = newZ;
+    sp.head = (h + 1) % SPARK_TRAIL_LEN;
+    // Gravity — slight arc
+    sp.vy -= 3.0 * dt;
+    // Light drag
+    sp.vx *= 0.98; sp.vz *= 0.98;
+
+    // Life fade
+    var lifeT = sp.life / sp.maxLife;
+    var masterAlpha = (1.0 - lifeT) * Math.min(lifeT * 15.0, 1.0);
+
+    // Build line segments from trail: head is brightest, tail fades
+    var curHead = sp.head;
+    for(var si=0;si<SPARK_TRAIL_LEN-1;si++){
+      var idx0 = (curHead - 1 - si + SPARK_TRAIL_LEN*2) % SPARK_TRAIL_LEN;
+      var idx1 = (curHead - 2 - si + SPARK_TRAIL_LEN*2) % SPARK_TRAIL_LEN;
+      var vOff = (segBase + si*2);
+      pos[vOff*3]   = sp.trail[idx0].x;
+      pos[vOff*3+1] = sp.trail[idx0].y;
+      pos[vOff*3+2] = sp.trail[idx0].z;
+      pos[(vOff+1)*3]   = sp.trail[idx1].x;
+      pos[(vOff+1)*3+1] = sp.trail[idx1].y;
+      pos[(vOff+1)*3+2] = sp.trail[idx1].z;
+      // Alpha: bright at head, fades along trail
+      var segFade = 1.0 - (si / (SPARK_TRAIL_LEN-1));
+      segFade = segFade * segFade;
+      alp[vOff]   = masterAlpha * segFade;
+      alp[vOff+1] = masterAlpha * segFade * 0.7;
+    }
+  }
+
+  sparkLines.geometry.attributes.position.needsUpdate = true;
+  sparkLines.geometry.attributes.alpha.needsUpdate = true;
+}
+
+// ══════════════════════════════════════════════
+// UPDATE ORBS
+// ══════════════════════════════════════════════
+var smoothedRpmForPlanets = 0;
+
+function updateOrbs(dt){
+  var orbPositions = [];
+  var orbVelocities = [];
+  var globalRpm = 0;
+
+  floors.forEach(function(fl){
+    if(!fl.orbs) return;
+    var vel=Math.abs(fl.group.userData.velocity);
+    var baseSpeed=Math.abs(fl.group.userData.rotationSpeed);
+    var speedRatio=vel/Math.max(baseSpeed,0.001);
+    var intensity=Math.min(speedRatio/40,1);
+    var stretchIntensity=Math.max(0,(intensity-0.5)*2);
+    var time=performance.now()*0.001;
+    var ud=fl.group.userData;
+
+    // Track RPM
+    var currentAngle=fl.group.rotation.y;
+    var deltaAngle=Math.abs(currentAngle-(ud.lastAngle||currentAngle));
+    if(deltaAngle>Math.PI) deltaAngle=2*Math.PI-deltaAngle;
+    ud.lastAngle=currentAngle;
+    var instantRPM=deltaAngle*60*60/(2*Math.PI);
+    ud.rpmSmooth+=(instantRPM-(ud.rpmSmooth||0))*0.1;
+    var rpm=ud.rpmSmooth||0;
+    var rpmNorm=Math.min(rpm/200,1);
+    globalRpm = rpm;
+
+    // Three-stage brightness:
+    // Stage 1 (rpmNorm 0-0.5): slow subtle buildup, barely noticeable
+    // Stage 2 (rpmNorm 0.5-0.85): background goes dark, center glows light blue
+    // Stage 3 (rpmNorm 0.85-1.0): blinding whiteout overtakes everything
+    var stage1 = Math.min(rpmNorm / 0.5, 1.0);
+    stage1 = stage1 * stage1; // quadratic
+    var stage2 = Math.max(Math.min((rpmNorm - 0.5) / 0.35, 1.0), 0.0);
+    var stage3 = Math.max((rpmNorm - 0.85) / 0.15, 0.0);
+
+    // Center star glow — light blue in stage 2, white in stage 3
+    var star=ud.centerStar;
+    if(star&&star.children[0]&&star.children[0].material){
+      var sm=star.children[0].material;
+      sm.emissive=sm.emissive||new THREE.Color(0x334466);
+      // Stage 1: subtle warm. Stage 2: shift to light blue. Stage 3: blazing white
+      var eR = 0.2 + stage1*0.3 + stage2*0.3 + stage3*2.5;
+      var eG = 0.15 + stage1*0.25 + stage2*0.5 + stage3*2.5;
+      var eB = 0.15 + stage1*0.2 + stage2*0.9 + stage3*2.5;
+      sm.emissive.setRGB(eR, eG, eB);
+      sm.emissiveIntensity = 0.3 + stage1*2.0 + stage2*5.0 + stage3*30.0;
+      // Also shift the base color toward light blue in stage 2
+      var baseR = 0.6 + stage2*0.15 + stage3*0.25;
+      var baseG = 0.6 + stage2*0.3 + stage3*0.1;
+      var baseB = 0.7 + stage2*0.3 + stage3*0.0;
+      sm.color.setRGB(baseR, baseG, baseB);
+    }
+    if(ud.centerLight){
+      ud.centerLight.intensity = 0.2 + stage1*2.0 + stage2*6.0 + stage3*40.0;
+      ud.centerLight.distance = 20 + stage1*15 + stage2*40 + stage3*120;
+      // Light color shifts to blue in stage 2
+      var lcR = 0.53 + stage2*0.1 + stage3*0.37;
+      var lcG = 0.67 + stage2*0.15 + stage3*0.18;
+      var lcB = 0.93 + stage2*0.07 + stage3*0.0;
+      ud.centerLight.color.setRGB(lcR, lcG, lcB);
+    }
+
+    // Center star spins faster in stage 3
+    if(ud.centerStar){
+      ud.centerStar.rotation.z += stage3 * 0.15;
+      ud.centerStar.rotation.x += stage3 * 0.08;
+    }
+
+    // Background: darkens during stage 2, stays dark into stage 3
+    var bgBase = 0xf0f0f5;
+    var bgR = ((bgBase>>16)&0xff)/255, bgG = ((bgBase>>8)&0xff)/255, bgB = (bgBase&0xff)/255;
+    var darkT = stage2;
+    var tR = bgR * (1 - darkT*0.92);
+    var tG = bgG * (1 - darkT*0.93);
+    var tB = bgB * (1 - darkT*0.90);
+    scene.background.setRGB(tR, tG, tB);
+    scene.fog.color.setRGB(tR, tG, tB);
+
+    // Whiteout overlay — only stage 3
+    if(postQuad && postQuad.material.uniforms.whiteout){
+      postQuad.material.uniforms.whiteout.value = stage3 * stage3;
+      postQuad.material.uniforms.shakeAmount.value = stage2 * 0.02 + stage3 * 0.04;
+      postQuad.material.uniforms.shakeTime.value = time * 60.0;
+    }
+
+    // God rays — grow through stage 1 and 2, intense in stage 2 dark phase
+    godrayIntensity = stage1 * 0.4 + stage2 * 1.8 + stage3 * 1.0;
+
+    // Light rays
+    updateLightRays(rpmNorm, time);
+
+    // Smoothed RPM for planets
+    smoothedRpmForPlanets += (rpmNorm - smoothedRpmForPlanets) * 0.02;
+
+    // Wobbly orbit tilt
+    var tiltAmount=intensity*0.3;
+    var wobbleSpeed=2+intensity*4;
+    var targetTiltX=Math.sin(time*wobbleSpeed)*tiltAmount;
+    var targetTiltZ=Math.cos(time*wobbleSpeed*0.7+1.3)*tiltAmount;
+    ud.orbTiltX+=(targetTiltX-(ud.orbTiltX||0))*0.05;
+    ud.orbTiltZ+=(targetTiltZ-(ud.orbTiltZ||0))*0.05;
+
+    var spinDir=fl.group.userData.velocity>=0?1:-1;
+
+    // Streak only kicks in at high RPM — dead zone until rpmNorm > 0.5 (stage 2)
+    var streakRaw = Math.max((rpmNorm - 0.5) * 2.0, 0.0); // 0 until halfway, then ramps to 1
+    var streakT = streakRaw * streakRaw; // ease-in so it's subtle at first then rapid
+
+    // Helper: compute tilted orbital position for any angle
+    var tx=ud.orbTiltX||0, tz=ud.orbTiltZ||0;
+    var cosX=Math.cos(tx),sinX=Math.sin(tx),cosZ=Math.cos(tz),sinZ=Math.sin(tz);
+    function orbPos(ang){
+      var baseR2=fl.orbs[0].mesh.userData.orbitR;
+      var sR=baseR2+intensity*1.5;
+      var fx=Math.sin(ang)*sR, fz=Math.cos(ang)*sR, fy=0;
+      var yy=fy*cosX-fz*sinX, zz=fy*sinX+fz*cosX;
+      var xx=fx*cosZ-yy*sinZ; yy=fx*sinZ+yy*cosZ;
+      return {x:xx, y:yy, z:zz};
+    }
+
+    fl.orbs.forEach(function(orb){
+      var prevX = orb.mesh.position.x;
+      var prevY = orb.mesh.position.y;
+      var prevZ = orb.mesh.position.z;
+
+      var totalAngle=orb.angle+fl.group.rotation.y;
+      var hp = orbPos(totalAngle);
+      orb.mesh.position.set(hp.x, hp.y, hp.z);
+
+      // Collect world positions for particle spawning
+      var wp = new THREE.Vector3();
+      orb.mesh.getWorldPosition(wp);
+      orbPositions.push(wp);
+      var dvx = (orb.mesh.position.x - prevX) / Math.max(dt, 0.001);
+      var dvy = (orb.mesh.position.y - prevY) / Math.max(dt, 0.001);
+      var dvz = (orb.mesh.position.z - prevZ) / Math.max(dt, 0.001);
+      orbVelocities.push({x:dvx, y:dvy, z:dvz});
+
+      orb.mesh.material.emissiveIntensity = 0.15 + streakT * 1.5;
+
+      if(streakT < 0.01){
+        // Normal sphere — swap back if needed
+        if(orb.isCurved){
+          orb.mesh.geometry = orb.sphereGeo;
+          orb.isCurved = false;
+        }
+        orb.mesh.rotation.x+=orb.spinSpeed*(1+intensity*5);
+        orb.mesh.rotation.y+=orb.spinSpeed*0.7*(1+intensity*5);
+        orb.mesh.scale.set(1,1,1);
+        orb.mesh.material.opacity = 0.7;
+        orb.edges.visible = true;
+        orb.edges.position.copy(orb.mesh.position);
+        orb.edges.rotation.copy(orb.mesh.rotation);
+        orb.edges.scale.set(1,1,1);
+        orb.edges.material.opacity = 0.25;
+      } else {
+        // Swap to curved tube geometry — the orb physically morphs
+        if(!orb.isCurved){
+          orb.mesh.geometry = orb.curveGeo;
+          orb.isCurved = true;
+        }
+        orb.mesh.position.set(0, 0, 0);
+        orb.mesh.rotation.set(0, 0, 0);
+        orb.mesh.scale.set(1, 1, 1);
+        orb.mesh.material.opacity = 0.7;
+        orb.edges.visible = false;
+
+        var segs = orb.curveSegs;
+        var rv = orb.curveRing;
+        var pos2 = orb.curveGeo.attributes.position.array;
+        var nrm = orb.curveGeo.attributes.normal.array;
+        var orbR = orb.mesh.userData.orbRadius;
+        // Arc length grows with speed — small stretch at first
+        var arcLen = streakT * Math.PI * 0.83;
+
+        for(var si2=0;si2<segs;si2++){
+          var t2 = si2/(segs-1); // 0 = front, 1 = back
+          // Remap t2 so 0 is the trailing edge, 0.5 is center, 1.0 is leading edge
+          // Center of the shape sits at the orb's actual position (middle of arc)
+          var arcT = (t2 - 0.5) * arcLen; // ranges from -arcLen/2 to +arcLen/2
+          var sAngle = totalAngle + spinDir * arcT;
+          var sp = orbPos(sAngle);
+
+          // Tangent via finite difference
+          var sAngle2 = sAngle + spinDir * 0.01;
+          var sp2 = orbPos(sAngle2);
+          var tdx=sp2.x-sp.x, tdy=sp2.y-sp.y, tdz=sp2.z-sp.z;
+          var tLen=Math.sqrt(tdx*tdx+tdy*tdy+tdz*tdz)||0.001;
+          tdx/=tLen; tdy/=tLen; tdz/=tLen;
+
+          // Radial direction (outward from orbit center)
+          var rdx=sp.x, rdy=sp.y, rdz=sp.z;
+          var rLen=Math.sqrt(rdx*rdx+rdy*rdy+rdz*rdz)||0.001;
+          rdx/=rLen; rdy/=rLen; rdz/=rLen;
+
+          // Binormal = tangent x radial
+          var bx=tdy*rdz-tdz*rdy, by=tdz*rdx-tdx*rdz, bz=tdx*rdy-tdy*rdx;
+          var bLen=Math.sqrt(bx*bx+by*by+bz*bz)||0.001;
+          bx/=bLen; by/=bLen; bz/=bLen;
+
+          // Capsule/pill radius profile:
+          // At low streakT: sphere profile (sin curve, bulges in middle)
+          // At high streakT: uniform tube with rounded caps
+          var distFromCenter = Math.abs(t2 - 0.5) * 2.0; // 0=center, 1=ends
+          // Sphere profile: circular cross-section sin(pi*t)
+          var sphereProfile = Math.sin(t2 * Math.PI);
+          // Pill profile: flat in middle, rounds off at ends
+          var capZone = 0.15; // how much of each end is rounded
+          var pillProfile = distFromCenter > (1.0 - capZone) ?
+            Math.cos((distFromCenter - (1.0 - capZone)) / capZone * Math.PI * 0.5) : 1.0;
+          // Blend between sphere and pill based on how stretched we are
+          var profileBlend = Math.min(streakT * 3.0, 1.0); // pill takes over quickly
+          var profile = sphereProfile * (1.0 - profileBlend) + pillProfile * profileBlend;
+          var segR = orbR * Math.max(profile, 0.02);
+          // Squash vertically (binormal axis) as it stretches — elliptical cross-section
+          var vertSquash = 1.0 - streakT * 0.6; // down to 40% height at max
+
+          for(var ri2=0;ri2<rv;ri2++){
+            var ra = (ri2/rv)*Math.PI*2;
+            var cosA=Math.cos(ra), sinA=Math.sin(ra)*vertSquash;
+            var vIdx = (si2*rv+ri2)*3;
+            pos2[vIdx]   = sp.x + (rdx*cosA + bx*sinA)*segR;
+            pos2[vIdx+1] = sp.y + (rdy*cosA + by*sinA)*segR;
+            pos2[vIdx+2] = sp.z + (rdz*cosA + bz*sinA)*segR;
+            nrm[vIdx]   = rdx*cosA + bx*sinA;
+            nrm[vIdx+1] = rdy*cosA + by*sinA;
+            nrm[vIdx+2] = rdz*cosA + bz*sinA;
+          }
+        }
+        orb.curveGeo.attributes.position.needsUpdate = true;
+        orb.curveGeo.attributes.normal.needsUpdate = true;
+        orb.curveGeo.computeBoundingSphere();
+      }
+    });
+  });
+
+  // Update orb particles
+  updateOrbParticles(dt, globalRpm, orbPositions, orbVelocities);
+}
+
+// ══════════════════════════════════════════════
+// INTRO
+// ══════════════════════════════════════════════
+function startIntro(){setTimeout(function(){introAnim.animating[0]=true;},300);}
+function updateIntro(){
+  floors.forEach(function(fl,fi){
+    if(!introAnim.animating[fi]||introAnim.revealed[fi])return;
+    introAnim.progress[fi]+=0.008;
+    var fp=introAnim.progress[fi], allDone=true;
+    fl.panels.forEach(function(panel,pi){
+      var pd=introAnim.offsets[fi][pi];
+      var pp=Math.max(0,Math.min(1,(fp-pd.delay)*0.8));
+      pd.prog=pp; if(pp<1)allDone=false;
+      var e=eOQ(pp);
+      panel.mesh.position.y=(pd.oy-pd.dd)+pd.dd*e;
+      panel.edges.position.y=panel.mesh.position.y;
+      var mo=0.01;
+      var oe=eOQ2(pp);
+      if(panel.mesh.material){panel.mesh.material.opacity=Math.max(mo,oe*0.7);panel.mesh.material.transparent=true;}
+      if(panel.edges.material){panel.edges.material.opacity=Math.max(mo,oe*0.4);panel.edges.material.transparent=true;}
+    });
+    var sp2=Math.max(0,Math.min(1,fp*0.9)),se=eOQ(sp2);
+    fl.group.children.forEach(function(c){if(c.type==='Group'&&c.userData.oy!==undefined){c.position.y=(c.userData.oy-1.5)+1.5*se;c.children.forEach(function(p){if(p.material&&p.geometry&&p.geometry.type==='OctahedronGeometry'){p.material.opacity=Math.max(0.01,eOQ2(sp2));p.material.transparent=true;}});}});
+    // Animate orbs rising in
+    if(fl.orbs){
+      fl.orbs.forEach(function(orb,oi){
+        var op=Math.max(0,Math.min(1,(fp-oi*0.08)*0.7));
+        if(op<1) allDone=false;
+        var oe2=eOQ(op);
+        var oyOff=orb.mesh.userData.oy||0;
+        var dropD=1.5+oi*0.2;
+        orb.mesh.position.y=(oyOff-dropD)+dropD*oe2;
+        orb.edges.position.y=orb.mesh.position.y;
+        orb.mesh.material.opacity=Math.max(0.01,eOQ2(op)*0.7);
+        orb.mesh.material.transparent=true;
+      });
+    }
+    if(allDone&&fp>=1.5){introAnim.revealed[fi]=true;introAnim.animating[fi]=false;}
+  });
+}
+
+// ══════════════════════════════════════════════
+// SCROLL (free scroll, no floor navigation)
+// ══════════════════════════════════════════════
+function onScroll(){
+  // Scrolling just moves through space freely — no floor snapping
+}
+
+// ══════════════════════════════════════════════
+// INPUT
+// ══════════════════════════════════════════════
+function onMD(e){e.preventDefault();pDown(e.clientX,e.clientY);}
+function onMM(e){pMove(e.clientX,e.clientY);}
+function onMU(e){pUp(e.clientX,e.clientY);}
+function onTS(e){e.preventDefault();if(e.touches.length===1)pDown(e.touches[0].clientX,e.touches[0].clientY);}
+function onTM(e){e.preventDefault();if(e.touches.length===1)pMove(e.touches[0].clientX,e.touches[0].clientY);}
+function onTE(e){pUp(e.changedTouches[0].clientX,e.changedTouches[0].clientY);}
+
+function pDown(cx,cy){
+  mouseDownX=cx;mouseDownY=cy;mouseDownTime=performance.now();
+  mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+  raycaster.setFromCamera(mouse,camera);
+
+  var hits=raycaster.intersectObjects(scene.children,true);
+  if(hits.length>0){
+    // Walk ALL hits looking for one that belongs to a floor group
+    for(var i=0;i<hits.length;i++){
+      var o=hits[i].object;
+      if(o.type==='Sprite'||o.type==='Points'||o.type==='Line'||o.type==='LineSegments') continue;
+      // Skip light ray meshes and other non-floor scene objects
+      if(o.material && o.material.type==='ShaderMaterial' && !o.userData.isDragPlane) {
+        // Check if this object is inside a floor group
+        var inFloor = false;
+        var check = o;
+        while(check.parent){if(check.userData.label){inFloor=true;break;}check=check.parent;}
+        if(!inFloor) continue;
+      }
+      var obj=o;
+      while(obj.parent){if(obj.userData.label)break;obj=obj.parent;}
+      if(obj.userData.label){
+        var fd=floors.find(function(f){return f.group===obj;});
+        if(fd){
+          var fi2=floors.indexOf(fd);
+          if(!introAnim.revealed[fi2]&&!introAnim.animating[fi2])introAnim.animating[fi2]=true;
+          isDragging=true;selectedFloor=fd;previousMouseX=cx;previousTime=performance.now();
+          selectedFloor.group.userData.isDamping=Math.abs(selectedFloor.group.userData.velocity)>0.0001;
+          renderer.domElement.parentElement.classList.add('dragging');
+          break;
+        }
+      }
+    }
+  }
+}
+
+function pMove(cx,cy){
+  if(isDragging&&selectedFloor){
+    var dx=cx-previousMouseX;var dt2=(performance.now()-previousTime)||1;
+    if(Math.abs(dx)>0.1){selectedFloor.group.userData.velocity+=(dx*selectedFloor.group.userData.sensitivity*10)/dt2;selectedFloor.group.userData.isDamping=false;}
+    else{selectedFloor.group.userData.isDamping=true;}
+    previousMouseX=cx;previousTime=performance.now();
+    return;
+  }
+  // Not dragging — update cursor
+  updateCursor(cx,cy);
+}
+
+function updateCursor(cx,cy){
+  var el=renderer.domElement.parentElement;
+  el.classList.remove('clickable','grabbable');
+  mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+  raycaster.setFromCamera(mouse,camera);
+  var hits=raycaster.intersectObjects(scene.children,true);
+  for(var hi=0;hi<hits.length;hi++){
+    var ho=hits[hi].object;
+    if(ho.type==='Sprite'||ho.type==='Points'||ho.type==='Line'||ho.type==='LineSegments')continue;
+    if(ho.userData.isDragPlane){el.classList.add('grabbable');return;}
+    if(ho.userData.isPlanet){el.classList.add('clickable');return;}
+    var obj2=ho;
+    while(obj2.parent){if(obj2.userData.label){el.classList.add('grabbable');return;}obj2=obj2.parent;}
+    break;
+  }
+}
+
+function pUp(cx,cy){
+  var dist=Math.sqrt(Math.pow(cx-mouseDownX,2)+Math.pow(cy-mouseDownY,2));
+  var wasClick=dist<5&&(performance.now()-mouseDownTime)<300;
+  if(wasClick){
+    mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+    raycaster.setFromCamera(mouse,camera);
+    // Check for planet clicks
+    var allPlanetHitMeshes=[];
+    for(var pci=0;pci<planets.length;pci++){if(planets[pci].alive&&planets[pci].hitMesh)allPlanetHitMeshes.push(planets[pci].hitMesh);}
+    if(allPlanetHitMeshes.length>0){
+      var planetHits=raycaster.intersectObjects(allPlanetHitMeshes);
+      if(planetHits.length>0){
+        var hitPlanet=planetHits[0].object;
+        if(hitPlanet.userData.isPlanet){
+          launchMeteor(hitPlanet.userData.planetIdx);
+          isDragging=false;selectedFloor=null;
+          renderer.domElement.parentElement.classList.remove('dragging');return;
+        }
+      }
+    }
+  }
+  if(selectedFloor)selectedFloor.group.userData.isDamping=false;
+  isDragging=false;selectedFloor=null;renderer.domElement.parentElement.classList.remove('dragging');
+}
+
+// ══════════════════════════════════════════════
+// ENV MAP
+// ══════════════════════════════════════════════
+function createEnv(){
+  var sz=256;
+  function cf(tc,bc,hl,hx,hy){var c=document.createElement('canvas');c.width=sz;c.height=sz;var ctx=c.getContext('2d');var g=ctx.createLinearGradient(0,0,0,sz);g.addColorStop(0,tc);g.addColorStop(1,bc);ctx.fillStyle=g;ctx.fillRect(0,0,sz,sz);if(hl){ctx.fillStyle='rgba(255,255,255,0.8)';ctx.beginPath();ctx.arc(sz*hx,sz*hy,sz*0.2,0,Math.PI*2);ctx.fill();ctx.fillStyle='rgba(220,230,245,0.5)';ctx.beginPath();ctx.arc(sz*(1-hx),sz*0.6,sz*0.12,0,Math.PI*2);ctx.fill();}return c;}
+  envMap=new THREE.CubeTexture([cf('#e8e8f0','#c0c0cc',true,0.3,0.4),cf('#e8e8f0','#c0c0cc',true,0.7,0.3),cf('#f0f0f5','#e0e0e8',true,0.5,0.5),cf('#a0a0b0','#808090',false,0,0),cf('#e8e8f0','#c0c0cc',true,0.5,0.35),cf('#e8e8f0','#c0c0cc',true,0.4,0.4)]);
+  envMap.needsUpdate=true;
+}
+
+// ══════════════════════════════════════════════
+// STARFIELD + SHOOTING STARS
+// ══════════════════════════════════════════════
+var starField = null;
+var shootingStars = [];
+
+function createStarField() {
+  var count = 600;
+  var positions = new Float32Array(count * 3);
+  var sizes = new Float32Array(count);
+  var phases = new Float32Array(count);
+  var speeds = new Float32Array(count);
+
+  for(var i = 0; i < count; i++) {
+    var theta = Math.random() * Math.PI * 2;
+    var phi = Math.acos(2 * Math.random() - 1);
+    var r = 25 + Math.random() * 60;
+    positions[i*3] = r * Math.sin(phi) * Math.cos(theta);
+    positions[i*3+1] = r * Math.sin(phi) * Math.sin(theta) - 30;
+    positions[i*3+2] = -r * Math.cos(phi) - 5;
+    sizes[i] = 0.5 + Math.random() * 2.0;
+    phases[i] = Math.random() * Math.PI * 2;
+    speeds[i] = 0.5 + Math.random() * 2.0;
+  }
+
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+  geo.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
+  geo.setAttribute('aSpeed', new THREE.BufferAttribute(speeds, 1));
+
+  var mat = new THREE.ShaderMaterial({
+    uniforms: {
+      time: {value: 0},
+      color: {value: new THREE.Color(0.75, 0.78, 0.88)}
+    },
+    vertexShader: [
+      'attribute float aSize;',
+      'attribute float aPhase;',
+      'attribute float aSpeed;',
+      'varying float vAlpha;',
+      'uniform float time;',
+      'void main() {',
+      '  float twinkle = sin(time * aSpeed + aPhase) * 0.5 + 0.5;',
+      '  twinkle = twinkle * twinkle;',
+      '  vAlpha = 0.15 + twinkle * 0.85;',
+      '  vec4 mvPos = modelViewMatrix * vec4(position, 1.0);',
+      '  gl_PointSize = aSize * (300.0 / -mvPos.z);',
+      '  gl_PointSize = max(gl_PointSize, 0.5);',
+      '  gl_Position = projectionMatrix * mvPos;',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 color;',
+      'varying float vAlpha;',
+      'void main() {',
+      '  float d = length(gl_PointCoord - 0.5) * 2.0;',
+      '  if(d > 1.0) discard;',
+      '  float glow = 1.0 - d * d;',
+      '  glow = pow(glow, 3.0);',
+      '  gl_FragColor = vec4(color, glow * vAlpha);',
+      '}'
+    ].join('\n'),
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+
+  starField = new THREE.Points(geo, mat);
+  scene.add(starField);
+}
+
+// ── Planets scattered in the background ──
+var planets = [];
+var meteors = [];
+var explosions = [];
+
+function createPlanets() {
+  var planetConfigs = [
+    {r:4, x:-90, y:-60, z:-180, col:0xb0b0c0, emi:0x445566, emiI:0.1, ring:true, ringCol:0x8888a0},
+    {r:3.5, x:60, y:-40, z:-140, col:0xa8b0c8, emi:0x445566, emiI:0.12, ring:true, ringCol:0x8890a8},
+    {r:5, x:-55, y:-10, z:-100, col:0xb8c0d8, emi:0x556688, emiI:0.15, ring:true, ringCol:0x9098b0},
+    {r:3, x:100, y:30, z:-160, col:0xc0b8c8, emi:0x554466, emiI:0.1, ring:false},
+    {r:2.5, x:80, y:8, z:-100, col:0xb0b8d0, emi:0x556678, emiI:0.1, ring:false},
+    {r:2, x:-70, y:40, z:-80, col:0xc8c0b8, emi:0x665544, emiI:0.1, ring:true, ringCol:0xa8a098},
+    {r:1.8, x:35, y:-30, z:-70, col:0xb8b0c0, emi:0x554466, emiI:0.09, ring:false},
+    {r:1.5, x:-30, y:-45, z:-60, col:0xc0c8d0, emi:0x556688, emiI:0.08, ring:false},
+    {r:2.2, x:-45, y:55, z:-90, col:0xb0c0b8, emi:0x446655, emiI:0.1, ring:false},
+    {r:1.8, x:55, y:50, z:-85, col:0xc8b8b0, emi:0x776655, emiI:0.09, ring:false},
+    {r:1.2, x:-60, y:35, z:-60, col:0xc0b8b0, emi:0x776655, emiI:0.09, ring:false},
+    {r:1.0, x:50, y:-55, z:-50, col:0xd0c8c0, emi:0x887766, emiI:0.08, ring:false},
+    {r:0.8, x:-25, y:-35, z:-45, col:0xb8c0c8, emi:0x557788, emiI:0.1, ring:false},
+    {r:1.5, x:20, y:40, z:-55, col:0xc8c0d0, emi:0x665577, emiI:0.09, ring:false},
+    {r:0.7, x:45, y:15, z:-35, col:0xc8b8a8, emi:0x665544, emiI:0.1, ring:false},
+    {r:0.5, x:-40, y:22, z:-30, col:0xd0c8c0, emi:0x887766, emiI:0.08, ring:false},
+    {r:0.4, x:-20, y:30, z:-25, col:0xc0c8d8, emi:0x667788, emiI:0.12, ring:false},
+    {r:0.3, x:25, y:-5, z:-20, col:0xd8d0c8, emi:0x998877, emiI:0.06, ring:false},
+    {r:0.4, x:-10, y:-20, z:-22, col:0xc8d0c8, emi:0x778877, emiI:0.07, ring:false},
+    {r:0.5, x:15, y:20, z:-28, col:0xd0c0c0, emi:0x887777, emiI:0.08, ring:false},
+    {r:0.6, x:-50, y:-15, z:-40, col:0xb8c8c0, emi:0x557766, emiI:0.09, ring:false},
+    {r:0.5, x:60, y:-10, z:-35, col:0xc0c0c8, emi:0x666688, emiI:0.08, ring:false},
+  ];
+
+  for(var i=0;i<planetConfigs.length;i++){
+    var cfg=planetConfigs[i];
+    var segs=cfg.r>10?48:cfg.r>3?32:16;
+    var planetGeo=new THREE.SphereGeometry(cfg.r,segs,segs/2);
+    var planetMat=new THREE.MeshStandardMaterial({
+      color:cfg.col, roughness:0.7, metalness:0.1,
+      emissive:cfg.emi, emissiveIntensity:cfg.emiI,
+      fog:true
+    });
+    var planetMesh=new THREE.Mesh(planetGeo,planetMat);
+    planetMesh.position.set(cfg.x,cfg.y,cfg.z);
+    planetMesh.rotation.set(Math.random()*0.5,Math.random()*Math.PI*2,Math.random()*0.3);
+    planetMesh.userData.isPlanet=true;
+    planetMesh.userData.planetIdx=i;
+    planetMesh.userData.radius=cfg.r;
+    planetMesh.userData.color=cfg.col;
+    scene.add(planetMesh);
+
+    var planetObj={mesh:planetMesh,rotSpeed:0.0003+Math.random()*0.0005,alive:true,radius:cfg.r,
+      orbitRadius:50+i*8+Math.random()*4,
+      orbitAngle:(i/planetConfigs.length)*Math.PI*2+Math.random()*0.3,
+      orbitSpeed:(0.0004+Math.random()*0.0006)*(Math.random()>0.5?1:-1),
+      orbitY:cfg.y, cfg:cfg,
+      // Motion blur trail
+      prevPositions: [],
+      trailMeshes: []
+    };
+    planetMesh.position.x=Math.cos(planetObj.orbitAngle)*planetObj.orbitRadius;
+    planetMesh.position.z=Math.sin(planetObj.orbitAngle)*planetObj.orbitRadius;
+
+    // Hit detection sphere
+    var hitGeo=new THREE.SphereGeometry(cfg.r*2,8,6);
+    var hitMat=new THREE.MeshBasicMaterial({visible:false});
+    var hitMesh=new THREE.Mesh(hitGeo,hitMat);
+    hitMesh.position.copy(planetMesh.position);
+    hitMesh.userData.isPlanet=true;
+    hitMesh.userData.planetIdx=i;
+    hitMesh.userData.radius=cfg.r;
+    hitMesh.userData.color=cfg.col;
+    scene.add(hitMesh);
+    planetObj.hitMesh=hitMesh;
+
+    if(cfg.ring){
+      var ringGeo=new THREE.RingGeometry(cfg.r*1.4,cfg.r*2.0,64);
+      var ringMat=new THREE.MeshStandardMaterial({
+        color:cfg.ringCol||0x9098b0, roughness:0.5, metalness:0.2,
+        emissive:cfg.ringCol||0x9098b0, emissiveIntensity:0.05,
+        side:THREE.DoubleSide, transparent:true, opacity:0.4, fog:true
+      });
+      var ringMesh=new THREE.Mesh(ringGeo,ringMat);
+      ringMesh.position.copy(planetMesh.position);
+      ringMesh.rotation.x=Math.PI*0.4+Math.random()*0.3;
+      ringMesh.rotation.y=Math.random()*0.5;
+      scene.add(ringMesh);
+      planetObj.ring=ringMesh;
+    }
+
+    // Create trail ghost meshes for motion blur (4 ghosts)
+    for(var ti=0;ti<4;ti++){
+      var ghostGeo=new THREE.SphereGeometry(cfg.r,Math.max(8,segs/2),Math.max(4,segs/4));
+      var ghostMat=new THREE.MeshStandardMaterial({
+        color:cfg.col, roughness:0.7, metalness:0.1,
+        emissive:cfg.emi, emissiveIntensity:cfg.emiI*0.5,
+        transparent:true, opacity:0, fog:true
+      });
+      var ghostMesh=new THREE.Mesh(ghostGeo,ghostMat);
+      ghostMesh.visible=false;
+      scene.add(ghostMesh);
+      planetObj.trailMeshes.push(ghostMesh);
+    }
+
+    planets.push(planetObj);
+  }
+}
+
+function launchMeteor(planetIdx){
+  var planet=planets[planetIdx];
+  if(!planet||!planet.alive)return;
+  var startPos=camera.position.clone();
+  startPos.x+=(Math.random()-0.5)*2;
+  startPos.y+=(Math.random()-0.5)*2;
+  var targetPos=planet.mesh.position.clone();
+  var dir=targetPos.clone().sub(startPos).normalize();
+  var speed=40+Math.random()*20;
+  var meteorGeo=new THREE.SphereGeometry(0.15+planet.radius*0.02,8,8);
+  var meteorMat=new THREE.MeshBasicMaterial({color:0xff6633,transparent:true,opacity:1});
+  var meteorMesh=new THREE.Mesh(meteorGeo,meteorMat);
+  meteorMesh.position.copy(startPos);
+  scene.add(meteorMesh);
+  var trailCount=20;
+  var trailGeo=new THREE.BufferGeometry();
+  var trailPositions=new Float32Array(trailCount*3);
+  var trailAlphas=new Float32Array(trailCount);
+  for(var i=0;i<trailCount;i++){trailPositions[i*3]=startPos.x;trailPositions[i*3+1]=startPos.y;trailPositions[i*3+2]=startPos.z;trailAlphas[i]=0;}
+  trailGeo.setAttribute('position',new THREE.BufferAttribute(trailPositions,3));
+  trailGeo.setAttribute('alpha',new THREE.BufferAttribute(trailAlphas,1));
+  var trailMat=new THREE.ShaderMaterial({
+    uniforms:{color:{value:new THREE.Color(0xff8844)}},
+    vertexShader:'attribute float alpha;varying float vA;void main(){vA=alpha;gl_PointSize=3.0;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
+    fragmentShader:'uniform vec3 color;varying float vA;void main(){float d=length(gl_PointCoord-0.5)*2.0;if(d>1.0)discard;gl_FragColor=vec4(color,vA*(1.0-d));}',
+    transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
+  });
+  var trail=new THREE.Points(trailGeo,trailMat);
+  scene.add(trail);
+  meteors.push({mesh:meteorMesh,trail:trail,trailPositions:trailPositions,trailAlphas:trailAlphas,trailGeo:trailGeo,velocity:dir.multiplyScalar(speed),target:planet,targetIdx:planetIdx,trailHead:0,trailCount:trailCount});
+}
+
+function explodePlanet(planet){
+  var pos=planet.mesh.position.clone();
+  var r=planet.radius;
+  var col=planet.mesh.userData.color||0xb0b8c8;
+  var count=Math.min(Math.floor(r*30),300);
+  var pGeo=new THREE.BufferGeometry();
+  var pPositions=new Float32Array(count*3);
+  var pVelocities=new Float32Array(count*3);
+  var pSizes=new Float32Array(count);
+  var pColors=new Float32Array(count*3);
+  var baseCol=new THREE.Color(col);
+  var hotCol=new THREE.Color(0xff6633);
+  for(var i=0;i<count;i++){
+    pPositions[i*3]=pos.x+(Math.random()-0.5)*r*0.5;
+    pPositions[i*3+1]=pos.y+(Math.random()-0.5)*r*0.5;
+    pPositions[i*3+2]=pos.z+(Math.random()-0.5)*r*0.5;
+    var spd=r*0.5+Math.random()*r*2;
+    var dx2=(Math.random()-0.5),dy2=(Math.random()-0.5),dz2=(Math.random()-0.5);
+    var dl=Math.sqrt(dx2*dx2+dy2*dy2+dz2*dz2)||1;
+    pVelocities[i*3]=dx2/dl*spd;pVelocities[i*3+1]=dy2/dl*spd;pVelocities[i*3+2]=dz2/dl*spd;
+    pSizes[i]=r*0.1+Math.random()*r*0.3;
+    var mix=Math.random();
+    var c=baseCol.clone().lerp(hotCol,mix*0.6);
+    pColors[i*3]=c.r;pColors[i*3+1]=c.g;pColors[i*3+2]=c.b;
+  }
+  pGeo.setAttribute('position',new THREE.BufferAttribute(pPositions,3));
+  pGeo.setAttribute('aSize',new THREE.BufferAttribute(pSizes,1));
+  pGeo.setAttribute('aColor',new THREE.BufferAttribute(pColors,3));
+  var pMat=new THREE.ShaderMaterial({
+    uniforms:{opacity:{value:1}},
+    vertexShader:'attribute float aSize;attribute vec3 aColor;varying vec3 vCol;varying float vAlpha;uniform float opacity;void main(){vCol=aColor;vAlpha=opacity;vec4 mv=modelViewMatrix*vec4(position,1.0);gl_PointSize=aSize*(200.0/-mv.z);gl_Position=projectionMatrix*mv;}',
+    fragmentShader:'varying vec3 vCol;varying float vAlpha;void main(){float d=length(gl_PointCoord-0.5)*2.0;if(d>1.0)discard;float g=1.0-d*d;gl_FragColor=vec4(vCol,g*vAlpha);}',
+    transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
+  });
+  var particles=new THREE.Points(pGeo,pMat);
+  scene.add(particles);
+  explosions.push({particles:particles,positions:pPositions,velocities:pVelocities,count:count,age:0,maxAge:3+r*0.3,mat:pMat});
+  scene.remove(planet.mesh);planet.mesh.geometry.dispose();planet.mesh.material.dispose();
+  if(planet.hitMesh){scene.remove(planet.hitMesh);planet.hitMesh.geometry.dispose();planet.hitMesh.material.dispose();}
+  if(planet.ring){scene.remove(planet.ring);planet.ring.geometry.dispose();planet.ring.material.dispose();}
+  // Remove trail ghosts
+  for(var tg=0;tg<planet.trailMeshes.length;tg++){scene.remove(planet.trailMeshes[tg]);planet.trailMeshes[tg].geometry.dispose();planet.trailMeshes[tg].material.dispose();}
+  planet.trailMeshes=[];
+  planet.alive=false;
+  setTimeout(function(){respawnPlanet(planet);}, 2000+Math.random()*3000);
+}
+
+function respawnPlanet(oldPlanet){
+  var cfg=oldPlanet.cfg;
+  var r=Math.min(cfg.r*(0.6+Math.random()*0.8), 5);
+  var segs=r>10?48:r>3?32:16;
+  var cols=[0xb8c0d8,0xc8b8a8,0xa8b0c8,0xd0c8c0,0xb0b8d0,0xc0c8d8,0xb0c0b8,0xc8b8b0];
+  var col=cols[Math.floor(Math.random()*cols.length)];
+  var planetGeo=new THREE.SphereGeometry(r,segs,Math.floor(segs/2));
+  var planetMat=new THREE.MeshStandardMaterial({color:col,roughness:0.7,metalness:0.1,emissive:col,emissiveIntensity:0.08,fog:true});
+  var planetMesh=new THREE.Mesh(planetGeo,planetMat);
+  var newY=cfg.y+(Math.random()-0.5)*20;
+  var camAngle=Math.atan2(camera.position.z, camera.position.x);
+  var startAngle=camAngle+Math.PI+((Math.random()-0.5)*1.0);
+  var orbitR=oldPlanet.orbitRadius;
+  planetMesh.position.set(Math.cos(startAngle)*orbitR, newY, Math.sin(startAngle)*orbitR);
+  planetMesh.rotation.set(Math.random()*0.5,Math.random()*Math.PI*2,Math.random()*0.3);
+  planetMesh.userData.isPlanet=true;
+  planetMesh.userData.radius=r;
+  planetMesh.userData.color=col;
+  scene.add(planetMesh);
+  var hitGeo=new THREE.SphereGeometry(r*2,8,6);
+  var hitMat=new THREE.MeshBasicMaterial({visible:false});
+  var hitMesh=new THREE.Mesh(hitGeo,hitMat);
+  hitMesh.position.copy(planetMesh.position);
+  hitMesh.userData.isPlanet=true;
+  hitMesh.userData.radius=r;
+  hitMesh.userData.color=col;
+  scene.add(hitMesh);
+  var hasRing=Math.random()>0.7;
+  var ringMesh2=null;
+  if(hasRing){
+    var ringGeo2=new THREE.RingGeometry(r*1.4,r*2.0,64);
+    var ringMat2=new THREE.MeshStandardMaterial({color:0x9098b0,roughness:0.5,metalness:0.2,emissive:0x9098b0,emissiveIntensity:0.05,side:THREE.DoubleSide,transparent:true,opacity:0.4,fog:true});
+    ringMesh2=new THREE.Mesh(ringGeo2,ringMat2);
+    ringMesh2.position.copy(planetMesh.position);
+    ringMesh2.rotation.x=Math.PI*0.4+Math.random()*0.3;
+    scene.add(ringMesh2);
+  }
+  var idx=planets.indexOf(oldPlanet);
+  hitMesh.userData.planetIdx=idx;
+
+  // Create new trail ghosts
+  var newTrailMeshes=[];
+  for(var ti=0;ti<4;ti++){
+    var ghostGeo=new THREE.SphereGeometry(r,Math.max(8,segs/2),Math.max(4,segs/4));
+    var ghostMat=new THREE.MeshStandardMaterial({color:col,roughness:0.7,metalness:0.1,emissive:col,emissiveIntensity:0.04,transparent:true,opacity:0,fog:true});
+    var ghostMesh=new THREE.Mesh(ghostGeo,ghostMat);
+    ghostMesh.visible=false;
+    scene.add(ghostMesh);
+    newTrailMeshes.push(ghostMesh);
+  }
+
+  planets[idx]={mesh:planetMesh,rotSpeed:0.0003+Math.random()*0.0005,alive:true,radius:r,
+    orbitRadius:orbitR,orbitAngle:startAngle,
+    orbitSpeed:(0.0004+Math.random()*0.0006)*(Math.random()>0.5?1:-1),
+    orbitY:newY,ring:ringMesh2,hitMesh:hitMesh,cfg:cfg,
+    prevPositions:[],trailMeshes:newTrailMeshes
+  };
+}
+
+function updatePlanets(){
+  var rpmMult = 3.0 + smoothedRpmForPlanets * 20.0; // base 3x, up to 23x at max RPM
+
+  for(var i=0;i<planets.length;i++){
+    var p=planets[i];
+    if(!p.alive) continue;
+    p.mesh.rotation.y+=p.rotSpeed;
+
+    // Store previous position for trail
+    if(!p.prevPositions) p.prevPositions=[];
+    p.prevPositions.unshift(p.mesh.position.clone());
+    if(p.prevPositions.length>5) p.prevPositions.length=5;
+
+    // Orbit with RPM influence
+    p.orbitAngle+=p.orbitSpeed*rpmMult;
+    var ox=Math.cos(p.orbitAngle)*p.orbitRadius;
+    var oz=Math.sin(p.orbitAngle)*p.orbitRadius;
+    p.mesh.position.x=ox;
+    p.mesh.position.z=oz;
+    if(p.hitMesh){p.hitMesh.position.x=ox;p.hitMesh.position.y=p.mesh.position.y;p.hitMesh.position.z=oz;}
+    if(p.ring){p.ring.position.x=ox;p.ring.position.z=oz;}
+
+    // Motion blur trail — show ghost copies at previous positions
+    var blurIntensity = Math.min(smoothedRpmForPlanets * 2.0, 1.0);
+    if(p.trailMeshes && p.prevPositions.length > 1){
+      for(var ti=0;ti<p.trailMeshes.length;ti++){
+        var ghost = p.trailMeshes[ti];
+        var prevIdx = ti + 1;
+        if(prevIdx < p.prevPositions.length && blurIntensity > 0.05){
+          ghost.visible = true;
+          ghost.position.copy(p.prevPositions[prevIdx]);
+          ghost.rotation.copy(p.mesh.rotation);
+          ghost.scale.copy(p.mesh.scale);
+          // Fade opacity based on trail index and blur intensity
+          var trailFade = (1.0 - (ti+1)/p.trailMeshes.length) * blurIntensity * 0.3;
+          ghost.material.opacity = trailFade;
+          ghost.material.transparent = true;
+        } else {
+          ghost.visible = false;
+          ghost.material.opacity = 0;
+        }
+      }
+    }
+  }
+
+  // Update meteors
+  var dt=1/60;
+  for(var mi=meteors.length-1;mi>=0;mi--){
+    var m=meteors[mi];
+    m.mesh.position.x+=m.velocity.x*dt;
+    m.mesh.position.y+=m.velocity.y*dt;
+    m.mesh.position.z+=m.velocity.z*dt;
+    m.trailHead=(m.trailHead+1)%m.trailCount;
+    m.trailPositions[m.trailHead*3]=m.mesh.position.x;
+    m.trailPositions[m.trailHead*3+1]=m.mesh.position.y;
+    m.trailPositions[m.trailHead*3+2]=m.mesh.position.z;
+    for(var ti2=0;ti2<m.trailCount;ti2++){
+      var age=((m.trailHead-ti2+m.trailCount)%m.trailCount)/m.trailCount;
+      m.trailAlphas[ti2]=age*0.8;
+    }
+    m.trailGeo.attributes.position.needsUpdate=true;
+    m.trailGeo.attributes.alpha.needsUpdate=true;
+    if(m.target.alive){
+      var dist2=m.mesh.position.distanceTo(m.target.mesh.position);
+      if(dist2<m.target.radius*1.1){
+        explodePlanet(m.target);
+        scene.remove(m.mesh);scene.remove(m.trail);
+        m.mesh.geometry.dispose();m.mesh.material.dispose();
+        m.trail.geometry.dispose();m.trail.material.dispose();
+        meteors.splice(mi,1);continue;
+      }
+    }
+    if(m.mesh.position.distanceTo(camera.position)>250){
+      scene.remove(m.mesh);scene.remove(m.trail);
+      m.mesh.geometry.dispose();m.mesh.material.dispose();
+      m.trail.geometry.dispose();m.trail.material.dispose();
+      meteors.splice(mi,1);
+    }
+  }
+
+  // Update explosions
+  for(var ei=explosions.length-1;ei>=0;ei--){
+    var exp=explosions[ei];
+    exp.age+=dt;
+    var lifeT=exp.age/exp.maxAge;
+    for(var pi=0;pi<exp.count;pi++){
+      exp.positions[pi*3]+=exp.velocities[pi*3]*dt;
+      exp.positions[pi*3+1]+=exp.velocities[pi*3+1]*dt;
+      exp.positions[pi*3+2]+=exp.velocities[pi*3+2]*dt;
+      exp.velocities[pi*3]*=0.98;
+      exp.velocities[pi*3+1]*=0.98;
+      exp.velocities[pi*3+2]*=0.98;
+    }
+    exp.particles.geometry.attributes.position.needsUpdate=true;
+    exp.mat.uniforms.opacity.value=1-lifeT;
+    if(exp.age>=exp.maxAge){
+      scene.remove(exp.particles);
+      exp.particles.geometry.dispose();exp.particles.material.dispose();
+      explosions.splice(ei,1);
+    }
+  }
+}
+
+function updateStarField(time) {
+  if(starField && starField.material.uniforms) {
+    starField.material.uniforms.time.value = time;
+  }
+}
+
+// ── Shooting Stars ──
+function spawnShootingStar() {
+  var startX = (Math.random() - 0.5) * 40;
+  var startY = camera.position.y + (Math.random() - 0.3) * 15;
+  var startZ = -15 - Math.random() * 30;
+  var dirX = (Math.random() > 0.5 ? 1 : -1) * (2 + Math.random() * 4);
+  var dirY = -(0.5 + Math.random() * 2);
+  var dirZ = (Math.random() - 0.5) * 2;
+  var length = 2 + Math.random() * 3;
+  var speed = 15 + Math.random() * 20;
+  var geo = new THREE.BufferGeometry();
+  var positions = new Float32Array(6);
+  var alphas = new Float32Array(2);
+  alphas[0] = 1.0; alphas[1] = 0.0;
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+  var mat = new THREE.ShaderMaterial({
+    uniforms: {color: {value: new THREE.Color(0.85, 0.88, 1.0)}},
+    vertexShader: [
+      'attribute float alpha;',
+      'varying float vAlpha;',
+      'void main() {',
+      '  vAlpha = alpha;',
+      '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 color;',
+      'varying float vAlpha;',
+      'void main() {',
+      '  gl_FragColor = vec4(color, vAlpha * 0.8);',
+      '}'
+    ].join('\n'),
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+  var line = new THREE.Line(geo, mat);
+  scene.add(line);
+  shootingStars.push({
+    mesh: line,
+    pos: new THREE.Vector3(startX, startY, startZ),
+    dir: new THREE.Vector3(dirX, dirY, dirZ).normalize(),
+    speed: speed, length: length,
+    life: 0, maxLife: 0.8 + Math.random() * 0.5
+  });
+}
+
+function updateShootingStars(dt) {
+  for(var i = shootingStars.length - 1; i >= 0; i--) {
+    var s = shootingStars[i];
+    s.life += dt;
+    s.pos.x += s.dir.x * s.speed * dt;
+    s.pos.y += s.dir.y * s.speed * dt;
+    s.pos.z += s.dir.z * s.speed * dt;
+    var positions = s.mesh.geometry.attributes.position.array;
+    positions[0] = s.pos.x; positions[1] = s.pos.y; positions[2] = s.pos.z;
+    positions[3] = s.pos.x - s.dir.x * s.length;
+    positions[4] = s.pos.y - s.dir.y * s.length;
+    positions[5] = s.pos.z - s.dir.z * s.length;
+    s.mesh.geometry.attributes.position.needsUpdate = true;
+    var fadeT = s.life / s.maxLife;
+    var fade = fadeT < 0.2 ? fadeT / 0.2 : (fadeT > 0.7 ? 1.0 - (fadeT - 0.7) / 0.3 : 1.0);
+    s.mesh.material.uniforms.color.value.setRGB(0.85 * fade, 0.88 * fade, fade);
+    if(s.life >= s.maxLife) {
+      scene.remove(s.mesh);
+      s.mesh.geometry.dispose();
+      s.mesh.material.dispose();
+      shootingStars.splice(i, 1);
+    }
+  }
+}
+
+// ══════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════
+function init(){
+  scene=new THREE.Scene();scene.background=new THREE.Color(0xf0f0f5);scene.fog=new THREE.FogExp2(0xf0f0f5,0.018);
+  camera=new THREE.PerspectiveCamera(75,window.innerWidth/window.innerHeight,0.1,200);
+  camera.position.set(0,0,CAM_ORBIT_RADIUS);camera.lookAt(0,0,0);
+  renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+  renderer.setSize(window.innerWidth,window.innerHeight);renderer.setPixelRatio(Math.min(window.devicePixelRatio,1.5));renderer.sortObjects=true;
+  document.getElementById('canvas-container').appendChild(renderer.domElement);
+  createEnv();scene.environment=envMap;
+  cubeRenderTarget=new THREE.WebGLCubeRenderTarget(256,{format:THREE.RGBAFormat,generateMipmaps:true,minFilter:THREE.LinearMipmapLinearFilter});
+  cubeCamera=new THREE.CubeCamera(0.1,100,cubeRenderTarget);scene.add(cubeCamera);
+  scene.add(new THREE.AmbientLight(0xffffff,0.4));
+  var kl=new THREE.PointLight(0xffffff,1.5,100);kl.position.set(10,5,20);scene.add(kl);
+  var rl=new THREE.PointLight(0x667eea,1,80);rl.position.set(-15,-5,15);scene.add(rl);
+  var al=new THREE.PointLight(0x764ba2,0.8,60);al.position.set(0,10,10);scene.add(al);
+  var fl=new THREE.PointLight(0xffffff,0.8,80);fl.position.set(0,0,15);scene.add(fl);
+
+  createFloors();
+  createLightRays();
+  createOrbParticles();
+  createStarField();
+  createPlanets();
+  createPostProcessing();
+  createGodRays();
+
+  window.addEventListener('resize',onResize);window.addEventListener('scroll',onScroll);
+  window.addEventListener('mousemove',function(e){
+    camMouseX=(e.clientX/window.innerWidth)*2-1;
+    camMouseY=(e.clientY/window.innerHeight)*2-1;
+  });
+  renderer.domElement.addEventListener('mousedown',onMD);renderer.domElement.addEventListener('mousemove',onMM);
+  renderer.domElement.addEventListener('mouseup',onMU);renderer.domElement.addEventListener('mouseleave',onMU);
+  renderer.domElement.addEventListener('touchstart',onTS,{passive:false});renderer.domElement.addEventListener('touchmove',onTM,{passive:false});renderer.domElement.addEventListener('touchend',onTE);
+  startIntro();animate();
+}
+
+// ══════════════════════════════════════════════
+// MAIN LOOP
+// ══════════════════════════════════════════════
+function animate(){
+  requestAnimationFrame(animate);
+  var time = performance.now() * 0.001;
+  var dt = Math.min(1/30, time - (window._lastTime || time));
+  window._lastTime = time;
+
+  updateIntro();
+  // Auto-reveal the single floor
+  if(!introAnim.revealed[0] && !introAnim.animating[0]) introAnim.animating[0] = true;
+
+  // Stars
+  updateStarField(time);
+  updateShootingStars(dt);
+  updatePlanets();
+  if(Math.random() < dt * 0.2) spawnShootingStar();
+
+  cubeCamera.position.set(0,camera.position.y,0);
+  if(!window._ccFrame)window._ccFrame=0;window._ccFrame++;
+  if(window._ccFrame%3===0){
+    cubeCamera.update(renderer,scene);
+  }
+
+  // Camera stays at y=0 (single floor centered)
+  camera.position.y = 0;
+
+  // Camera: face tracking or mouse
+  if(faceTrack.active && faceTrack.enabled){
+    var dx=(faceTrack.x-faceTrack.calX)*faceTrack.sensitivity;
+    var dy=(faceTrack.y-faceTrack.calY)*faceTrack.sensitivity*0.6;
+    var zDist=CAM_ORBIT_RADIUS;
+    camTiltX+=(dx-camTiltX)*0.15;
+    camTiltY+=(dy-camTiltY)*0.15;
+    camera.position.x=camTiltX*3.5;
+    camera.position.z=zDist;
+    camera.fov=75;
+    var near=camera.near;
+    var fov=camera.fov*Math.PI/180;
+    var top2=near*Math.tan(fov/2),right2=top2*camera.aspect;
+    var shiftX=-camera.position.x*near/zDist;
+    var shiftY=-camTiltY*2.5*near/zDist;
+    camera.projectionMatrix.makePerspective(-right2+shiftX,right2+shiftX,top2+shiftY,-top2+shiftY,near,camera.far);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  } else {
+    camera.fov=75;
+    camTiltX+=(camMouseX-camTiltX)*0.04;
+    camTiltY+=(camMouseY-camTiltY)*0.04;
+    var tiltAngleY=camTiltX*CAM_TILT_STRENGTH;
+    camera.position.x=Math.sin(tiltAngleY)*CAM_ORBIT_RADIUS;
+    camera.position.z=Math.cos(tiltAngleY)*CAM_ORBIT_RADIUS;
+    camera.updateProjectionMatrix();
+  }
+
+  camera.lookAt(0,camera.position.y,0);
+
+  // Floor physics
+  floors.forEach(function(fl2){
+    var cs=Math.abs(fl2.group.userData.velocity),is=Math.abs(fl2.group.userData.rotationSpeed);
+    if(isDragging&&selectedFloor===fl2){
+      if(fl2.group.userData.isDamping){
+        if(fl2.group.userData.velocity>0){fl2.group.userData.velocity-=fl2.group.userData.brakingForce;if(fl2.group.userData.velocity<0)fl2.group.userData.velocity=0;}
+        else if(fl2.group.userData.velocity<0){fl2.group.userData.velocity+=fl2.group.userData.brakingForce;if(fl2.group.userData.velocity>0)fl2.group.userData.velocity=0;}
+      }
+      fl2.group.rotation.y+=fl2.group.userData.velocity;
+      if(fl2.group.userData.centerStar){fl2.group.userData.centerStar.rotation.y=-fl2.group.rotation.y;fl2.group.userData.centerStar.rotation.x+=fl2.group.userData.velocity*0.5;}
+    }else{
+      fl2.group.rotation.y+=fl2.group.userData.rotationSpeed+fl2.group.userData.velocity;
+      if(fl2.group.userData.centerStar){fl2.group.userData.centerStar.rotation.y=-fl2.group.rotation.y;fl2.group.userData.centerStar.rotation.x+=fl2.group.userData.velocity*0.5;}
+      // Speed-dependent friction: linear buildup then plateaus
+      var absVel=Math.abs(fl2.group.userData.velocity);
+      var dragCap = 0.003; // max drag amount — the plateau
+      var linearDrag = Math.min(absVel * 0.008, dragCap);
+      fl2.group.userData.velocity*=fl2.group.userData.friction;
+      if(fl2.group.userData.velocity>0){fl2.group.userData.velocity=Math.max(0,fl2.group.userData.velocity-linearDrag);}
+      else if(fl2.group.userData.velocity<0){fl2.group.userData.velocity=Math.min(0,fl2.group.userData.velocity+linearDrag);}
+      if(Math.abs(fl2.group.userData.velocity)<0.0001)fl2.group.userData.velocity=0;
+    }
+  });
+
+  updateOrbs(dt);
+
+  // God rays occlusion + blur pass
+  renderGodRays();
+
+  // Render scene to post-processing FBO
+  renderer.setRenderTarget(postFBO);
+  renderer.clear();
+  renderer.render(scene,camera);
+  renderer.setRenderTarget(null);
+
+  // Render fullscreen quad with chromatic aberration + vignette + god rays
+  postQuad.material.uniforms.tScene.value=postFBO.texture;
+  postQuad.material.uniforms.tGodRays.value=godrayBlurFBO?godrayBlurFBO.texture:null;
+  postQuad.material.uniforms.godrayStr.value=godrayIntensity;
+  postQuad.material.uniforms.resolution.value.set(window.innerWidth,window.innerHeight);
+  renderer.render(postScene,postCamera);
+}
+
+// ── Post-processing (chromatic aberration + vignette) ──
+var postFBO,postScene,postCamera,postQuad;
+function createPostProcessing(){
+  var pr=Math.min(window.devicePixelRatio,1.5);
+  postFBO=new THREE.WebGLRenderTarget(Math.floor(window.innerWidth*pr),Math.floor(window.innerHeight*pr),{minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBFormat});
+  postScene=new THREE.Scene();
+  postCamera=new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+  var postMat=new THREE.ShaderMaterial({
+    uniforms:{
+      tScene:{value:null},
+      tGodRays:{value:null},
+      godrayStr:{value:0.0},
+      resolution:{value:new THREE.Vector2(window.innerWidth,window.innerHeight)},
+      caStrength:{value:0.011},
+      vignetteRadius:{value:0.65},
+      vignetteSmooth:{value:0.5},
+      whiteout:{value:0.0},
+      shakeAmount:{value:0.0},
+      shakeTime:{value:0.0}
+    },
+    vertexShader:'varying vec2 vUV;void main(){vUV=uv;gl_Position=vec4(position,1.0);}',
+    fragmentShader:[
+      'uniform sampler2D tScene;',
+      'uniform sampler2D tGodRays;',
+      'uniform float godrayStr;',
+      'uniform vec2 resolution;',
+      'uniform float caStrength,vignetteRadius,vignetteSmooth,whiteout;',
+      'uniform float shakeAmount,shakeTime;',
+      'varying vec2 vUV;',
+      // Pseudo-random hash
+      'float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}',
+      'void main(){',
+      '  vec2 uv=vUV;',
+      '  vec2 center=vec2(0.5);',
+      '  vec2 delta=uv-center;',
+      '  float dist=length(delta);',
+      // Edge shake — displacement scales with distance from center
+      '  float edgeMask=smoothstep(0.15, 0.6, dist);', // 0 at center, 1 at edges
+      '  float shakeStr=shakeAmount*edgeMask*edgeMask;', // quadratic so center is perfectly still
+      '  vec2 shakeOff=vec2(0.0);',
+      '  if(shakeStr>0.001){',
+      '    float t=shakeTime;',
+      '    shakeOff.x=shakeStr*(sin(t*73.1+uv.y*15.0)*0.5+sin(t*127.3+uv.x*23.0)*0.3+sin(t*31.7)*0.2);',
+      '    shakeOff.y=shakeStr*(cos(t*89.3+uv.x*17.0)*0.5+cos(t*153.7+uv.y*19.0)*0.3+cos(t*47.1)*0.2);',
+      '  }',
+      '  vec2 sUV=uv+shakeOff;',
+      '  float edgeFactor=smoothstep(0.1,0.7,dist);',
+      '  float ca=caStrength*edgeFactor;',
+      '  vec2 dir=normalize(delta+0.0001);',
+      '  float r=texture2D(tScene,sUV+dir*ca).r;',
+      '  float g=texture2D(tScene,sUV).g;',
+      '  float b=texture2D(tScene,sUV-dir*ca).b;',
+      '  vec3 col=vec3(r,g,b);',
+      '  float vig=1.0-smoothstep(vignetteRadius,vignetteRadius+vignetteSmooth,dist);',
+      '  col*=mix(0.8,1.0,vig);',
+      // God rays — additive blend
+      '  vec3 gr=texture2D(tGodRays,sUV).rgb;',
+      '  col+=gr*godrayStr;',
+      '  float wDist=length(uv-vec2(0.5));',
+      '  float wBloom=1.0-smoothstep(0.0, 0.8-whiteout*0.6, wDist);',
+      '  col=mix(col, vec3(1.0), whiteout*wBloom);',
+      '  col=mix(col, vec3(1.0), whiteout*whiteout*0.7);',
+      '  gl_FragColor=vec4(col,1.0);',
+      '}'
+    ].join('\n'),
+    depthWrite:false,depthTest:false
+  });
+  postQuad=new THREE.Mesh(new THREE.PlaneGeometry(2,2),postMat);
+  postScene.add(postQuad);
+}
+// ── God Rays (screen-space radial light scattering) ──
+var godrayFBO, godrayBlurFBO, godrayOccScene, godrayBlurScene, godrayBlurCamera, godrayBlurQuad;
+var godrayIntensity = 0;
+var occlusionMat; // black material for silhouettes
+
+function createGodRays(){
+  var pr = Math.min(window.devicePixelRatio, 1.5);
+  var w = Math.floor(window.innerWidth * pr * 0.5); // half res for performance
+  var h = Math.floor(window.innerHeight * pr * 0.5);
+  godrayFBO = new THREE.WebGLRenderTarget(w, h, {minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter, format:THREE.RGBFormat});
+  godrayBlurFBO = new THREE.WebGLRenderTarget(w, h, {minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter, format:THREE.RGBFormat});
+
+  occlusionMat = new THREE.MeshBasicMaterial({color:0x000000});
+
+  godrayBlurScene = new THREE.Scene();
+  godrayBlurCamera = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+  var blurMat = new THREE.ShaderMaterial({
+    uniforms:{
+      tOcclusion:{value:null},
+      lightPos:{value:new THREE.Vector2(0.5,0.5)},
+      density:{value:1.0},
+      weight:{value:0.015},
+      decay:{value:0.97},
+      numSamples:{value:60}
+    },
+    vertexShader:'varying vec2 vUV;void main(){vUV=uv;gl_Position=vec4(position,1.0);}',
+    fragmentShader:[
+      'uniform sampler2D tOcclusion;',
+      'uniform vec2 lightPos;',
+      'uniform float density,weight,decay;',
+      'uniform float numSamples;',
+      'varying vec2 vUV;',
+      'void main(){',
+      '  vec2 tc=vUV;',
+      '  vec2 deltaUV=(tc-lightPos)*density/numSamples;',
+      '  float illum=1.0;',
+      '  vec3 col=vec3(0.0);',
+      '  for(float i=0.0;i<60.0;i++){',
+      '    tc-=deltaUV;',
+      '    vec3 s=texture2D(tOcclusion,tc).rgb;',
+      '    s*=illum*weight;',
+      '    col+=s;',
+      '    illum*=decay;',
+      '  }',
+      '  gl_FragColor=vec4(col,1.0);',
+      '}'
+    ].join('\n'),
+    depthWrite:false, depthTest:false
+  });
+  godrayBlurQuad = new THREE.Mesh(new THREE.PlaneGeometry(2,2), blurMat);
+  godrayBlurScene.add(godrayBlurQuad);
+}
+
+function resizeGodRays(){
+  if(godrayFBO){
+    var pr=Math.min(window.devicePixelRatio,1.5);
+    var w=Math.floor(window.innerWidth*pr*0.5), h=Math.floor(window.innerHeight*pr*0.5);
+    godrayFBO.setSize(w,h);
+    godrayBlurFBO.setSize(w,h);
+  }
+}
+
+function renderGodRays(){
+  if(!godrayFBO || godrayIntensity < 0.01 || !floors.length) return;
+
+  var centerStarGroup = floors[0].group.userData.centerStar;
+  if(!centerStarGroup) return;
+
+  // Project light source (center, y=0) to screen space
+  var lightWorld = new THREE.Vector3(0, 0, 0);
+  var lightScreen = lightWorld.clone().project(camera);
+  var lightUV = new THREE.Vector2(lightScreen.x * 0.5 + 0.5, lightScreen.y * 0.5 + 0.5);
+
+  // Swap materials to black for occlusion pass, keep center star bright
+  var savedMats = [];
+  var savedBg = scene.background.clone();
+  var savedFog = scene.fog.color.clone();
+  scene.background.setRGB(0,0,0);
+  scene.fog.color.setRGB(0,0,0);
+
+  scene.traverse(function(obj){
+    if(obj.isMesh && obj.material && obj.visible){
+      // Keep the center star bright (it's the light source)
+      var isCenterStar = false;
+      var p = obj;
+      while(p){
+        if(p === centerStarGroup){ isCenterStar=true; break; }
+        p = p.parent;
+      }
+      if(isCenterStar){
+        savedMats.push({obj:obj, mat:obj.material});
+        obj.material = new THREE.MeshBasicMaterial({color:0xffffff});
+      } else if(obj.material.type === 'SpriteMaterial'){
+        // skip sprites
+      } else {
+        // Everything else becomes solid black — orbs, streaks, planets, drag planes
+        savedMats.push({obj:obj, mat:obj.material, oldVis:obj.visible});
+        // Skip invisible/transparent-only objects like drag planes
+        if(obj.material.opacity < 0.05 && obj.material.transparent){
+          obj.visible = false;
+        } else {
+          obj.material = occlusionMat;
+        }
+      }
+    }
+  });
+
+  // Hide sprites, points, lines, light rays for clean occlusion
+  var hiddenObjs = [];
+  scene.traverse(function(obj){
+    if(obj.isSprite || obj.isPoints || obj.isLine){
+      if(obj.visible){ hiddenObjs.push(obj); obj.visible=false; }
+    }
+  });
+  // Also hide light ray meshes
+  for(var ri=0;ri<lightRays.length;ri++){
+    if(lightRays[ri].visible){ hiddenObjs.push(lightRays[ri]); lightRays[ri].visible=false; }
+  }
+
+  // Render occlusion
+  renderer.setRenderTarget(godrayFBO);
+  renderer.clear();
+  renderer.render(scene, camera);
+
+  // Restore materials
+  for(var i=0;i<savedMats.length;i++){
+    savedMats[i].obj.material = savedMats[i].mat;
+    if(savedMats[i].oldVis !== undefined) savedMats[i].obj.visible = true;
+  }
+  for(var j=0;j<hiddenObjs.length;j++) hiddenObjs[j].visible=true;
+  scene.background.copy(savedBg);
+  scene.fog.color.copy(savedFog);
+
+  // Radial blur pass
+  godrayBlurQuad.material.uniforms.tOcclusion.value = godrayFBO.texture;
+  godrayBlurQuad.material.uniforms.lightPos.value.copy(lightUV);
+  godrayBlurQuad.material.uniforms.weight.value = 0.01 + godrayIntensity * 0.02;
+  renderer.setRenderTarget(godrayBlurFBO);
+  renderer.clear();
+  renderer.render(godrayBlurScene, godrayBlurCamera);
+  renderer.setRenderTarget(null);
+}
+
+function resizePostFBO(){
+  if(postFBO){
+    var pr=Math.min(window.devicePixelRatio,1.5);
+    postFBO.setSize(Math.floor(window.innerWidth*pr),Math.floor(window.innerHeight*pr));
+  }
+}
+
+function onResize(){camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);resizePostFBO();resizeGodRays();}
+
+init();
+
+// ── Wix Custom Element iframe fix ──
+// Tells the Wix parent page to resize this element to fill the viewport.
+// Also ensures the canvas always matches the iframe dimensions.
+(function(){
+  var inIframe = false;
+  try { inIframe = window.self !== window.top; } catch(e){ inIframe = true; }
+
+  if(inIframe){
+    // Ask parent to resize us to full viewport via postMessage
+    try {
+      window.parent.postMessage({type:'comingsoon-resize', width:'100vw', height:'100vh'}, '*');
+    } catch(e){}
+
+    // Ensure we always fill whatever size the iframe is
+    var container = document.getElementById('canvas-container');
+    if(container){
+      container.style.position = 'fixed';
+      container.style.top = '0';
+      container.style.left = '0';
+      container.style.width = '100vw';
+      container.style.height = '100vh';
+    }
+  }
+})();
+
+</script>
+</body>
+</html>
