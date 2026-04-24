@@ -275,6 +275,8 @@ var isDragging = false, selectedFloor = null;
 var mouseDownX = 0, mouseDownY = 0, mouseDownTime = 0;
 var previousMouseX = 0, previousMouseY = 0, previousTime = 0;
 
+var hoveredPanel = null; // currently hovered panel mesh
+
 // Camera mouse tilt
 var camMouseX = 0, camMouseY = 0;
 var camTiltX = 0, camTiltY = 0;
@@ -474,6 +476,8 @@ function createPanel(floorR, vertR) {
   mat.userData.imgRotationTarget = 0.0;
   mat.userData.backTex = {value:getWhiteTex()};
   mat.userData.hasBackTex = {value:0.0};
+  mat.userData.hoverAmount = {value:0.0};
+  mat.userData.hoverTarget = 0.0;
   mat.onBeforeCompile = function(shader){
     shader.uniforms.holoTime = mat.userData.holoTime;
     shader.uniforms.productTex = mat.userData.productTex;
@@ -483,7 +487,20 @@ function createPanel(floorR, vertR) {
     shader.uniforms.imgRotation = mat.userData.imgRotation;
     shader.uniforms.backTex = mat.userData.backTex;
     shader.uniforms.hasBackTex = mat.userData.hasBackTex;
-    shader.fragmentShader = 'uniform float holoTime;\nuniform sampler2D productTex;\nuniform float hasProductTex;\nuniform float productTexAspect;\nuniform float panelAspect;\nuniform float imgRotation;\nuniform sampler2D backTex;\nuniform float hasBackTex;\n' + shader.fragmentShader;
+    shader.uniforms.hoverAmount = mat.userData.hoverAmount;
+    shader.fragmentShader = 'uniform float holoTime;\nuniform sampler2D productTex;\nuniform float hasProductTex;\nuniform float productTexAspect;\nuniform float panelAspect;\nuniform float imgRotation;\nuniform sampler2D backTex;\nuniform float hasBackTex;\nuniform float hoverAmount;\n' + shader.fragmentShader;
+    // Vertex shader: depress toward center on hover
+    shader.vertexShader = 'uniform float hoverAmount;\n' + shader.vertexShader;
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <begin_vertex>',
+      [
+        '#include <begin_vertex>',
+        'if(hoverAmount > 0.0) {',
+        '  // Push inward along normal (toward wheel center)',
+        '  transformed -= normal * hoverAmount * 0.15;',
+        '}'
+      ].join('\n')
+    );
     shader.fragmentShader = shader.fragmentShader.replace(
       '#include <emissivemap_fragment>',
       [
@@ -606,6 +623,11 @@ function createPanel(floorR, vertR) {
         '  if(refreshDist > 0.5) refreshDist = 1.0 - refreshDist;',
         '  float refreshLine = (1.0 - smoothstep(0.0, 0.015, refreshDist)) * 0.18;',
         '  totalEmissiveRadiance += refreshLine * vec3(0.7, 0.85, 1.0);',
+        '',
+        '  // ── Hover darkening: blend toward deep blue ──',
+        '  if(hoverAmount > 0.0) {',
+        '    totalEmissiveRadiance = mix(totalEmissiveRadiance, vec3(0.08, 0.12, 0.25), hoverAmount * 0.45);',
+        '  }',
         '}'
       ].join('\n')
     );
@@ -637,6 +659,9 @@ function createPanel(floorR, vertR) {
         '    }',
         '  }',
         '  diffuseColor = mix(diffuseColor, vec4(0.0, 0.0, 0.0, 1.0), imgA);',
+        '}',
+        'if(hoverAmount > 0.0) {',
+        '  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.05, 0.08, 0.18), hoverAmount * 0.5);',
         '}'
       ].join('\n')
     );
@@ -2804,7 +2829,38 @@ function onScroll(){
 // INPUT
 // ══════════════════════════════════════════════
 function onMD(e){e.preventDefault();pDown(e.clientX,e.clientY);}
-function onMM(e){pMove(e.clientX,e.clientY);}
+function updateHoverPanel(cx, cy){
+  if(!pdv.active && !pdv.entering){
+    var hx=(cx/window.innerWidth)*2-1;
+    var hy=-(cy/window.innerHeight)*2+1;
+    raycaster.setFromCamera({x:hx,y:hy},camera);
+    var found=null;
+    for(var fi=0;fi<floors.length;fi++){
+      var fl=floors[fi];
+      if(!fl.panels) continue;
+      for(var pi=0;pi<fl.panels.length;pi++){
+        var pm=fl.panels[pi].mesh;
+        if(!pm.visible) continue;
+        var hits=raycaster.intersectObject(pm);
+        if(hits.length>0){found=pm;break;}
+      }
+      if(found) break;
+    }
+    if(!found && dm.displayTemp && dm.displayTemp.plane && dm.displayTemp.plane.visible){
+      var dHits=raycaster.intersectObject(dm.displayTemp.plane);
+      if(dHits.length>0) found=dm.displayTemp.plane;
+    }
+    hoveredPanel=found;
+  } else {
+    hoveredPanel=null;
+  }
+}
+function onMM(e){
+  pMove(e.clientX,e.clientY);
+  if(!isDragging) updateHoverPanel(e.clientX, e.clientY);
+  else hoveredPanel=null;
+  renderer.domElement.parentElement.style.cursor=hoveredPanel?'pointer':'';
+}
 function onMU(e){pUp(e.clientX,e.clientY);}
 var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null, startX:0, startY:0, startTime:0, scrollMomentum:0 }; // locked: null,'scroll','wheel','vwheel'
 function onTS(e){
@@ -2816,6 +2872,8 @@ function onTS(e){
     touchScroll.startTime=performance.now();
     touchScroll.velY=0; touchScroll.active=true; touchScroll.locked=null;
     touchScroll.scrollMomentum=0;
+    // Tap hover animation
+    updateHoverPanel(tx, ty);
     pDown(tx,ty);
   }
 }
@@ -2828,6 +2886,7 @@ function onTM(e){
 
     // First movement decides lock direction based on actual swipe angle
     if(touchScroll.locked===null && (Math.abs(dx)>6 || Math.abs(dy)>6)){
+      hoveredPanel=null; // release tap hover once swiping starts
       var totalDX = Math.abs(tx - touchScroll.startX);
       var totalDY = Math.abs(ty - touchScroll.startY);
       if(totalDY > totalDX * 0.8){
@@ -2873,6 +2932,8 @@ function onTE(e){
   }
   var wasScroll = touchScroll.locked==='scroll';
   touchScroll.active=false; touchScroll.locked=null;
+  // Release tap hover — will animate back to 0
+  hoveredPanel=null;
   if(!wasScroll) pUp(e.changedTouches[0].clientX,e.changedTouches[0].clientY);
   else { isDragging=false; selectedFloor=null; renderer.domElement.parentElement.classList.remove('dragging'); }
 }
@@ -6799,7 +6860,10 @@ function animate(){
     // Panel expansion based on velocity — needs higher speed to kick in
     if(fl.panels&&!(dm.active&&dm.floor===fl)){
       var sf=cs/is,re=sf>4?(sf-4)*0.03:0;
-      fl.panels.forEach(function(panel){var br=panel.mesh.userData.baseRadius,er=br+re;panel.mesh.scale.x=er/br;panel.mesh.scale.z=er/br;panel.edges.scale.x=er/br;panel.edges.scale.z=er/br;});
+      fl.panels.forEach(function(panel){var br=panel.mesh.userData.baseRadius,er=br+re;panel.mesh.scale.x=er/br;panel.mesh.scale.z=er/br;panel.edges.scale.x=er/br;panel.edges.scale.z=er/br;
+        panel.edges.userData.preHoverSX=panel.edges.scale.x;panel.edges.userData.preHoverSZ=panel.edges.scale.z;});
+    } else if(fl.panels){
+      fl.panels.forEach(function(panel){panel.edges.userData.preHoverSX=panel.edges.scale.x;panel.edges.userData.preHoverSZ=panel.edges.scale.z;});
     }
     // Update holographic shader time on all panels
     if(fl.panels){fl.panels.forEach(function(panel, pi){
@@ -6824,9 +6888,32 @@ function animate(){
         panel.edges.position.y = panel.mesh.position.y;
         panel.mesh.userData.curBob = 0;
       }
+      // Hover animation
+      if(ud.hoverAmount){
+        ud.hoverTarget = (hoveredPanel === panel.mesh) ? 1.0 : 0.0;
+        var hd = ud.hoverTarget - ud.hoverAmount.value;
+        if(Math.abs(hd) > 0.005) ud.hoverAmount.value += hd * 0.12;
+        else ud.hoverAmount.value = ud.hoverTarget;
+        // Scale edges inward to follow panel depression (using pre-hover base)
+        var hsc = 1.0 - ud.hoverAmount.value * 0.04;
+        var bsx = panel.edges.userData.preHoverSX || 1;
+        var bsz = panel.edges.userData.preHoverSZ || 1;
+        panel.edges.scale.set(bsx * hsc, hsc, bsz * hsc);
+      }
     });}
   });
-  
+
+  // Hover for DM display temp (shares material with selected panel)
+  if(dm.active && dm.displayTemp && dm.displayTemp.plane && dm.floor){
+    var dtMat = dm.displayTemp.plane.material;
+    if(dtMat.userData.hoverAmount){
+      var dtTarget = (hoveredPanel === dm.displayTemp.plane) ? 1.0 : 0.0;
+      var dtDiff = dtTarget - dtMat.userData.hoverAmount.value;
+      if(Math.abs(dtDiff) > 0.005) dtMat.userData.hoverAmount.value += dtDiff * 0.12;
+      else dtMat.userData.hoverAmount.value = dtTarget;
+    }
+  }
+
   if(dm.active&&dm.vWheel&&!dm.closing&&!dm.animating){
     if(Math.abs(dm.vwVel)>0.0025)dm.vwVel*=0.995;else dm.vwVel=0.0025;
     dm.vWheel.rotation.x+=dm.vwVel;
