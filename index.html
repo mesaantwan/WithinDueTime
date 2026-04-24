@@ -1462,7 +1462,7 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
   
   var bpMat=new THREE.ShaderMaterial({
     uniforms:{
-      pixelRatio:{value:Math.min(window.devicePixelRatio,1.5)},
+      pixelRatio:{value:Math.min(window.devicePixelRatio,2.5)},
       uRPM:{value:0.0}
     },
     vertexShader:[
@@ -2177,7 +2177,7 @@ function createGodRays(){
 
 function resizeGodRays(){
   if(godrayFBO){
-    var pr=Math.min(window.devicePixelRatio,1.5);
+    var pr=Math.min(window.devicePixelRatio,2.5);
     var w=Math.floor(window.innerWidth*pr*0.5), h=Math.floor(window.innerHeight*pr*0.5);
     godrayFBO.setSize(w,h); godrayBlurFBO.setSize(w,h);
   }
@@ -6632,7 +6632,7 @@ function init(){
   updateCamRadius();
   camera.position.set(0,0,CAM_ORBIT_RADIUS);camera.lookAt(0,0,0);
   renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
-  renderer.setSize(window.innerWidth,window.innerHeight);renderer.setPixelRatio(Math.min(window.devicePixelRatio,1.5));renderer.sortObjects=true;
+  renderer.setSize(window.innerWidth,window.innerHeight);renderer.setPixelRatio(Math.min(window.devicePixelRatio,2.5));renderer.sortObjects=true;
   document.getElementById('canvas-container').appendChild(renderer.domElement);
   createEnv();scene.environment=envMap;
   cubeRenderTarget=new THREE.WebGLCubeRenderTarget(256,{format:THREE.RGBAFormat,generateMipmaps:true,minFilter:THREE.LinearMipmapLinearFilter});
@@ -6987,7 +6987,7 @@ function animate(){
 // ── Post-processing (chromatic aberration + vignette + god rays + whiteout + shake) ──
 var postFBO,postScene,postCamera,postQuad;
 function createPostProcessing(){
-  var pr=Math.min(window.devicePixelRatio,1.5);
+  var pr=Math.min(window.devicePixelRatio,2.5);
   postFBO=new THREE.WebGLRenderTarget(Math.floor(window.innerWidth*pr),Math.floor(window.innerHeight*pr),{minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBFormat});
   postScene=new THREE.Scene();
   postCamera=new THREE.OrthographicCamera(-1,1,1,-1,0,1);
@@ -7072,7 +7072,7 @@ function createPostProcessing(){
 }
 function resizePostFBO(){
   if(postFBO){
-    var pr=Math.min(window.devicePixelRatio,1.5);
+    var pr=Math.min(window.devicePixelRatio,2.5);
     postFBO.setSize(Math.floor(window.innerWidth*pr),Math.floor(window.innerHeight*pr));
   }
 }
