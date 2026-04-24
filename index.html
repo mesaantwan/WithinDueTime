@@ -285,12 +285,13 @@ var CAM_TILT_STRENGTH = 0.015;
 function updateCamRadius() {
   var aspect = window.innerWidth / window.innerHeight;
   if (aspect < 1.0) {
-    // Portrait: push back
+    // Portrait: keep base distance
     CAM_ORBIT_RADIUS = CAM_ORBIT_RADIUS_BASE + (1.0 / aspect - 1.0) * 3.0;
   } else {
-    // Landscape: pull in as it gets wider
+    // Landscape: 20% closer base, pull in more as it gets wider
+    var landscapeBase = CAM_ORBIT_RADIUS_BASE * 0.8;
     var wideT = Math.min((aspect - 1.0) / 1.5, 1.0); // 0 at 1:1, 1 at 2.5:1
-    CAM_ORBIT_RADIUS = CAM_ORBIT_RADIUS_BASE - wideT * 3.5;
+    CAM_ORBIT_RADIUS = landscapeBase - wideT * 3.5;
   }
 }
 
@@ -390,7 +391,10 @@ var pdv = {
   selectedSize: 'M',
   scrollY: 0, scrollVel: 0, // scroll state
   contentH: 0, viewH: 0, // total content height vs viewport height
-  dragging: false
+  dragging: false,
+  mainImgMesh: null, mainImgPanel: null,
+  allImgSrcs: null, thumbMeshes: null,
+  loadMainImage: null
 };
 
 // ══════════════════════════════════════════════
@@ -467,6 +471,7 @@ function createPanel(floorR, vertR) {
   mat.userData.productTexAspect = {value:1.0}; // image width/height ratio
   mat.userData.panelAspect = {value: (floorR * arcF) / PLANE_WIDTH};
   mat.userData.imgRotation = {value: 0.0}; // 0 = normal, 1 = 90deg for vertical wheel
+  mat.userData.imgRotationTarget = 0.0;
   mat.userData.backTex = {value:getWhiteTex()};
   mat.userData.hasBackTex = {value:0.0};
   mat.onBeforeCompile = function(shader){
@@ -551,40 +556,56 @@ function createPanel(floorR, vertR) {
         '  );',
         '  phosphor = mix(vec3(1.0), phosphor, 0.12);',
         '',
-        '  // ── Composite ──',
+        '  // ── Composite base VHS on background ──',
         '  totalEmissiveRadiance += scanline * vec3(0.4, 0.6, 1.0);',
         '  totalEmissiveRadiance += subScan * vec3(0.25, 0.45, 0.75);',
         '  totalEmissiveRadiance += grain * vec3(0.4, 0.55, 0.8);',
         '  totalEmissiveRadiance -= bandDarken + band2Darken;',
         '  totalEmissiveRadiance *= phosphor;',
-        '',
-        '  // ── Flicker: irregular temporal variation ──',
         '  float flicker = 0.96 + 0.04 * sin(holoTime * 14.0 + sin(holoTime * 4.3) * 6.0);',
         '  flicker *= 0.98 + 0.02 * sin(holoTime * 53.0);',
         '  totalEmissiveRadiance *= flicker;',
         '',
-        '  // ── Product image overlay (on top of VHS, cover mode) ──',
+        '  // ── Product image overlay ──',
         '  if(hasProductTex > 0.5) {',
         '    vec2 imgUV = puv;',
-        '    // Rotate 90deg for vertical wheel',
-        '    if(imgRotation > 0.5) { imgUV = vec2(1.0 - imgUV.y, imgUV.x); }',
-        '    // Cover mode: fill panel without distortion, crop excess',
-        '    float pA = imgRotation > 0.5 ? 1.0 / panelAspect : panelAspect;',
+        '    float rAngle = imgRotation * 1.5708;',
+        '    vec2 rc = imgUV - 0.5;',
+        '    float rCos = cos(rAngle), rSin = sin(rAngle);',
+        '    imgUV = vec2(rc.x * rCos - rc.y * rSin, rc.x * rSin + rc.y * rCos) + 0.5;',
+        '    float pA = mix(panelAspect, 1.0 / panelAspect, imgRotation);',
         '    if(pA > productTexAspect) {',
         '      float sc = productTexAspect / pA;',
-        '      imgUV.y = imgUV.y * sc + (1.0 - sc) * 0.5;',
+        '      imgUV.x = imgUV.x / sc - (1.0 / sc - 1.0) * 0.5;',
         '    } else {',
         '      float sc = pA / productTexAspect;',
-        '      imgUV.x = imgUV.x * sc + (1.0 - sc) * 0.5;',
+        '      imgUV.y = imgUV.y / sc - (1.0 / sc - 1.0) * 0.5;',
         '    }',
-        '    vec4 imgCol = texture2D(productTex, imgUV);',
-        '    // Show back image on back face',
-        '    if(!gl_FrontFacing && hasBackTex > 0.5) {',
-        '      imgUV.x = 1.0 - imgUV.x;',
-        '      imgCol = texture2D(backTex, imgUV);',
+        '    vec4 imgCol = vec4(0.0);',
+        '    if(imgUV.x >= 0.0 && imgUV.x <= 1.0 && imgUV.y >= 0.0 && imgUV.y <= 1.0) {',
+        '      imgCol = texture2D(productTex, imgUV);',
+        '      if(!gl_FrontFacing && hasBackTex > 0.5) {',
+        '        imgUV.x = 1.0 - imgUV.x;',
+        '        imgCol = texture2D(backTex, imgUV);',
+        '      }',
         '    }',
         '    totalEmissiveRadiance = mix(totalEmissiveRadiance, imgCol.rgb, imgCol.a);',
         '  }',
+        '',
+        '  // ── VHS overlay on top of everything (including image) ──',
+        '  // Scanlines over image',
+        '  totalEmissiveRadiance -= scanline * 0.12;',
+        '  totalEmissiveRadiance += grain * vec3(0.15, 0.18, 0.22);',
+        '  totalEmissiveRadiance -= (bandDarken + band2Darken) * 0.6;',
+        '  totalEmissiveRadiance *= mix(vec3(1.0), phosphor, 0.08);',
+        '  totalEmissiveRadiance *= flicker;',
+        '',
+        '  // ── Interlace refresh line: bright horizontal bar sweeping down ──',
+        '  float refreshPos = fract(holoTime * 0.08);',
+        '  float refreshDist = abs(puv.y - refreshPos);',
+        '  if(refreshDist > 0.5) refreshDist = 1.0 - refreshDist;',
+        '  float refreshLine = (1.0 - smoothstep(0.0, 0.015, refreshDist)) * 0.18;',
+        '  totalEmissiveRadiance += refreshLine * vec3(0.7, 0.85, 1.0);',
         '}'
       ].join('\n')
     );
@@ -595,19 +616,25 @@ function createPanel(floorR, vertR) {
         '#include <color_fragment>',
         'if(hasProductTex > 0.5) {',
         '  vec2 duv = vUv;',
-        '  if(imgRotation > 0.5) { duv = vec2(1.0 - duv.y, duv.x); }',
-        '  float dpA = imgRotation > 0.5 ? 1.0 / panelAspect : panelAspect;',
+        '  float drAngle = imgRotation * 1.5708;',
+        '  vec2 drc = duv - 0.5;',
+        '  float drCos = cos(drAngle), drSin = sin(drAngle);',
+        '  duv = vec2(drc.x * drCos - drc.y * drSin, drc.x * drSin + drc.y * drCos) + 0.5;',
+        '  float dpA = mix(panelAspect, 1.0 / panelAspect, imgRotation);',
         '  if(dpA > productTexAspect) {',
         '    float dsc = productTexAspect / dpA;',
-        '    duv.y = duv.y * dsc + (1.0 - dsc) * 0.5;',
+        '    duv.x = duv.x / dsc - (1.0 / dsc - 1.0) * 0.5;',
         '  } else {',
         '    float dsc = dpA / productTexAspect;',
-        '    duv.x = duv.x * dsc + (1.0 - dsc) * 0.5;',
+        '    duv.y = duv.y / dsc - (1.0 / dsc - 1.0) * 0.5;',
         '  }',
-        '  float imgA = texture2D(productTex, duv).a;',
-        '  if(!gl_FrontFacing && hasBackTex > 0.5) {',
-        '    duv.x = 1.0 - duv.x;',
-        '    imgA = texture2D(backTex, duv).a;',
+        '  float imgA = 0.0;',
+        '  if(duv.x >= 0.0 && duv.x <= 1.0 && duv.y >= 0.0 && duv.y <= 1.0) {',
+        '    imgA = texture2D(productTex, duv).a;',
+        '    if(!gl_FrontFacing && hasBackTex > 0.5) {',
+        '      duv.x = 1.0 - duv.x;',
+        '      imgA = texture2D(backTex, duv).a;',
+        '    }',
         '  }',
         '  diffuseColor = mix(diffuseColor, vec4(0.0, 0.0, 0.0, 1.0), imgA);',
         '}'
@@ -2779,13 +2806,16 @@ function onScroll(){
 function onMD(e){e.preventDefault();pDown(e.clientX,e.clientY);}
 function onMM(e){pMove(e.clientX,e.clientY);}
 function onMU(e){pUp(e.clientX,e.clientY);}
-var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null }; // locked: null,'scroll','wheel','vwheel'
+var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null, startX:0, startY:0, startTime:0, scrollMomentum:0 }; // locked: null,'scroll','wheel','vwheel'
 function onTS(e){
   e.preventDefault();
   if(e.touches.length===1){
     var tx=e.touches[0].clientX, ty=e.touches[0].clientY;
     touchScroll.lastX=tx; touchScroll.lastY=ty;
+    touchScroll.startX=tx; touchScroll.startY=ty;
+    touchScroll.startTime=performance.now();
     touchScroll.velY=0; touchScroll.active=true; touchScroll.locked=null;
+    touchScroll.scrollMomentum=0;
     pDown(tx,ty);
   }
 }
@@ -2796,9 +2826,19 @@ function onTM(e){
     var dy=ty-touchScroll.lastY;
     var dx=tx-touchScroll.lastX;
 
-    // First movement decides lock direction
-    if(touchScroll.locked===null && (Math.abs(dx)>4 || Math.abs(dy)>4)){
-      if(isDragging && dm.draggingVW){
+    // First movement decides lock direction based on actual swipe angle
+    if(touchScroll.locked===null && (Math.abs(dx)>6 || Math.abs(dy)>6)){
+      var totalDX = Math.abs(tx - touchScroll.startX);
+      var totalDY = Math.abs(ty - touchScroll.startY);
+      if(totalDY > totalDX * 0.8){
+        // Predominantly vertical swipe — always page scroll
+        touchScroll.locked='scroll';
+        // Release any wheel/vwheel drag that pDown started
+        if(isDragging){
+          isDragging=false; selectedFloor=null; dm.draggingVW=false;
+          renderer.domElement.parentElement.classList.remove('dragging');
+        }
+      } else if(isDragging && dm.draggingVW){
         touchScroll.locked='vwheel';
       } else if(isDragging && selectedFloor){
         touchScroll.locked='wheel';
@@ -2810,24 +2850,31 @@ function onTM(e){
     if(touchScroll.locked==='scroll'){
       var dist=4.5; var fovRad=camera.fov*Math.PI/180;
       var halfH=Math.tan(fovRad/2)*dist;
-      targetCameraY+=dy*halfH*0.004;
+      var scrollAmt=dy*halfH*0.004;
+      targetCameraY+=scrollAmt;
       var minY=-(TOTAL_FLOORS-1)*FLOOR_SPACING;
       targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
-      touchScroll.velY=dy*halfH*0.004;
+      // Track velocity for momentum
+      var now=performance.now();
+      var dt=(now-touchScroll.startTime)||1;
+      touchScroll.velY=scrollAmt;
+      touchScroll.scrollMomentum=touchScroll.scrollMomentum*0.7+scrollAmt*0.3;
+      touchScroll.startTime=now;
     }
 
     touchScroll.lastX=tx; touchScroll.lastY=ty;
-    pMove(tx,ty);
+    if(touchScroll.locked!=='scroll') pMove(tx,ty);
   }
 }
 function onTE(e){
   if(touchScroll.active && touchScroll.locked==='scroll'){
-    targetCameraY+=touchScroll.velY*5;
-    var minY=-(TOTAL_FLOORS-1)*FLOOR_SPACING;
-    targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
+    // Apply momentum — use smoothed velocity scaled up for continued scrolling
+    touchScroll.scrollMomentum=touchScroll.scrollMomentum*4;
   }
+  var wasScroll = touchScroll.locked==='scroll';
   touchScroll.active=false; touchScroll.locked=null;
-  pUp(e.changedTouches[0].clientX,e.changedTouches[0].clientY);
+  if(!wasScroll) pUp(e.changedTouches[0].clientX,e.changedTouches[0].clientY);
+  else { isDragging=false; selectedFloor=null; renderer.domElement.parentElement.classList.remove('dragging'); }
 }
 
 function pDown(cx,cy){
@@ -3506,6 +3553,9 @@ function animateDM() {
     // Build real vertical wheel
     buildVW();
 
+    // Selected panel is displayed upright, not on VW — reset its image rotation
+    fd.panels[dm.selIdx].mesh.material.userData.imgRotationTarget = 0.0;
+
     // Add icon overlays to morphed stars (now circles) and register as dmButtons
     dm.dmButtons = [];
     var actionTypes2 = ['add-to-cart', 'close', 'expand'];
@@ -3541,7 +3591,7 @@ function buildVW() {
     // Morph to vertical — wireframe auto-tracks since it shares geometry
     morphTo(panel.mesh,1);
     // Rotate image to stay upright on vertical wheel
-    panel.mesh.material.userData.imgRotation.value = 1.0;
+    panel.mesh.material.userData.imgRotationTarget = 1.0;
     
     panel.mesh.position.set(0,0,0);
     panel.mesh.rotation.set(0,0,0);
@@ -3659,7 +3709,7 @@ function exitDM() {
     data.panel.mesh.position.copy(data.pos);data.panel.mesh.rotation.copy(data.rot);data.panel.mesh.scale.copy(data.scl);
     data.panel.edges.position.copy(data.ePos);data.panel.edges.rotation.copy(data.eRot);data.panel.edges.scale.copy(data.eScl);
     morphTo(data.panel.mesh,0); // back to floor radius — wireframe auto-tracks
-    data.panel.mesh.material.userData.imgRotation.value = 0.0;
+    data.panel.mesh.material.userData.imgRotationTarget = 0.0;
   });
 
   // Get target world positions
@@ -3810,6 +3860,7 @@ function animateClosing(){
       data.panel.edges.position.copy(data.ePos);data.panel.edges.rotation.copy(data.eRot);data.panel.edges.scale.copy(data.eScl);
       morphTo(data.panel.mesh, 0);
       data.panel.mesh.material.userData.imgRotation.value = 0.0;
+      data.panel.mesh.material.userData.imgRotationTarget = 0.0;
     });
 
     if(dm.displayPlane){scene.remove(dm.displayPlane);dm.displayPlane=null;}
@@ -3983,15 +4034,20 @@ function animateSwitch(){
     var oldPanel = dm.floor.panels[switchAnim.oldIdx];
     oldPanel.mesh.visible = true;
     oldPanel.edges.visible = true;
-    
+    // Old panel goes back to VW — animate rotation for vertical wheel
+    oldPanel.mesh.material.userData.imgRotationTarget = 1.0;
+
     // Clean up old display temp
     if(dm.displayTemp){
       if(dm.displayTemp.plane)scene.remove(dm.displayTemp.plane);
       if(dm.displayTemp.edge)scene.remove(dm.displayTemp.edge);
     }
-    
+
     // New temp becomes the display
     dm.displayTemp = switchAnim.newTemp;
+    // New panel is displayed upright — animate image rotation back
+    var newPanel = dm.floor.panels[switchAnim.newIdx];
+    newPanel.mesh.material.userData.imgRotationTarget = 0.0;
     
     // Keep new panel hidden on vertical wheel
     var newPanel = dm.floor.panels[switchAnim.newIdx];
@@ -4516,6 +4572,9 @@ function destroyProductDetailScene(){
     pdv.scrollY = 0; pdv.scrollVel = 0;
     pdv.contentH = 0; pdv.viewH = 0;
     pdv.dragging = false;
+    pdv.mainImgMesh = null; pdv.mainImgPanel = null;
+    pdv.allImgSrcs = null; pdv.thumbMeshes = null;
+    pdv.loadMainImage = null;
   }
 }
 
@@ -4730,62 +4789,81 @@ function buildProductDetailScene(){
     imgPanel.position.set(colCX, curY, 0);
     pdv.scrollGroup.add(imgPanel);
 
-    // Load product image onto the panel
-    if(product.image) {
-      var pdvImgSrc = product.image;
-      if(pdvImgSrc.indexOf('http') !== 0 && pdvImgSrc.indexOf('//') !== 0) pdvImgSrc = 'product-images/' + pdvImgSrc;
-      var pdvImgLoader = new THREE.TextureLoader();
-      (function(cx, cy, pw, ph) {
-        pdvImgLoader.load(pdvImgSrc, function(tex) {
-          tex.minFilter = THREE.LinearFilter;
-          tex.magFilter = THREE.LinearFilter;
-          var imgAspect = tex.image.width / tex.image.height;
-          var fitW, fitH;
-          // Fit image inside panel preserving its native aspect ratio
-          if(imgAspect > pw / ph) {
-            fitW = pw * 0.92;
-            fitH = fitW / imgAspect;
-          } else {
-            fitH = ph * 0.92;
-            fitW = fitH * imgAspect;
-          }
-          var imgMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
-          var imgMesh = new THREE.Mesh(new THREE.PlaneGeometry(fitW, fitH), imgMat);
-          imgMesh.position.set(cx, cy, 0.02);
-          imgMesh.layers.enable(1);
-          pdv.scrollGroup.add(imgMesh);
-        });
-      })(colCX, curY, colW, imgH);
+    // Collect all available images (front, back, Shopify extras)
+    var allImgs = [];
+    if(product.image) allImgs.push(product.image);
+    if(product.backImage) allImgs.push(product.backImage);
+    if(product.images && product.images.length > 0){
+      for(var ii = 0; ii < product.images.length; ii++){
+        if(allImgs.indexOf(product.images[ii]) === -1) allImgs.push(product.images[ii]);
+      }
     }
 
-    var imgLabel = pdvTextMesh(product.name.toUpperCase(), {
-      cw: 512, ch: 100, font: '600 ' + fs(44) + 'px Arial', color: '#5a6278', align: 'center',
-      w: colW * 0.7, h: imgH * 0.08
-    });
-    imgLabel.position.set(colCX, curY + imgH * 0.05, 0.03);
-    pdv.scrollGroup.add(imgLabel);
-    var catLabel = pdvTextMesh(PRODUCT_DATA.floors[pdv.floorIdx].label.toUpperCase(), {
-      cw: 256, ch: 40, font: '300 ' + fs(22) + 'px Arial', color: '#7a8298', align: 'center',
-      w: colW * 0.4, h: imgH * 0.04
-    });
-    catLabel.position.set(colCX, curY - imgH * 0.05, 0.03);
-    pdv.scrollGroup.add(catLabel);
+    // Load and display main product image
+    pdv.mainImgMesh = null;
+    pdv.mainImgPanel = {cx: colCX, cy: curY, pw: colW, ph: imgH};
+    pdv.allImgSrcs = allImgs;
+    pdv.thumbMeshes = [];
 
-    // Thumbnails at bottom of image
-    var thumbS = Math.min(colW * 0.18, imgH * 0.15);
-    var thumbGap2 = thumbS * 0.15;
-    var thumbY2 = curY - imgH / 2 + thumbS / 2 + thumbS * 0.12;
-    for(var ti = 0; ti < 3; ti++){
-      var ttx = colCX + (ti - 1) * (thumbS + thumbGap2);
-      var thumb = createPdvGlassPanel(thumbS, thumbS, 0.3, 0.06);
-      thumb.position.set(ttx, thumbY2, 0.01);
-      pdv.scrollGroup.add(thumb);
-      var thLabel = pdvTextMesh((ti+1).toString(), {
-        cw: 64, ch: 64, font: '500 ' + fs(28) + 'px Arial', color: '#6a7288', align: 'center',
-        w: thumbS * 0.5, h: thumbS * 0.5
+    pdv.loadMainImage = function(src){
+      if(pdv.mainImgMesh){ pdv.scrollGroup.remove(pdv.mainImgMesh); pdv.mainImgMesh = null; }
+      var imgSrc = src;
+      if(imgSrc.indexOf('http') !== 0 && imgSrc.indexOf('//') !== 0) imgSrc = 'product-images/' + imgSrc;
+      var loader = new THREE.TextureLoader();
+      var mp = pdv.mainImgPanel;
+      loader.load(imgSrc, function(tex){
+        tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+        var imgAspect = tex.image.width / tex.image.height;
+        var fitW, fitH;
+        if(imgAspect > mp.pw / mp.ph){ fitW = mp.pw * 0.92; fitH = fitW / imgAspect; }
+        else { fitH = mp.ph * 0.92; fitW = fitH * imgAspect; }
+        var imgMat = new THREE.MeshBasicMaterial({map: tex, transparent: true, depthWrite: false, depthTest: false, side: THREE.DoubleSide});
+        var imgMesh = new THREE.Mesh(new THREE.PlaneGeometry(fitW, fitH), imgMat);
+        imgMesh.position.set(mp.cx, mp.cy, 0.05);
+        imgMesh.renderOrder = 15;
+        imgMesh.layers.enable(1);
+        pdv.scrollGroup.add(imgMesh);
+        pdv.mainImgMesh = imgMesh;
       });
-      thLabel.position.set(ttx, thumbY2, 0.04);
-      pdv.scrollGroup.add(thLabel);
+    }
+    if(allImgs.length > 0) pdv.loadMainImage(allImgs[0]);
+
+    // Thumbnails at bottom of image — show actual images
+    var thumbCount = Math.min(allImgs.length, 5);
+    if(thumbCount > 1){
+      var thumbS = Math.min(colW * 0.18, imgH * 0.15);
+      var thumbGap2 = thumbS * 0.15;
+      var thumbY2 = curY - imgH / 2 + thumbS / 2 + thumbS * 0.12;
+      var totalThumbW = thumbCount * thumbS + (thumbCount - 1) * thumbGap2;
+      var thumbStartX = colCX - totalThumbW / 2 + thumbS / 2;
+      for(var ti = 0; ti < thumbCount; ti++){
+        var ttx = thumbStartX + ti * (thumbS + thumbGap2);
+        var thumb = createPdvGlassPanel(thumbS, thumbS, ti === 0 ? 0.55 : 0.25, 0.06);
+        thumb.position.set(ttx, thumbY2, 0.01);
+        thumb.userData.actionId = 'pdv-thumb-' + ti;
+        thumb.userData.clickable = true;
+        pdv.scrollGroup.add(thumb);
+        pdv.thumbMeshes.push(thumb);
+        // Load thumbnail image
+        (function(idx, tx, ty, ts){
+          var tsrc = allImgs[idx];
+          if(tsrc.indexOf('http') !== 0 && tsrc.indexOf('//') !== 0) tsrc = 'product-images/' + tsrc;
+          var tl = new THREE.TextureLoader();
+          tl.load(tsrc, function(tex){
+            tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+            var ta = tex.image.width / tex.image.height;
+            var tw2, th2;
+            if(ta > 1){ tw2 = ts * 0.85; th2 = tw2 / ta; }
+            else { th2 = ts * 0.85; tw2 = th2 * ta; }
+            var tm = new THREE.Mesh(new THREE.PlaneGeometry(tw2, th2),
+              new THREE.MeshBasicMaterial({map: tex, transparent: true, depthWrite: false, depthTest: false, side: THREE.DoubleSide}));
+            tm.position.set(tx, ty, 0.05);
+            tm.renderOrder = 15;
+            tm.layers.enable(1);
+            pdv.scrollGroup.add(tm);
+          });
+        })(ti, ttx, thumbY2, thumbS);
+      }
     }
     curY -= imgH / 2 + gap;
 
@@ -4860,61 +4938,81 @@ function buildProductDetailScene(){
     imgPanel2.position.set(leftCX2, imgY2, 0);
     pdv.scrollGroup.add(imgPanel2);
 
-    // Load product image onto landscape panel
-    if(product.image) {
-      var pdvImgSrc2 = product.image;
-      if(pdvImgSrc2.indexOf('http') !== 0 && pdvImgSrc2.indexOf('//') !== 0) pdvImgSrc2 = 'product-images/' + pdvImgSrc2;
-      var pdvImgLoader2 = new THREE.TextureLoader();
-      (function(cx, cy, pw, ph) {
-        pdvImgLoader2.load(pdvImgSrc2, function(tex) {
-          tex.minFilter = THREE.LinearFilter;
-          tex.magFilter = THREE.LinearFilter;
-          var imgAspect = tex.image.width / tex.image.height;
-          var fitW, fitH;
-          if(imgAspect > pw / ph) {
-            fitW = pw * 0.92;
-            fitH = fitW / imgAspect;
-          } else {
-            fitH = ph * 0.92;
-            fitW = fitH * imgAspect;
-          }
-          var imgMat2 = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
-          var imgMesh2 = new THREE.Mesh(new THREE.PlaneGeometry(fitW, fitH), imgMat2);
-          imgMesh2.position.set(cx, cy, 0.02);
-          imgMesh2.layers.enable(1);
-          pdv.scrollGroup.add(imgMesh2);
-        });
-      })(leftCX2, imgY2, leftColW2, imgH2);
+    // Collect all available images
+    var allImgs2 = [];
+    if(product.image) allImgs2.push(product.image);
+    if(product.backImage) allImgs2.push(product.backImage);
+    if(product.images && product.images.length > 0){
+      for(var ii2 = 0; ii2 < product.images.length; ii2++){
+        if(allImgs2.indexOf(product.images[ii2]) === -1) allImgs2.push(product.images[ii2]);
+      }
     }
 
-    var imgLabel2 = pdvTextMesh(product.name.toUpperCase(), {
-      cw: 512, ch: 128, font: '600 52px Arial', color: '#5a6278', align: 'center',
-      w: leftColW2 * 0.8, h: leftColW2 * 0.2
-    });
-    imgLabel2.position.set(leftCX2, imgY2 + 0.1, 0.03);
-    pdv.scrollGroup.add(imgLabel2);
-    var catLabel2 = pdvTextMesh(PRODUCT_DATA.floors[pdv.floorIdx].label.toUpperCase(), {
-      cw: 256, ch: 48, font: '300 28px Arial', color: '#7a8298', align: 'center',
-      w: leftColW2 * 0.5, h: leftColW2 * 0.08
-    });
-    catLabel2.position.set(leftCX2, imgY2 - leftColW2 * 0.08, 0.03);
-    pdv.scrollGroup.add(catLabel2);
+    // Load and display main product image
+    pdv.mainImgMesh = null;
+    pdv.mainImgPanel = {cx: leftCX2, cy: imgY2, pw: leftColW2, ph: imgH2};
+    pdv.allImgSrcs = allImgs2;
+    pdv.thumbMeshes = [];
 
-    // Thumbnails below image
-    var thumbS2 = leftColW2 * 0.25;
-    var thumbGap3 = gap * 0.8;
-    var thumbY3 = imgY2 - imgH2 / 2 - gap - thumbS2 / 2;
-    for(var ti2 = 0; ti2 < 3; ti2++){
-      var ttx2 = leftCX2 + (ti2 - 1) * (thumbS2 + thumbGap3);
-      var thumb2 = createPdvGlassPanel(thumbS2, thumbS2, 0.25, 0.08);
-      thumb2.position.set(ttx2, thumbY3, 0);
-      pdv.scrollGroup.add(thumb2);
-      var thLabel2 = pdvTextMesh((ti2+1).toString(), {
-        cw: 64, ch: 64, font: '500 34px Arial', color: '#6a7288', align: 'center',
-        w: thumbS2 * 0.5, h: thumbS2 * 0.5
+    pdv.loadMainImage = function(src){
+      if(pdv.mainImgMesh){ pdv.scrollGroup.remove(pdv.mainImgMesh); pdv.mainImgMesh = null; }
+      var imgSrc = src;
+      if(imgSrc.indexOf('http') !== 0 && imgSrc.indexOf('//') !== 0) imgSrc = 'product-images/' + imgSrc;
+      var loader = new THREE.TextureLoader();
+      var mp = pdv.mainImgPanel;
+      loader.load(imgSrc, function(tex){
+        tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+        var imgAspect = tex.image.width / tex.image.height;
+        var fitW, fitH;
+        if(imgAspect > mp.pw / mp.ph){ fitW = mp.pw * 0.92; fitH = fitW / imgAspect; }
+        else { fitH = mp.ph * 0.92; fitW = fitH * imgAspect; }
+        var imgMat = new THREE.MeshBasicMaterial({map: tex, transparent: true, depthWrite: false, depthTest: false, side: THREE.DoubleSide});
+        var imgMesh = new THREE.Mesh(new THREE.PlaneGeometry(fitW, fitH), imgMat);
+        imgMesh.position.set(mp.cx, mp.cy, 0.05);
+        imgMesh.renderOrder = 15;
+        imgMesh.layers.enable(1);
+        pdv.scrollGroup.add(imgMesh);
+        pdv.mainImgMesh = imgMesh;
       });
-      thLabel2.position.set(ttx2, thumbY3, 0.03);
-      pdv.scrollGroup.add(thLabel2);
+    }
+    if(allImgs2.length > 0) pdv.loadMainImage(allImgs2[0]);
+
+    // Thumbnails below image — show actual images
+    var thumbCount2 = Math.min(allImgs2.length, 5);
+    if(thumbCount2 > 1){
+      var thumbS2 = leftColW2 * 0.25;
+      var thumbGap3 = gap * 0.8;
+      var thumbY3 = imgY2 - imgH2 / 2 - gap - thumbS2 / 2;
+      var totalThumbW2 = thumbCount2 * thumbS2 + (thumbCount2 - 1) * thumbGap3;
+      var thumbStartX2 = leftCX2 - totalThumbW2 / 2 + thumbS2 / 2;
+      for(var ti2 = 0; ti2 < thumbCount2; ti2++){
+        var ttx2 = thumbStartX2 + ti2 * (thumbS2 + thumbGap3);
+        var thumb2 = createPdvGlassPanel(thumbS2, thumbS2, ti2 === 0 ? 0.55 : 0.25, 0.08);
+        thumb2.position.set(ttx2, thumbY3, 0);
+        thumb2.userData.actionId = 'pdv-thumb-' + ti2;
+        thumb2.userData.clickable = true;
+        pdv.scrollGroup.add(thumb2);
+        pdv.thumbMeshes.push(thumb2);
+        // Load thumbnail image
+        (function(idx, tx, ty, ts){
+          var tsrc = allImgs2[idx];
+          if(tsrc.indexOf('http') !== 0 && tsrc.indexOf('//') !== 0) tsrc = 'product-images/' + tsrc;
+          var tl = new THREE.TextureLoader();
+          tl.load(tsrc, function(tex){
+            tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+            var ta = tex.image.width / tex.image.height;
+            var tw2, th2;
+            if(ta > 1){ tw2 = ts * 0.85; th2 = tw2 / ta; }
+            else { th2 = ts * 0.85; tw2 = th2 * ta; }
+            var tm = new THREE.Mesh(new THREE.PlaneGeometry(tw2, th2),
+              new THREE.MeshBasicMaterial({map: tex, transparent: true, depthWrite: false, depthTest: false, side: THREE.DoubleSide}));
+            tm.position.set(tx, ty, 0.05);
+            tm.renderOrder = 15;
+            tm.layers.enable(1);
+            pdv.scrollGroup.add(tm);
+          });
+        })(ti2, ttx2, thumbY3, thumbS2);
+      }
     }
 
     // RIGHT: Stack top to bottom (below top reserve)
@@ -5107,6 +5205,20 @@ function handleProductDetailClick(cx, cy){
           var savedScroll = pdv.scrollY;
           buildProductDetailScene();
           pdv.scrollY = savedScroll;
+          return true;
+        } else if(aid.indexOf('pdv-thumb-') === 0){
+          var thumbIdx = parseInt(aid.replace('pdv-thumb-', ''));
+          if(pdv.allImgSrcs && pdv.allImgSrcs[thumbIdx]){
+            pdv.loadMainImage(pdv.allImgSrcs[thumbIdx]);
+            // Update thumb highlights
+            if(pdv.thumbMeshes){
+              pdv.thumbMeshes.forEach(function(tm, tmi){
+                if(tm.material && tm.material.uniforms && tm.material.uniforms.opacity){
+                  tm.material.uniforms.opacity.value = (tmi === thumbIdx) ? 0.55 : 0.25;
+                }
+              });
+            }
+          }
           return true;
         }
         return true;
@@ -6574,6 +6686,14 @@ function animate(){
     floors.forEach(function(f){if(f.hasRings){f.rings.top.forEach(function(r){r.visible=true;});f.rings.bottom.forEach(function(r){r.visible=true;});}});
   }
   
+  // Apply touch scroll momentum with friction
+  if(Math.abs(touchScroll.scrollMomentum) > 0.0001){
+    targetCameraY+=touchScroll.scrollMomentum;
+    touchScroll.scrollMomentum*=0.88; // friction
+    var minY=-(TOTAL_FLOORS-1)*FLOOR_SPACING;
+    targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
+  }
+
   var nY=null,nD=Infinity;
   floors.forEach(function(f){var d=Math.abs(targetCameraY-f.group.position.y);if(d<nD){nD=d;nY=f.group.position.y;}});
   if(nD<0.8&&nY!==null)targetCameraY+=(nY-targetCameraY)*0.12;
@@ -6682,7 +6802,29 @@ function animate(){
       fl.panels.forEach(function(panel){var br=panel.mesh.userData.baseRadius,er=br+re;panel.mesh.scale.x=er/br;panel.mesh.scale.z=er/br;panel.edges.scale.x=er/br;panel.edges.scale.z=er/br;});
     }
     // Update holographic shader time on all panels
-    if(fl.panels){fl.panels.forEach(function(panel){if(panel.mesh.material.userData.holoTime)panel.mesh.material.userData.holoTime.value=time+(panel.mesh.material.userData.holoOffset||0);});}
+    if(fl.panels){fl.panels.forEach(function(panel, pi){
+      if(panel.mesh.material.userData.holoTime)panel.mesh.material.userData.holoTime.value=time+(panel.mesh.material.userData.holoOffset||0);
+      // Animate image rotation toward target
+      var ud=panel.mesh.material.userData;
+      if(ud.imgRotation && ud.imgRotationTarget !== undefined){
+        var diff = ud.imgRotationTarget - ud.imgRotation.value;
+        if(Math.abs(diff) > 0.005) ud.imgRotation.value += diff * 0.18;
+        else ud.imgRotation.value = ud.imgRotationTarget;
+      }
+      // Gentle bobbing — each panel delayed by 0.5s * index
+      if(!(dm.active && dm.floor === fl)){
+        var prevBob = panel.mesh.userData.curBob || 0;
+        var bobDelay = pi * 0.5;
+        var bob = Math.sin((time + bobDelay) * 1.2) * 0.03;
+        panel.mesh.position.y += bob - prevBob;
+        panel.edges.position.y = panel.mesh.position.y;
+        panel.mesh.userData.curBob = bob;
+      } else if(panel.mesh.userData.curBob){
+        panel.mesh.position.y -= panel.mesh.userData.curBob;
+        panel.edges.position.y = panel.mesh.position.y;
+        panel.mesh.userData.curBob = 0;
+      }
+    });}
   });
   
   if(dm.active&&dm.vWheel&&!dm.closing&&!dm.animating){
