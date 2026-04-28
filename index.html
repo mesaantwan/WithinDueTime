@@ -186,11 +186,11 @@ function fetchShopifyProducts() {
 }
 
 function addToShopifyCart(product, sizeLabel) {
-  if (!shopifyClient || !shopifyCheckout || !product.shopifyVariants) return;
+  if (!shopifyClient || !shopifyCheckout || !product.shopifyVariants) return Promise.resolve(null);
   var variantId = null;
   if (product.shopifyVariants.length === 1) {
     variantId = product.shopifyVariants[0].id;
-  } else {
+  } else if (sizeLabel) {
     for (var i = 0; i < product.shopifyVariants.length; i++) {
       if (product.shopifyVariants[i].title === sizeLabel) {
         variantId = product.shopifyVariants[i].id;
@@ -198,15 +198,29 @@ function addToShopifyCart(product, sizeLabel) {
       }
     }
   }
-  if (!variantId) { console.warn('Variant not found for size:', sizeLabel); return; }
+  // Fallback: first available variant
+  if (!variantId) {
+    for (var k = 0; k < product.shopifyVariants.length; k++) {
+      if (product.shopifyVariants[k].available) { variantId = product.shopifyVariants[k].id; break; }
+    }
+  }
+  if (!variantId && product.shopifyVariants.length > 0) variantId = product.shopifyVariants[0].id;
+  if (!variantId) { console.warn('No variant found for product:', product.name); return Promise.resolve(null); }
 
-  shopifyClient.checkout.addLineItems(shopifyCheckout.id, [{
+  return shopifyClient.checkout.addLineItems(shopifyCheckout.id, [{
     variantId: variantId,
     quantity: 1
   }]).then(function(co) {
     shopifyCheckout = co;
     console.log('Added to cart. Items:', co.lineItems.length);
+    return co;
   });
+}
+
+function buyNowAndCheckout(product) {
+  // Update local cart state too (so count + scale reflect it)
+  addToCart(product);
+  shopifyGoToCheckout();
 }
 
 function shopifyGoToCheckout() {
@@ -276,6 +290,20 @@ var mouseDownX = 0, mouseDownY = 0, mouseDownTime = 0;
 var previousMouseX = 0, previousMouseY = 0, previousTime = 0;
 
 var hoveredPanel = null; // currently hovered panel mesh
+var hoveredGlassMesh = null; // currently hovered glass UI element
+var pressedGlassMesh = null; // glass UI element being pressed
+var dmCenterAnims = []; // {floor, prog, target, side}
+
+function setDmCenterAnimTarget(floor, target, side) {
+  for(var i=0;i<dmCenterAnims.length;i++){
+    if(dmCenterAnims[i].floor === floor){
+      dmCenterAnims[i].target = target;
+      if(side) dmCenterAnims[i].side = side;
+      return;
+    }
+  }
+  dmCenterAnims.push({floor: floor, prog: 0, target: target, side: side || 'right'});
+}
 
 // Camera mouse tilt
 var camMouseX = 0, camMouseY = 0;
@@ -478,6 +506,9 @@ function createPanel(floorR, vertR) {
   mat.userData.hasBackTex = {value:0.0};
   mat.userData.hoverAmount = {value:0.0};
   mat.userData.hoverTarget = 0.0;
+  mat.userData.flatten = {value:0.0};
+  mat.userData.flattenZ = {value: floorR}; // center Z of arc — flatten target
+  mat.userData.splitGap = {value:0.0};
   mat.onBeforeCompile = function(shader){
     shader.uniforms.holoTime = mat.userData.holoTime;
     shader.uniforms.productTex = mat.userData.productTex;
@@ -488,16 +519,29 @@ function createPanel(floorR, vertR) {
     shader.uniforms.backTex = mat.userData.backTex;
     shader.uniforms.hasBackTex = mat.userData.hasBackTex;
     shader.uniforms.hoverAmount = mat.userData.hoverAmount;
-    shader.fragmentShader = 'uniform float holoTime;\nuniform sampler2D productTex;\nuniform float hasProductTex;\nuniform float productTexAspect;\nuniform float panelAspect;\nuniform float imgRotation;\nuniform sampler2D backTex;\nuniform float hasBackTex;\nuniform float hoverAmount;\n' + shader.fragmentShader;
+    shader.uniforms.flatten = mat.userData.flatten;
+    shader.uniforms.flattenZ = mat.userData.flattenZ;
+    shader.uniforms.splitGap = mat.userData.splitGap;
+    shader.fragmentShader = 'uniform float holoTime;\nuniform sampler2D productTex;\nuniform float hasProductTex;\nuniform float productTexAspect;\nuniform float panelAspect;\nuniform float imgRotation;\nuniform sampler2D backTex;\nuniform float hasBackTex;\nuniform float hoverAmount;\nuniform float flatten;\nuniform float splitGap;\n' + shader.fragmentShader;
     // Vertex shader: depress toward center on hover
-    shader.vertexShader = 'uniform float hoverAmount;\n' + shader.vertexShader;
+    shader.vertexShader = 'uniform float hoverAmount;\nuniform float flatten;\nuniform float flattenZ;\nuniform float splitGap;\n' + shader.vertexShader;
     shader.vertexShader = shader.vertexShader.replace(
       '#include <begin_vertex>',
       [
         '#include <begin_vertex>',
         'if(hoverAmount > 0.0) {',
-        '  // Push inward along normal (toward wheel center)',
         '  transformed -= normal * hoverAmount * 0.15;',
+        '}',
+        '// Flatten: remove curvature by lerping Z toward front of arc',
+        'if(flatten > 0.0) {',
+        '  transformed.z = mix(transformed.z, flattenZ, flatten);',
+        '}',
+        '// Split: push top half up, bottom half down from center',
+        'if(splitGap > 0.0) {',
+        '  float halfH = ' + (PLANE_WIDTH * 0.5).toFixed(3) + ';',
+        '  float normY = (transformed.y + halfH) / (halfH * 2.0);', // 0 at bottom, 1 at top
+        '  float splitDir = smoothstep(0.45, 0.55, normY) * 2.0 - 1.0;', // -1 bottom, +1 top, smooth blend at center
+        '  transformed.y += splitDir * splitGap;',
         '}'
       ].join('\n')
     );
@@ -507,6 +551,13 @@ function createPanel(floorR, vertR) {
         '#include <emissivemap_fragment>',
         '{',
         '  vec2 puv = vUv;',
+        '',
+        '  // ── Split gap: discard pixels in the center gap ──',
+        '  if(splitGap > 0.0) {',
+        '    float distFromCenter = abs(puv.y - 0.5);',
+        '    float stripH = 0.5 - splitGap * 0.45;', // how much of the half remains as strip
+        '    if(distFromCenter < 0.5 - stripH) discard;',
+        '  }',
         '',
         '  // ── Edge glow: soft bloom emanating inward from panel edges ──',
         '  float edgeL = smoothstep(0.0, 0.18, puv.x);',
@@ -1232,15 +1283,18 @@ function createGlassCircleBtn(circleR) {
       tScratch:{value:generateScratchTexture()},
       tFrost:{value:generateFrostTexture()},
       res:{value:new THREE.Vector2(window.innerWidth,window.innerHeight)},
-      cR:{value:CR}, time:{value:0}
+      cR:{value:CR}, time:{value:0},
+      hoverPress:{value:0.0}
     },
     vertexShader:[
+      'uniform float hoverPress;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
       'void main(){',
-      '  vLP=position;',
+      '  vec3 transformed = position - normal * hoverPress * 0.04;',
+      '  vLP=transformed;',
       '  vUv=uv;',
-      '  vec4 mv=modelViewMatrix*vec4(position,1.0);',
+      '  vec4 mv=modelViewMatrix*vec4(transformed,1.0);',
       '  vN=normalize(normalMatrix*normal);',
       '  vV=normalize(-mv.xyz);',
       '  gl_Position=projectionMatrix*mv;',
@@ -1249,7 +1303,7 @@ function createGlassCircleBtn(circleR) {
     fragmentShader:[
       'uniform sampler2D tBg,tScratch,tFrost;',
       'uniform vec2 res;',
-      'uniform float cR,time;',
+      'uniform float cR,time,hoverPress;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
       GLARE_GLSL_FUNCS,
@@ -1277,6 +1331,7 @@ function createGlassCircleBtn(circleR) {
       GLASS_TINT_GLSL,
       GLARE_GLSL_CALC,
       '  col+=glareResult;',
+      '  col=mix(col,vec3(0.05,0.08,0.18),hoverPress*0.45);',
       '  gl_FragColor=vec4(col,alpha);',
       '}'
     ].join('\n'),
@@ -2884,6 +2939,14 @@ function onTM(e){
     var dy=ty-touchScroll.lastY;
     var dx=tx-touchScroll.lastX;
 
+    // Cart panel drag takes priority — route swipe directly to cart drag, never lock to scroll
+    if(cartDrag.active){
+      touchScroll.locked='cart';
+      pMove(tx, ty);
+      touchScroll.lastX=tx; touchScroll.lastY=ty;
+      return;
+    }
+
     // First movement decides lock direction based on actual swipe angle
     if(touchScroll.locked===null && (Math.abs(dx)>6 || Math.abs(dy)>6)){
       hoveredPanel=null; // release tap hover once swiping starts
@@ -2940,17 +3003,50 @@ function onTE(e){
 
 function pDown(cx,cy){
   mouseDownX=cx;mouseDownY=cy;mouseDownTime=performance.now();
+  // Detect glass UI press for visual feedback
+  mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+  raycaster.setFromCamera(mouse,camera);
+  pressedGlassMesh = null;
+  if(navMenu.glassMesh){
+    var pdGH = raycaster.intersectObject(navMenu.glassMesh);
+    if(pdGH.length>0) pressedGlassMesh = navMenu.glassMesh;
+  }
+  if(!pressedGlassMesh && navMenu.open){
+    for(var pdNbi=0;pdNbi<navMenu.buttons.length;pdNbi++){
+      var pdNbH = raycaster.intersectObjects(navMenu.buttons[pdNbi].group.children,true);
+      if(pdNbH.length>0){ pressedGlassMesh = findGlassMeshFromHit(pdNbH[0].object); break; }
+    }
+  }
+  if(!pressedGlassMesh){
+    for(var pdOi=0;pdOi<cartOverlays.length;pdOi++){
+      var pdOvH = raycaster.intersectObjects(cartOverlays[pdOi].group.children,true);
+      if(pdOvH.length>0){ pressedGlassMesh = findGlassMeshFromHit(pdOvH[0].object); break; }
+    }
+  }
+  if(!pressedGlassMesh && cart.glassMesh){
+    var pdCgH = raycaster.intersectObject(cart.glassMesh);
+    if(pdCgH.length>0) pressedGlassMesh = cart.glassMesh;
+  }
+  if(!pressedGlassMesh && dm.active && dm.dmButtons.length>0){
+    for(var pdDbi=0;pdDbi<dm.dmButtons.length;pdDbi++){
+      var pdQvH = raycaster.intersectObjects(dm.dmButtons[pdDbi].children,true);
+      if(pdQvH.length>0){ pressedGlassMesh = findGlassMeshFromHit(pdQvH[0].object); break; }
+    }
+  }
   // During product detail view: allow cart, nav, and PDV scrolling (no background spinning)
   if(pdv.active || pdv.entering || pdv.exitingToDM){
     mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
     raycaster.setFromCamera(mouse,camera);
-    // Cart drag
+    // Cart drag — check panel children AND glass surface
     if(cart.panelOpen && cart.panelGroup){
       var cartHits2 = raycaster.intersectObjects(cart.panelGroup.children, true);
+      if(cartHits2.length === 0 && cart.glassMesh) {
+        cartHits2 = raycaster.intersectObject(cart.glassMesh);
+      }
       if(cartHits2.length > 0){
         var hitIsBtn2 = false;
         var chk2 = cartHits2[0].object;
-        while(chk2 && chk2 !== cart.panelGroup){
+        while(chk2 && chk2 !== cart.panelGroup && chk2 !== scene){
           if(chk2.userData.clickable && chk2.userData.actionId){ hitIsBtn2 = true; break; }
           chk2 = chk2.parent;
         }
@@ -2966,15 +3062,17 @@ function pDown(cx,cy){
   mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
   
-  // Check if clicking on cart panel title bar area for dragging
+  // Check if clicking on cart panel area for dragging (panel children OR the glass surface)
   if(cart.panelOpen && cart.panelGroup) {
     var cartHits = raycaster.intersectObjects(cart.panelGroup.children, true);
+    if(cartHits.length === 0 && cart.glassMesh) {
+      cartHits = raycaster.intersectObject(cart.glassMesh);
+    }
     if(cartHits.length > 0) {
-      var hitLocal = cart.panelGroup.worldToLocal(cartHits[0].point.clone());
       // Check if we hit a clickable button — if so, don't drag
       var hitIsButton = false;
       var checkObj = cartHits[0].object;
-      while(checkObj && checkObj !== cart.panelGroup) {
+      while(checkObj && checkObj !== cart.panelGroup && checkObj !== scene) {
         if(checkObj.userData.clickable && checkObj.userData.actionId) { hitIsButton = true; break; }
         checkObj = checkObj.parent;
       }
@@ -3054,35 +3152,46 @@ function pMove(cx,cy){
   updateCursor(cx,cy);
 }
 
+// Walk up the parent chain to find a glass mesh (one with hoverPress uniform)
+function findGlassMeshFromHit(obj){
+  while(obj){
+    if(obj.material && obj.material.uniforms && obj.material.uniforms.hoverPress) return obj;
+    if(obj.userData && obj.userData.glassMesh && obj.userData.glassMesh.material && obj.userData.glassMesh.material.uniforms && obj.userData.glassMesh.material.uniforms.hoverPress) return obj.userData.glassMesh;
+    obj = obj.parent;
+  }
+  return null;
+}
+
 function updateCursor(cx,cy){
   var el=renderer.domElement.parentElement;
   el.classList.remove('clickable','grabbable');
-  
+  hoveredGlassMesh = null;
+
   mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
-  
+
   // Check nav menu (clickable)
   if(navMenu.glassMesh){
     var navH=raycaster.intersectObject(navMenu.glassMesh);
-    if(navH.length>0){el.classList.add('clickable');return;}
+    if(navH.length>0){hoveredGlassMesh = navMenu.glassMesh; el.classList.add('clickable');return;}
   }
   if(navMenu.open){
     for(var nci=0;nci<navMenu.buttons.length;nci++){
       var nbcH=raycaster.intersectObjects(navMenu.buttons[nci].group.children,true);
-      if(nbcH.length>0){el.classList.add('clickable');return;}
+      if(nbcH.length>0){hoveredGlassMesh = findGlassMeshFromHit(nbcH[0].object); el.classList.add('clickable');return;}
     }
   }
-  
+
   // Check overlay buttons (clickable)
   for(var oi=0;oi<cartOverlays.length;oi++){
     var ovH=raycaster.intersectObjects(cartOverlays[oi].group.children,true);
-    if(ovH.length>0){el.classList.add('clickable');return;}
+    if(ovH.length>0){hoveredGlassMesh = findGlassMeshFromHit(ovH[0].object); el.classList.add('clickable');return;}
   }
-  
+
   // Check cart glass mesh (clickable to open/close)
   if(cart.glassMesh){
     var cgh=raycaster.intersectObject(cart.glassMesh);
-    if(cgh.length>0){el.classList.add('clickable');return;}
+    if(cgh.length>0){hoveredGlassMesh = cart.glassMesh; el.classList.add('clickable');return;}
   }
   
   // Check cart panel buttons (clickable)
@@ -3107,7 +3216,7 @@ function updateCursor(cx,cy){
   if(dm.active&&dm.dmButtons.length>0){
     for(var dbi=0;dbi<dm.dmButtons.length;dbi++){
       var qvh=raycaster.intersectObjects(dm.dmButtons[dbi].children,true);
-      if(qvh.length>0){el.classList.add('clickable');return;}
+      if(qvh.length>0){hoveredGlassMesh = findGlassMeshFromHit(qvh[0].object); el.classList.add('clickable');return;}
     }
   }
   
@@ -3136,6 +3245,7 @@ function updateCursor(cx,cy){
 }
 
 function pUp(cx,cy){
+  pressedGlassMesh = null;
   if(cartDrag.active){endCartDrag();isDragging=false;renderer.domElement.parentElement.classList.remove('dragging');return;}
   // End PDV scroll drag
   if(pdv.dragging){ pdv.dragging=false; }
@@ -3263,7 +3373,11 @@ function pUp(cx,cy){
           } else if(actionId==='close'){
             exitDM();
           } else if(actionId==='expand'){
-            enterProductDetail();
+            // Right arrow: add to cart + immediately go to checkout
+            var floorCfg2 = PRODUCT_DATA.floors[dm.floorIdx];
+            if(floorCfg2 && floorCfg2.products[dm.selIdx]) {
+              buyNowAndCheckout(floorCfg2.products[dm.selIdx]);
+            }
           }
           isDragging=false;selectedFloor=null;if(dm.draggingVW)dm.draggingVW=false;
           renderer.domElement.parentElement.classList.remove('dragging');
@@ -3373,17 +3487,31 @@ function pUp(cx,cy){
 // ══════════════════════════════════════════════
 function enterDM(floorData, panelIdx, floorIdx) {
   if(dm.active||dm.closing){
-    // Queue open after current section finishes closing
     if(dm.floorIdx===floorIdx&&dm.selIdx===panelIdx&&!dm.closing) return; // same panel, ignore
-    dm.queuedOpen={fd:floorData,pi:panelIdx,fi:floorIdx};
-    if(!dm.closing) exitDM();
-    return;
+    // Start closing animation for old floor, extract it to run independently
+    if(dm.active && !dm.closing) exitDMImmediate(true);
+    extractClosingToPending();
   }
   dm.active=true; dm.floorIdx=floorIdx; dm.floor=floorData; dm.selIdx=panelIdx;
-  
+
+  // Smooth scroll camera to center on this floor's wheel
+  touchScroll.scrollMomentum = 0;
+  var floorY = floorData.group.position.y;
+  if(Math.abs(camera.position.y - floorY) > 0.3) {
+    navScrollAnim.active = true;
+    navScrollAnim.startY = camera.position.y;
+    navScrollAnim.targetY = floorY;
+    navScrollAnim.progress = 0;
+  } else {
+    targetCameraY = floorY;
+  }
+
   var isLeft = floorIdx===1||floorIdx===3;
   dm.vwSide = isLeft?'left':'right';
-  
+
+  // Trigger center star fly-out to vWheel center
+  setDmCenterAnimTarget(floorData, 1, isLeft ? 'left' : 'right');
+
   // 1. Capture current world transforms of all panels
   dm.animData = [];
   floorData.panels.forEach(function(panel,idx){
@@ -3630,6 +3758,9 @@ function animateDM() {
 
     // Create label (no longer creates buttons — stars ARE the buttons)
     createQuickViewPanels();
+
+    // Start display panel flatten + split animation
+    startDisplayAnim();
   }
 }
 
@@ -3678,10 +3809,375 @@ function buildVW() {
   vg.visible=true; scene.add(vg);
 }
 
+// Instant teardown — skips closing animation, used when switching to a different floor's DM
+function teardownDM() {
+  if(!dm.active && !dm.closing) return;
+  var fd = dm.floor;
+  if(!fd) return;
+
+  cleanupDisplayAnim();
+  destroyQuickViewPanels();
+
+  // Remove star icons
+  for(var ri = 0; ri < dm.starIcons.length; ri++){
+    var ico = dm.starIcons[ri];
+    if(ico.parent) ico.parent.remove(ico);
+  }
+
+  // Re-attach star temps to ring
+  if(fd.glassRing){
+    var rr = fd.glassRing.userData.ringRadius || 1.8;
+    var allStars = dm.starTemps.concat(dm.closingStarTemps || []);
+    allStars.forEach(function(st, ci){
+      scene.remove(st);
+      var na = ci * (Math.PI * 2 / 3);
+      st.position.set(Math.sin(na) * rr, 0, Math.cos(na) * rr);
+      st.rotation.set(0, na, 0);
+      st.scale.set(1, 1, 1);
+      fd.glassRing.add(st);
+    });
+    if(!fd.glassRing.userData.nodes) fd.glassRing.userData.nodes = [];
+    fd.glassRing.userData.nodes = allStars.slice();
+    fd.glassRing.visible = true;
+    var rmesh = fd.glassRing.userData.glassMesh;
+    if(rmesh && rmesh.material.uniforms.opacity) rmesh.material.uniforms.opacity.value = 1.0;
+    if(rmesh && rmesh.material.uniforms.morph) rmesh.material.uniforms.morph.value = 0.0;
+  }
+
+  // Clean closing temps if mid-closing
+  if(dm.closingTemps){
+    dm.closingTemps.forEach(function(t){if(t.plane)scene.remove(t.plane);if(t.edge)scene.remove(t.edge);});
+  }
+
+  // Remove display temp
+  if(dm.displayTemp){
+    if(dm.displayTemp.plane) scene.remove(dm.displayTemp.plane);
+    if(dm.displayTemp.edge) scene.remove(dm.displayTemp.edge);
+  }
+
+  // Restore panels to floor
+  if(dm.origPanelData){
+    dm.origPanelData.forEach(function(data){
+      if(dm.vWheel){dm.vWheel.remove(data.panel.mesh);dm.vWheel.remove(data.panel.edges);}
+      if(data.parent) data.parent.add(data.panel.mesh);
+      if(data.eParent) data.eParent.add(data.panel.edges);
+      data.panel.mesh.position.copy(data.pos);data.panel.mesh.rotation.copy(data.rot);data.panel.mesh.scale.copy(data.scl);
+      data.panel.edges.position.copy(data.ePos);data.panel.edges.rotation.copy(data.eRot);data.panel.edges.scale.copy(data.eScl);
+      data.panel.mesh.visible = data.vis; data.panel.edges.visible = data.eVis;
+      morphTo(data.panel.mesh, 0);
+      data.panel.mesh.material.userData.imgRotation.value = 0.0;
+      data.panel.mesh.material.userData.imgRotationTarget = 0.0;
+      data.panel.mesh.material.userData.flatten.value = 0.0;
+      data.panel.mesh.material.userData.splitGap.value = 0.0;
+    });
+  }
+
+  // Restore rings
+  if(fd.rings && dm.origState){
+    if(dm.origState.rtp) fd.rings.top.forEach(function(rg,i){var op=dm.origState.rtp[i];var os=dm.origState.rts[i];if(op)rg.position.copy(op);if(os)rg.scale.copy(os);});
+    if(dm.origState.rbp) fd.rings.bottom.forEach(function(rg,i){var op=dm.origState.rbp[i];var os=dm.origState.rbs[i];if(op)rg.position.copy(op);if(os)rg.scale.copy(os);});
+  }
+
+  if(dm.displayPlane){scene.remove(dm.displayPlane);dm.displayPlane=null;}
+  if(dm.displayEdges){scene.remove(dm.displayEdges);dm.displayEdges=null;}
+  if(dm.vWheel){scene.remove(dm.vWheel);dm.vWheel=null;}
+  if(fd&&fd.group){var pf=0.015;fd.group.userData.velocity+=((dm.floorIdx===1||dm.floorIdx===3)?-pf:pf);}
+
+  dm.active=false;dm.floorIdx=-1;dm.floor=null;dm.selIdx=-1;
+  dm.animProg=0;dm.animating=false;dm.closing=false;dm.closingProg=0;
+  dm.vwVel=0.0025;dm.draggingVW=false;dm.vwSide=null;
+  dm.origState={};dm.animData=[];dm.origPanelData=[];dm.displayTemp=null;
+  dm.dmButtons=[];dm.starTemps=[];dm.starAnimData=[];dm.starIcons=[];
+  dm.closingTemps=[];dm.closingAnimData=[];
+  dm.closingStarTemps=[];dm.closingStarAnimData=[];
+  dm.queuedOpen=null;
+}
+
+// Independent closing animation that runs detached from dm state
+var pendingCloses = [];
+
+function extractClosingToPending() {
+  // exitDMImmediate() must have been called first (sets up dm.closing state)
+  if(!dm.closing) return;
+  var pc = {
+    prog: dm.closingProg,
+    floor: dm.floor,
+    floorIdx: dm.floorIdx,
+    closingTemps: dm.closingTemps,
+    closingAnimData: dm.closingAnimData,
+    closingStarTemps: dm.closingStarTemps,
+    closingStarAnimData: dm.closingStarAnimData,
+    origState: dm.origState,
+    origPanelData: dm.origPanelData,
+    displayPlane: dm.displayPlane,
+    displayEdges: dm.displayEdges,
+    vWheel: dm.vWheel,
+    // Carry over display animation state for reverse playback
+    dispAnim: null
+  };
+  if(displayAnim.origPos || displayAnim.backdrop) {
+    pc.dispAnim = {
+      backdrop: displayAnim.backdrop,
+      origPos: displayAnim.origPos,
+      origScale: displayAnim.origScale,
+      origEdgePos: displayAnim.origEdgePos,
+      origEdgeScale: displayAnim.origEdgeScale,
+      btnOrigPositions: displayAnim.btnOrigPositions,
+      phase: 'retract',
+      prog: 0,
+      plane: dm.displayTemp ? dm.displayTemp.plane : null,
+      edge: dm.displayTemp ? dm.displayTemp.edge : null
+    };
+    // Determine correct starting phase
+    if(displayAnim.backdrop && displayAnim.backdrop.visible) {
+      pc.dispAnim.phase = 'retract';
+    } else if(pc.dispAnim.plane && pc.dispAnim.plane.material.userData.splitGap.value > 0) {
+      pc.dispAnim.phase = 'unsplit';
+    } else {
+      pc.dispAnim.phase = 'unflatten';
+    }
+    // Backdrop stays as child of plane — it tracks automatically during reverse animation
+    // Clear from main displayAnim so it doesn't conflict
+    displayAnim.backdrop = null;
+    displayAnim.origPos = null;
+    displayAnim.origScale = null;
+    displayAnim.origEdgePos = null;
+    displayAnim.origEdgeScale = null;
+    displayAnim.btnOrigPositions = [];
+    displayAnim.active = false;
+    displayAnim.phase = 'idle';
+    displayAnim.prog = 0;
+    displayAnim.pendingExit = false;
+  }
+  pendingCloses.push(pc);
+
+  // Clear these from dm so new enterDM doesn't conflict
+  dm.closing = false; dm.closingProg = 0;
+  dm.closingTemps = []; dm.closingAnimData = [];
+  dm.closingStarTemps = []; dm.closingStarAnimData = [];
+  dm.origState = {}; dm.origPanelData = [];
+  dm.displayPlane = null; dm.displayEdges = null; dm.vWheel = null;
+  dm.active = false; dm.floorIdx = -1; dm.floor = null; dm.selIdx = -1;
+  dm.animProg = 0; dm.animating = false; dm.vwVel = 0.0025;
+  dm.draggingVW = false; dm.vwSide = null;
+  dm.animData = []; dm.displayTemp = null;
+  dm.dmButtons = []; dm.starTemps = []; dm.starAnimData = []; dm.starIcons = [];
+  dm.queuedOpen = null;
+}
+
+function animatePendingCloses() {
+  for(var pci = pendingCloses.length - 1; pci >= 0; pci--) {
+    var pc = pendingCloses[pci];
+    pc.prog += 0.025;
+    if(pc.prog >= 1) pc.prog = 1;
+    var p = eIO(pc.prog);
+    var fd = pc.floor;
+
+    // Update targets to track floor rotation
+    fd.group.updateMatrixWorld(true);
+    pc.closingAnimData.forEach(function(ad, idx) {
+      var panel = fd.panels[idx];
+      var wp=new THREE.Vector3(),wq=new THREE.Quaternion(),ws=new THREE.Vector3();
+      panel.mesh.getWorldPosition(wp);panel.mesh.getWorldQuaternion(wq);panel.mesh.getWorldScale(ws);
+      ad.targetPos=wp; ad.targetQuat=wq; ad.targetScale=ws;
+    });
+
+    pc.closingAnimData.forEach(function(ad, idx) {
+      var t = pc.closingTemps[idx]; if(!t||!t.plane) return;
+      t.plane.position.lerpVectors(ad.startPos, ad.targetPos, p);
+      t.plane.quaternion.slerpQuaternions(ad.startQuat, ad.targetQuat, p);
+      t.plane.scale.lerpVectors(ad.startScale, ad.targetScale, p);
+      t.edge.position.copy(t.plane.position);t.edge.quaternion.copy(t.plane.quaternion);t.edge.scale.copy(t.plane.scale);
+      morphTo(t.plane, 1 - p);
+    });
+
+    // Star button closing
+    if(pc.closingStarTemps && pc.closingStarTemps.length > 0) {
+      if(fd.glassRing) {
+        var crWP = new THREE.Vector3();
+        fd.glassRing.getWorldPosition(crWP);
+        var crR = fd.glassRing.userData.ringRadius || 1.8;
+        for(var csi = 0; csi < pc.closingStarTemps.length; csi++) {
+          var csad = pc.closingStarAnimData[csi];
+          var sa2 = csi * (Math.PI * 2 / 3);
+          csad.targetPos = new THREE.Vector3(crWP.x+Math.sin(sa2)*crR, crWP.y, crWP.z+Math.cos(sa2)*crR);
+        }
+      }
+      var btnCloseP = Math.min(p / 0.5, 1.0);
+      for(var csi2 = 0; csi2 < pc.closingStarTemps.length; csi2++) {
+        var csad2 = pc.closingStarAnimData[csi2];
+        var cst = pc.closingStarTemps[csi2];
+        cst.position.lerpVectors(csad2.startPos, csad2.targetPos, btnCloseP);
+        cst.quaternion.slerpQuaternions(csad2.startQuat, csad2.targetQuat, btnCloseP);
+        cst.scale.lerpVectors(csad2.startScale, csad2.targetScale, btnCloseP);
+        cst.visible = (btnCloseP < 1.0);
+      }
+    }
+
+    // Ring reverse morph
+    if(fd.glassRing) {
+      fd.glassRing.visible = true;
+      var ringMesh2 = fd.glassRing.userData.glassMesh;
+      if(ringMesh2 && ringMesh2.material.uniforms.morph) {
+        var ringP2 = Math.max((p - 0.5) / 0.5, 0.0);
+        ringMesh2.material.uniforms.morph.value = 1.0 - ringP2;
+        ringMesh2.material.uniforms.opacity.value = 1.0;
+      }
+    }
+
+    // Ring position restore
+    if(fd.rings && pc.origState) {
+      var sa=1.25, vo=0.5;
+      if(pc.origState.rtp) fd.rings.top.forEach(function(rg,i){var op=pc.origState.rtp[i];if(!op)return;rg.position.y=(op.y+vo)+(op.y-(op.y+vo))*p;var os=pc.origState.rts[i];rg.scale.set(sa+(os.x-sa)*p,1,sa+(os.x-sa)*p);});
+      if(pc.origState.rbp) fd.rings.bottom.forEach(function(rg,i){var op=pc.origState.rbp[i];if(!op)return;rg.position.y=(op.y-vo)+(op.y-(op.y-vo))*p;var os=pc.origState.rbs[i];rg.scale.set(sa+(os.x-sa)*p,1,sa+(os.x-sa)*p);});
+    }
+
+    // Reverse display animation (retract → unsplit → unflatten) on pending close
+    if(pc.dispAnim && pc.dispAnim.plane) {
+      var da = pc.dispAnim;
+      var daSpeed = (da.phase === 'unflatten') ? 0.21 : 0.07875;
+      da.prog += daSpeed;
+      if(da.prog > 1) da.prog = 1;
+      var daP = eIO(da.prog);
+      var daMat2 = da.plane.material;
+
+      if(da.phase === 'retract') {
+        if(da.backdrop) {
+          da.backdrop.visible = true;
+          var bd4 = da.backdrop.userData;
+          var pW4 = PLANE_WIDTH, d4 = 0.35;
+          var mS4 = PLANE_WIDTH * 0.3;
+          var gH4 = mS4 * (0.45 * PLANE_WIDTH + 1.0);
+          var rd4 = 1 - daP, op4 = rd4 * 0.65, wH4 = gH4 * rd4;
+          bd4.topWall.position.set(0, gH4 - wH4*0.5, -d4);
+          bd4.topWall.scale.set(pW4, Math.max(wH4, 0.001), 1);
+          bd4.topWall.material.uniforms.opacity.value = op4;
+          bd4.botWall.position.set(0, -gH4 + wH4*0.5, -d4);
+          bd4.botWall.scale.set(pW4, Math.max(wH4, 0.001), 1);
+          bd4.botWall.material.uniforms.opacity.value = op4;
+          bd4.topLip.position.set(0, gH4, -d4*0.5);
+          bd4.topLip.scale.set(pW4, d4, 1);
+          bd4.topLip.material.uniforms.opacity.value = op4;
+          bd4.botLip.position.set(0, -gH4, -d4*0.5);
+          bd4.botLip.scale.set(pW4, d4, 1);
+          bd4.botLip.material.uniforms.opacity.value = op4;
+        }
+        if(da.prog >= 1) {
+          if(da.backdrop) da.backdrop.visible = false;
+          da.phase = 'unsplit'; da.prog = 0;
+        }
+      } else if(da.phase === 'unsplit') {
+        var mS5 = PLANE_WIDTH * 0.3;
+        var rd5 = 1 - daP;
+        daMat2.userData.splitGap.value = rd5 * mS5;
+        if(da.origPos) {
+          var fwd5 = rd5 * 5.0;
+          var sc5 = 1 + rd5 * (-0.3);
+          var isL5 = pc.floorIdx===1||pc.floorIdx===3;
+          var cp5 = rd5 * 1.8 * (isL5 ? -1 : 1);
+          da.plane.position.z = da.origPos.z + fwd5;
+          da.plane.position.x = da.origPos.x + cp5;
+          da.plane.scale.set(da.origScale.x * sc5, da.origScale.y * sc5, da.origScale.z);
+        }
+        if(da.prog >= 1) {
+          daMat2.userData.splitGap.value = 0.0;
+          if(da.origPos) {
+            da.plane.position.copy(da.origPos);
+            da.plane.scale.copy(da.origScale);
+          }
+          da.phase = 'unflatten'; da.prog = 0;
+          if(da.backdrop) da.backdrop.visible = false;
+        }
+      } else if(da.phase === 'unflatten') {
+        daMat2.userData.flatten.value = 1 - daP;
+        if(da.prog >= 1) {
+          daMat2.userData.flatten.value = 0.0;
+          daMat2.userData.splitGap.value = 0.0;
+          if(da.origPos) {
+            da.plane.position.copy(da.origPos);
+            da.plane.scale.copy(da.origScale);
+          }
+          // Clean up backdrop
+          if(da.backdrop) {
+            if(da.backdrop.parent) da.backdrop.parent.remove(da.backdrop);
+            da.backdrop.traverse(function(ch){ if(ch.geometry)ch.geometry.dispose(); if(ch.material)ch.material.dispose(); });
+          }
+          scene.remove(da.plane);
+          if(da.edge) scene.remove(da.edge);
+          pc.dispAnim = null;
+        }
+      }
+    }
+
+    // Completion
+    if(pc.prog >= 1 && !pc.dispAnim) {
+      pc.closingTemps.forEach(function(t){if(t.plane)scene.remove(t.plane);if(t.edge)scene.remove(t.edge);});
+      if(pc.closingStarTemps && fd.glassRing) {
+        var rr = fd.glassRing.userData.ringRadius || 1.8;
+        pc.closingStarTemps.forEach(function(cst2, ci) {
+          scene.remove(cst2);
+          var na = ci * (Math.PI * 2 / 3);
+          cst2.position.set(Math.sin(na)*rr, 0, Math.cos(na)*rr);
+          cst2.rotation.set(0, na, 0);
+          cst2.scale.set(1, 1, 1);
+          fd.glassRing.add(cst2);
+        });
+        if(!fd.glassRing.userData.nodes) fd.glassRing.userData.nodes = [];
+        fd.glassRing.userData.nodes = pc.closingStarTemps.slice();
+      } else if(pc.closingStarTemps) {
+        pc.closingStarTemps.forEach(function(cst2){scene.remove(cst2);});
+      }
+      if(fd.glassRing) {
+        fd.glassRing.visible = true;
+        var rmesh = fd.glassRing.userData.glassMesh;
+        if(rmesh && rmesh.material.uniforms.opacity) rmesh.material.uniforms.opacity.value = 1.0;
+        if(rmesh && rmesh.material.uniforms.morph) rmesh.material.uniforms.morph.value = 0.0;
+      }
+      pc.origPanelData.forEach(function(data) {
+        data.panel.mesh.visible = data.vis; data.panel.edges.visible = data.eVis;
+        data.panel.mesh.position.copy(data.pos);data.panel.mesh.rotation.copy(data.rot);data.panel.mesh.scale.copy(data.scl);
+        data.panel.edges.position.copy(data.ePos);data.panel.edges.rotation.copy(data.eRot);data.panel.edges.scale.copy(data.eScl);
+        morphTo(data.panel.mesh, 0);
+        data.panel.mesh.material.userData.imgRotation.value = 0.0;
+        data.panel.mesh.material.userData.imgRotationTarget = 0.0;
+        data.panel.mesh.material.userData.flatten.value = 0.0;
+        data.panel.mesh.material.userData.splitGap.value = 0.0;
+      });
+      if(pc.displayPlane){scene.remove(pc.displayPlane);}
+      if(pc.displayEdges){scene.remove(pc.displayEdges);}
+      if(pc.vWheel){scene.remove(pc.vWheel);}
+      if(fd&&fd.group){var pf=0.015;fd.group.userData.velocity+=((pc.floorIdx===1||pc.floorIdx===3)?-pf:pf);}
+      pendingCloses.splice(pci, 1);
+    }
+  }
+}
+
 function exitDM() {
   if(!dm.active)return;
+  // If already reversing, just make sure pendingExit is set
+  if(displayAnim.active && (displayAnim.phase === 'retract' || displayAnim.phase === 'unsplit' || displayAnim.phase === 'unflatten')) {
+    displayAnim.pendingExit = true;
+    return;
+  }
+  // If display animation is open, reverse it first, then exit when done
+  if(displayAnim.origPos || displayAnim.backdrop) {
+    displayAnim.pendingExit = true;
+    reverseDisplayAnim();
+    return;
+  }
+  exitDMImmediate();
+}
+
+function exitDMImmediate(skipDisplayCleanup) {
+  if(!dm.active)return;
   var fd=dm.floor;
-  
+
+  // Trigger center star fly-back to floor center
+  if(fd) setDmCenterAnimTarget(fd, 0);
+
+  // Clean up display animation (skip if caller will extract it to pending)
+  if(!skipDisplayCleanup) cleanupDisplayAnim();
+
   destroyQuickViewPanels();
 
   // ── Set up button closing animation (buttons shrink back toward ring) ──
@@ -3755,13 +4251,48 @@ function exitDM() {
     startData.push({startPos:wp.clone(),startQuat:wq.clone(),startScale:ws.clone()});
   });
   
-  // Hide and remove display temp
-  if(dm.displayTemp) {
+  // Hide and remove display temp (keep if skipDisplayCleanup — pending close will own it)
+  if(dm.displayTemp && !skipDisplayCleanup) {
     if(dm.displayTemp.plane) scene.remove(dm.displayTemp.plane);
     if(dm.displayTemp.edge) scene.remove(dm.displayTemp.edge);
     dm.displayTemp = null;
   }
   
+  // Give display temp its own material so uniforms don't conflict with closing temps
+  if(skipDisplayCleanup && dm.displayTemp && dm.displayTemp.plane) {
+    var srcMat = dm.displayTemp.plane.material;
+    var dtFlatten = srcMat.userData.flatten ? srcMat.userData.flatten.value : 0;
+    var dtSplitGap = srcMat.userData.splitGap ? srcMat.userData.splitGap.value : 0;
+    var dtFlattenZ = srcMat.userData.flattenZ ? srcMat.userData.flattenZ.value : 0;
+    // Clone material to isolate uniforms
+    var isoMat = srcMat.clone();
+    isoMat.userData.flatten = {value: dtFlatten};
+    isoMat.userData.splitGap = {value: dtSplitGap};
+    isoMat.userData.flattenZ = {value: dtFlattenZ};
+    // Copy other userData
+    for(var umk in srcMat.userData) {
+      if(!isoMat.userData[umk]) {
+        if(srcMat.userData[umk] && srcMat.userData[umk].value !== undefined) {
+          isoMat.userData[umk] = {value: srcMat.userData[umk].value};
+        } else {
+          isoMat.userData[umk] = srcMat.userData[umk];
+        }
+      }
+    }
+    var srcOBC = srcMat.onBeforeCompile;
+    isoMat.onBeforeCompile = function(shader) {
+      srcOBC.call(isoMat, shader);
+      // Rebind to isolated uniform objects
+      for(var iuk in isoMat.userData) {
+        if(isoMat.userData[iuk] && isoMat.userData[iuk].value !== undefined && shader.uniforms[iuk]) {
+          shader.uniforms[iuk] = isoMat.userData[iuk];
+        }
+      }
+    };
+    isoMat.needsUpdate = true;
+    dm.displayTemp.plane.material = isoMat;
+  }
+
   // Restore panels to floor group to get target positions
   dm.origPanelData.forEach(function(data){
     if(dm.vWheel){dm.vWheel.remove(data.panel.mesh);dm.vWheel.remove(data.panel.edges);}
@@ -3922,6 +4453,8 @@ function animateClosing(){
       morphTo(data.panel.mesh, 0);
       data.panel.mesh.material.userData.imgRotation.value = 0.0;
       data.panel.mesh.material.userData.imgRotationTarget = 0.0;
+      data.panel.mesh.material.userData.flatten.value = 0.0;
+      data.panel.mesh.material.userData.splitGap.value = 0.0;
     });
 
     if(dm.displayPlane){scene.remove(dm.displayPlane);dm.displayPlane=null;}
@@ -3943,6 +4476,382 @@ function animateClosing(){
 }
 
 // ══════════════════════════════════════════════
+// DISPLAY PANEL FLATTEN + SPLIT ANIMATION
+// ══════════════════════════════════════════════
+var displayAnim = {
+  active: false,
+  phase: 'idle', // 'flatten', 'split', 'backdrop', 'idle', 'retract', 'unsplit', 'unflatten'
+  prog: 0,
+  backdrop: null,
+  origPos: null,
+  origScale: null,
+  origEdgePos: null,
+  origEdgeScale: null,
+  btnOrigPositions: [],
+  pendingExit: false,
+  queuedSwitchIdx: -1
+};
+
+function startDisplayAnim() {
+  if(!dm.displayTemp || !dm.displayTemp.plane) return;
+  var mat = dm.displayTemp.plane.material;
+  mat.userData.flatten.value = 0.0;
+  mat.userData.splitGap.value = 0.0;
+  displayAnim.active = true;
+  displayAnim.phase = 'flatten';
+  displayAnim.prog = 0;
+
+  // Save original positions for panel and edge
+  displayAnim.origPos = dm.displayTemp.plane.position.clone();
+  displayAnim.origScale = dm.displayTemp.plane.scale.clone();
+  if(dm.displayTemp.edge) {
+    displayAnim.origEdgePos = dm.displayTemp.edge.position.clone();
+    displayAnim.origEdgeScale = dm.displayTemp.edge.scale.clone();
+    dm.displayTemp.edge.visible = false; // hide outline during display anim
+  }
+
+  // Save original star button positions
+  displayAnim.btnOrigPositions = [];
+  for(var si = 0; si < dm.starTemps.length; si++) {
+    displayAnim.btnOrigPositions.push(dm.starTemps[si].position.clone());
+  }
+
+  // Create backdrop — two wall halves sprouting from border inner edges + lips
+  if(!displayAnim.backdrop) {
+    var bdGroup = new THREE.Group();
+    bdGroup.renderOrder = 2;
+
+    // Top wall half — grows downward from top border inner edge
+    var topWall = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), createBackdropBlurMaterial());
+    bdGroup.add(topWall);
+
+    // Bottom wall half — grows upward from bottom border inner edge
+    var botWall = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), createBackdropBlurMaterial());
+    bdGroup.add(botWall);
+
+    // Top lip — horizontal shelf from top border edge going back
+    var topLip = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), createBackdropBlurMaterial());
+    topLip.rotation.x = Math.PI / 2;
+    bdGroup.add(topLip);
+
+    // Bottom lip — horizontal shelf from bottom border edge going back
+    var botLip = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), createBackdropBlurMaterial());
+    botLip.rotation.x = -Math.PI / 2;
+    bdGroup.add(botLip);
+
+    bdGroup.userData = { topWall: topWall, botWall: botWall, topLip: topLip, botLip: botLip };
+    bdGroup.visible = false;
+
+    // Add as child of display temp so it tracks automatically in local space
+    dm.displayTemp.plane.add(bdGroup);
+
+    // Position at the panel face (flattenZ) in local space
+    var fz = dm.displayTemp.plane.material.userData.flattenZ.value;
+    bdGroup.position.set(0, 0, fz);
+
+    displayAnim.backdrop = bdGroup;
+
+    // Floating product image + silhouette shadow (sits at same Z as borders)
+    var pUd = dm.displayTemp.plane.material.userData;
+    var prodTex = pUd.productTex ? pUd.productTex.value : null;
+    var prodAspect = pUd.productTexAspect ? pUd.productTexAspect.value : 1.0;
+    if(prodTex) {
+      // Shadow plane (behind image, dark silhouette)
+      var shadowGeo = new THREE.PlaneGeometry(PLANE_WIDTH * 1.05, PLANE_WIDTH * 1.05);
+      var shadowMat = createProductOverlayMaterial(prodTex, prodAspect, true);
+      var shadowMesh = new THREE.Mesh(shadowGeo, shadowMat);
+      shadowMesh.renderOrder = 50; // above backdrop walls, below the image
+      // Position slightly behind the image with a subtle drop offset
+      shadowMesh.position.set(0.06, -0.08, fz - 0.12);
+      dm.displayTemp.plane.add(shadowMesh);
+
+      // Product image plane (floats in front at same Z as borders)
+      var imgGeo = new THREE.PlaneGeometry(PLANE_WIDTH * 0.95, PLANE_WIDTH * 0.95);
+      var imgMat = createProductOverlayMaterial(prodTex, prodAspect, false);
+      var imgMesh = new THREE.Mesh(imgGeo, imgMat);
+      imgMesh.renderOrder = 100; // very high to guarantee drawing on top
+      imgMesh.position.set(0, 0, fz + 0.005); // just in front of borders, same plane visually
+      dm.displayTemp.plane.add(imgMesh);
+
+      bdGroup.userData.imgMesh = imgMesh;
+      bdGroup.userData.shadowMesh = shadowMesh;
+      // Initially invisible — fade in during backdrop phase
+      imgMesh.visible = false;
+      shadowMesh.visible = false;
+    }
+  }
+}
+
+function createProductOverlayMaterial(productTex, productTexAspect, isShadow) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      productTex: {value: productTex},
+      productTexAspect: {value: productTexAspect},
+      panelAspect: {value: 1.0},
+      opacity: {value: 1.0}, // default to fully opaque
+      distort: {value: 0.0}, // 0 = clean, 1 = fully distorted/glassy
+      isShadow: {value: isShadow ? 1.0 : 0.0}
+    },
+    vertexShader: [
+      'varying vec2 vUv;',
+      'void main(){',
+      '  vUv = uv;',
+      '  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform sampler2D productTex;',
+      'uniform float productTexAspect, panelAspect, opacity, isShadow, distort;',
+      'varying vec2 vUv;',
+      'void main(){',
+      '  vec2 uv = vUv;',
+      '  float scale = productTexAspect / panelAspect;',
+      '  if(scale > 1.0){ uv.y = (uv.y - 0.5) * scale + 0.5; }',
+      '  else { uv.x = (uv.x - 0.5) / scale + 0.5; }',
+      '  if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) discard;',
+      '  // Glass distortion when fused into backdrop',
+      '  if(distort > 0.001){',
+      '    vec2 c = uv - 0.5;',
+      '    float d = length(c);',
+      '    float wave = sin(d * 30.0 - distort * 10.0) * 0.04 * distort;',
+      '    uv += normalize(c + 0.0001) * wave;',
+      '    uv = mix(uv, vec2(0.5), distort * 0.4);',
+      '  }',
+      '  vec4 t = texture2D(productTex, uv);',
+      '  if(t.a < 0.5) discard;',
+      '  if(isShadow > 0.5){',
+      '    gl_FragColor = vec4(0.02, 0.04, 0.08, t.a * 0.55 * opacity);',
+      '  } else {',
+      '    gl_FragColor = vec4(t.rgb, opacity);',
+      '  }',
+      '}'
+    ].join('\n'),
+    transparent: true,
+    alphaTest: !isShadow ? 0.5 : 0.0,        // discard transparent edges on the image for clean cutout
+    depthWrite: !isShadow ? true : false,    // image writes depth, walls/shadow can't draw over
+    depthTest: true,
+    side: THREE.DoubleSide
+  });
+}
+
+function cleanupDisplayAnim() {
+  // Restore original positions
+  if(dm.displayTemp && dm.displayTemp.plane && displayAnim.origPos) {
+    dm.displayTemp.plane.position.copy(displayAnim.origPos);
+    dm.displayTemp.plane.scale.copy(displayAnim.origScale);
+    if(dm.displayTemp.edge && displayAnim.origEdgePos) {
+      dm.displayTemp.edge.position.copy(displayAnim.origEdgePos);
+      dm.displayTemp.edge.scale.copy(displayAnim.origEdgeScale);
+    }
+  }
+  // Restore star button positions
+  if(dm.starTemps && displayAnim.btnOrigPositions.length > 0) {
+    for(var ri = 0; ri < dm.starTemps.length && ri < displayAnim.btnOrigPositions.length; ri++) {
+      dm.starTemps[ri].position.copy(displayAnim.btnOrigPositions[ri]);
+    }
+  }
+  displayAnim.active = false;
+  displayAnim.phase = 'idle';
+  displayAnim.prog = 0;
+  displayAnim.origPos = null;
+  displayAnim.origScale = null;
+  displayAnim.origEdgePos = null;
+  displayAnim.origEdgeScale = null;
+  displayAnim.btnOrigPositions = [];
+  displayAnim.pendingExit = false;
+  displayAnim.queuedSwitchIdx = -1;
+  if(displayAnim.backdrop) {
+    var bdImg = displayAnim.backdrop.userData ? displayAnim.backdrop.userData.imgMesh : null;
+    var bdShadow = displayAnim.backdrop.userData ? displayAnim.backdrop.userData.shadowMesh : null;
+    if(bdImg){ if(bdImg.parent) bdImg.parent.remove(bdImg); bdImg.geometry.dispose(); bdImg.material.dispose(); }
+    if(bdShadow){ if(bdShadow.parent) bdShadow.parent.remove(bdShadow); bdShadow.geometry.dispose(); bdShadow.material.dispose(); }
+    if(displayAnim.backdrop.parent) displayAnim.backdrop.parent.remove(displayAnim.backdrop);
+    displayAnim.backdrop.traverse(function(child) {
+      if(child.geometry) child.geometry.dispose();
+      if(child.material) child.material.dispose();
+    });
+    displayAnim.backdrop = null;
+  }
+  // Reset uniforms on all panel materials
+  if(dm.floor && dm.floor.panels) {
+    dm.floor.panels.forEach(function(panel) {
+      panel.mesh.material.userData.flatten.value = 0.0;
+      panel.mesh.material.userData.splitGap.value = 0.0;
+    });
+  }
+}
+
+// Independent reverse animations (e.g. when switching panels mid-display)
+var pendingReverses = [];
+
+function forkDisplayAnimToReverse() {
+  if(!dm.displayTemp || !dm.displayTemp.plane) return;
+  if(!displayAnim.origPos && !displayAnim.backdrop) return;
+
+  var srcPlane = dm.displayTemp.plane;
+  var srcMat = srcPlane.material;
+  var dtFlatten = srcMat.userData.flatten ? srcMat.userData.flatten.value : 0;
+  var dtSplitGap = srcMat.userData.splitGap ? srcMat.userData.splitGap.value : 0;
+  var dtFlattenZ = srcMat.userData.flattenZ ? srcMat.userData.flattenZ.value : 0;
+
+  // Build isolated material clone with current uniform values
+  var isoMat = srcMat.clone();
+  isoMat.userData.flatten = {value: dtFlatten};
+  isoMat.userData.splitGap = {value: dtSplitGap};
+  isoMat.userData.flattenZ = {value: dtFlattenZ};
+  for(var umk in srcMat.userData) {
+    if(!isoMat.userData[umk]) {
+      if(srcMat.userData[umk] && srcMat.userData[umk].value !== undefined) {
+        isoMat.userData[umk] = {value: srcMat.userData[umk].value};
+      } else {
+        isoMat.userData[umk] = srcMat.userData[umk];
+      }
+    }
+  }
+  var srcOBC = srcMat.onBeforeCompile;
+  isoMat.onBeforeCompile = function(shader) {
+    srcOBC.call(isoMat, shader);
+    for(var iuk in isoMat.userData) {
+      if(isoMat.userData[iuk] && isoMat.userData[iuk].value !== undefined && shader.uniforms[iuk]) {
+        shader.uniforms[iuk] = isoMat.userData[iuk];
+      }
+    }
+  };
+  isoMat.needsUpdate = true;
+
+  // Clone plane mesh at current local position (parent is scene)
+  var clonePlane = new THREE.Mesh(srcPlane.geometry.clone(), isoMat);
+  clonePlane.userData = {};
+  for(var udk in srcPlane.userData) clonePlane.userData[udk] = srcPlane.userData[udk];
+  clonePlane.position.copy(srcPlane.position);
+  clonePlane.quaternion.copy(srcPlane.quaternion);
+  clonePlane.scale.copy(srcPlane.scale);
+  scene.add(clonePlane);
+
+  // Reparent backdrop from src plane to clone (so it tracks the reverse animation)
+  if(displayAnim.backdrop) {
+    if(displayAnim.backdrop.parent) displayAnim.backdrop.parent.remove(displayAnim.backdrop);
+    clonePlane.add(displayAnim.backdrop);
+  }
+  // Reparent product image overlay + shadow to clone too
+  if(displayAnim.backdrop && displayAnim.backdrop.userData){
+    var bImg = displayAnim.backdrop.userData.imgMesh;
+    var bShd = displayAnim.backdrop.userData.shadowMesh;
+    if(bImg && bImg.parent){ bImg.parent.remove(bImg); clonePlane.add(bImg); }
+    if(bShd && bShd.parent){ bShd.parent.remove(bShd); clonePlane.add(bShd); }
+  }
+
+  var startPhase = 'unflatten';
+  if(displayAnim.backdrop && displayAnim.backdrop.visible) startPhase = 'retract';
+  else if(dtSplitGap > 0) startPhase = 'unsplit';
+
+  pendingReverses.push({
+    plane: clonePlane,
+    backdrop: displayAnim.backdrop,
+    origPos: displayAnim.origPos ? displayAnim.origPos.clone() : srcPlane.position.clone(),
+    origScale: displayAnim.origScale ? displayAnim.origScale.clone() : srcPlane.scale.clone(),
+    floorIdx: dm.floorIdx,
+    phase: startPhase,
+    prog: 0
+  });
+
+  // Clear backdrop ref so cleanupDisplayAnim doesn't dispose it (clone now owns it)
+  displayAnim.backdrop = null;
+}
+
+function animatePendingReverses() {
+  for(var pri = pendingReverses.length - 1; pri >= 0; pri--) {
+    var pr = pendingReverses[pri];
+    var prSpeed = (pr.phase === 'unflatten') ? 0.21 : 0.07875;
+    pr.prog += prSpeed;
+    if(pr.prog > 1) pr.prog = 1;
+    var prP = eIO(pr.prog);
+    var prMat = pr.plane.material;
+
+    if(pr.phase === 'retract') {
+      if(pr.backdrop) {
+        pr.backdrop.visible = true;
+        var bdR = pr.backdrop.userData;
+        var pWR = PLANE_WIDTH, dR = 0.35;
+        var mSR = PLANE_WIDTH * 0.3;
+        var gHR = mSR * (0.45 * PLANE_WIDTH + 1.0);
+        var rdR = 1 - prP, opR = rdR * 0.65, wHR = gHR * rdR;
+        bdR.topWall.position.set(0, gHR - wHR*0.5, -dR);
+        bdR.topWall.scale.set(pWR, Math.max(wHR, 0.001), 1);
+        bdR.topWall.material.uniforms.opacity.value = opR;
+        bdR.botWall.position.set(0, -gHR + wHR*0.5, -dR);
+        bdR.botWall.scale.set(pWR, Math.max(wHR, 0.001), 1);
+        bdR.botWall.material.uniforms.opacity.value = opR;
+        bdR.topLip.position.set(0, gHR, -dR*0.5);
+        bdR.topLip.scale.set(pWR, dR, 1);
+        bdR.topLip.material.uniforms.opacity.value = opR;
+        bdR.botLip.position.set(0, -gHR, -dR*0.5);
+        bdR.botLip.scale.set(pWR, dR, 1);
+        bdR.botLip.material.uniforms.opacity.value = opR;
+      }
+      if(pr.prog >= 1) {
+        if(pr.backdrop) pr.backdrop.visible = false;
+        pr.phase = 'unsplit'; pr.prog = 0;
+      }
+    } else if(pr.phase === 'unsplit') {
+      var mSU = PLANE_WIDTH * 0.3;
+      var rdU = 1 - prP;
+      prMat.userData.splitGap.value = rdU * mSU;
+      if(pr.origPos) {
+        var fwdU = rdU * 5.0;
+        var scU = 1 + rdU * (-0.3);
+        var isLU = pr.floorIdx===1||pr.floorIdx===3;
+        var cpU = rdU * 1.8 * (isLU ? -1 : 1);
+        pr.plane.position.z = pr.origPos.z + fwdU;
+        pr.plane.position.x = pr.origPos.x + cpU;
+        pr.plane.scale.set(pr.origScale.x * scU, pr.origScale.y * scU, pr.origScale.z);
+      }
+      if(pr.prog >= 1) {
+        prMat.userData.splitGap.value = 0.0;
+        if(pr.origPos) {
+          pr.plane.position.copy(pr.origPos);
+          pr.plane.scale.copy(pr.origScale);
+        }
+        pr.phase = 'unflatten'; pr.prog = 0;
+        if(pr.backdrop) pr.backdrop.visible = false;
+      }
+    } else if(pr.phase === 'unflatten') {
+      prMat.userData.flatten.value = 1 - prP;
+      if(pr.prog >= 1) {
+        prMat.userData.flatten.value = 0.0;
+        prMat.userData.splitGap.value = 0.0;
+        if(pr.backdrop) {
+          var pImg = pr.backdrop.userData ? pr.backdrop.userData.imgMesh : null;
+          var pShd = pr.backdrop.userData ? pr.backdrop.userData.shadowMesh : null;
+          if(pImg){ if(pImg.parent) pImg.parent.remove(pImg); pImg.geometry.dispose(); pImg.material.dispose(); }
+          if(pShd){ if(pShd.parent) pShd.parent.remove(pShd); pShd.geometry.dispose(); pShd.material.dispose(); }
+          if(pr.backdrop.parent) pr.backdrop.parent.remove(pr.backdrop);
+          pr.backdrop.traverse(function(ch){ if(ch.geometry)ch.geometry.dispose(); if(ch.material)ch.material.dispose(); });
+        }
+        scene.remove(pr.plane);
+        if(pr.plane.geometry) pr.plane.geometry.dispose();
+        if(pr.plane.material) pr.plane.material.dispose();
+        pendingReverses.splice(pri, 1);
+      }
+    }
+  }
+}
+
+function reverseDisplayAnim() {
+  if(!displayAnim.active && !displayAnim.backdrop && !displayAnim.origPos) return;
+  displayAnim.active = true;
+  displayAnim.prog = 0;
+  // Start at the appropriate reverse phase based on how far we got
+  if(displayAnim.backdrop && displayAnim.backdrop.visible) {
+    displayAnim.phase = 'retract'; // has backdrop, retract it first
+  } else if(dm.displayTemp && dm.displayTemp.plane && dm.displayTemp.plane.material.userData.splitGap.value > 0) {
+    displayAnim.phase = 'unsplit'; // has split, unsplit first
+  } else {
+    displayAnim.phase = 'unflatten'; // only flattened, just unflatten
+  }
+}
+
+// ══════════════════════════════════════════════
 // SWITCH PANEL ANIMATION
 // ══════════════════════════════════════════════
 var switchAnim = {
@@ -3955,7 +4864,27 @@ var switchAnim = {
 
 function switchPanel(newIdx){
   var fd=dm.floor;if(!fd||switchAnim.active||dm.animating||dm.closing)return;
-  
+
+  // If display animation is expanded, play reverse first then switch (sequential)
+  if(displayAnim.origPos || displayAnim.backdrop) {
+    displayAnim.queuedSwitchIdx = newIdx;
+    // Only kick off reverse if not already reversing
+    var ph = displayAnim.phase;
+    if(ph !== 'retract' && ph !== 'unsplit' && ph !== 'unflatten') {
+      reverseDisplayAnim();
+    }
+    return;
+  }
+
+  performSwitchPanel(newIdx);
+}
+
+function performSwitchPanel(newIdx){
+  var fd=dm.floor;if(!fd||switchAnim.active||dm.animating||dm.closing)return;
+
+  // Reset display animation immediately (no-op if already reset)
+  cleanupDisplayAnim();
+
   var oldIdx = dm.selIdx;
   switchAnim.oldIdx = oldIdx;
   switchAnim.newIdx = newIdx;
@@ -4135,6 +5064,9 @@ function animateSwitch(){
     switchAnim.prog = 0;
     switchAnim.oldTemp = null;
     switchAnim.newTemp = null;
+
+    // Start display panel flatten + split animation for new panel
+    startDisplayAnim();
   }
 }
 
@@ -4165,6 +5097,222 @@ function resizeGlassFBO() {
   }
 }
 
+// ══════════════════════════════════════════════
+// BACKDROP BLUR FBO SYSTEM
+// Captures scene behind backdrop and applies Gaussian blur
+// ══════════════════════════════════════════════
+var bdBlurFBO1, bdBlurFBO2, bdBlurScene, bdBlurCamera, bdBlurQuad;
+
+function createBackdropBlur() {
+  var pr = Math.min(window.devicePixelRatio, 1.5);
+  var w = Math.floor(window.innerWidth * pr * 0.25);
+  var h = Math.floor(window.innerHeight * pr * 0.25);
+  bdBlurFBO1 = new THREE.WebGLRenderTarget(w, h, {minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter, format:THREE.RGBFormat});
+  bdBlurFBO2 = new THREE.WebGLRenderTarget(w, h, {minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter, format:THREE.RGBFormat});
+  bdBlurScene = new THREE.Scene();
+  bdBlurCamera = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+  var blurMat = new THREE.ShaderMaterial({
+    uniforms: {
+      tInput: {value: null},
+      direction: {value: new THREE.Vector2(1,0)}
+    },
+    vertexShader: 'varying vec2 vUV;void main(){vUV=uv;gl_Position=vec4(position,1.0);}',
+    fragmentShader: [
+      'uniform sampler2D tInput;',
+      'uniform vec2 direction;',
+      'varying vec2 vUV;',
+      'void main(){',
+      '  vec4 sum=vec4(0.0);',
+      '  sum+=texture2D(tInput,vUV-4.0*direction)*0.0162;',
+      '  sum+=texture2D(tInput,vUV-3.0*direction)*0.0540;',
+      '  sum+=texture2D(tInput,vUV-2.0*direction)*0.1218;',
+      '  sum+=texture2D(tInput,vUV-1.0*direction)*0.1962;',
+      '  sum+=texture2D(tInput,vUV)*0.2236;',
+      '  sum+=texture2D(tInput,vUV+1.0*direction)*0.1962;',
+      '  sum+=texture2D(tInput,vUV+2.0*direction)*0.1218;',
+      '  sum+=texture2D(tInput,vUV+3.0*direction)*0.0540;',
+      '  sum+=texture2D(tInput,vUV+4.0*direction)*0.0162;',
+      '  gl_FragColor=sum;',
+      '}'
+    ].join('\n'),
+    depthWrite: false, depthTest: false
+  });
+  bdBlurQuad = new THREE.Mesh(new THREE.PlaneGeometry(2,2), blurMat);
+  bdBlurScene.add(bdBlurQuad);
+}
+
+function resizeBackdropBlur() {
+  if(bdBlurFBO1) {
+    var pr = Math.min(window.devicePixelRatio, 1.5);
+    var w = Math.floor(window.innerWidth * pr * 0.25);
+    var h = Math.floor(window.innerHeight * pr * 0.25);
+    bdBlurFBO1.setSize(w, h);
+    bdBlurFBO2.setSize(w, h);
+  }
+}
+
+function createBackdropBlurMaterial() {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      tBg: {value: glassFBO ? glassFBO.texture : null},
+      tBlur: {value: null}, // legacy
+      tScratch: {value: (function(){
+        var t = generateScratchTexture().clone();
+        t.wrapS = THREE.ClampToEdgeWrapping;
+        t.wrapT = THREE.ClampToEdgeWrapping;
+        t.needsUpdate = true;
+        return t;
+      })()},
+      tFrost: {value: generateFrostTexture()},
+      res: {value: new THREE.Vector2(window.innerWidth, window.innerHeight)},
+      opacity: {value: 0.0},
+      time: {value: 0},
+      tintColor: {value: new THREE.Color(0x1a3358)} // softer stained blue
+    },
+    vertexShader: [
+      'varying vec3 vN, vV;',
+      'varying vec2 vUv;',
+      'void main(){',
+      '  vUv = uv;',
+      '  vec4 mv = modelViewMatrix * vec4(position, 1.0);',
+      '  vN = normalize(normalMatrix * normal);',
+      '  vV = normalize(-mv.xyz);',
+      '  gl_Position = projectionMatrix * mv;',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform sampler2D tBg, tScratch, tFrost;',
+      'uniform vec2 res;',
+      'uniform float opacity, time;',
+      'uniform vec3 tintColor;',
+      'varying vec3 vN, vV;',
+      'varying vec2 vUv;',
+      GLARE_GLSL_FUNCS,
+      'void main(){',
+      '  vec3 N = normalize(vN); vec3 V = normalize(vV);',
+      '  vec2 suv = gl_FragCoord.xy / res;',
+      '  vec2 refr = N.xy * 0.16;',
+      '  refr += 0.003 * vec2(sin(time*1.5 + suv.y*8.0), cos(time*1.2 + suv.x*8.0));',
+      '  float ef = 1.0 - abs(dot(V, N));',
+      '  float ca = 0.22 * (0.3 + ef * 2.5);',
+      '  vec2 tx = 1.0 / res;',
+      '  vec2 ru = suv + refr * (1.0 + ca);',
+      '  vec2 gu = suv + refr;',
+      '  vec2 bu = suv + refr * (1.0 - ca);',
+      '  float r = texture2D(tBg, ru).r * .6 + texture2D(tBg, ru + tx).r * .2 + texture2D(tBg, ru - tx).r * .2;',
+      '  float g = texture2D(tBg, gu).g * .6 + texture2D(tBg, gu + tx).g * .2 + texture2D(tBg, gu - tx).g * .2;',
+      '  float b = texture2D(tBg, bu).b * .6 + texture2D(tBg, bu + tx).b * .2 + texture2D(tBg, bu - tx).b * .2;',
+      '  vec3 col = vec3(r, g, b);',
+      '  // Subtle stained blue tint (lighter)',
+      '  col = mix(col, tintColor, 0.32);',
+      '  // Fresnel edge highlight + light sheen',
+      '  float fresnel = pow(1.0 - max(dot(V, N), 0.0), 2.0) * 0.5;',
+      '  col = mix(col, vec3(0.65, 0.8, 1.0), fresnel * 0.45);',
+      '  col += vec3(0.85, 0.92, 1.0) * fresnel * 0.5;',
+      GLASS_TINT_GLSL,
+      GLARE_GLSL_CALC,
+      '  col += glareResult * 1.8;',
+      '  // Single scratch overlay (no tiling: vUv covers the plane exactly once)',
+      '  float scratchTex = texture2D(tScratch, vUv).r;',
+      '  col += vec3(0.55, 0.7, 0.95) * scratchTex * 0.22;',
+      '  // Static light reflection band (subtle highlight)',
+      '  float reflBand = smoothstep(0.32, 0.42, vUv.y) * (1.0 - smoothstep(0.42, 0.55, vUv.y));',
+      '  col += vec3(0.85, 0.92, 1.0) * reflBand * 0.18;',
+      '  gl_FragColor = vec4(col, opacity);',
+      '}'
+    ].join('\n'),
+    transparent: true,
+    side: THREE.DoubleSide,
+    depthWrite: false
+  });
+}
+
+function renderBackdropBlur() {
+  if(!bdBlurFBO1) return;
+
+  // Collect all visible backdrops (main + pending closes + pending reverses)
+  var visibleBackdrops = [];
+  if(displayAnim.backdrop && displayAnim.backdrop.visible) visibleBackdrops.push(displayAnim.backdrop);
+  for(var bpi=0;bpi<pendingCloses.length;bpi++){
+    var pda = pendingCloses[bpi].dispAnim;
+    if(pda && pda.backdrop && pda.backdrop.visible) visibleBackdrops.push(pda.backdrop);
+  }
+  for(var bri2=0;bri2<pendingReverses.length;bri2++){
+    var pdr = pendingReverses[bri2];
+    if(pdr.backdrop && pdr.backdrop.visible) visibleBackdrops.push(pdr.backdrop);
+  }
+  if(visibleBackdrops.length === 0) return;
+
+  // Hide backdrops during capture
+  for(var bhi=0;bhi<visibleBackdrops.length;bhi++) visibleBackdrops[bhi].visible = false;
+
+  // Also hide UI elements
+  var cartIconVis = cart.iconGroup ? cart.iconGroup.visible : false;
+  var cartPanelVis = cart.panelGroup ? cart.panelGroup.visible : false;
+  if(cart.iconGroup) cart.iconGroup.visible = false;
+  if(cart.panelGroup) cart.panelGroup.visible = false;
+  if(navMenu.group) navMenu.group.visible = false;
+  for(var nb=0;nb<navMenu.buttons.length;nb++) navMenu.buttons[nb].group.visible = false;
+
+  // Render scene to first FBO (at quarter res = natural pre-blur)
+  renderer.setRenderTarget(bdBlurFBO1);
+  renderer.clear();
+  renderer.render(scene, camera);
+
+  // Two rounds of Gaussian blur for stronger effect
+  var pr = Math.min(window.devicePixelRatio, 1.5);
+  var w = Math.floor(window.innerWidth * pr * 0.25);
+  var h = Math.floor(window.innerHeight * pr * 0.25);
+  var spread = 3.0; // multiplier for wider blur kernel
+
+  // Pass 1: Horizontal FBO1 -> FBO2
+  bdBlurQuad.material.uniforms.tInput.value = bdBlurFBO1.texture;
+  bdBlurQuad.material.uniforms.direction.value.set(spread/w, 0);
+  renderer.setRenderTarget(bdBlurFBO2);
+  renderer.clear();
+  renderer.render(bdBlurScene, bdBlurCamera);
+
+  // Pass 2: Vertical FBO2 -> FBO1
+  bdBlurQuad.material.uniforms.tInput.value = bdBlurFBO2.texture;
+  bdBlurQuad.material.uniforms.direction.value.set(0, spread/h);
+  renderer.setRenderTarget(bdBlurFBO1);
+  renderer.clear();
+  renderer.render(bdBlurScene, bdBlurCamera);
+
+  // Pass 3: Horizontal again FBO1 -> FBO2
+  bdBlurQuad.material.uniforms.tInput.value = bdBlurFBO1.texture;
+  bdBlurQuad.material.uniforms.direction.value.set(spread/w, 0);
+  renderer.setRenderTarget(bdBlurFBO2);
+  renderer.clear();
+  renderer.render(bdBlurScene, bdBlurCamera);
+
+  // Pass 4: Vertical again FBO2 -> FBO1
+  bdBlurQuad.material.uniforms.tInput.value = bdBlurFBO2.texture;
+  bdBlurQuad.material.uniforms.direction.value.set(0, spread/h);
+  renderer.setRenderTarget(bdBlurFBO1);
+  renderer.clear();
+  renderer.render(bdBlurScene, bdBlurCamera);
+
+  renderer.setRenderTarget(null);
+
+  // Restore visibility and update blur texture on all backdrops
+  if(cart.iconGroup) cart.iconGroup.visible = cartIconVis;
+  if(cart.panelGroup) cart.panelGroup.visible = cartPanelVis;
+  if(navMenu.group) navMenu.group.visible = true;
+  for(var nb2=0;nb2<navMenu.buttons.length;nb2++){
+    var nbE2=navMenu.morphT<.5?4*navMenu.morphT*navMenu.morphT*navMenu.morphT:1-Math.pow(-2*navMenu.morphT+2,3)/2;
+    navMenu.buttons[nb2].group.visible=nbE2>0.6;
+  }
+  for(var bri=0;bri<visibleBackdrops.length;bri++){
+    visibleBackdrops[bri].visible = true;
+    visibleBackdrops[bri].traverse(function(child) {
+      if(child.isMesh && child.material.uniforms && child.material.uniforms.tBlur) {
+        child.material.uniforms.tBlur.value = bdBlurFBO1.texture;
+      }
+    });
+  }
+}
+
 function createGlassShaderMaterial() {
   var scratchTex = generateScratchTexture();
   return new THREE.ShaderMaterial({
@@ -4179,15 +5327,18 @@ function createGlassShaderMaterial() {
       fresnelStrength: { value: 0.3 },
       time: { value: 0 },
       tScratch: { value: scratchTex },
-      tFrost: { value: generateFrostTexture() }
+      tFrost: { value: generateFrostTexture() },
+      hoverPress: { value: 0.0 }
     },
     vertexShader: [
+      'uniform float hoverPress;',
       'varying vec2 vUv;',
       'varying vec3 vNormal;',
       'varying vec3 vViewDir;',
       'void main() {',
       '  vUv = uv;',
-      '  vec4 mvPos = modelViewMatrix * vec4(position, 1.0);',
+      '  vec3 transformed = position - normal * hoverPress * 0.04;',
+      '  vec4 mvPos = modelViewMatrix * vec4(transformed, 1.0);',
       '  vNormal = normalize(normalMatrix * normal);',
       '  vViewDir = normalize(-mvPos.xyz);',
       '  gl_Position = projectionMatrix * mvPos;',
@@ -4198,7 +5349,7 @@ function createGlassShaderMaterial() {
       'uniform vec2 resolution;',
       'uniform float refractionStrength, chromaticAberration;',
       'uniform vec3 tintColor;',
-      'uniform float tintStrength, fresnelPower, fresnelStrength, time;',
+      'uniform float tintStrength, fresnelPower, fresnelStrength, time, hoverPress;',
       'varying vec2 vUv;',
       'varying vec3 vNormal, vViewDir;',
       GLARE_GLSL_FUNCS,
@@ -4223,6 +5374,7 @@ function createGlassShaderMaterial() {
       GLASS_TINT_GLSL,
       GLARE_GLSL_CALC,
       '  col+=glareResult;',
+      '  col = mix(col, vec3(0.05, 0.08, 0.18), hoverPress * 0.45);',
       '  gl_FragColor=vec4(col,0.92);',
       '}'
     ].join('\n'),
@@ -4584,7 +5736,7 @@ function animateProductDetailExit(){
     if(dm.vWheel) dm.vWheel.visible = true;
     if(dm.displayTemp){
       if(dm.displayTemp.plane) dm.displayTemp.plane.visible = true;
-      if(dm.displayTemp.edge) dm.displayTemp.edge.visible = true;
+      if(dm.displayTemp.edge && !displayAnim.active) dm.displayTemp.edge.visible = true;
     }
     dm.starTemps.forEach(function(st){ st.visible = true; });
     dm.dmButtons.forEach(function(b){ b.visible = true; });
@@ -4661,15 +5813,18 @@ function createPdvGlassPanel(w, h, frost, cornerR){
       rW:{value:hw},rH:{value:hh},time:{value:0},
       frost:{value:frost},
       tScratch:{value:generateScratchTexture()},
-      tFrost:{value:generateFrostTexture()}
+      tFrost:{value:generateFrostTexture()},
+      hoverPress:{value:0.0}
     },
     vertexShader:[
+      'uniform float hoverPress;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
       'void main(){',
-      '  vLP=position;',
+      '  vec3 transformed = position - normal * hoverPress * 0.04;',
+      '  vLP=transformed;',
       '  vUv=uv;',
-      '  vec4 mv=modelViewMatrix*vec4(position,1.0);',
+      '  vec4 mv=modelViewMatrix*vec4(transformed,1.0);',
       '  vN=normalize(normalMatrix*normal);',
       '  vV=normalize(-mv.xyz);',
       '  gl_Position=projectionMatrix*mv;',
@@ -4678,7 +5833,7 @@ function createPdvGlassPanel(w, h, frost, cornerR){
     fragmentShader:[
       'uniform sampler2D tBg,tScratch,tFrost;',
       'uniform vec2 res;',
-      'uniform float rW,rH,time,frost;',
+      'uniform float rW,rH,time,frost,hoverPress;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
       GLARE_GLSL_FUNCS,
@@ -4711,6 +5866,7 @@ function createPdvGlassPanel(w, h, frost, cornerR){
       GLASS_TINT_GLSL,
       GLARE_GLSL_CALC,
       '  col+=glareResult;',
+      '  col=mix(col,vec3(0.05,0.08,0.18),hoverPress*0.45);',
       '  gl_FragColor=vec4(col,alpha);',
       '}'
     ].join('\n'),
@@ -5310,10 +6466,384 @@ function addToCart(product, sizeLabel) {
   var existing = null;
   for(var i=0;i<cart.items.length;i++){if(cart.items[i].cartId===cartId){existing=cart.items[i];break;}}
   if(existing){existing.qty++;}else{cart.items.push({cartId:cartId,id:product.id,name:product.name,price:product.price,size:sizeLabel||'',qty:1});}
+  // Trigger cart fly-in animation from current backdrop (if any)
+  triggerCartFlyAnim();
   updateCartIcon();
   if(cart.panelOpen) rebuildCartPanel();
   // Also add to Shopify cart
   if(product.shopifyVariants) addToShopifyCart(product, sizeLabel);
+}
+
+// ══════════════════════════════════════════════
+// CART FLY-IN ANIMATION (glass ball flying to cart icon)
+// ══════════════════════════════════════════════
+var cartFlyAnims = []; // {ball, startPos, controlPos, prevPos, prog, duration, startScale}
+var cartImpact = { prog: 0, target: 0 }; // 0..1, drives icon push-back/grow
+
+function createGlassBallMaterial() {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      tBg: {value: glassFBO ? glassFBO.texture : null},
+      res: {value: new THREE.Vector2(window.innerWidth, window.innerHeight)},
+      time: {value: 0}
+    },
+    vertexShader: [
+      'varying vec3 vN, vV;',
+      'void main(){',
+      '  vec4 mv = modelViewMatrix * vec4(position, 1.0);',
+      '  vN = normalize(normalMatrix * normal);',
+      '  vV = normalize(-mv.xyz);',
+      '  gl_Position = projectionMatrix * mv;',
+      '}'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform sampler2D tBg;',
+      'uniform vec2 res;',
+      'uniform float time;',
+      'varying vec3 vN, vV;',
+      'void main(){',
+      '  vec3 N = normalize(vN); vec3 V = normalize(vV);',
+      '  vec2 suv = gl_FragCoord.xy / res;',
+      '  vec2 refr = N.xy * 0.18;',
+      '  float ef = 1.0 - abs(dot(V, N));',
+      '  float ca = 0.25 * (0.3 + ef * 2.5);',
+      '  vec2 tx = 1.0 / res;',
+      '  vec2 ru = suv + refr * (1.0 + ca), gu = suv + refr, bu = suv + refr * (1.0 - ca);',
+      '  float r = texture2D(tBg, ru).r;',
+      '  float g = texture2D(tBg, gu).g;',
+      '  float b = texture2D(tBg, bu).b;',
+      '  vec3 col = vec3(r, g, b);',
+      '  float fresnel = pow(1.0 - max(dot(V, N), 0.0), 2.0) * 0.5;',
+      '  col = mix(col, vec3(0.85, 0.9, 1.0), fresnel * 0.4);',
+      '  col += vec3(0.95, 0.97, 1.0) * fresnel * 0.4;',
+      '  gl_FragColor = vec4(col, 0.92);',
+      '}'
+    ].join('\n'),
+    transparent: true, side: THREE.DoubleSide, depthWrite: false
+  });
+}
+
+function triggerCartFlyAnim() {
+  // Locate the current visible backdrop (could be in displayAnim or a pendingClose/Reverse)
+  var sourceBackdrop = null;
+  if(displayAnim.backdrop && displayAnim.backdrop.visible) {
+    sourceBackdrop = displayAnim.backdrop;
+  } else {
+    for(var pi=0;pi<pendingCloses.length;pi++){
+      var pda = pendingCloses[pi].dispAnim;
+      if(pda && pda.backdrop && pda.backdrop.visible){ sourceBackdrop = pda.backdrop; break; }
+    }
+    if(!sourceBackdrop){
+      for(var pri=0;pri<pendingReverses.length;pri++){
+        if(pendingReverses[pri].backdrop && pendingReverses[pri].backdrop.visible){ sourceBackdrop = pendingReverses[pri].backdrop; break; }
+      }
+    }
+  }
+  if(!sourceBackdrop) return; // no backdrop to launch
+
+  // Get backdrop world position and a rough "size" for the initial ball scale
+  sourceBackdrop.updateMatrixWorld(true);
+  var srcWP = new THREE.Vector3();
+  sourceBackdrop.getWorldPosition(srcWP);
+  // Approximate size from PLANE_WIDTH (backdrop walls span panelW horizontally)
+  var srcSize = PLANE_WIDTH * 0.8;
+
+  // Create the glass ball (backdrop stays visible — ball is a "launched" copy)
+  var ballGeo = new THREE.SphereGeometry(0.5, 24, 16);
+  var ballMat = createGlassBallMaterial();
+  var ball = new THREE.Mesh(ballGeo, ballMat);
+  ball.position.copy(srcWP);
+  ball.scale.set(srcSize, srcSize, srcSize);
+  ball.renderOrder = 50;
+  scene.add(ball);
+
+  // Compute control point: arc upward + toward cart side
+  var endPos = new THREE.Vector3();
+  if(cart.iconGroup){ cart.iconGroup.updateMatrixWorld(true); cart.iconGroup.getWorldPosition(endPos); }
+  else endPos.copy(srcWP).add(new THREE.Vector3(0, 4, 0));
+
+  var ctrl = srcWP.clone().lerp(endPos, 0.5);
+  ctrl.y += Math.abs(endPos.y - srcWP.y) * 0.4 + 1.5; // arc up
+
+  // Capture refs to image, shadow, and backdrop walls for slam + fuse animation
+  var bdUd = sourceBackdrop.userData || {};
+  var imgRef = bdUd.imgMesh || null;
+  var shadowRef = bdUd.shadowMesh || null;
+  var imgStartZ = imgRef ? imgRef.position.z : 0;
+  var imgStartOpacity = (imgRef && imgRef.material && imgRef.material.uniforms && imgRef.material.uniforms.opacity) ? imgRef.material.uniforms.opacity.value : 1.0;
+  var shadowStartOpacity = (shadowRef && shadowRef.material && shadowRef.material.uniforms && shadowRef.material.uniforms.opacity) ? shadowRef.material.uniforms.opacity.value : 1.0;
+  var wallStartOpacity = (bdUd.topWall && bdUd.topWall.material.uniforms.opacity) ? bdUd.topWall.material.uniforms.opacity.value : 0.65;
+  // Backdrop wall depth in panel local space (matches startDisplayAnim setup)
+  var slamTargetZ = imgStartZ - 0.36;
+
+  cartFlyAnims.push({
+    ball: ball,
+    startPos: srcWP.clone(),
+    controlPos: ctrl,
+    prevPos: srcWP.clone(),
+    prog: 0,
+    duration: 1.4, // seconds (slam + form + fly)
+    startScale: 0.02, // pinpoint — forms into the ball
+    ballSize: 0.55,   // settled size after forming
+    endScale: 0.18,   // size on arrival at cart
+    impactTriggered: false,
+    // Slam refs
+    imgMesh: imgRef,
+    shadowMesh: shadowRef,
+    backdrop: sourceBackdrop,
+    imgStartZ: imgStartZ,
+    imgStartOpacity: imgStartOpacity,
+    shadowStartOpacity: shadowStartOpacity,
+    wallStartOpacity: wallStartOpacity,
+    slamTargetZ: slamTargetZ
+  });
+  ball.scale.set(0.02, 0.02, 0.02); // ensure the spawn frame doesn't render at default
+  ball.visible = false; // hidden until form phase
+}
+
+function updateCartFlyAnims(dt) {
+  var nowT = performance.now() * 0.001;
+  for(var i = cartFlyAnims.length - 1; i >= 0; i--) {
+    var a = cartFlyAnims[i];
+    // Refresh uniforms
+    if(a.ball.material.uniforms.res) a.ball.material.uniforms.res.value.set(window.innerWidth, window.innerHeight);
+    if(a.ball.material.uniforms.tBg && glassFBO) a.ball.material.uniforms.tBg.value = glassFBO.texture;
+    if(a.ball.material.uniforms.time) a.ball.material.uniforms.time.value = nowT;
+    a.prog += dt / a.duration;
+    if(a.prog > 1) a.prog = 1;
+    var t = a.prog;
+
+    // Phases:
+    // SLAM (0 .. slamEnd):       image slams into backdrop + fuses (distorts) + walls fade slightly
+    // FORM (slamEnd .. formEnd): walls fade out, ball appears at center and grows
+    // FLY  (formEnd .. 1.0):     ball travels along bezier to cart with stretch + speed ramp
+    var slamEnd = 0.18;
+    var formEnd = 0.42;
+    var newPos;
+
+    if(t < slamEnd) {
+      // SLAM phase — image slams to backdrop wall depth, distorts, fades
+      var slamP = t / slamEnd;
+      var slamE = slamP * slamP * (3 - 2 * slamP); // smoothstep
+      // Add a slight overshoot for impact feel
+      var slamOver = slamP < 0.85 ? slamE : (slamE + Math.sin((slamP-0.85)/0.15 * Math.PI) * 0.06);
+      if(a.imgMesh) {
+        a.imgMesh.position.z = a.imgStartZ + (a.slamTargetZ - a.imgStartZ) * slamOver;
+        if(a.imgMesh.material.uniforms.distort) a.imgMesh.material.uniforms.distort.value = slamE * 0.6;
+        // Image stays visible during slam (will fade in form phase)
+        a.imgMesh.material.uniforms.opacity.value = a.imgStartOpacity * (1 - slamE * 0.15);
+      }
+      if(a.shadowMesh) {
+        a.shadowMesh.material.uniforms.opacity.value = a.shadowStartOpacity * (1 - slamE);
+      }
+      a.ball.visible = false;
+      newPos = a.startPos.clone();
+      a.ball.position.copy(newPos);
+      a.prevPos.copy(newPos);
+    } else if(t < formEnd) {
+      // FORM phase — image + walls fade out, ball appears
+      var formP = (t - slamEnd) / (formEnd - slamEnd);
+      var formE = formP * formP * (3 - 2 * formP);
+      // Image distorts more + fades to 0
+      if(a.imgMesh) {
+        if(a.imgMesh.material.uniforms.distort) a.imgMesh.material.uniforms.distort.value = 0.6 + formE * 0.6;
+        a.imgMesh.material.uniforms.opacity.value = a.imgStartOpacity * 0.85 * (1 - formE);
+        if(formE >= 0.95) a.imgMesh.visible = false;
+      }
+      // Backdrop walls fade out
+      if(a.backdrop && a.backdrop.userData) {
+        var bU = a.backdrop.userData;
+        var wallOp = a.wallStartOpacity * (1 - formE);
+        if(bU.topWall) bU.topWall.material.uniforms.opacity.value = wallOp;
+        if(bU.botWall) bU.botWall.material.uniforms.opacity.value = wallOp;
+        if(bU.topLip) bU.topLip.material.uniforms.opacity.value = wallOp;
+        if(bU.botLip) bU.botLip.material.uniforms.opacity.value = wallOp;
+      }
+      // Ball appears + grows
+      a.ball.visible = true;
+      var s = a.startScale + (a.ballSize - a.startScale) * formE;
+      var wobble = 1 + Math.sin(formP * Math.PI * 2) * 0.05 * (1 - formP);
+      a.ball.scale.set(s * wobble, s / wobble, s * wobble);
+      a.ball.quaternion.identity();
+      newPos = a.startPos.clone();
+      a.ball.position.copy(newPos);
+      a.prevPos.copy(newPos);
+    } else {
+      // FLY phase — travel along bezier from startPos to cart with stretch
+      var flyP = (t - formEnd) / (1 - formEnd);
+      var endPos = new THREE.Vector3();
+      if(cart.iconGroup){ cart.iconGroup.updateMatrixWorld(true); cart.iconGroup.getWorldPosition(endPos); }
+      else endPos.copy(a.startPos);
+
+      // Ease-in cubic — slow start, fast finish into target (speed ramp)
+      var eT = flyP * flyP * flyP * 0.7 + flyP * 0.3;
+      var p0 = a.startPos, p1 = a.controlPos, p2 = endPos;
+      var oneMinusT = 1 - eT;
+      newPos = new THREE.Vector3(
+        oneMinusT*oneMinusT*p0.x + 2*oneMinusT*eT*p1.x + eT*eT*p2.x,
+        oneMinusT*oneMinusT*p0.y + 2*oneMinusT*eT*p1.y + eT*eT*p2.y,
+        oneMinusT*oneMinusT*p0.z + 2*oneMinusT*eT*p1.z + eT*eT*p2.z
+      );
+
+      // Velocity-based stretch — beefier so the ramp is visible
+      var vel = newPos.clone().sub(a.prevPos);
+      var velMag = vel.length() / Math.max(dt, 0.001);
+      var stretch = 1 + Math.min(velMag * 0.025, 2.2);
+      var invS = 1 / Math.sqrt(stretch);
+
+      if(velMag > 0.01){
+        var velDir = vel.clone().normalize();
+        a.ball.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), velDir);
+      }
+
+      // Scale: ballSize → endScale (small) during fly
+      var baseScale = a.ballSize + (a.endScale - a.ballSize) * flyP;
+      a.ball.scale.set(baseScale * invS, baseScale * stretch, baseScale * invS);
+      a.ball.position.copy(newPos);
+      a.prevPos.copy(newPos);
+    }
+
+    // Trigger impact slightly before reaching target so the cart reacts as ball arrives
+    if(!a.impactTriggered && t > 0.95){
+      a.impactTriggered = true;
+      cartImpact.target = 1.0;
+      cartImpact.prog = 1.0;
+    }
+
+    if(a.prog >= 1) {
+      // Restore image + backdrop walls so user can add another item
+      if(a.imgMesh) {
+        a.imgMesh.position.z = a.imgStartZ;
+        if(a.imgMesh.material.uniforms.distort) a.imgMesh.material.uniforms.distort.value = 0;
+        a.imgMesh.material.uniforms.opacity.value = a.imgStartOpacity;
+        a.imgMesh.visible = true;
+      }
+      if(a.shadowMesh) {
+        a.shadowMesh.material.uniforms.opacity.value = a.shadowStartOpacity;
+        a.shadowMesh.visible = true;
+      }
+      if(a.backdrop && a.backdrop.userData) {
+        var bU2 = a.backdrop.userData;
+        if(bU2.topWall) bU2.topWall.material.uniforms.opacity.value = a.wallStartOpacity;
+        if(bU2.botWall) bU2.botWall.material.uniforms.opacity.value = a.wallStartOpacity;
+        if(bU2.topLip) bU2.topLip.material.uniforms.opacity.value = a.wallStartOpacity;
+        if(bU2.botLip) bU2.botLip.material.uniforms.opacity.value = a.wallStartOpacity;
+      }
+      scene.remove(a.ball);
+      if(a.ball.geometry) a.ball.geometry.dispose();
+      if(a.ball.material) a.ball.material.dispose();
+      cartFlyAnims.splice(i, 1);
+    }
+  }
+}
+
+// Items needed per +10% growth cycles through 3,4,5,6,7 then repeats
+function getCartScaleFromCount(count) {
+  var pattern = [3, 4, 5, 6, 7];
+  var level = 0;
+  var idx = 0;
+  while(count >= pattern[idx % 5]) {
+    count -= pattern[idx % 5];
+    level++;
+    idx++;
+  }
+  return 1 + level * 0.10;
+}
+
+function updateCartImpact(dt) {
+  // Drive cart icon push-back/grow reaction
+  if(cartImpact.prog > 0.001) {
+    // Decay toward 0 with spring
+    cartImpact.prog *= 0.88;
+    if(cartImpact.prog < 0.005) cartImpact.prog = 0;
+  }
+  if(!cart.iconGroup) return;
+  var k = cartImpact.prog;
+  // Icon grows with count, but the OPEN panel stays at base size
+  var count = getCartCount();
+  var iconBase = getCartScaleFromCount(count);
+  // Panel openness 0..1
+  var openness = cartMorphT < 0.5 ? 4*cartMorphT*cartMorphT*cartMorphT : 1-Math.pow(-2*cartMorphT+2,3)/2;
+  // Lerp from icon-count-scale (closed) to 1.0 (open) so the panel always opens to base size
+  var targetBase = iconBase + (1.0 - iconBase) * openness;
+  if(cart.iconGroup.userData._cartBaseScale === undefined) cart.iconGroup.userData._cartBaseScale = 1;
+  var curBase = cart.iconGroup.userData._cartBaseScale;
+  cart.iconGroup.userData._cartBaseScale = curBase + (targetBase - curBase) * 0.15;
+  // Combine with impact bounce (scale up briefly)
+  var impactBoost = 1 + k * 0.25;
+  cart.iconGroup.userData._cartImpactScale = cart.iconGroup.userData._cartBaseScale * impactBoost;
+  // Push back away from camera (force absorbed)
+  cart.iconGroup.userData._cartImpactZ = k * 0.25;
+}
+
+// ══════════════════════════════════════════════
+// CART PANEL WEIGHT — falls under gravity when items > 4
+// ══════════════════════════════════════════════
+var cartPanelFall = { y_offset: 0, vel_y: 0, hasHit: false, openTime: 0 };
+var cartShake = { amount: 0 };
+
+function updateCartPanelFall(dt) {
+  // Reset when the panel is closed (or closing)
+  var open = cart.panelOpen || (cart.panelAnimating && cart.panelTargetState);
+  if(!open) {
+    cartPanelFall.y_offset = 0;
+    cartPanelFall.vel_y = 0;
+    cartPanelFall.hasHit = false;
+    cartPanelFall.openTime = 0;
+    return;
+  }
+  // Pause physics while the user is holding the panel
+  if(typeof cartDrag !== 'undefined' && cartDrag.active) return;
+  // Track time since panel opened (for hold + ramp-up)
+  cartPanelFall.openTime += dt;
+
+  var count = getCartCount();
+  var weight = Math.max(0, count - 4); // only after 4 items does it start sinking
+  if(weight <= 0 || cartPanelFall.hasHit) return;
+
+  // Hold for ~0.7s after open, then ramp gravity smoothly to max over the next 0.9s
+  var holdTime = 0.7;
+  var rampDuration = 0.9;
+  var rampElapsed = cartPanelFall.openTime - holdTime;
+  if(rampElapsed <= 0) return; // still in the hold period — panel sits in place
+  var ramp = Math.min(rampElapsed / rampDuration, 1.0);
+  ramp = ramp * ramp * (3 - 2 * ramp); // smoothstep ease-in
+
+  // Stronger gravity so the panel always reaches the floor in a reasonable time
+  var maxGravity = 1.6 + weight * 1.2;
+  var gravity = maxGravity * ramp;
+  cartPanelFall.vel_y += gravity * dt;
+  cartPanelFall.y_offset += cartPanelFall.vel_y * dt;
+
+  // Ground threshold — accounts for current drag offset so the panel always falls until its
+  // BOTTOM edge hits the screen-bottom margin (not a fixed distance from origin)
+  var fovRad = camera.fov * Math.PI / 180;
+  var dist = 4.5;
+  var halfH = Math.tan(fovRad/2) * dist;
+  var dragY = cart.dragOffsetY || 0;
+  // panelY (world Y at rest) = dragY * halfH * 2
+  // panel bottom = panelY - y_offset - CART_RH/2; want = -halfH + 0.30
+  // → y_offset = halfH*(2*dragY + 1) - 0.30 - CART_RH/2
+  var groundDist = halfH * (2 * dragY + 1) - 0.30 - CART_RH * 0.5;
+  if(groundDist < 0) groundDist = 0;
+  if(cartPanelFall.y_offset >= groundDist) {
+    cartPanelFall.y_offset = groundDist;
+    cartPanelFall.hasHit = true;
+    // Big shake on impact — heavier panel = harder slam = more shake (capped)
+    cartShake.amount = Math.min(0.08 + cartPanelFall.vel_y * 0.08, 0.45);
+  }
+}
+
+function updateCartShake(dt) {
+  if(!postQuad || !postQuad.material.uniforms.shakeAmount) return;
+  if(cartShake.amount > 0.001) {
+    var existing = postQuad.material.uniforms.shakeAmount.value || 0;
+    postQuad.material.uniforms.shakeAmount.value = Math.max(existing, cartShake.amount);
+    postQuad.material.uniforms.shakeTime.value = performance.now() * 0.06;
+    cartShake.amount *= 0.90;
+  } else {
+    cartShake.amount = 0;
+  }
 }
 
 function removeFromCart(idx) {
@@ -5341,10 +6871,29 @@ function renderGlassFBO() {
   for(var fsi=0;fsi<floors.length;fsi++){if(floors[fsi].glassRing){floors[fsi].glassRing.userData._fboVis=floors[fsi].glassRing.visible;floors[fsi].glassRing.visible=false;}}
   for(var sti3=0;sti3<dm.starTemps.length;sti3++) dm.starTemps[sti3].visible=false;
   if(dm.closingStarTemps){for(var csti=0;csti<dm.closingStarTemps.length;csti++) dm.closingStarTemps[csti].visible=false;}
+  // Hide cart fly balls so they don't appear in their own refraction
+  for(var cfi=0;cfi<cartFlyAnims.length;cfi++) cartFlyAnims[cfi].ball.visible=false;
+  // Hide backdrops + image overlays so they don't self-reference in the FBO
+  var bdHidden = [];
+  var imgHidden = [];
+  function _hideBackdropAndImg(bd){
+    if(!bd) return;
+    if(bd.visible){ bdHidden.push(bd); bd.visible=false; }
+    if(bd.userData){
+      if(bd.userData.imgMesh && bd.userData.imgMesh.visible){ imgHidden.push(bd.userData.imgMesh); bd.userData.imgMesh.visible=false; }
+      if(bd.userData.shadowMesh && bd.userData.shadowMesh.visible){ imgHidden.push(bd.userData.shadowMesh); bd.userData.shadowMesh.visible=false; }
+    }
+  }
+  _hideBackdropAndImg(displayAnim.backdrop);
+  for(var pcb=0;pcb<pendingCloses.length;pcb++){var pcbd=pendingCloses[pcb].dispAnim;if(pcbd) _hideBackdropAndImg(pcbd.backdrop);}
+  for(var prb=0;prb<pendingReverses.length;prb++) _hideBackdropAndImg(pendingReverses[prb].backdrop);
   renderer.setRenderTarget(glassFBO);
   renderer.clear();
   renderer.render(scene,camera);
   renderer.setRenderTarget(null);
+  for(var cfi2=0;cfi2<cartFlyAnims.length;cfi2++) cartFlyAnims[cfi2].ball.visible=true;
+  for(var bdi=0;bdi<bdHidden.length;bdi++) bdHidden[bdi].visible=true;
+  for(var imi=0;imi<imgHidden.length;imi++) imgHidden[imi].visible=true;
   if(pdv.group) pdv.group.visible=pdvFboVis;
   for(var dbi4=0;dbi4<dm.dmButtons.length;dbi4++) dm.dmButtons[dbi4].visible=true;
   // Restore floor glass rings
@@ -5418,7 +6967,7 @@ function renderGlassFBO() {
 }
 
 // ── Cart System (morphable glass circle to rectangle) ──
-var CART_CR = 0.25, CART_RW = 2.8, CART_RH = 4.5, CART_THICK = 0.06;
+var CART_CR = 0.25, CART_RW = 2.1, CART_RH = 3.375, CART_THICK = 0.06;
 var CART_SX = 40, CART_SY = 40, CART_PERIM = 80;
 var cartMorphT = 0, cartTargetT = 0;
 
@@ -5454,7 +7003,8 @@ function createCartIcon() {
       tBg:{value:null}, res:{value:new THREE.Vector2(window.innerWidth,window.innerHeight)},
       morphT:{value:0}, cR:{value:CART_CR}, rW:{value:CART_RW}, rH:{value:CART_RH}, time:{value:0},
       tScratch:{value:cartScratchTex},
-      tFrost:{value:generateFrostTexture()}
+      tFrost:{value:generateFrostTexture()},
+      blurAmt:{value:2.925} // pixel-radius for the glass blur (0.65× of 4.5)
     },
     vertexShader: [
       'varying vec3 vN,vV,vLP;',
@@ -5471,12 +7021,26 @@ function createCartIcon() {
     fragmentShader: [
       'uniform sampler2D tBg,tScratch,tFrost;',
       'uniform vec2 res;',
-      'uniform float morphT,cR,rW,rH,time;',
+      'uniform float morphT,cR,rW,rH,time,blurAmt;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
       GLARE_GLSL_FUNCS,
       'float sdCircle(vec2 p,float r){return length(p)-r;}',
       'float sdRRect(vec2 p,vec2 b,float r){vec2 d2=abs(p)-b+r;return length(max(d2,0.0))+min(max(d2.x,d2.y),0.0)-r;}',
+      // 9-tap weighted blur (Gaussian-ish) — frosted-glass softening on top of refraction
+      'vec3 blurredSample(vec2 uv){',
+      '  vec2 b = blurAmt / res;',
+      '  vec3 c = texture2D(tBg, uv).rgb * 0.20;',
+      '  c += texture2D(tBg, uv + vec2( b.x, 0.0)).rgb * 0.13;',
+      '  c += texture2D(tBg, uv + vec2(-b.x, 0.0)).rgb * 0.13;',
+      '  c += texture2D(tBg, uv + vec2(0.0,  b.y)).rgb * 0.13;',
+      '  c += texture2D(tBg, uv + vec2(0.0, -b.y)).rgb * 0.13;',
+      '  c += texture2D(tBg, uv + vec2( b.x,  b.y)).rgb * 0.07;',
+      '  c += texture2D(tBg, uv + vec2( b.x, -b.y)).rgb * 0.07;',
+      '  c += texture2D(tBg, uv + vec2(-b.x,  b.y)).rgb * 0.07;',
+      '  c += texture2D(tBg, uv + vec2(-b.x, -b.y)).rgb * 0.07;',
+      '  return c;',
+      '}',
       'void main(){',
       '  vec3 N=normalize(vN); vec3 V=normalize(vV);',
       '  float sd=mix(sdCircle(vLP.xy,cR),sdRRect(vLP.xy,vec2(rW,rH)*0.5,0.12),morphT);',
@@ -5489,12 +7053,14 @@ function createCartIcon() {
       '  refr+=0.003*vec2(sin(time*1.5+suv.y*8.0),cos(time*1.2+suv.x*8.0));',
       '  float ef=1.0-abs(dot(V,N));',
       '  float ca=0.23*(0.3+ef*2.5);',
-      '  vec2 tx=1.0/res;',
       '  vec2 ru=suv+refr*(1.0+ca),gu=suv+refr,bu=suv+refr*(1.0-ca);',
-      '  float r=texture2D(tBg,ru).r*.6+texture2D(tBg,ru+tx).r*.2+texture2D(tBg,ru-tx).r*.2;',
-      '  float g=texture2D(tBg,gu).g*.6+texture2D(tBg,gu+tx).g*.2+texture2D(tBg,gu-tx).g*.2;',
-      '  float b=texture2D(tBg,bu).b*.6+texture2D(tBg,bu+tx).b*.2+texture2D(tBg,bu-tx).b*.2;',
+      // Blurred refraction — chromatic aberration with frosted-glass softening
+      '  float r=blurredSample(ru).r;',
+      '  float g=blurredSample(gu).g;',
+      '  float b=blurredSample(bu).b;',
       '  vec3 col=vec3(r,g,b);',
+      // Slight darken to lift contrast against bright backgrounds
+      '  col *= 0.92;',
       '  float fresnel=pow(1.0-max(dot(V,N),0.0),2.0)*0.15;',
       '  col=mix(col,vec3(0.95,0.96,0.98),fresnel*0.1);',
       '  col+=vec3(0.7,0.75,0.9)*glow*0.3;',
@@ -5546,13 +7112,14 @@ function morphCartShape(eased) {
 function updateCartIcon() {
   var count=getCartCount();
   if(cart.countMesh){cart.iconGroup.remove(cart.countMesh);cart.countMesh.geometry.dispose();cart.countMesh.material.dispose();cart.countMesh=null;}
-  if(count>0&&!cart.panelOpen){
+  if(count>0){
     var c=document.createElement('canvas');c.width=48;c.height=48;
-    var x=c.getContext('2d');x.fillStyle='rgba(100,126,234,0.9)';x.beginPath();x.arc(24,24,20,0,Math.PI*2);x.fill();
+    var x=c.getContext('2d');x.fillStyle='rgba(100,126,234,0.95)';x.beginPath();x.arc(24,24,20,0,Math.PI*2);x.fill();
     x.fillStyle='#fff';x.font='bold 22px Arial';x.textAlign='center';x.textBaseline='middle';x.fillText(''+count,24,24);
     var tx=new THREE.CanvasTexture(c);tx.needsUpdate=true;
     cart.countMesh=new THREE.Mesh(new THREE.PlaneGeometry(0.18,0.18),new THREE.MeshBasicMaterial({map:tx,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
     cart.countMesh.renderOrder=20;
+    cart.countMesh.userData.noTint = true; // skip icon contrast tinting
     cart.countMesh.position.set(0.14,0.14,0.04);cart.iconGroup.add(cart.countMesh);
   }
 }
@@ -5599,6 +7166,10 @@ function positionCartIcon() {
   var panelX=baseX*halfW*2, panelY=baseY*halfH*2;
   var finalX=iconX+(panelX-iconX)*e;
   var finalY=iconY+(panelY-iconY)*e;
+  // Apply heavy-cart fall: panel sinks down as more items are added (kicks in after 4)
+  if(cartPanelFall && cartPanelFall.y_offset > 0) {
+    finalY -= cartPanelFall.y_offset * e;
+  }
   // Clamp expanded panel within viewport bounds
   if(e>0.01){
     var pw=CART_RW*0.5*e, ph=CART_RH*0.5*e;
@@ -5625,10 +7196,15 @@ function positionCartIcon() {
   
   var physicsOffsetX = cartPhysics.x - camera.position.x;
   var physicsOffsetY = cartPhysics.y - camera.position.y;
-  var offset=new THREE.Vector3(physicsOffsetX, physicsOffsetY, -dist);
+  // Apply cart impact push-back along the camera's local -Z (toward camera)
+  var impactZ = cart.iconGroup.userData._cartImpactZ || 0;
+  var offset=new THREE.Vector3(physicsOffsetX, physicsOffsetY, -dist - impactZ);
   offset.applyQuaternion(camera.quaternion);
   cart.iconGroup.position.copy(camera.position).add(offset);
   cart.iconGroup.quaternion.copy(camera.quaternion);
+  // Apply cart impact scale grow
+  var impactScale = cart.iconGroup.userData._cartImpactScale || 1;
+  cart.iconGroup.scale.set(impactScale, impactScale, impactScale);
   
   // Position panel content to match cart
   if(cart.panelGroup){
@@ -5666,7 +7242,6 @@ function toggleCartPanel() {
   if(!cart.panelOpen){
     rebuildCartPanel();
     if(cart.iconOverlay)cart.iconOverlay.visible=false;
-    if(cart.countMesh)cart.countMesh.visible=false;
   }
 }
 
@@ -5743,24 +7318,54 @@ function rebuildCartPanel() {
   if(cart.panelGroup){scene.remove(cart.panelGroup);cart.panelGroup=null;}
   cart.panelGroup=new THREE.Group();
   var panelW=CART_RW,panelH=CART_RH;
-  // No glass background here - the morphing glassMesh IS the background
+  // ── Header row: CART title (left) + X close button (right), both integrated into the panel ──
+  var headerY = panelH/2 - 0.35;
+  var headerH = 0.38;
+  var sideMargin = 0.22;
+  var gap = 0.08;
+  var xBtnW = headerH; // square X button (matches title-box vertical dimension)
+  var titleW = panelW - sideMargin*2 - gap - xBtnW;
+  var titleX = -panelW/2 + sideMargin + titleW/2;
+  var xBtnX = panelW/2 - sideMargin - xBtnW/2;
+
+  // CART title canvas
   var titleCanvas=document.createElement('canvas');titleCanvas.width=200;titleCanvas.height=50;
   var tCtx=titleCanvas.getContext('2d');tCtx.font='600 32px Arial';tCtx.fillStyle='#3a4258';tCtx.textAlign='center';tCtx.textBaseline='middle';tCtx.fillText('CART',100,25);
   var titleTex=new THREE.CanvasTexture(titleCanvas);titleTex.needsUpdate=true;
-  var titleMesh=new THREE.Mesh(new THREE.PlaneGeometry(1.0,0.25),new THREE.MeshBasicMaterial({map:titleTex,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
+  var titleMesh=new THREE.Mesh(new THREE.PlaneGeometry(titleW*0.8,0.25),new THREE.MeshBasicMaterial({map:titleTex,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
   titleMesh.renderOrder=20;
-  titleMesh.position.set(0,panelH/2-0.35,0.05);cart.panelGroup.add(titleMesh);
+  titleMesh.position.set(titleX,headerY,0.05);cart.panelGroup.add(titleMesh);
 
-  // Highlight box behind CART title
-  var titleHighlight = createGlassHighlight(1.4, 0.38, { opacity: 0.75, cornerRadius: 0.08, blur: 0.025, frost: 0.8 });
-  titleHighlight.position.set(0, panelH/2 - 0.35, 0.02);
+  // CART highlight box (behind text)
+  var titleHighlight = createGlassHighlight(titleW, headerH, { opacity: 0.75, cornerRadius: 0.08, blur: 0.025, frost: 0.8 });
+  titleHighlight.position.set(titleX, headerY, 0.02);
   cart.panelGroup.add(titleHighlight);
-  
-  // Close button — separate 3D glass shader rect, same refraction as cart
+
+  // X close button — same format as CART title (highlight box + canvas text), integrated into panel
+  var xCloseGroup = new THREE.Group();
+  var xCloseHighlight = createGlassHighlight(xBtnW, headerH, { opacity: 0.75, cornerRadius: 0.08, blur: 0.025, frost: 0.8 });
+  xCloseGroup.add(xCloseHighlight);
+  var xBtnCanvas = document.createElement('canvas'); xBtnCanvas.width = 80; xBtnCanvas.height = 80;
+  var xBtnCtx = xBtnCanvas.getContext('2d');
+  xBtnCtx.font = '500 50px Arial'; xBtnCtx.fillStyle = '#3a4258';
+  xBtnCtx.textAlign = 'center'; xBtnCtx.textBaseline = 'middle';
+  xBtnCtx.fillText('✕', 40, 40);
+  var xBtnTex = new THREE.CanvasTexture(xBtnCanvas); xBtnTex.needsUpdate = true;
+  var xBtnLabel = new THREE.Mesh(
+    new THREE.PlaneGeometry(headerH*0.55, headerH*0.55),
+    new THREE.MeshBasicMaterial({map:xBtnTex, transparent:true, side:THREE.DoubleSide, depthWrite:false, depthTest:false})
+  );
+  xBtnLabel.renderOrder = 20;
+  xBtnLabel.position.z = 0.03;
+  xCloseGroup.add(xBtnLabel);
+  xCloseGroup.position.set(xBtnX, headerY, 0.02);
+  xCloseGroup.userData.actionId = 'close-cart';
+  xCloseGroup.userData.clickable = true;
+  cart.panelGroup.add(xCloseGroup);
+  /* removed: floating glass close button has been replaced by the integrated header X button above
   var closeBtnSize=0.2;
   var closeBtnGeo=new THREE.PlaneGeometry(closeBtnSize*2,closeBtnSize*2,16,16);
   var closeBtnPos=closeBtnGeo.attributes.position;
-  // Add bevel to edges
   for(var cbj=0;cbj<closeBtnPos.count;cbj++){
     var cbx=closeBtnPos.array[cbj*3],cby=closeBtnPos.array[cbj*3+1];
     var cbd=Math.min(Math.abs(cbx-closeBtnSize),Math.abs(cbx+closeBtnSize),Math.abs(cby-closeBtnSize),Math.abs(cby+closeBtnSize));
@@ -5776,15 +7381,18 @@ function rebuildCartPanel() {
       rW:{value:closeBtnSize},rH:{value:closeBtnSize},time:{value:0},
       frost:{value:0.35},
       tScratch:{value:closeScratchTex},
-      tFrost:{value:generateFrostTexture()}
+      tFrost:{value:generateFrostTexture()},
+      hoverPress:{value:0.0}
     },
     vertexShader:[
+      'uniform float hoverPress;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
       'void main(){',
-      '  vLP=position;',
+      '  vec3 transformed = position - normal * hoverPress * 0.04;',
+      '  vLP=transformed;',
       '  vUv=uv;',
-      '  vec4 mv=modelViewMatrix*vec4(position,1.0);',
+      '  vec4 mv=modelViewMatrix*vec4(transformed,1.0);',
       '  vN=normalize(normalMatrix*normal);',
       '  vV=normalize(-mv.xyz);',
       '  gl_Position=projectionMatrix*mv;',
@@ -5793,7 +7401,7 @@ function rebuildCartPanel() {
     fragmentShader:[
       'uniform sampler2D tBg,tScratch,tFrost;',
       'uniform vec2 res;',
-      'uniform float rW,rH,time,frost;',
+      'uniform float rW,rH,time,frost,hoverPress;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
       GLARE_GLSL_FUNCS,
@@ -5823,6 +7431,7 @@ function rebuildCartPanel() {
       GLASS_TINT_GLSL,
       GLARE_GLSL_CALC,
       '  col+=glareResult;',
+      '  col=mix(col,vec3(0.05,0.08,0.18),hoverPress*0.45);',
       '  gl_FragColor=vec4(col,alpha);',
       '}'
     ].join('\n'),
@@ -5865,26 +7474,49 @@ function rebuildCartPanel() {
     localOffset:closeLocalOffset,
     physX:initX,physY:initY,physZ:initZ
   });
-  var yOff=panelH/2-0.9;
+  */
+  // \u2500\u2500 Footer (TOTAL + CHECKOUT) \u2014 fixed at bottom of panel, always shown when items exist \u2500\u2500
+  var checkoutCenterY = -panelH/2 + 0.40;
+  var totalCenterY = checkoutCenterY + 0.50;
+  // \u2500\u2500 Items scroll region (between header and footer) \u2500\u2500
+  var itemsTopY = headerY - headerH/2 - 0.05;
+  var itemsBottomY = totalCenterY + 0.20;
+  var itemHeight = 0.55;
+
+  cart.itemsGroup = new THREE.Group();
+  cart.panelGroup.add(cart.itemsGroup);
+  cart.itemsScrollY = cart.itemsScrollY || 0;
+  cart.itemsTopY = itemsTopY;
+  cart.itemsBottomY = itemsBottomY;
+  cart.itemsScrollMax = 0;
+
   if(cart.items.length===0){
     var ec=document.createElement('canvas');ec.width=300;ec.height=40;
     var ex=ec.getContext('2d');ex.font='400 24px Arial';ex.fillStyle='#8890a8';ex.textAlign='center';ex.textBaseline='middle';ex.fillText('CART IS EMPTY',150,20);
     var et=new THREE.CanvasTexture(ec);et.needsUpdate=true;
+    var emY = (itemsTopY + itemsBottomY) / 2;
     var em=new THREE.Mesh(new THREE.PlaneGeometry(1.5,0.2),new THREE.MeshBasicMaterial({map:et,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
     em.renderOrder=20;
-    em.position.set(0,0,0.05);cart.panelGroup.add(em);
+    em.position.set(0,emY,0.05);cart.panelGroup.add(em);
+    cart.itemsScrollY = 0;
   }else{
+    var firstRowY = itemsTopY - 0.2; // top item center
     for(var i=0;i<cart.items.length;i++){
       var item=cart.items[i];
+      var rowY = firstRowY - i * itemHeight;
+      var itemRowGroup = new THREE.Group();
+      itemRowGroup.position.set(0, rowY, 0);
+      cart.itemsGroup.add(itemRowGroup);
+
       var itemRow=createGlassHighlight(panelW-0.4,0.4,{opacity:0.7,cornerRadius:0.06,blur:0.025,frost:0.78});
-      itemRow.position.set(0,yOff,0.05);cart.panelGroup.add(itemRow);
+      itemRow.position.set(0,0,0.05);itemRowGroup.add(itemRow);
       var itemText=item.name.toUpperCase()+'  x'+item.qty+'  $'+(item.price*item.qty);
       var ic2=document.createElement('canvas');ic2.width=500;ic2.height=40;
       var ix2=ic2.getContext('2d');ix2.font='500 22px Arial';ix2.fillStyle='#4a5268';ix2.textBaseline='middle';ix2.fillText(itemText,10,20);
       var it2=new THREE.CanvasTexture(ic2);it2.needsUpdate=true;
       var itm=new THREE.Mesh(new THREE.PlaneGeometry(panelW-0.8,0.2),new THREE.MeshBasicMaterial({map:it2,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
       itm.renderOrder=20;
-      itm.position.set(-0.15,yOff,0.08);cart.panelGroup.add(itm);
+      itm.position.set(-0.15,0,0.08);itemRowGroup.add(itm);
       var rbGroup=new THREE.Group();
       var rbHighlight=createGlassHighlight(0.3,0.3,{opacity:0.7,cornerRadius:0.06,blur:0.02,frost:0.75});
       rbGroup.add(rbHighlight);
@@ -5894,18 +7526,25 @@ function rebuildCartPanel() {
       var rbLabel=new THREE.Mesh(new THREE.PlaneGeometry(0.22,0.22),new THREE.MeshBasicMaterial({map:rbt,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
       rbLabel.renderOrder=20;rbLabel.position.z=0.02;
       rbGroup.add(rbLabel);
-      rbGroup.position.set(panelW/2-0.4,yOff,0.08);rbGroup.userData.actionId='remove-cart-'+i;rbGroup.userData.clickable=true;cart.panelGroup.add(rbGroup);
-      yOff-=0.55;
+      rbGroup.position.set(panelW/2-0.4,0,0.08);rbGroup.userData.actionId='remove-cart-'+i;rbGroup.userData.clickable=true;itemRowGroup.add(rbGroup);
     }
+    // Scroll bounds: how far we can scroll DOWN (items move up to reveal lower ones)
+    var contentH = cart.items.length * itemHeight + 0.2;
+    var visibleH = itemsTopY - itemsBottomY;
+    cart.itemsScrollMax = Math.max(0, contentH - visibleH);
+    if(cart.itemsScrollY > cart.itemsScrollMax) cart.itemsScrollY = cart.itemsScrollMax;
+    if(cart.itemsScrollY < 0) cart.itemsScrollY = 0;
+
+    // \u2500\u2500 Fixed footer: TOTAL + CHECKOUT \u2500\u2500
     var total=getCartTotal();
     var tc=document.createElement('canvas');tc.width=300;tc.height=40;
     var tx2=tc.getContext('2d');tx2.font='700 28px Arial';tx2.fillStyle='#3a4258';tx2.textAlign='center';tx2.textBaseline='middle';tx2.fillText('TOTAL  $'+total,150,20);
     var tt=new THREE.CanvasTexture(tc);tt.needsUpdate=true;
     var tm=new THREE.Mesh(new THREE.PlaneGeometry(1.5,0.2),new THREE.MeshBasicMaterial({map:tt,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
     tm.renderOrder=20;
-    tm.position.set(0,yOff-0.2,0.08);cart.panelGroup.add(tm);
+    tm.position.set(0,totalCenterY,0.08);cart.panelGroup.add(tm);
     var cbGroup=new THREE.Group();
-    var cbHighlight=createGlassHighlight(1.8,0.45,{opacity:0.75,cornerRadius:0.08,blur:0.025,frost:0.8});
+    var cbHighlight=createGlassHighlight(panelW-0.3,0.45,{opacity:0.75,cornerRadius:0.08,blur:0.025,frost:0.8});
     cbGroup.add(cbHighlight);
     var cbc=document.createElement('canvas');cbc.width=300;cbc.height=50;
     var cbx=cbc.getContext('2d');cbx.font='700 30px Arial';cbx.fillStyle='#3a4258';cbx.textAlign='center';cbx.textBaseline='middle';cbx.fillText('CHECKOUT',150,25);
@@ -5913,8 +7552,9 @@ function rebuildCartPanel() {
     var cbLabel=new THREE.Mesh(new THREE.PlaneGeometry(1.5,0.25),new THREE.MeshBasicMaterial({map:cbt,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
     cbLabel.renderOrder=20;cbLabel.position.z=0.02;
     cbGroup.add(cbLabel);
-    cbGroup.position.set(0,yOff-0.65,0.08);cbGroup.userData.actionId='checkout';cbGroup.userData.clickable=true;cart.panelGroup.add(cbGroup);
+    cbGroup.position.set(0,checkoutCenterY,0.08);cbGroup.userData.actionId='checkout';cbGroup.userData.clickable=true;cart.panelGroup.add(cbGroup);
   }
+  updateCartItemsScroll();
   cart.panelGroup.layers.enable(1);
   cart.panelGroup.traverse(function(c){c.layers.enable(1);});
   scene.add(cart.panelGroup);
@@ -5931,6 +7571,29 @@ function positionCartPanel() {
   // handled by positionCartIcon now
 }
 
+// Scroll the cart items list within the visible scroll region
+function updateCartItemsScroll() {
+  if(!cart.itemsGroup) return;
+  cart.itemsGroup.position.y = cart.itemsScrollY || 0;
+  // Hide rows that fall outside the visible scroll viewport
+  var topY = cart.itemsTopY, botY = cart.itemsBottomY;
+  cart.itemsGroup.children.forEach(function(rowGroup){
+    var localY = rowGroup.position.y + (cart.itemsScrollY || 0);
+    var rowTop = localY + 0.20;
+    var rowBot = localY - 0.20;
+    var visible = (rowBot < topY) && (rowTop > botY);
+    rowGroup.visible = visible;
+  });
+}
+
+function scrollCartItems(deltaY) {
+  if(!cart.panelOpen || !cart.itemsGroup) return;
+  cart.itemsScrollY = (cart.itemsScrollY || 0) + deltaY;
+  if(cart.itemsScrollY < 0) cart.itemsScrollY = 0;
+  if(cart.itemsScrollY > (cart.itemsScrollMax || 0)) cart.itemsScrollY = cart.itemsScrollMax || 0;
+  updateCartItemsScroll();
+}
+
 // ── Draggable Cart Panel ──
 // Track drag state separately from floor wheel dragging
 var cartDrag = {
@@ -5942,6 +7605,17 @@ var cartDrag = {
 };
 
 function startCartDrag(cx, cy) {
+  // If the panel has sunk under its own weight, bake the fall offset into dragOffsetY so the panel
+  // stays where it currently is when grabbed — then reset the fall state so it doesn't keep sinking.
+  if(cartPanelFall && cartPanelFall.y_offset > 0) {
+    var fovRad = camera.fov * Math.PI / 180;
+    var dist = 4.5;
+    var halfH = Math.tan(fovRad/2) * dist;
+    cart.dragOffsetY = (cart.dragOffsetY || 0) - cartPanelFall.y_offset / (halfH * 2);
+    cartPanelFall.y_offset = 0;
+    cartPanelFall.vel_y = 0;
+    cartPanelFall.hasHit = false;
+  }
   cartDrag.active = true;
   cartDrag.startMouseX = cx;
   cartDrag.startMouseY = cy;
@@ -6680,6 +8354,7 @@ function init(){
   createNavMenu();
   setupIntersectionGlow();
   createGlassFBO();
+  createBackdropBlur();
   createStarField();
   createPlanets();
   // Set orb floor Y for light rays positioning
@@ -6727,6 +8402,34 @@ function animate(){
   }
   if(dm.animating)animateDM();
   if(dm.closing)animateClosing();
+  if(pendingCloses.length > 0) animatePendingCloses();
+  if(pendingReverses.length > 0) animatePendingReverses();
+
+  // Animate glass UI hover/press feedback + icon contrast
+  scene.traverse(function(o){
+    if(o.isMesh && o.material && o.material.uniforms && o.material.uniforms.hoverPress){
+      var tgt = (o === pressedGlassMesh) ? 1.0 : (o === hoveredGlassMesh ? 0.5 : 0.0);
+      var cur = o.material.uniforms.hoverPress.value;
+      var diff = tgt - cur;
+      if(Math.abs(diff) > 0.005) o.material.uniforms.hoverPress.value += diff * 0.18;
+      else o.material.uniforms.hoverPress.value = tgt;
+
+      // Update sibling icon colors to contrast against the glass background
+      if(o.parent){
+        var hp = o.material.uniforms.hoverPress.value;
+        // Dark when hp=0 (glass is light), light when hp=1 (glass is dark)
+        var iconRGB = 0.25 + hp * 0.75; // 0.25 → 1.0
+        for(var ci=0;ci<o.parent.children.length;ci++){
+          var sibling = o.parent.children[ci];
+          if(sibling === o) continue;
+          if(sibling.userData && sibling.userData.noTint) continue;
+          if(sibling.isMesh && sibling.material && sibling.material.color && sibling.material.map){
+            sibling.material.color.setScalar(iconRGB);
+          }
+        }
+      }
+    }
+  });
   if(switchAnim.active)animateSwitch();
   if(pdv.entering)animateProductDetailEnter();
   if(pdv.exitingToDM)animateProductDetailExit();
@@ -6755,9 +8458,6 @@ function animate(){
     targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
   }
 
-  var nY=null,nD=Infinity;
-  floors.forEach(function(f){var d=Math.abs(targetCameraY-f.group.position.y);if(d<nD){nD=d;nY=f.group.position.y;}});
-  if(nD<0.8&&nY!==null)targetCameraY+=(nY-targetCameraY)*0.12;
   camera.position.y+=(targetCameraY-camera.position.y)*0.45;
   
   // Nav scroll animation — overrides camera Y with smooth ease-out
@@ -6863,7 +8563,7 @@ function animate(){
       fl.panels.forEach(function(panel){var br=panel.mesh.userData.baseRadius,er=br+re;panel.mesh.scale.x=er/br;panel.mesh.scale.z=er/br;panel.edges.scale.x=er/br;panel.edges.scale.z=er/br;
         panel.edges.userData.preHoverSX=panel.edges.scale.x;panel.edges.userData.preHoverSZ=panel.edges.scale.z;});
     } else if(fl.panels){
-      fl.panels.forEach(function(panel){panel.edges.userData.preHoverSX=panel.edges.scale.x;panel.edges.userData.preHoverSZ=panel.edges.scale.z;});
+      fl.panels.forEach(function(panel){panel.edges.userData.preHoverSX=1;panel.edges.userData.preHoverSZ=1;});
     }
     // Update holographic shader time on all panels
     if(fl.panels){fl.panels.forEach(function(panel, pi){
@@ -6903,6 +8603,38 @@ function animate(){
     });}
   });
 
+  // Animate centerStar fly-out to vWheel center on DM enter / fly-back on exit
+  for(var dca=dmCenterAnims.length-1; dca>=0; dca--){
+    var dCA = dmCenterAnims[dca];
+    if(!dCA.floor || !dCA.floor.group || !dCA.floor.group.userData.centerStar) {
+      dmCenterAnims.splice(dca, 1);
+      continue;
+    }
+    var dCATgt = dCA.target;
+    var dCAdiff = dCATgt - dCA.prog;
+    if(Math.abs(dCAdiff) > 0.001) dCA.prog += dCAdiff * 0.08;
+    else dCA.prog = dCATgt;
+
+    var cstar = dCA.floor.group.userData.centerStar;
+    var ease = dCA.prog<.5 ? 4*dCA.prog*dCA.prog*dCA.prog : 1-Math.pow(-2*dCA.prog+2,3)/2;
+    // VW world position relative to floor center: (±3, 0, 3.5)
+    var vwLocalX = (dCA.side === 'left') ? -3 : 3;
+    var vwLocalZ = 3.5;
+    // Compensate for floor's Y rotation so the centerStar reaches the vWheel world position
+    var theta = dCA.floor.group.rotation.y;
+    var cosT = Math.cos(theta), sinT = Math.sin(theta);
+    var tgtX = vwLocalX * cosT - vwLocalZ * sinT;
+    var tgtZ = vwLocalX * sinT + vwLocalZ * cosT;
+    cstar.position.x = tgtX * ease;
+    cstar.position.z = tgtZ * ease;
+
+    // Remove entry once fully retracted
+    if(dCA.target === 0 && dCA.prog < 0.001) {
+      cstar.position.set(0, 0, 0);
+      dmCenterAnims.splice(dca, 1);
+    }
+  }
+
   // Hover for DM display temp (shares material with selected panel)
   if(dm.active && dm.displayTemp && dm.displayTemp.plane && dm.floor){
     var dtMat = dm.displayTemp.plane.material;
@@ -6914,6 +8646,239 @@ function animate(){
     }
   }
 
+  // Display panel flatten + split animation driver
+  if(displayAnim.active && dm.displayTemp && dm.displayTemp.plane) {
+    var daMat = dm.displayTemp.plane.material;
+    var speed = (displayAnim.phase === 'flatten' || displayAnim.phase === 'unflatten') ? 0.21 : 0.07875;
+    displayAnim.prog += speed;
+    if(displayAnim.prog > 1) displayAnim.prog = 1;
+    var dap = eIO(displayAnim.prog);
+
+    if(displayAnim.phase === 'flatten') {
+      daMat.userData.flatten.value = dap;
+      if(displayAnim.prog >= 1) {
+        daMat.userData.flatten.value = 1.0;
+        displayAnim.phase = 'split';
+        displayAnim.prog = 0;
+      }
+    } else if(displayAnim.phase === 'split') {
+      var maxSplit = PLANE_WIDTH * 0.3;
+      daMat.userData.splitGap.value = dap * maxSplit;
+
+      // Move panel forward (in front of rings), toward center, scale down to keep apparent size
+      if(displayAnim.origPos) {
+        var fwdAmt = dap * 5.0;
+        var scaleUp = 1 + dap * (-0.3); // scale down to compensate for being closer to camera
+        var isL = dm.floorIdx===1||dm.floorIdx===3;
+        var centerPush = dap * 1.8 * (isL ? -1 : 1); // move X toward 0
+        dm.displayTemp.plane.position.z = displayAnim.origPos.z + fwdAmt;
+        dm.displayTemp.plane.position.x = displayAnim.origPos.x + centerPush;
+        dm.displayTemp.plane.scale.set(
+          displayAnim.origScale.x * scaleUp,
+          displayAnim.origScale.y * scaleUp,
+          displayAnim.origScale.z
+        );
+        if(dm.displayTemp.edge) {
+          dm.displayTemp.edge.position.z = displayAnim.origEdgePos.z + fwdAmt;
+          dm.displayTemp.edge.position.x = displayAnim.origEdgePos.x + centerPush;
+          dm.displayTemp.edge.scale.set(
+            displayAnim.origEdgeScale.x * scaleUp,
+            displayAnim.origEdgeScale.y * scaleUp,
+            displayAnim.origEdgeScale.z
+          );
+        }
+      }
+
+      // Push star buttons toward the vertical wheel
+      if(dm.starTemps && displayAnim.btnOrigPositions.length > 0) {
+        var isLeft = dm.floorIdx===1||dm.floorIdx===3;
+        var pushX = dap * 1.0 * (isLeft ? -1 : 1); // push toward VW side
+        var pushZ = dap * 0.75; // push away from camera toward VW
+        for(var bsi = 0; bsi < dm.starTemps.length && bsi < displayAnim.btnOrigPositions.length; bsi++) {
+          var bOrig = displayAnim.btnOrigPositions[bsi];
+          dm.starTemps[bsi].position.x = bOrig.x + pushX;
+          dm.starTemps[bsi].position.z = bOrig.z + pushZ;
+        }
+      }
+
+      if(displayAnim.prog >= 1) {
+        displayAnim.phase = 'backdrop';
+        displayAnim.prog = 0;
+      }
+    } else if(displayAnim.phase === 'backdrop') {
+      // Backdrop grows AFTER split is complete — two halves sprout from borders toward center
+      if(displayAnim.backdrop) {
+        displayAnim.backdrop.visible = true;
+        var bd = displayAnim.backdrop.userData;
+        var panelW = PLANE_WIDTH;
+        var depth = 0.35;
+        var maxSplitBd = PLANE_WIDTH * 0.3;
+        var gapHalf = maxSplitBd * (0.45 * PLANE_WIDTH + 1.0);
+        var bdOpacity = dap * 0.65;
+        // Wall halves grow from 0 to full gapHalf
+        var wallH = gapHalf * dap;
+
+        // Top wall half — top edge anchored at top border, grows down toward center
+        bd.topWall.position.set(0, gapHalf - wallH * 0.5, -depth);
+        bd.topWall.scale.set(panelW, Math.max(wallH, 0.001), 1);
+        bd.topWall.material.uniforms.opacity.value = bdOpacity;
+
+        // Bottom wall half — bottom edge anchored at bottom border, grows up toward center
+        bd.botWall.position.set(0, -gapHalf + wallH * 0.5, -depth);
+        bd.botWall.scale.set(panelW, Math.max(wallH, 0.001), 1);
+        bd.botWall.material.uniforms.opacity.value = bdOpacity;
+
+        // Top lip — shelf at top border inner edge
+        bd.topLip.position.set(0, gapHalf, -depth * 0.5);
+        bd.topLip.scale.set(panelW, depth, 1);
+        bd.topLip.material.uniforms.opacity.value = bdOpacity;
+
+        // Bottom lip — shelf at bottom border inner edge
+        bd.botLip.position.set(0, -gapHalf, -depth * 0.5);
+        bd.botLip.scale.set(panelW, depth, 1);
+        bd.botLip.material.uniforms.opacity.value = bdOpacity;
+        // Show product image overlay + shadow during backdrop phase (always opaque)
+        if(bd.imgMesh){
+          bd.imgMesh.visible = true;
+          bd.imgMesh.material.uniforms.opacity.value = 1.0;
+        }
+        if(bd.shadowMesh){
+          bd.shadowMesh.visible = true;
+          bd.shadowMesh.material.uniforms.opacity.value = 1.0;
+        }
+      }
+      if(displayAnim.prog >= 1) {
+        displayAnim.phase = 'idle';
+        displayAnim.active = false;
+      }
+    } else if(displayAnim.phase === 'retract') {
+      // Backdrop retracts before borders close — walls shrink back to border edges
+      if(displayAnim.backdrop) {
+        var bd3 = displayAnim.backdrop.userData;
+        var panelW3 = PLANE_WIDTH;
+        var depth3 = 0.35;
+        var maxSplitR = PLANE_WIDTH * 0.3;
+        var gapHalfR = maxSplitR * (0.45 * PLANE_WIDTH + 1.0);
+        var rdapR = 1 - dap;
+        var bdOpacityR = rdapR * 0.65;
+        var wallHR = gapHalfR * rdapR;
+
+        bd3.topWall.position.set(0, gapHalfR - wallHR * 0.5, -depth3);
+        bd3.topWall.scale.set(panelW3, Math.max(wallHR, 0.001), 1);
+        bd3.topWall.material.uniforms.opacity.value = bdOpacityR;
+
+        bd3.botWall.position.set(0, -gapHalfR + wallHR * 0.5, -depth3);
+        bd3.botWall.scale.set(panelW3, Math.max(wallHR, 0.001), 1);
+        bd3.botWall.material.uniforms.opacity.value = bdOpacityR;
+
+        bd3.topLip.position.set(0, gapHalfR, -depth3 * 0.5);
+        bd3.topLip.scale.set(panelW3, depth3, 1);
+        bd3.topLip.material.uniforms.opacity.value = bdOpacityR;
+
+        bd3.botLip.position.set(0, -gapHalfR, -depth3 * 0.5);
+        bd3.botLip.scale.set(panelW3, depth3, 1);
+        bd3.botLip.material.uniforms.opacity.value = bdOpacityR;
+        // Fade out product image overlay + shadow during retract
+        if(bd3.imgMesh) bd3.imgMesh.material.uniforms.opacity.value = rdapR;
+        if(bd3.shadowMesh) bd3.shadowMesh.material.uniforms.opacity.value = rdapR;
+      }
+      if(displayAnim.prog >= 1) {
+        if(displayAnim.backdrop) displayAnim.backdrop.visible = false;
+        if(displayAnim.backdrop && displayAnim.backdrop.userData.imgMesh) displayAnim.backdrop.userData.imgMesh.visible = false;
+        if(displayAnim.backdrop && displayAnim.backdrop.userData.shadowMesh) displayAnim.backdrop.userData.shadowMesh.visible = false;
+        displayAnim.phase = 'unsplit';
+        displayAnim.prog = 0;
+      }
+    } else if(displayAnim.phase === 'unsplit') {
+      var maxSplit2 = PLANE_WIDTH * 0.3;
+      var rdap = 1 - dap; // reverse progress
+      daMat.userData.splitGap.value = rdap * maxSplit2;
+
+      // Reverse panel forward movement, center push, and scale
+      if(displayAnim.origPos) {
+        var fwdAmt2 = rdap * 5.0;
+        var scaleUp2 = 1 + rdap * (-0.3);
+        var isL2 = dm.floorIdx===1||dm.floorIdx===3;
+        var centerPush2 = rdap * 1.8 * (isL2 ? -1 : 1);
+        dm.displayTemp.plane.position.z = displayAnim.origPos.z + fwdAmt2;
+        dm.displayTemp.plane.position.x = displayAnim.origPos.x + centerPush2;
+        dm.displayTemp.plane.scale.set(
+          displayAnim.origScale.x * scaleUp2,
+          displayAnim.origScale.y * scaleUp2,
+          displayAnim.origScale.z
+        );
+        if(dm.displayTemp.edge) {
+          dm.displayTemp.edge.position.z = displayAnim.origEdgePos.z + fwdAmt2;
+          dm.displayTemp.edge.position.x = displayAnim.origEdgePos.x + centerPush2;
+          dm.displayTemp.edge.scale.set(
+            displayAnim.origEdgeScale.x * scaleUp2,
+            displayAnim.origEdgeScale.y * scaleUp2,
+            displayAnim.origEdgeScale.z
+          );
+        }
+      }
+
+      // Reverse button push
+      if(dm.starTemps && displayAnim.btnOrigPositions.length > 0) {
+        var isLeft2 = dm.floorIdx===1||dm.floorIdx===3;
+        var pushX2 = rdap * 1.0 * (isLeft2 ? -1 : 1);
+        var pushZ2 = rdap * 0.75;
+        for(var bsi2 = 0; bsi2 < dm.starTemps.length && bsi2 < displayAnim.btnOrigPositions.length; bsi2++) {
+          var bOrig2 = displayAnim.btnOrigPositions[bsi2];
+          dm.starTemps[bsi2].position.x = bOrig2.x + pushX2;
+          dm.starTemps[bsi2].position.z = bOrig2.z + pushZ2;
+        }
+      }
+
+      if(displayAnim.prog >= 1) {
+        daMat.userData.splitGap.value = 0.0;
+        // Restore original positions
+        if(displayAnim.origPos) {
+          dm.displayTemp.plane.position.copy(displayAnim.origPos);
+          dm.displayTemp.plane.scale.copy(displayAnim.origScale);
+          if(dm.displayTemp.edge && displayAnim.origEdgePos) {
+            dm.displayTemp.edge.position.copy(displayAnim.origEdgePos);
+            dm.displayTemp.edge.scale.copy(displayAnim.origEdgeScale);
+          }
+        }
+        if(dm.starTemps && displayAnim.btnOrigPositions.length > 0) {
+          for(var bsi3 = 0; bsi3 < dm.starTemps.length && bsi3 < displayAnim.btnOrigPositions.length; bsi3++) {
+            dm.starTemps[bsi3].position.copy(displayAnim.btnOrigPositions[bsi3]);
+          }
+        }
+        displayAnim.phase = 'unflatten';
+        displayAnim.prog = 0;
+        if(displayAnim.backdrop) displayAnim.backdrop.visible = false;
+      }
+    } else if(displayAnim.phase === 'unflatten') {
+      daMat.userData.flatten.value = 1 - dap;
+      if(displayAnim.prog >= 1) {
+        daMat.userData.flatten.value = 0.0;
+        if(displayAnim.origPos) {
+          dm.displayTemp.plane.position.copy(displayAnim.origPos);
+          dm.displayTemp.plane.scale.copy(displayAnim.origScale);
+          if(dm.displayTemp.edge && displayAnim.origEdgePos) {
+            dm.displayTemp.edge.position.copy(displayAnim.origEdgePos);
+            dm.displayTemp.edge.scale.copy(displayAnim.origEdgeScale);
+            dm.displayTemp.edge.visible = true; // restore outline
+          }
+        }
+        displayAnim.phase = 'idle';
+        displayAnim.active = false;
+        // If exitDM is pending, trigger the actual exit now
+        if(displayAnim.pendingExit) {
+          displayAnim.pendingExit = false;
+          exitDMImmediate();
+        } else if(displayAnim.queuedSwitchIdx !== undefined && displayAnim.queuedSwitchIdx !== -1) {
+          var qSwIdx = displayAnim.queuedSwitchIdx;
+          displayAnim.queuedSwitchIdx = -1;
+          performSwitchPanel(qSwIdx);
+        }
+      }
+    }
+  }
+  // Backdrop is a child of displayTemp.plane — tracks automatically
+
   if(dm.active&&dm.vWheel&&!dm.closing&&!dm.animating){
     if(Math.abs(dm.vwVel)>0.0025)dm.vwVel*=0.995;else dm.vwVel=0.0025;
     dm.vWheel.rotation.x+=dm.vwVel;
@@ -6924,13 +8889,36 @@ function animate(){
   // Update quick view panels to face camera
   if(dm.active && !dm.animating && !dm.closing) updateQuickViewPanels();
   
+  // Update cart fly animations + impact + panel weight
+  if(cartFlyAnims.length > 0) updateCartFlyAnims(dt);
+  updateCartImpact(dt);
+  updateCartPanelFall(dt);
+
   // Update cart
   positionCartIcon();
   positionCartPanel();
   positionNavMenu();
   updateOrbs(dt);
+  // Cart shake AFTER updateOrbs so it doesn't get overwritten by orb stage shake
+  updateCartShake(dt);
   updateGlowMeshes();
   
+  // Update backdrop glass uniforms (time + res + tBg) each frame
+  var bdT = performance.now() * 0.001;
+  function _updBd(bd){
+    if(!bd) return;
+    bd.traverse(function(c){
+      if(c.material && c.material.uniforms){
+        if(c.material.uniforms.time) c.material.uniforms.time.value = bdT;
+        if(c.material.uniforms.res) c.material.uniforms.res.value.set(window.innerWidth, window.innerHeight);
+        if(c.material.uniforms.tBg && glassFBO) c.material.uniforms.tBg.value = glassFBO.texture;
+      }
+    });
+  }
+  _updBd(displayAnim.backdrop);
+  for(var pcb2=0;pcb2<pendingCloses.length;pcb2++){if(pendingCloses[pcb2].dispAnim) _updBd(pendingCloses[pcb2].dispAnim.backdrop);}
+  for(var prb2=0;prb2<pendingReverses.length;prb2++) _updBd(pendingReverses[prb2].backdrop);
+
   // Render background to FBO for glass refraction
   renderGlassFBO();
 
@@ -7077,7 +9065,7 @@ function resizePostFBO(){
   }
 }
 
-function onResize(){camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);resizeGlassFBO();resizePostFBO();resizeGodRays();updateCamRadius();}
+function onResize(){camera.aspect=window.innerWidth/window.innerHeight;camera.updateProjectionMatrix();renderer.setSize(window.innerWidth,window.innerHeight);resizeGlassFBO();resizePostFBO();resizeGodRays();resizeBackdropBlur();updateCamRadius();}
 
 window.scrollTo(0,0);
 
