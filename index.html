@@ -2939,6 +2939,13 @@ function onTM(e){
     var dy=ty-touchScroll.lastY;
     var dx=tx-touchScroll.lastX;
 
+    // Ball drag takes top priority — never lock to scroll
+    if(ballDrag.active){
+      touchScroll.locked='ball';
+      pMove(tx, ty);
+      touchScroll.lastX=tx; touchScroll.lastY=ty;
+      return;
+    }
     // Cart panel drag takes priority — route swipe directly to cart drag, never lock to scroll
     if(cartDrag.active){
       touchScroll.locked='cart';
@@ -3006,6 +3013,21 @@ function pDown(cx,cy){
   // Detect glass UI press for visual feedback
   mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
+  // Ball drag — top priority once cart is broken
+  if(cartBouncyBall && cartBouncyBall.mesh){
+    var ballHits = raycaster.intersectObject(cartBouncyBall.mesh);
+    if(ballHits.length > 0){
+      ballDrag.active = true;
+      ballDrag.history = [];
+      var w0 = screenToBallWorld(cx, cy);
+      ballDrag.history.push({ x: w0.x, y: w0.y, t: performance.now() });
+      cartBouncyBall.vel.set(0, 0, 0);
+      cartBouncyBall.settled = false;
+      isDragging = true;
+      renderer.domElement.parentElement.classList.add('dragging');
+      return;
+    }
+  }
   pressedGlassMesh = null;
   if(navMenu.glassMesh){
     var pdGH = raycaster.intersectObject(navMenu.glassMesh);
@@ -3126,6 +3148,14 @@ function pDown(cx,cy){
 }
 
 function pMove(cx,cy){
+  if(ballDrag.active && cartBouncyBall){
+    var w = screenToBallWorld(cx, cy);
+    cartBouncyBall.pos.x = w.x;
+    cartBouncyBall.pos.y = w.y;
+    ballDrag.history.push({ x: w.x, y: w.y, t: performance.now() });
+    if(ballDrag.history.length > 6) ballDrag.history.shift();
+    return;
+  }
   if(cartDrag.active){updateCartDrag(cx,cy);return;}
   // PDV scroll drag
   if(pdv.dragging && pdv.active){
@@ -3246,6 +3276,23 @@ function updateCursor(cx,cy){
 
 function pUp(cx,cy){
   pressedGlassMesh = null;
+  // Release ball drag with throw velocity from recent motion history
+  if(ballDrag.active && cartBouncyBall){
+    ballDrag.active = false;
+    isDragging = false;
+    renderer.domElement.parentElement.classList.remove('dragging');
+    var hist = ballDrag.history;
+    if(hist.length >= 2){
+      var last = hist[hist.length - 1];
+      var oldest = hist[0];
+      var dts = (last.t - oldest.t) / 1000;
+      if(dts > 0.005){
+        cartBouncyBall.vel.x = (last.x - oldest.x) / dts;
+        cartBouncyBall.vel.y = (last.y - oldest.y) / dts;
+      }
+    }
+    return;
+  }
   if(cartDrag.active){endCartDrag();isDragging=false;renderer.domElement.parentElement.classList.remove('dragging');return;}
   // End PDV scroll drag
   if(pdv.dragging){ pdv.dragging=false; }
@@ -6781,6 +6828,12 @@ function updateCartImpact(dt) {
 // ══════════════════════════════════════════════
 var cartPanelFall = { y_offset: 0, vel_y: 0, hasHit: false, openTime: 0 };
 var cartShake = { amount: 0 };
+var cartDegradation = 0; // 0..1 cumulative damage
+var CART_BREAK_THRESHOLD = 0.6;
+var cartBouncyBall = null; // {mesh, pos, vel} when broken
+var cartBroken = false;
+var deviceTilt = { x: 0, y: 0, ready: false }; // device orientation gravity offsets
+var ballDrag = { active: false, history: [] };
 
 function updateCartPanelFall(dt) {
   // Reset when the panel is closed (or closing)
@@ -6830,7 +6883,17 @@ function updateCartPanelFall(dt) {
     cartPanelFall.y_offset = groundDist;
     cartPanelFall.hasHit = true;
     // Big shake on impact — heavier panel = harder slam = more shake (capped)
-    cartShake.amount = Math.min(0.08 + cartPanelFall.vel_y * 0.08, 0.45);
+    var impactForce = cartPanelFall.vel_y;
+    cartShake.amount = Math.min(0.08 + impactForce * 0.08, 0.45);
+    // Accumulate degradation — heavier slam = more cracks added
+    if(!cartBroken){
+      var dmg = Math.max(0.22, Math.min(impactForce * 0.20, 0.5));
+      cartDegradation += dmg;
+      if(cartDegradation >= CART_BREAK_THRESHOLD){
+        cartDegradation = CART_BREAK_THRESHOLD;
+        breakCartPanel(impactForce);
+      }
+    }
   }
 }
 
@@ -6844,6 +6907,163 @@ function updateCartShake(dt) {
   } else {
     cartShake.amount = 0;
   }
+}
+
+// Update cart glass shader's degradation uniform every frame (lerp toward target)
+function updateCartDegradation(dt) {
+  if(!cart.glassMesh) return;
+  if(cart.glassMesh.material.uniforms.degradation){
+    cart.glassMesh.material.uniforms.degradation.value = Math.min(cartDegradation, CART_BREAK_THRESHOLD);
+  }
+}
+
+// Break the cart panel apart: hide it, spawn a bouncy ball at last position
+function breakCartPanel(impactForce){
+  if(cartBroken) return;
+  cartBroken = true;
+  // Big shake on break
+  cartShake.amount = 0.55;
+  // Get cart panel world position to spawn ball there
+  var bp = new THREE.Vector3();
+  if(cart.iconGroup) cart.iconGroup.getWorldPosition(bp);
+  else bp.copy(camera.position);
+  // Initial velocity: launched upward with sideways spread + impact-driven
+  var iv = Math.min(impactForce * 0.3, 4.5);
+  var ballMat = createGlassBallMaterial();
+  var ballGeo = new THREE.SphereGeometry(0.35, 24, 16);
+  var ball = new THREE.Mesh(ballGeo, ballMat);
+  ball.position.copy(bp);
+  ball.renderOrder = 60;
+  scene.add(ball);
+  cartBouncyBall = {
+    mesh: ball,
+    pos: bp.clone(),
+    vel: new THREE.Vector3((Math.random()-0.5)*1.6, iv, 0),
+    radius: 0.35,
+    bounceDamp: 0.78,
+    minSpeed: 0.05,
+    settled: false
+  };
+  // Hide cart UI elements
+  if(cart.iconGroup) cart.iconGroup.visible = false;
+  if(cart.panelGroup) cart.panelGroup.visible = false;
+  for(var oi=0;oi<cartOverlays.length;oi++) cartOverlays[oi].group.visible = false;
+}
+
+// ── Device orientation tracking — phone tilt becomes ball gravity ──
+function setupDeviceOrientation(){
+  function attach(){
+    window.addEventListener('devicemotion', function(e){
+      var acc = e.accelerationIncludingGravity;
+      if(!acc) return;
+      // Map device acceleration to screen-space gravity
+      // Phone held upright (portrait): gravity ~= (0, -9.8, 0). Tilt right → x positive.
+      // We want: tilt right → ball rolls right (positive x-vel)
+      deviceTilt.x = (acc.x || 0);
+      // For Y: when phone is held upright, acc.y is around -9.8 (pointing toward bottom of phone)
+      // We want negative Y (gravity down) baseline. Use acc.y directly.
+      deviceTilt.y = (acc.y || 0);
+      deviceTilt.ready = true;
+    });
+  }
+  // iOS 13+ requires explicit user-gesture permission
+  if(typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+    var grant = function(){
+      DeviceMotionEvent.requestPermission().then(function(s){
+        if(s === 'granted') attach();
+      }).catch(function(){});
+      window.removeEventListener('touchstart', grant);
+      window.removeEventListener('mousedown', grant);
+    };
+    window.addEventListener('touchstart', grant, { once: true });
+    window.addEventListener('mousedown', grant, { once: true });
+  } else if(typeof DeviceMotionEvent !== 'undefined'){
+    attach();
+  }
+}
+
+function updateCartBouncyBall(dt){
+  var b = cartBouncyBall;
+  if(!b) return;
+  // Refresh shader uniforms
+  if(b.mesh.material.uniforms.res) b.mesh.material.uniforms.res.value.set(window.innerWidth, window.innerHeight);
+  if(b.mesh.material.uniforms.tBg && glassFBO) b.mesh.material.uniforms.tBg.value = glassFBO.texture;
+  if(b.mesh.material.uniforms.time) b.mesh.material.uniforms.time.value = performance.now()*0.001;
+
+  // Compute screen bounds in world coords (camera-aligned)
+  var dist = 4.5;
+  var fovRad = camera.fov*Math.PI/180;
+  var halfH = Math.tan(fovRad/2)*dist;
+  var halfW = halfH*camera.aspect;
+  var margin = 0.20;
+  var leftBound  = camera.position.x - halfW + margin + b.radius;
+  var rightBound = camera.position.x + halfW - margin - b.radius;
+  var botBound   = camera.position.y - halfH + margin + b.radius;
+  var topBound   = camera.position.y + halfH - margin - b.radius;
+
+  if(ballDrag.active){
+    // Don't apply physics while user is dragging — position is set by drag handler
+    // Position update (camera-relative)
+    var camLocalD = new THREE.Vector3(b.pos.x - camera.position.x, b.pos.y - camera.position.y, -dist);
+    camLocalD.applyQuaternion(camera.quaternion);
+    b.mesh.position.copy(camera.position).add(camLocalD);
+    b.mesh.quaternion.copy(camera.quaternion);
+    return;
+  }
+
+  // Gravity — phone tilt influences direction if available, else default down
+  var gx, gy;
+  if(deviceTilt.ready){
+    // Tilt-driven gravity: phone tilted left → ball rolls left, etc.
+    gx = -deviceTilt.x * 1.4;       // accel.x positive when tilted right; flip so ball rolls right when tilted right
+    gy = deviceTilt.y * 1.4 - 1.5;  // include downward bias even when flat
+  } else {
+    gx = 0;
+    gy = -9.0;
+  }
+  b.vel.x += gx * dt;
+  b.vel.y += gy * dt;
+
+  // Integrate position
+  b.pos.x += b.vel.x * dt;
+  b.pos.y += b.vel.y * dt;
+  // Air drag
+  b.vel.x *= 0.995;
+  b.vel.y *= 0.998;
+  // Bounces
+  if(b.pos.x < leftBound){ b.pos.x = leftBound; b.vel.x = -b.vel.x * b.bounceDamp; }
+  else if(b.pos.x > rightBound){ b.pos.x = rightBound; b.vel.x = -b.vel.x * b.bounceDamp; }
+  if(b.pos.y < botBound){
+    b.pos.y = botBound;
+    b.vel.y = -b.vel.y * b.bounceDamp;
+    b.vel.x *= 0.92;
+    if(Math.abs(b.vel.y) < 0.4 && Math.abs(b.vel.x) < 0.04 && !deviceTilt.ready){
+      b.vel.set(0,0,0);
+      b.settled = true;
+    }
+  } else if(b.pos.y > topBound){
+    b.pos.y = topBound;
+    b.vel.y = -b.vel.y * b.bounceDamp;
+  }
+  // Place at proper Z in front of camera
+  var camLocal = new THREE.Vector3(b.pos.x - camera.position.x, b.pos.y - camera.position.y, -dist);
+  camLocal.applyQuaternion(camera.quaternion);
+  b.mesh.position.copy(camera.position).add(camLocal);
+  b.mesh.quaternion.copy(camera.quaternion);
+}
+
+// Convert screen pixel coords to world coords at the ball's depth
+function screenToBallWorld(cx, cy){
+  var dist = 4.5;
+  var fovRad = camera.fov*Math.PI/180;
+  var halfH = Math.tan(fovRad/2)*dist;
+  var halfW = halfH*camera.aspect;
+  var nx = (cx / window.innerWidth) * 2 - 1;
+  var ny = -((cy / window.innerHeight) * 2 - 1);
+  return {
+    x: camera.position.x + nx * halfW,
+    y: camera.position.y + ny * halfH
+  };
 }
 
 function removeFromCart(idx) {
@@ -7004,7 +7224,8 @@ function createCartIcon() {
       morphT:{value:0}, cR:{value:CART_CR}, rW:{value:CART_RW}, rH:{value:CART_RH}, time:{value:0},
       tScratch:{value:cartScratchTex},
       tFrost:{value:generateFrostTexture()},
-      blurAmt:{value:2.925} // pixel-radius for the glass blur (0.65× of 4.5)
+      blurAmt:{value:2.925}, // pixel-radius for the glass blur (0.65× of 4.5)
+      degradation:{value:0.0} // 0..1 — cracks rise from bottom as cart absorbs impact
     },
     vertexShader: [
       'varying vec3 vN,vV,vLP;',
@@ -7021,12 +7242,64 @@ function createCartIcon() {
     fragmentShader: [
       'uniform sampler2D tBg,tScratch,tFrost;',
       'uniform vec2 res;',
-      'uniform float morphT,cR,rW,rH,time,blurAmt;',
+      'uniform float morphT,cR,rW,rH,time,blurAmt,degradation;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
       GLARE_GLSL_FUNCS,
       'float sdCircle(vec2 p,float r){return length(p)-r;}',
       'float sdRRect(vec2 p,vec2 b,float r){vec2 d2=abs(p)-b+r;return length(max(d2,0.0))+min(max(d2.x,d2.y),0.0)-r;}',
+      // Procedural crack pattern — cracks emanate from the bottom edge.
+      // Cracks taper from thick at the base to a point at the tip, with sub-branches.
+      'float crackLine(vec2 uv, vec2 origin, float angle, float crackLen){',
+      '  vec2 d = uv - origin;',
+      '  float c = cos(angle), s = sin(angle);',
+      '  float along  = c * d.x + s * d.y;',
+      '  float across = abs(-s * d.x + c * d.y);',
+      '  if(along < 0.0 || along > crackLen) return 0.0;',
+      '  // Wobble — gives the line organic, jagged shape',
+      '  float wob = sin(along * 32.0) * 0.014 + cos(along * 67.0) * 0.007 + sin(along * 113.0) * 0.003;',
+      '  // Taper: thick near base, sharp point at tip',
+      '  float t = along / crackLen;',
+      '  float taper = 1.0 - t;',
+      '  float thickness = 0.026 * (0.35 + 0.65 * taper);',
+      '  return smoothstep(thickness, 0.0, across + wob) * taper;',
+      '}',
+      'float crackPattern(vec2 uv, float deg){',
+      '  if(deg <= 0.0) return 0.0;',
+      '  float maxLen = deg * 1.4;',
+      '  float total = 0.0;',
+      '  // Main cracks — all emanate from the bottom edge (vUv.y = 0)',
+      '  total = max(total, crackLine(uv, vec2(0.13, 0.0), 1.45, maxLen * 0.95));',
+      '  total = max(total, crackLine(uv, vec2(0.24, 0.0), 1.30, maxLen * 0.70));',
+      '  total = max(total, crackLine(uv, vec2(0.36, 0.0), 1.85, maxLen * 0.85));',
+      '  total = max(total, crackLine(uv, vec2(0.48, 0.0), 1.55, maxLen * 1.00));',
+      '  total = max(total, crackLine(uv, vec2(0.60, 0.0), 1.40, maxLen * 0.80));',
+      '  total = max(total, crackLine(uv, vec2(0.71, 0.0), 1.70, maxLen * 0.65));',
+      '  total = max(total, crackLine(uv, vec2(0.82, 0.0), 1.20, maxLen * 0.78));',
+      '  total = max(total, crackLine(uv, vec2(0.91, 0.0), 1.65, maxLen * 0.55));',
+      '  // Sub-branches — shorter cracks branching off the main lines (when degradation > ~0.3)',
+      '  float branchLen = maxLen * 0.45;',
+      '  if(deg > 0.3){',
+      '    total = max(total, crackLine(uv, vec2(0.18, 0.08), 1.10, branchLen));',
+      '    total = max(total, crackLine(uv, vec2(0.32, 0.12), 2.05, branchLen));',
+      '    total = max(total, crackLine(uv, vec2(0.45, 0.16), 1.05, branchLen));',
+      '    total = max(total, crackLine(uv, vec2(0.58, 0.14), 2.00, branchLen));',
+      '    total = max(total, crackLine(uv, vec2(0.70, 0.10), 1.15, branchLen));',
+      '    total = max(total, crackLine(uv, vec2(0.82, 0.13), 2.10, branchLen));',
+      '  }',
+      '  return clamp(total, 0.0, 1.0);',
+      '}',
+      // Damage zone at the bottom — the area where cracks originate looks chipped/fractured
+      'float damageZone(vec2 uv, float deg){',
+      '  if(deg <= 0.0) return 0.0;',
+      '  float bandH = 0.03 + deg * 0.04;', // taller as degradation grows
+      '  float dist = uv.y;',
+      '  if(dist > bandH) return 0.0;',
+      '  // Jagged top edge of the damage band',
+      '  float jag = sin(uv.x * 47.0) * 0.008 + cos(uv.x * 91.0) * 0.005;',
+      '  float intensity = smoothstep(bandH + jag, 0.0, dist);',
+      '  return intensity * deg;',
+      '}',
       // 9-tap weighted blur (Gaussian-ish) — frosted-glass softening on top of refraction
       'vec3 blurredSample(vec2 uv){',
       '  vec2 b = blurAmt / res;',
@@ -7067,6 +7340,19 @@ function createCartIcon() {
       GLASS_TINT_GLSL,
       GLARE_GLSL_CALC,
       '  col+=glareResult;',
+      // Cracks — only meaningful in panel mode (morphT high)
+      '  float cracks = crackPattern(vUv, degradation) * morphT;',
+      '  // Damage zone at bottom — chipped, darkened band that grows with degradation',
+      '  float dmgZone = damageZone(vUv, degradation) * morphT;',
+      '  // Apply damage band — dark, fractured-looking',
+      '  col = mix(col, vec3(0.04, 0.06, 0.12), dmgZone * 0.85);',
+      '  col += vec3(0.85, 0.92, 1.0) * dmgZone * 0.35;',
+      '  // Dark crevasse inside the crack',
+      '  col = mix(col, vec3(0.01, 0.02, 0.06), cracks * 0.95);',
+      '  // Bright stress edge along the crack (catches simulated light)',
+      '  col += vec3(0.95, 0.97, 1.0) * cracks * 0.85;',
+      '  // Whole-panel darkens as degradation grows',
+      '  col *= mix(1.0, 0.82, degradation * morphT * 0.45);',
       '  gl_FragColor=vec4(col,alpha);',
       '}'
     ].join('\n'),
@@ -7619,13 +7905,54 @@ function startCartDrag(cx, cy) {
   cartDrag.active = true;
   cartDrag.startMouseX = cx;
   cartDrag.startMouseY = cy;
+  cartDrag.lastTouchY = cy;
   cartDrag.startOffsetX = cart.dragOffsetX || 0;
   cartDrag.startOffsetY = cart.dragOffsetY || 0;
+  cartDrag.mode = undefined;
+  // Determine whether the click landed inside the items scroll area (not the header/footer)
+  cartDrag.startedInItemsArea = false;
+  if(cart.panelOpen && cart.panelGroup){
+    mouse.x = (cx/window.innerWidth)*2-1;
+    mouse.y = -(cy/window.innerHeight)*2+1;
+    raycaster.setFromCamera(mouse, camera);
+    var clickHits = raycaster.intersectObjects(cart.panelGroup.children, true);
+    if(clickHits.length === 0 && cart.glassMesh) clickHits = raycaster.intersectObject(cart.glassMesh);
+    if(clickHits.length > 0){
+      var localPt = cart.panelGroup.worldToLocal(clickHits[0].point.clone());
+      if(localPt.y < (cart.itemsTopY || 999) && localPt.y > (cart.itemsBottomY || -999)){
+        cartDrag.startedInItemsArea = true;
+      }
+    }
+  }
 }
 
 function updateCartDrag(cx, cy) {
   if(!cartDrag.active) return;
-  // Convert pixel delta to normalized screen coords
+  // Lock drag mode on first sustained motion: if we're in scroll mode, stay in scroll mode;
+  // otherwise drag the panel. Default → panel drag (so a sunken panel can always be grabbed back up).
+  if(cartDrag.mode === undefined){
+    var tdx = Math.abs(cx - cartDrag.startMouseX);
+    var tdy = Math.abs(cy - cartDrag.startMouseY);
+    if(tdx + tdy < 8) {
+      // not enough motion yet to decide
+    } else if(cart.panelOpen && cart.itemsGroup && cart.itemsScrollMax > 0
+              && cartDrag.startedInItemsArea
+              && tdy > tdx * 2.5) {
+      cartDrag.mode = 'scroll';
+    } else {
+      cartDrag.mode = 'drag';
+    }
+  }
+  if(cartDrag.mode === 'scroll'){
+    var deltaPx = cy - cartDrag.lastTouchY;
+    cartDrag.lastTouchY = cy;
+    var fovRad = camera.fov*Math.PI/180;
+    var halfH = Math.tan(fovRad/2)*4.5;
+    var pxToWorld = halfH*2/window.innerHeight;
+    scrollCartItems(-deltaPx * pxToWorld);
+    return;
+  }
+  // Default: drag the whole panel
   var dx = (cx - cartDrag.startMouseX) / window.innerWidth;
   var dy = -(cy - cartDrag.startMouseY) / window.innerHeight;
   cart.dragOffsetX = cartDrag.startOffsetX + dx;
@@ -8380,8 +8707,28 @@ function init(){
       var halfH=Math.tan(fovRad/2)*4.0;
       var pxToWorld=halfH*2/window.innerHeight;
       pdv.scrollY -= e.deltaY * pxToWorld * 0.5;
+      return;
+    }
+    // Cart panel item-list scroll
+    if(cart.panelOpen && cart.itemsGroup && cart.itemsScrollMax > 0){
+      // Raycast to see if cursor is over the cart panel
+      var mx = (e.clientX/window.innerWidth)*2-1;
+      var my = -(e.clientY/window.innerHeight)*2+1;
+      raycaster.setFromCamera({x:mx,y:my}, camera);
+      var hit = false;
+      if(cart.glassMesh) hit = raycaster.intersectObject(cart.glassMesh).length > 0;
+      if(!hit && cart.panelGroup) hit = raycaster.intersectObjects(cart.panelGroup.children, true).length > 0;
+      if(hit){
+        e.preventDefault();
+        // Convert pixel delta to world units (panel is at distance 4.5)
+        var fovRad2 = camera.fov*Math.PI/180;
+        var halfH2 = Math.tan(fovRad2/2)*4.5;
+        var pxToWorld2 = halfH2*2/window.innerHeight;
+        scrollCartItems(e.deltaY * pxToWorld2 * 0.7);
+      }
     }
   },{passive:false});
+  setupDeviceOrientation();
   startIntro();animate();
 }
 
@@ -8889,14 +9236,15 @@ function animate(){
   // Update quick view panels to face camera
   if(dm.active && !dm.animating && !dm.closing) updateQuickViewPanels();
   
-  // Update cart fly animations + impact + panel weight
+  // Update cart fly animations + impact + panel weight + degradation
   if(cartFlyAnims.length > 0) updateCartFlyAnims(dt);
   updateCartImpact(dt);
   updateCartPanelFall(dt);
+  updateCartDegradation(dt);
+  if(cartBouncyBall) updateCartBouncyBall(dt);
 
   // Update cart
-  positionCartIcon();
-  positionCartPanel();
+  if(!cartBroken){ positionCartIcon(); positionCartPanel(); }
   positionNavMenu();
   updateOrbs(dt);
   // Cart shake AFTER updateOrbs so it doesn't get overwritten by orb stage shake
