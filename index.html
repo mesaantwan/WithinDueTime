@@ -7083,13 +7083,16 @@ function updateCartShards(dt){
 }
 
 // ── Device orientation tracking — phone tilt becomes ball gravity ──
-// Uses `deviceorientation` (beta/gamma in degrees) which is more standardized
-// than `devicemotion` and works consistently across iOS, Android, and Chrome.
-// Gated to touch devices only — desktop laptops with accelerometers (Surface,
-// 2-in-1s) report unreliable values that send the ball flying upward.
+// Gated by user-agent to actual phones/tablets. Touch-device gating wasn't
+// strict enough — laptops with touchscreens (Surface, 2-in-1s) passed it but
+// reported orientation in conventions that produce inverted gravity. Desktops
+// fall back to plain downward gravity, which is what you'd want there anyway.
 function setupDeviceOrientation(){
-  var isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
-  if(!isTouchDevice) return;
+  var ua = navigator.userAgent || '';
+  var isMobile = /Android|webOS|iPhone|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(ua)
+    || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1) // iPadOS 13+ reports as Mac
+    || /iPad|Tablet/i.test(ua);
+  if(!isMobile) return;
 
   function attach(){
     window.addEventListener('deviceorientation', function(e){
