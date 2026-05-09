@@ -3,7 +3,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>CHRISOLIN - 3D Storefront</title>
+<title>Chrysolin</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -310,18 +310,23 @@ var camMouseX = 0, camMouseY = 0;
 var camTiltX = 0, camTiltY = 0;
 var CAM_ORBIT_RADIUS_BASE = 13.0;
 var CAM_ORBIT_RADIUS = 13.0;
+var CAM_FOV_BASE = 75;
+var CAM_FOV = 75;
 var CAM_TILT_STRENGTH = 0.015;
 
 function updateCamRadius() {
   var aspect = window.innerWidth / window.innerHeight;
   if (aspect < 1.0) {
-    // Portrait: keep base distance
+    // Portrait: keep base distance + base FOV
     CAM_ORBIT_RADIUS = CAM_ORBIT_RADIUS_BASE + (1.0 / aspect - 1.0) * 3.0;
+    CAM_FOV = CAM_FOV_BASE;
   } else {
     // Landscape: 20% closer base, pull in more as it gets wider
     var landscapeBase = CAM_ORBIT_RADIUS_BASE * 0.8;
     var wideT = Math.min((aspect - 1.0) / 1.5, 1.0); // 0 at 1:1, 1 at 2.5:1
-    CAM_ORBIT_RADIUS = landscapeBase - wideT * 3.5;
+    // Move back ~50% (1.3 × 1.15) and zoom in ~19% (0.9 × 0.9 = 0.81) for desktop framing
+    CAM_ORBIT_RADIUS = (landscapeBase - wideT * 3.5) * 1.495;
+    CAM_FOV = CAM_FOV_BASE * 0.81;
   }
 }
 
@@ -2579,6 +2584,8 @@ function updateOrbs(dt){
     }
 
     fl.orbs.forEach(function(orb){
+      // Skip orbs that have been knocked loose — physics owns them now
+      if(orb.mesh.userData._fallen) return;
       var prevX = orb.mesh.position.x;
       var prevY = orb.mesh.position.y;
       var prevZ = orb.mesh.position.z;
@@ -3013,19 +3020,35 @@ function pDown(cx,cy){
   // Detect glass UI press for visual feedback
   mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
-  // Ball drag — top priority once cart is broken
-  if(cartBouncyBall && cartBouncyBall.mesh){
-    var ballHits = raycaster.intersectObject(cartBouncyBall.mesh);
+  // Ball drag — top priority once cart is broken (any of the spawned balls)
+  if(cartBouncyBalls.length > 0){
+    var ballMeshes = [];
+    for(var bI = 0; bI < cartBouncyBalls.length; bI++) ballMeshes.push(cartBouncyBalls[bI].mesh);
+    var ballHits = raycaster.intersectObjects(ballMeshes);
     if(ballHits.length > 0){
-      ballDrag.active = true;
-      ballDrag.history = [];
-      var w0 = screenToBallWorld(cx, cy);
-      ballDrag.history.push({ x: w0.x, y: w0.y, t: performance.now() });
-      cartBouncyBall.vel.set(0, 0, 0);
-      cartBouncyBall.settled = false;
-      isDragging = true;
-      renderer.domElement.parentElement.classList.add('dragging');
-      return;
+      var hitMesh = ballHits[0].object;
+      var hitBall = null;
+      for(var bJ = 0; bJ < cartBouncyBalls.length; bJ++){
+        if(cartBouncyBalls[bJ].mesh === hitMesh){ hitBall = cartBouncyBalls[bJ]; break; }
+      }
+      if(hitBall){
+        ballDrag.ball = hitBall;
+        ballDrag.active = true;
+        ballDrag.history = [];
+        var w0 = screenToBallWorld(cx, cy);
+        ballDrag.history.push({ x: w0.x, y: w0.y, t: performance.now() });
+        // Reset charge state — only octahedron ('crystal') balls actually charge
+        ballDrag.lastMoveT = performance.now();
+        ballDrag.lastMoveX = cx;
+        ballDrag.lastMoveY = cy;
+        ballDrag.chargeLevel = 0;
+        ballDrag.isCharging = false;
+        hitBall.vel.set(0, 0, 0);
+        hitBall.settled = false;
+        isDragging = true;
+        renderer.domElement.parentElement.classList.add('dragging');
+        return;
+      }
     }
   }
   pressedGlassMesh = null;
@@ -3148,10 +3171,22 @@ function pDown(cx,cy){
 }
 
 function pMove(cx,cy){
-  if(ballDrag.active && cartBouncyBall){
+  if(ballDrag.active && ballDrag.ball){
+    // Generous tolerance — only when cursor drifts >60px from the anchor
+    // do we count it as "moving" (partial drain, anchor follows). Small jitter
+    // and tiny adjustments are ignored so the user can hold loosely.
+    var dxM = cx - ballDrag.lastMoveX, dyM = cy - ballDrag.lastMoveY;
+    if(dxM*dxM + dyM*dyM > 3600){
+      ballDrag.lastMoveT = performance.now();
+      ballDrag.lastMoveX = cx;
+      ballDrag.lastMoveY = cy;
+      // Partial drain — keep some charge so users don't lose all progress
+      ballDrag.chargeLevel = Math.max(0, ballDrag.chargeLevel - 0.4);
+      ballDrag.isCharging = ballDrag.chargeLevel > 0.05;
+    }
     var w = screenToBallWorld(cx, cy);
-    cartBouncyBall.pos.x = w.x;
-    cartBouncyBall.pos.y = w.y;
+    ballDrag.ball.pos.x = w.x;
+    ballDrag.ball.pos.y = w.y;
     ballDrag.history.push({ x: w.x, y: w.y, t: performance.now() });
     if(ballDrag.history.length > 6) ballDrag.history.shift();
     return;
@@ -3276,19 +3311,29 @@ function updateCursor(cx,cy){
 
 function pUp(cx,cy){
   pressedGlassMesh = null;
-  // Release ball drag with throw velocity from recent motion history
-  if(ballDrag.active && cartBouncyBall){
+  // Release ball drag — either throw-into-scene (charged octahedron) or normal release
+  if(ballDrag.active && ballDrag.ball){
+    var heldBall = ballDrag.ball;
+    var releaseCharge = ballDrag.chargeLevel;
     ballDrag.active = false;
+    ballDrag.ball = null;
+    ballDrag.chargeLevel = 0;
+    ballDrag.isCharging = false;
     isDragging = false;
     renderer.domElement.parentElement.classList.remove('dragging');
-    var hist = ballDrag.history;
-    if(hist.length >= 2){
-      var last = hist[hist.length - 1];
-      var oldest = hist[0];
-      var dts = (last.t - oldest.t) / 1000;
-      if(dts > 0.005){
-        cartBouncyBall.vel.x = (last.x - oldest.x) / dts;
-        cartBouncyBall.vel.y = (last.y - oldest.y) / dts;
+    if(heldBall.type === 'octahedron' && releaseCharge > 0.2){
+      throwBallIntoScene(heldBall, releaseCharge);
+    } else {
+      // Normal release — apply throw velocity from recent motion history
+      var hist = ballDrag.history;
+      if(hist.length >= 2){
+        var last = hist[hist.length - 1];
+        var oldest = hist[0];
+        var dts = (last.t - oldest.t) / 1000;
+        if(dts > 0.005){
+          heldBall.vel.x = (last.x - oldest.x) / dts;
+          heldBall.vel.y = (last.y - oldest.y) / dts;
+        }
       }
     }
     return;
@@ -3406,6 +3451,18 @@ function pUp(cx,cy){
       }
     }
     
+    // Click on the product image enters the lightbox (only when DM display is fully open)
+    if(dm.active && !imgLightbox.active && !imgLightbox.entering && !imgLightbox.exiting
+        && displayAnim.backdrop && displayAnim.backdrop.userData.imgMesh){
+      var lbHits = raycaster.intersectObject(displayAnim.backdrop.userData.imgMesh);
+      if(lbHits.length > 0){
+        enterImgLightbox();
+        isDragging=false;selectedFloor=null;if(dm.draggingVW)dm.draggingVW=false;
+        renderer.domElement.parentElement.classList.remove('dragging');
+        return;
+      }
+    }
+
         // Check quick view button clicks (3 glass icons)
     if(dm.active && dm.dmButtons.length>0) {
       for(var dbi=0;dbi<dm.dmButtons.length;dbi++){
@@ -3418,7 +3475,11 @@ function pUp(cx,cy){
               addToCart(floorCfg.products[dm.selIdx]);
             }
           } else if(actionId==='close'){
-            exitDM();
+            if(imgLightbox.active || imgLightbox.entering){
+              exitImgLightbox();
+            } else {
+              exitDM();
+            }
           } else if(actionId==='expand'){
             // Right arrow: add to cart + immediately go to checkout
             var floorCfg2 = PRODUCT_DATA.floors[dm.floorIdx];
@@ -4539,6 +4600,137 @@ var displayAnim = {
   queuedSwitchIdx: -1
 };
 
+// ══════════════════════════════════════════════
+// IMAGE LIGHTBOX — fullscreen view of the product image, triggered by clicking
+// it while in display mode. The X button moves to top-right; the other two
+// buttons fly to the bottom (and become alt-image thumbnail slots in a follow-up).
+// ══════════════════════════════════════════════
+var imgLightbox = {
+  active: false, entering: false, exiting: false, prog: 0,
+  imgOrigPos: null, imgOrigScale: null,
+  shadowOrigPos: null, shadowOrigScale: null,
+  btnOrigPos: []
+};
+
+function enterImgLightbox(){
+  if(imgLightbox.active || imgLightbox.entering) return;
+  if(!dm.active || !displayAnim.backdrop || !displayAnim.backdrop.userData.imgMesh) return;
+  var imgMesh = displayAnim.backdrop.userData.imgMesh;
+  var shadowMesh = displayAnim.backdrop.userData.shadowMesh;
+  imgLightbox.imgOrigPos = imgMesh.position.clone();
+  imgLightbox.imgOrigScale = imgMesh.scale.clone();
+  if(shadowMesh){
+    imgLightbox.shadowOrigPos = shadowMesh.position.clone();
+    imgLightbox.shadowOrigScale = shadowMesh.scale.clone();
+  }
+  // Snapshot the buttons' current world positions; we'll lerp from these
+  // toward camera-relative lightbox anchors each frame.
+  imgLightbox.btnOrigPos = dm.starTemps.map(function(b){ return b.position.clone(); });
+  imgLightbox.entering = true;
+  imgLightbox.prog = 0;
+}
+
+function exitImgLightbox(){
+  if(!imgLightbox.active && !imgLightbox.entering) return;
+  if(imgLightbox.entering){ imgLightbox.entering = false; }
+  imgLightbox.exiting = true;
+}
+
+function animateImgLightbox(dt){
+  if(!imgLightbox.entering && !imgLightbox.exiting && !imgLightbox.active) return;
+
+  if(imgLightbox.entering){
+    imgLightbox.prog = Math.min(imgLightbox.prog + 0.04, 1);
+    if(imgLightbox.prog >= 1){
+      imgLightbox.entering = false;
+      imgLightbox.active = true;
+    }
+  } else if(imgLightbox.exiting){
+    imgLightbox.prog = Math.max(imgLightbox.prog - 0.04, 0);
+  }
+
+  var p = eIO(imgLightbox.prog);
+  if(!displayAnim.backdrop) return;
+  var imgMesh = displayAnim.backdrop.userData.imgMesh;
+  var shadowMesh = displayAnim.backdrop.userData.shadowMesh;
+  if(!imgMesh || !imgMesh.parent || !imgLightbox.imgOrigPos) return;
+
+  var dist = 3.5;
+  var fovRad = camera.fov * Math.PI / 180;
+  var halfH = Math.tan(fovRad / 2) * dist;
+  var halfW = halfH * camera.aspect;
+  var camFwd = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+  var camRight = new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);
+  var camUp = new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion);
+  var camCenter = camera.position.clone().add(camFwd.clone().multiplyScalar(dist));
+
+  // ── Image: lerp local position toward "centered in front of camera"
+  var plane = imgMesh.parent;
+  var localCenter = plane.worldToLocal(camCenter.clone());
+  imgMesh.position.lerpVectors(imgLightbox.imgOrigPos, localCenter, p);
+
+  // Scale up so image fills ~85% of viewport height (in world units)
+  var planeWorldScale = new THREE.Vector3();
+  plane.getWorldScale(planeWorldScale);
+  var targetWorldHeight = halfH * 1.7;
+  var imgBaseSize = PLANE_WIDTH * 0.95; // matches the geometry constructor
+  var targetLocalScale = targetWorldHeight / Math.max(planeWorldScale.y * imgBaseSize, 0.001);
+  var origLocalScale = imgLightbox.imgOrigScale.x;
+  var sFinal = origLocalScale + (targetLocalScale - origLocalScale) * p;
+  imgMesh.scale.set(sFinal, sFinal, 1);
+
+  if(shadowMesh && imgLightbox.shadowOrigPos){
+    shadowMesh.position.lerpVectors(imgLightbox.shadowOrigPos, localCenter, p);
+    shadowMesh.scale.set(sFinal * 1.05, sFinal * 1.05, 1);
+  }
+
+  // ── Buttons: lerp from snapshotted world positions to camera-relative anchors
+  if(dm.starTemps && dm.starTemps.length === 3 && imgLightbox.btnOrigPos.length === 3){
+    var btnDist = 3.8;
+    var bHalfH = Math.tan(fovRad/2) * btnDist;
+    var bHalfW = bHalfH * camera.aspect;
+    var bCamCenter = camera.position.clone().add(camFwd.clone().multiplyScalar(btnDist));
+    var bottomY = -bHalfH * 0.82;
+    var topY = bHalfH * 0.85;
+    var rightX = bHalfW * 0.85;
+    var targets = [
+      // 0 = add-to-cart → bottom-left thumbnail slot
+      bCamCenter.clone().add(camRight.clone().multiplyScalar(-1.1)).add(camUp.clone().multiplyScalar(bottomY)),
+      // 1 = close (X) → top-right corner
+      bCamCenter.clone().add(camRight.clone().multiplyScalar(rightX)).add(camUp.clone().multiplyScalar(topY)),
+      // 2 = expand → bottom-right thumbnail slot
+      bCamCenter.clone().add(camRight.clone().multiplyScalar(1.1)).add(camUp.clone().multiplyScalar(bottomY))
+    ];
+    for(var b = 0; b < 3; b++){
+      if(!dm.starTemps[b]) continue;
+      dm.starTemps[b].position.lerpVectors(imgLightbox.btnOrigPos[b], targets[b], p);
+    }
+  }
+
+  // Cleanup once the exit animation finishes
+  if(imgLightbox.exiting && imgLightbox.prog <= 0){
+    imgLightbox.exiting = false;
+    imgLightbox.active = false;
+    imgMesh.position.copy(imgLightbox.imgOrigPos);
+    imgMesh.scale.copy(imgLightbox.imgOrigScale);
+    if(shadowMesh && imgLightbox.shadowOrigPos){
+      shadowMesh.position.copy(imgLightbox.shadowOrigPos);
+      shadowMesh.scale.copy(imgLightbox.shadowOrigScale);
+    }
+    if(dm.starTemps){
+      for(var b2 = 0; b2 < 3; b2++){
+        if(!dm.starTemps[b2] || !imgLightbox.btnOrigPos[b2]) continue;
+        dm.starTemps[b2].position.copy(imgLightbox.btnOrigPos[b2]);
+      }
+    }
+    imgLightbox.imgOrigPos = null;
+    imgLightbox.imgOrigScale = null;
+    imgLightbox.shadowOrigPos = null;
+    imgLightbox.shadowOrigScale = null;
+    imgLightbox.btnOrigPos = [];
+  }
+}
+
 function startDisplayAnim() {
   if(!dm.displayTemp || !dm.displayTemp.plane) return;
   var mat = dm.displayTemp.plane.material;
@@ -4568,22 +4760,30 @@ function startDisplayAnim() {
     var bdGroup = new THREE.Group();
     bdGroup.renderOrder = 2;
 
+    // Stamp the canonical "fully grown backdrop" opacity (0.65) on each wall
+    // so cart fly-ins always restore to the same value regardless of mid-flight
+    // state — without this, rapid-fire adds capture the faded value and the
+    // backdrop ghosts out completely after a few clicks.
     // Top wall half — grows downward from top border inner edge
     var topWall = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), createBackdropBlurMaterial());
+    topWall.userData.restOpacity = 0.65;
     bdGroup.add(topWall);
 
     // Bottom wall half — grows upward from bottom border inner edge
     var botWall = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), createBackdropBlurMaterial());
+    botWall.userData.restOpacity = 0.65;
     bdGroup.add(botWall);
 
     // Top lip — horizontal shelf from top border edge going back
     var topLip = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), createBackdropBlurMaterial());
     topLip.rotation.x = Math.PI / 2;
+    topLip.userData.restOpacity = 0.65;
     bdGroup.add(topLip);
 
     // Bottom lip — horizontal shelf from bottom border edge going back
     var botLip = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), createBackdropBlurMaterial());
     botLip.rotation.x = -Math.PI / 2;
+    botLip.userData.restOpacity = 0.65;
     bdGroup.add(botLip);
 
     bdGroup.userData = { topWall: topWall, botWall: botWall, topLip: topLip, botLip: botLip };
@@ -4610,6 +4810,10 @@ function startDisplayAnim() {
       shadowMesh.renderOrder = 50; // above backdrop walls, below the image
       // Position slightly behind the image with a subtle drop offset
       shadowMesh.position.set(0.06, -0.08, fz - 0.12);
+      // Stamp canonical rest pose so cart fly-ins always restore to the same
+      // values regardless of what state the image is in when a new add starts.
+      shadowMesh.userData.restZ = fz - 0.12;
+      shadowMesh.userData.restOpacity = 1.0;
       dm.displayTemp.plane.add(shadowMesh);
 
       // Product image plane (floats in front at same Z as borders)
@@ -4618,6 +4822,8 @@ function startDisplayAnim() {
       var imgMesh = new THREE.Mesh(imgGeo, imgMat);
       imgMesh.renderOrder = 100; // very high to guarantee drawing on top
       imgMesh.position.set(0, 0, fz + 0.005); // just in front of borders, same plane visually
+      imgMesh.userData.restZ = fz + 0.005;
+      imgMesh.userData.restOpacity = 1.0;
       dm.displayTemp.plane.add(imgMesh);
 
       bdGroup.userData.imgMesh = imgMesh;
@@ -5670,7 +5876,7 @@ function positionNavMenu(){
   }
 
   navMenu.glassMesh.material.uniforms.time.value=time;
-  navMenu.glassMesh.material.uniforms.res.value.set(window.innerWidth,window.innerHeight);
+  navMenu.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
 }
 
 // ══════════════════════════════════════════════
@@ -6612,14 +6818,26 @@ function triggerCartFlyAnim() {
   var ctrl = srcWP.clone().lerp(endPos, 0.5);
   ctrl.y += Math.abs(endPos.y - srcWP.y) * 0.4 + 1.5; // arc up
 
-  // Capture refs to image, shadow, and backdrop walls for slam + fuse animation
+  // Capture refs to image, shadow, and backdrop walls for slam + fuse animation.
+  // Use the canonical rest pose stamped at creation time — never the live
+  // position/opacity, which may be mid-animation if the user is rapid-firing
+  // adds. Without this, each fly-in would "restore" to the previous depressed
+  // state, drifting deeper every click until the image is invisible.
   var bdUd = sourceBackdrop.userData || {};
   var imgRef = bdUd.imgMesh || null;
   var shadowRef = bdUd.shadowMesh || null;
-  var imgStartZ = imgRef ? imgRef.position.z : 0;
-  var imgStartOpacity = (imgRef && imgRef.material && imgRef.material.uniforms && imgRef.material.uniforms.opacity) ? imgRef.material.uniforms.opacity.value : 1.0;
-  var shadowStartOpacity = (shadowRef && shadowRef.material && shadowRef.material.uniforms && shadowRef.material.uniforms.opacity) ? shadowRef.material.uniforms.opacity.value : 1.0;
-  var wallStartOpacity = (bdUd.topWall && bdUd.topWall.material.uniforms.opacity) ? bdUd.topWall.material.uniforms.opacity.value : 0.65;
+  var imgStartZ = imgRef
+    ? (imgRef.userData.restZ !== undefined ? imgRef.userData.restZ : imgRef.position.z)
+    : 0;
+  var imgStartOpacity = imgRef
+    ? (imgRef.userData.restOpacity !== undefined ? imgRef.userData.restOpacity : 1.0)
+    : 1.0;
+  var shadowStartOpacity = shadowRef
+    ? (shadowRef.userData.restOpacity !== undefined ? shadowRef.userData.restOpacity : 1.0)
+    : 1.0;
+  var wallStartOpacity = (bdUd.topWall && bdUd.topWall.userData.restOpacity !== undefined)
+    ? bdUd.topWall.userData.restOpacity
+    : 0.65;
   // Backdrop wall depth in panel local space (matches startDisplayAnim setup)
   var slamTargetZ = imgStartZ - 0.36;
 
@@ -6653,7 +6871,7 @@ function updateCartFlyAnims(dt) {
   for(var i = cartFlyAnims.length - 1; i >= 0; i--) {
     var a = cartFlyAnims[i];
     // Refresh uniforms
-    if(a.ball.material.uniforms.res) a.ball.material.uniforms.res.value.set(window.innerWidth, window.innerHeight);
+    if(a.ball.material.uniforms.res) a.ball.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(), window.innerHeight*renderer.getPixelRatio());
     if(a.ball.material.uniforms.tBg && glassFBO) a.ball.material.uniforms.tBg.value = glassFBO.texture;
     if(a.ball.material.uniforms.time) a.ball.material.uniforms.time.value = nowT;
     a.prog += dt / a.duration;
@@ -6830,10 +7048,26 @@ var cartPanelFall = { y_offset: 0, vel_y: 0, hasHit: false, openTime: 0 };
 var cartShake = { amount: 0 };
 var cartDegradation = 0; // 0..1 cumulative damage
 var CART_BREAK_THRESHOLD = 0.6;
-var cartBouncyBall = null; // {mesh, pos, vel} when broken
+var cartBouncyBalls = []; // array of {mesh, pos, vel, radius, angVel, type, thrown, ...}
 var cartBroken = false;
+var cartRespawnTimer = null; // pending setTimeout id while waiting to respawn the cart
+var cartBreakCount = 0; // 1st break = octahedron, 2nd = glass, alternating
 var deviceTilt = { beta: 0, gamma: 0, ready: false }; // device orientation in degrees
-var ballDrag = { active: false, history: [] };
+// Drag state — adds charge tracking for the throw mechanic on octahedron balls
+var ballDrag = {
+  active: false, history: [], ball: null,
+  lastMoveT: 0, lastMoveX: 0, lastMoveY: 0,
+  chargeLevel: 0, isCharging: false
+};
+// Lazy scene-collision registry — built on first throw so non-thrown balls
+// don't pay any per-frame collision cost against the rest of the scene.
+var sceneHittables = [];
+var sceneHittablesBuilt = false;
+// Objects knocked loose by a thrown ball — fall under gravity, settle near the
+// bottom, then dissolve and respawn at their original parent slot after 30s.
+var fallenObjects = [];
+var FALLEN_DURATION_MS = 30000;  // 30s before respawn
+var FALLEN_DISSOLVE_MS = 1500;   // last 1.5s fades opacity to 0
 
 function updateCartPanelFall(dt) {
   // Reset when the panel is closed (or closing)
@@ -6917,40 +7151,411 @@ function updateCartDegradation(dt) {
   }
 }
 
-// Break the cart panel apart: hide it, spawn a bouncy ball at last position
+// Break the cart panel apart: hide it, spawn a bouncy "center-star" ball, then
+// respawn an empty cart icon so the user can repeat the process and accumulate
+// multiple balls bouncing around the screen.
 function breakCartPanel(impactForce){
   if(cartBroken) return;
   cartBroken = true;
   // Big shake on break
   cartShake.amount = 0.55;
-  // Get cart panel world position to spawn ball there
+  // Get cart panel world position + orientation to spawn from there
   var bp = new THREE.Vector3();
   var bq = new THREE.Quaternion();
   if(cart.iconGroup){ cart.iconGroup.getWorldPosition(bp); cart.iconGroup.getWorldQuaternion(bq); }
   else { bp.copy(camera.position); bq.copy(camera.quaternion); }
   // Spawn glass shards bursting outward from the panel
   spawnCartShards(bp, bq, impactForce);
-  // Initial velocity: launched upward with sideways spread + impact-driven
+  // Alternate spawn type by break-count: 1st = octahedron (crystal), 2nd = glass, repeat.
+  cartBreakCount++;
   var iv = Math.min(impactForce * 0.3, 4.5);
-  var ballMat = createGlassBallMaterial();
-  var ballGeo = new THREE.SphereGeometry(0.35, 24, 16);
-  var ball = new THREE.Mesh(ballGeo, ballMat);
-  ball.position.copy(bp);
-  ball.renderOrder = 60;
-  scene.add(ball);
-  cartBouncyBall = {
-    mesh: ball,
-    pos: bp.clone(),
-    vel: new THREE.Vector3((Math.random()-0.5)*1.6, iv, 0),
-    radius: 0.35,
-    bounceDamp: 0.78,
-    minSpeed: 0.05,
-    settled: false
-  };
-  // Hide cart UI elements
+  var spawnType = (cartBreakCount % 2 === 1) ? 'octahedron' : 'glass';
+  spawnCartBouncyBall(spawnType, bp, new THREE.Vector3((Math.random()-0.5)*1.6, iv, 0));
+
+  // Hide cart UI during the brief shatter window
   if(cart.iconGroup) cart.iconGroup.visible = false;
   if(cart.panelGroup) cart.panelGroup.visible = false;
   for(var oi=0;oi<cartOverlays.length;oi++) cartOverlays[oi].group.visible = false;
+
+  // Respawn an empty cart icon shortly after the shatter so the player can
+  // load it up and break it again. The existing balls stay in play.
+  if(cartRespawnTimer) clearTimeout(cartRespawnTimer);
+  cartRespawnTimer = setTimeout(function(){
+    cartRespawnTimer = null;
+    cartBroken = false;
+    cartDegradation = 0;
+    cart.items = [];
+    cart.panelOpen = false;
+    cart.panelTargetState = false;
+    cart.panelAnimating = false;
+    cartMorphT = 0;
+    cartTargetT = 0;
+    cartPanelFall.y_offset = 0;
+    cartPanelFall.vel_y = 0;
+    cartPanelFall.hasHit = false;
+    cartPanelFall.openTime = 0;
+    cart.dragOffsetX = 0.3;
+    cart.dragOffsetY = 0;
+    if(cart.panelGroup){ scene.remove(cart.panelGroup); cart.panelGroup = null; }
+    for(var ri = 0; ri < cartOverlays.length; ri++) scene.remove(cartOverlays[ri].group);
+    cartOverlays = [];
+    if(cart.iconOverlay) cart.iconOverlay.visible = true;
+    cartPhysics.initialized = false; // snap icon back to its corner instead of lerping in
+    updateCartIcon();
+  }, 550);
+}
+
+// Spawn a single bouncy ball of the given type ('glass' = refractive sphere,
+// 'octahedron' = metallic flat-shaded center-star). Both share the same physics
+// shape (sphere) — only the visual differs.
+function spawnCartBouncyBall(type, originPos, initVel){
+  var ballRadius = type === 'octahedron' ? 0.45 : 0.40;
+  var geo, mat;
+  if(type === 'octahedron'){
+    geo = new THREE.OctahedronGeometry(ballRadius, 1);
+    mat = new THREE.MeshStandardMaterial({
+      color: 0x9a9aa2,
+      metalness: 1,
+      roughness: 0.03,
+      envMap: cubeRenderTarget ? cubeRenderTarget.texture : null,
+      envMapIntensity: 1.8,
+      flatShading: true
+    });
+  } else {
+    geo = new THREE.SphereGeometry(ballRadius, 24, 16);
+    mat = createGlassBallMaterial();
+  }
+  var mesh = new THREE.Mesh(geo, mat);
+  mesh.position.copy(originPos);
+  mesh.renderOrder = type === 'octahedron' ? 5 : 60;
+  scene.add(mesh);
+  cartBouncyBalls.push({
+    mesh: mesh,
+    type: type,
+    pos: originPos.clone(),
+    vel: initVel.clone(),
+    radius: ballRadius,
+    bounceDamp: 0.82,
+    minSpeed: 0.05,
+    settled: false,
+    angVel: new THREE.Vector3(
+      (Math.random()-0.5)*5,
+      (Math.random()-0.5)*5,
+      (Math.random()-0.5)*5
+    )
+  });
+}
+
+// Build the lazy hittable registry — done on first throw so non-thrown balls
+// pay zero collision cost. Only includes the big visible scene objects (panels,
+// orbs, planets, center stars) — UI / cart / shards are excluded.
+function ensureSceneHittables(){
+  if(sceneHittablesBuilt) return;
+  sceneHittables = [];
+  // Floor panels (clothing/product wheels)
+  for(var fi = 0; fi < floors.length; fi++){
+    var fl = floors[fi];
+    if(fl.panels){
+      for(var pi = 0; pi < fl.panels.length; pi++){
+        // Tag panels as fallable — getting hit detaches them from the wheel
+        fl.panels[pi].mesh.userData._fallType = 'panel';
+        sceneHittables.push({mesh: fl.panels[pi].mesh, radius: PLANE_WIDTH * 0.55});
+      }
+    }
+    if(fl.orbs){
+      for(var oi = 0; oi < fl.orbs.length; oi++){
+        fl.orbs[oi].mesh.userData._fallType = 'orb';
+        sceneHittables.push({mesh: fl.orbs[oi].mesh, radius: 0.45});
+      }
+    }
+    if(fl.group && fl.group.userData.centerStar){
+      sceneHittables.push({mesh: fl.group.userData.centerStar, radius: 1.0});
+    }
+  }
+  // Background planets
+  for(var pli = 0; pli < planets.length; pli++){
+    if(planets[pli].alive && planets[pli].mesh){
+      sceneHittables.push({mesh: planets[pli].mesh, radius: planets[pli].radius * 1.15});
+    }
+  }
+  sceneHittablesBuilt = true;
+}
+
+// Convert an octahedron from screen-space drag to a real 3D projectile flying
+// into the scene along the camera's forward vector. Charge level scales speed.
+function throwBallIntoScene(ball, charge){
+  var wp = new THREE.Vector3();
+  ball.mesh.getWorldPosition(wp);
+  ball.pos.copy(wp);
+  var fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  var speed = 6 + charge * 28;
+  ball.vel.copy(fwd).multiplyScalar(speed);
+  ball.vel.y += 1.5; // small upward arc on launch
+  ball.thrown = true;
+  ball.spinMult = 1 + charge * 6; // permanent spin boost imparted on launch
+  ensureSceneHittables();
+}
+
+// Per-frame physics + collisions for a thrown ball in true 3D world space.
+function updateThrownBall(b, dt){
+  // 3D gravity + integrate + drag
+  b.vel.y -= 9.0 * dt;
+  b.pos.x += b.vel.x * dt;
+  b.pos.y += b.vel.y * dt;
+  b.pos.z += b.vel.z * dt;
+  b.vel.multiplyScalar(0.996);
+  // Spin (3D)
+  var sm = b.spinMult || 1;
+  b.mesh.rotation.x += b.angVel.x * dt * sm;
+  b.mesh.rotation.y += b.angVel.y * dt * sm;
+  b.mesh.rotation.z += b.angVel.z * dt * sm;
+
+  // Sphere-vs-sphere collision against scene hittables
+  var hp = new THREE.Vector3();
+  for(var hi = 0; hi < sceneHittables.length; hi++){
+    var h = sceneHittables[hi];
+    if(!h.mesh.parent) continue; // mesh was removed (e.g. exploded planet)
+    if(h.mesh.userData._fallen) continue; // already knocked loose, skip until respawn
+    h.mesh.getWorldPosition(hp);
+    var dx = b.pos.x - hp.x;
+    var dy = b.pos.y - hp.y;
+    var dz = b.pos.z - hp.z;
+    var dSq = dx*dx + dy*dy + dz*dz;
+    var minD = h.radius + b.radius;
+    if(dSq < minD*minD && dSq > 0.0001){
+      var d = Math.sqrt(dSq);
+      var nx = dx/d, ny = dy/d, nz = dz/d;
+      var overlap = minD - d;
+      b.pos.x += nx*overlap; b.pos.y += ny*overlap; b.pos.z += nz*overlap;
+      var vn = b.vel.x*nx + b.vel.y*ny + b.vel.z*nz;
+      if(vn < 0){
+        var imp = (1 + 0.65) * vn;
+        b.vel.x -= imp * nx;
+        b.vel.y -= imp * ny;
+        b.vel.z -= imp * nz;
+      }
+      reactToBallHit(h.mesh, b.vel);
+    }
+  }
+
+  // Despawn if it has flown too far away from the camera
+  if(b.pos.distanceToSquared(camera.position) > 12000){
+    scene.remove(b.mesh);
+    if(b.mesh.geometry) b.mesh.geometry.dispose();
+    if(b.mesh.material) b.mesh.material.dispose();
+    var idx = cartBouncyBalls.indexOf(b);
+    if(idx >= 0) cartBouncyBalls.splice(idx, 1);
+    return;
+  }
+
+  b.mesh.position.copy(b.pos);
+}
+
+// On-hit reaction — fallable types (panels, orbs) get knocked loose and become
+// physics objects; everything else just does the brief scale-pulse jiggle.
+function reactToBallHit(mesh, ballVel){
+  if(mesh.userData._fallType && !mesh.userData._fallen){
+    detachAsFallen(mesh, ballVel);
+    return;
+  }
+  if(!mesh.userData._hitJiggle){
+    mesh.userData._hitJiggle = {
+      amount: 0,
+      baseScale: mesh.scale.clone(),
+      phase: Math.random() * Math.PI
+    };
+  }
+  mesh.userData._hitJiggle.amount = 1.0;
+}
+
+// Knock a panel/orb loose: snapshot its world transform + parent + opacity,
+// reparent to scene root so it can move freely, also detach its sibling edge
+// outline so the two move as one. Stays detached until updateFallenObjects
+// dissolves and respawns it.
+function detachAsFallen(mesh, ballVel){
+  var origParent = mesh.parent;
+  if(!origParent || origParent === scene) return;
+
+  // World transform (for the "fall starts here" pose)
+  var wp = new THREE.Vector3(), wq = new THREE.Quaternion(), ws = new THREE.Vector3();
+  mesh.getWorldPosition(wp);
+  mesh.getWorldQuaternion(wq);
+  mesh.getWorldScale(ws);
+
+  // Local transform (for restoration to original wheel slot)
+  var localPos = mesh.position.clone();
+  var localQuat = mesh.quaternion.clone();
+  var localScale = mesh.scale.clone();
+
+  var origOpacity = (mesh.material && mesh.material.opacity !== undefined) ? mesh.material.opacity : 1;
+  var origTransparent = !!(mesh.material && mesh.material.transparent);
+
+  origParent.remove(mesh);
+  scene.add(mesh);
+  mesh.position.copy(wp);
+  mesh.quaternion.copy(wq);
+  mesh.scale.copy(ws);
+  mesh.userData._fallen = true;
+
+  // Find the matching edge (panels and orbs both have outline lines) and detach it too
+  var edgeData = null;
+  function _detachEdge(edge){
+    if(!edge || !edge.parent || edge.parent === scene) return null;
+    var ewp = new THREE.Vector3(), ewq = new THREE.Quaternion(), ews = new THREE.Vector3();
+    edge.getWorldPosition(ewp);
+    edge.getWorldQuaternion(ewq);
+    edge.getWorldScale(ews);
+    var ed = {
+      mesh: edge,
+      localPos: edge.position.clone(),
+      localQuat: edge.quaternion.clone(),
+      localScale: edge.scale.clone(),
+      origOpacity: edge.material ? edge.material.opacity : 1
+    };
+    edge.parent.remove(edge);
+    scene.add(edge);
+    edge.position.copy(ewp);
+    edge.quaternion.copy(ewq);
+    edge.scale.copy(ews);
+    edge.userData._fallen = true;
+    return ed;
+  }
+  if(mesh.userData._fallType === 'panel'){
+    for(var fi = 0; fi < floors.length && !edgeData; fi++){
+      var fl = floors[fi];
+      if(!fl.panels) continue;
+      for(var pi = 0; pi < fl.panels.length; pi++){
+        if(fl.panels[pi].mesh === mesh){ edgeData = _detachEdge(fl.panels[pi].edges); break; }
+      }
+    }
+  } else if(mesh.userData._fallType === 'orb'){
+    for(var fi2 = 0; fi2 < floors.length && !edgeData; fi2++){
+      var fl2 = floors[fi2];
+      if(!fl2.orbs) continue;
+      for(var oi = 0; oi < fl2.orbs.length; oi++){
+        if(fl2.orbs[oi].mesh === mesh){ edgeData = _detachEdge(fl2.orbs[oi].edges); break; }
+      }
+    }
+  }
+
+  // Initial impulse: a fraction of the ball's velocity + downward kick + tumble
+  var vel = new THREE.Vector3();
+  if(ballVel) vel.copy(ballVel).multiplyScalar(0.25);
+  vel.y -= 0.6;
+  var angVel = new THREE.Vector3(
+    (Math.random()-0.5)*4,
+    (Math.random()-0.5)*4,
+    (Math.random()-0.5)*4
+  );
+
+  // Ground line is just past the bottom of the camera view at hit time
+  var fovRad = camera.fov * Math.PI / 180;
+  var distF = 4.5;
+  var halfHF = Math.tan(fovRad/2) * distF;
+  var groundY = camera.position.y - halfHF * 1.05;
+
+  fallenObjects.push({
+    mesh: mesh, edge: edgeData,
+    vel: vel, angVel: angVel,
+    origParent: origParent,
+    localPos: localPos, localQuat: localQuat, localScale: localScale,
+    origOpacity: origOpacity, origTransparent: origTransparent,
+    hitTime: performance.now(),
+    groundY: groundY,
+    settled: false
+  });
+}
+
+// Per-frame fallen-object physics: gravity + ground bounce + spin + dissolve + respawn.
+function updateFallenObjects(dt){
+  if(fallenObjects.length === 0) return;
+  var nowMs = performance.now();
+  for(var i = fallenObjects.length - 1; i >= 0; i--){
+    var f = fallenObjects[i];
+    var elapsed = nowMs - f.hitTime;
+
+    if(!f.settled){
+      f.vel.y -= 9.0 * dt;
+      f.vel.multiplyScalar(0.997);
+      f.mesh.position.x += f.vel.x * dt;
+      f.mesh.position.y += f.vel.y * dt;
+      f.mesh.position.z += f.vel.z * dt;
+      f.mesh.rotation.x += f.angVel.x * dt;
+      f.mesh.rotation.y += f.angVel.y * dt;
+      f.mesh.rotation.z += f.angVel.z * dt;
+
+      if(f.mesh.position.y < f.groundY){
+        f.mesh.position.y = f.groundY;
+        f.vel.y = -f.vel.y * 0.4;
+        f.vel.x *= 0.7;
+        f.vel.z *= 0.7;
+        f.angVel.multiplyScalar(0.6);
+        if(Math.abs(f.vel.y) < 0.5){
+          f.settled = true;
+          f.vel.set(0,0,0);
+        }
+      }
+
+      if(f.edge){
+        f.edge.mesh.position.copy(f.mesh.position);
+        f.edge.mesh.quaternion.copy(f.mesh.quaternion);
+        f.edge.mesh.scale.copy(f.mesh.scale);
+      }
+    }
+
+    // Dissolve in the last FALLEN_DISSOLVE_MS before respawn
+    var dissolveStart = FALLEN_DURATION_MS - FALLEN_DISSOLVE_MS;
+    if(elapsed >= dissolveStart && elapsed < FALLEN_DURATION_MS){
+      var fade = 1 - (elapsed - dissolveStart) / FALLEN_DISSOLVE_MS;
+      if(f.mesh.material){
+        f.mesh.material.transparent = true;
+        f.mesh.material.opacity = f.origOpacity * fade;
+      }
+      if(f.edge && f.edge.mesh.material){
+        f.edge.mesh.material.transparent = true;
+        f.edge.mesh.material.opacity = f.edge.origOpacity * fade;
+      }
+    }
+
+    // Respawn: re-parent to original wheel/group at original local transform
+    if(elapsed >= FALLEN_DURATION_MS){
+      scene.remove(f.mesh);
+      f.origParent.add(f.mesh);
+      f.mesh.position.copy(f.localPos);
+      f.mesh.quaternion.copy(f.localQuat);
+      f.mesh.scale.copy(f.localScale);
+      f.mesh.userData._fallen = false;
+      if(f.mesh.material){
+        f.mesh.material.opacity = f.origOpacity;
+        f.mesh.material.transparent = f.origTransparent;
+      }
+      if(f.edge){
+        scene.remove(f.edge.mesh);
+        f.origParent.add(f.edge.mesh);
+        f.edge.mesh.position.copy(f.edge.localPos);
+        f.edge.mesh.quaternion.copy(f.edge.localQuat);
+        f.edge.mesh.scale.copy(f.edge.localScale);
+        f.edge.mesh.userData._fallen = false;
+        if(f.edge.mesh.material) f.edge.mesh.material.opacity = f.edge.origOpacity;
+      }
+      fallenObjects.splice(i, 1);
+    }
+  }
+}
+
+function updateHitJiggles(dt){
+  for(var i = 0; i < sceneHittables.length; i++){
+    var m = sceneHittables[i].mesh;
+    var j = m.userData._hitJiggle;
+    if(!j || j.amount <= 0.001) continue;
+    var pulse = 1 + j.amount * 0.18 * Math.sin(performance.now() * 0.045 + j.phase);
+    m.scale.set(j.baseScale.x * pulse, j.baseScale.y * pulse, j.baseScale.z * pulse);
+    j.amount *= 0.90;
+    if(j.amount <= 0.001){
+      m.scale.copy(j.baseScale);
+      j.amount = 0;
+    }
+  }
 }
 
 // ── Cart shatter shards — small glass triangles that burst outward, spin, fall, fade ──
@@ -7078,7 +7683,7 @@ function updateCartShards(dt){
     var u = s.mesh.material.uniforms;
     if(u.alphaFade) u.alphaFade.value = alpha;
     if(u.tBg && glassFBO) u.tBg.value = glassFBO.texture;
-    if(u.res) u.res.value.set(window.innerWidth, window.innerHeight);
+    if(u.res) u.res.value.set(window.innerWidth*renderer.getPixelRatio(), window.innerHeight*renderer.getPixelRatio());
   }
 }
 
@@ -7143,74 +7748,199 @@ function computeScreenGravity(){
   return { x: gxPhone, y: gyPhone };
 }
 
-function updateCartBouncyBall(dt){
-  var b = cartBouncyBall;
-  if(!b) return;
-  // Refresh shader uniforms
-  if(b.mesh.material.uniforms.res) b.mesh.material.uniforms.res.value.set(window.innerWidth, window.innerHeight);
-  if(b.mesh.material.uniforms.tBg && glassFBO) b.mesh.material.uniforms.tBg.value = glassFBO.texture;
-  if(b.mesh.material.uniforms.time) b.mesh.material.uniforms.time.value = performance.now()*0.001;
+function updateCartBouncyBalls(dt){
+  if(cartBouncyBalls.length === 0) return;
 
-  // Compute screen bounds in world coords (camera-aligned)
+  // Compute gravity once per frame (same for every ball)
+  var gx, gy;
+  if(deviceTilt.ready){
+    var g = computeScreenGravity();
+    gx = g.x; gy = g.y;
+  } else {
+    gx = 0; gy = -9.0;
+  }
+
+  // Screen bounds in world coords (camera-aligned)
   var dist = 4.5;
   var fovRad = camera.fov*Math.PI/180;
   var halfH = Math.tan(fovRad/2)*dist;
   var halfW = halfH*camera.aspect;
   var margin = 0.20;
-  var leftBound  = camera.position.x - halfW + margin + b.radius;
-  var rightBound = camera.position.x + halfW - margin - b.radius;
-  var botBound   = camera.position.y - halfH + margin + b.radius;
-  var topBound   = camera.position.y + halfH - margin - b.radius;
 
-  if(ballDrag.active){
-    // Don't apply physics while user is dragging — position is set by drag handler
-    // Position update (camera-relative)
-    var camLocalD = new THREE.Vector3(b.pos.x - camera.position.x, b.pos.y - camera.position.y, -dist);
-    camLocalD.applyQuaternion(camera.quaternion);
-    b.mesh.position.copy(camera.position).add(camLocalD);
-    b.mesh.quaternion.copy(camera.quaternion);
-    return;
+  // Cart obstacle (only when present and visible)
+  var cartObstacle = null;
+  if(!cartBroken && cart.iconGroup && cart.iconGroup.visible){
+    var cwp = new THREE.Vector3();
+    cart.iconGroup.getWorldPosition(cwp);
+    var cartScale = (cart.iconGroup.scale && cart.iconGroup.scale.x) || 1;
+    // Approximate the morphed shape as a rectangle that grows from icon → panel.
+    // At cartMorphT=0 it's a small square (≈ icon circle); at cartMorphT=1 it's the full panel.
+    var halfRW = (CART_CR + (CART_RW*0.5 - CART_CR) * cartMorphT) * cartScale;
+    var halfRH = (CART_CR + (CART_RH*0.5 - CART_CR) * cartMorphT) * cartScale;
+    cartObstacle = { x: cwp.x, y: cwp.y, halfW: halfRW, halfH: halfRH };
   }
 
-  // Gravity — phone tilt influences direction if available, else default down
-  var gx, gy;
-  if(deviceTilt.ready){
-    var g = computeScreenGravity();
-    gx = g.x;
-    gy = g.y;
-  } else {
-    gx = 0;
-    gy = -9.0;
-  }
-  b.vel.x += gx * dt;
-  b.vel.y += gy * dt;
+  // ── Per-ball physics + cart collision + integration ──
+  for(var i = 0; i < cartBouncyBalls.length; i++){
+    var b = cartBouncyBalls[i];
 
-  // Integrate position
-  b.pos.x += b.vel.x * dt;
-  b.pos.y += b.vel.y * dt;
-  // Air drag
-  b.vel.x *= 0.995;
-  b.vel.y *= 0.998;
-  // Bounces
-  if(b.pos.x < leftBound){ b.pos.x = leftBound; b.vel.x = -b.vel.x * b.bounceDamp; }
-  else if(b.pos.x > rightBound){ b.pos.x = rightBound; b.vel.x = -b.vel.x * b.bounceDamp; }
-  if(b.pos.y < botBound){
-    b.pos.y = botBound;
-    b.vel.y = -b.vel.y * b.bounceDamp;
-    b.vel.x *= 0.92;
-    if(Math.abs(b.vel.y) < 0.4 && Math.abs(b.vel.x) < 0.04 && !deviceTilt.ready){
-      b.vel.set(0,0,0);
-      b.settled = true;
+    // Glass-ball shader uniforms need refresh each frame (octahedron uses standard mat — skip)
+    var bu = b.mesh.material.uniforms;
+    if(bu){
+      if(bu.tBg && glassFBO) bu.tBg.value = glassFBO.texture;
+      if(bu.res) bu.res.value.set(window.innerWidth*renderer.getPixelRatio(), window.innerHeight*renderer.getPixelRatio());
+      if(bu.time) bu.time.value = performance.now() * 0.001;
     }
-  } else if(b.pos.y > topBound){
-    b.pos.y = topBound;
-    b.vel.y = -b.vel.y * b.bounceDamp;
+
+    // ── Thrown projectile path: pure 3D physics + scene-collision check ──
+    if(b.thrown){
+      updateThrownBall(b, dt);
+      continue;
+    }
+
+    // ── Charge buildup (only for held octahedron held still in one place) ──
+    var spinScale = 1;
+    var shakeAmt = 0;
+    if(ballDrag.active && ballDrag.ball === b && b.type === 'octahedron'){
+      var sinceMoveSec = (performance.now() - ballDrag.lastMoveT) / 1000;
+      if(sinceMoveSec > 0.2){ // 200ms of stillness before charge starts
+        ballDrag.isCharging = true;
+        ballDrag.chargeLevel = Math.min(ballDrag.chargeLevel + dt * 0.55, 1.0);
+      }
+      spinScale = 1 + ballDrag.chargeLevel * 9;
+      shakeAmt = ballDrag.chargeLevel * 0.06;
+    }
+
+    // Always spin (looks alive even when settled). Scale up while charging.
+    b.mesh.rotation.x += b.angVel.x * dt * spinScale;
+    b.mesh.rotation.y += b.angVel.y * dt * spinScale;
+    b.mesh.rotation.z += b.angVel.z * dt * spinScale;
+
+    var leftBound  = camera.position.x - halfW + margin + b.radius;
+    var rightBound = camera.position.x + halfW - margin - b.radius;
+    var botBound   = camera.position.y - halfH + margin + b.radius;
+    var topBound   = camera.position.y + halfH - margin - b.radius;
+
+    // Drag: snap to mouse / finger, skip physics
+    if(ballDrag.active && ballDrag.ball === b){
+      var camLocalD = new THREE.Vector3(b.pos.x - camera.position.x, b.pos.y - camera.position.y, -dist);
+      camLocalD.applyQuaternion(camera.quaternion);
+      b.mesh.position.copy(camera.position).add(camLocalD);
+      // Visual-only shake while charging (doesn't affect drag pos)
+      if(shakeAmt > 0){
+        b.mesh.position.x += (Math.random()-0.5) * shakeAmt;
+        b.mesh.position.y += (Math.random()-0.5) * shakeAmt;
+        b.mesh.position.z += (Math.random()-0.5) * shakeAmt * 0.5;
+      }
+      continue;
+    }
+
+    // Gravity + integrate + air drag
+    b.vel.x += gx * dt;
+    b.vel.y += gy * dt;
+    b.pos.x += b.vel.x * dt;
+    b.pos.y += b.vel.y * dt;
+    b.vel.x *= 0.995;
+    b.vel.y *= 0.998;
+
+    // Wall bounces
+    if(b.pos.x < leftBound){ b.pos.x = leftBound; b.vel.x = -b.vel.x * b.bounceDamp; b.settled = false; }
+    else if(b.pos.x > rightBound){ b.pos.x = rightBound; b.vel.x = -b.vel.x * b.bounceDamp; b.settled = false; }
+    if(b.pos.y < botBound){
+      b.pos.y = botBound;
+      b.vel.y = -b.vel.y * b.bounceDamp;
+      b.vel.x *= 0.92;
+      if(Math.abs(b.vel.y) < 0.4 && Math.abs(b.vel.x) < 0.04 && !deviceTilt.ready){
+        b.vel.set(0,0,0);
+        b.settled = true;
+      }
+    } else if(b.pos.y > topBound){
+      b.pos.y = topBound;
+      b.vel.y = -b.vel.y * b.bounceDamp;
+    }
+
+    // Cart collision (rect vs circle in screen space)
+    if(cartObstacle){
+      var cdx = b.pos.x - cartObstacle.x;
+      var cdy = b.pos.y - cartObstacle.y;
+      var cx = Math.max(-cartObstacle.halfW, Math.min(cartObstacle.halfW, cdx));
+      var cy = Math.max(-cartObstacle.halfH, Math.min(cartObstacle.halfH, cdy));
+      var diffX = cdx - cx;
+      var diffY = cdy - cy;
+      var distSq = diffX*diffX + diffY*diffY;
+      if(distSq < b.radius*b.radius){
+        var d = Math.sqrt(distSq);
+        var nx, ny;
+        if(d > 0.001){
+          nx = diffX/d; ny = diffY/d;
+        } else {
+          // Center of ball is INSIDE the rectangle — push out the closest edge
+          var pushX = cartObstacle.halfW - Math.abs(cdx);
+          var pushY = cartObstacle.halfH - Math.abs(cdy);
+          if(pushX < pushY){ nx = cdx >= 0 ? 1 : -1; ny = 0; }
+          else { nx = 0; ny = cdy >= 0 ? 1 : -1; }
+          d = 0;
+        }
+        var overlap = b.radius - d;
+        b.pos.x += nx * overlap;
+        b.pos.y += ny * overlap;
+        var vn = b.vel.x*nx + b.vel.y*ny;
+        if(vn < 0){
+          b.vel.x -= (1 + b.bounceDamp) * vn * nx;
+          b.vel.y -= (1 + b.bounceDamp) * vn * ny;
+          b.settled = false;
+        }
+      }
+    }
   }
-  // Place at proper Z in front of camera
-  var camLocal = new THREE.Vector3(b.pos.x - camera.position.x, b.pos.y - camera.position.y, -dist);
-  camLocal.applyQuaternion(camera.quaternion);
-  b.mesh.position.copy(camera.position).add(camLocal);
-  b.mesh.quaternion.copy(camera.quaternion);
+
+  // ── Pairwise ball-ball collisions (after individual movement) ──
+  for(var i = 0; i < cartBouncyBalls.length; i++){
+    var ba = cartBouncyBalls[i];
+    if(ba.thrown) continue; // thrown balls live in true world coords — skip
+    for(var j = i + 1; j < cartBouncyBalls.length; j++){
+      var bb = cartBouncyBalls[j];
+      if(bb.thrown) continue; // mixed coord systems — skip
+      var ddx = ba.pos.x - bb.pos.x;
+      var ddy = ba.pos.y - bb.pos.y;
+      var minDist = ba.radius + bb.radius;
+      var dSq = ddx*ddx + ddy*ddy;
+      if(dSq < minDist*minDist && dSq > 0.000001){
+        var d = Math.sqrt(dSq);
+        var nx = ddx/d, ny = ddy/d;
+        // Positional correction — split overlap evenly
+        var overlap = (minDist - d) * 0.5;
+        ba.pos.x += nx * overlap; ba.pos.y += ny * overlap;
+        bb.pos.x -= nx * overlap; bb.pos.y -= ny * overlap;
+        // Elastic exchange of normal-velocity component (equal mass) with damping
+        var v1n = ba.vel.x*nx + ba.vel.y*ny;
+        var v2n = bb.vel.x*nx + bb.vel.y*ny;
+        var dvn = v2n - v1n;
+        if(dvn > 0){
+          // already separating
+        } else {
+          var imp = -dvn * 0.85; // restitution
+          ba.vel.x += imp * nx; ba.vel.y += imp * ny;
+          bb.vel.x -= imp * nx; bb.vel.y -= imp * ny;
+          ba.settled = false;
+          bb.settled = false;
+        }
+      }
+    }
+  }
+
+  // ── Place each ball in its world-space slot in front of the camera ──
+  // Skip thrown balls — updateThrownBall already wrote their true world
+  // position; this screen-relative placement would otherwise overwrite it
+  // and snap the ball back in front of the camera every frame.
+  for(var i = 0; i < cartBouncyBalls.length; i++){
+    var b = cartBouncyBalls[i];
+    if(b.thrown) continue;
+    if(ballDrag.active && ballDrag.ball === b) continue; // drag already positioned it
+    var camLocal = new THREE.Vector3(b.pos.x - camera.position.x, b.pos.y - camera.position.y, -dist);
+    camLocal.applyQuaternion(camera.quaternion);
+    b.mesh.position.copy(camera.position).add(camLocal);
+  }
 }
 
 // Convert screen pixel coords to world coords at the ball's depth
@@ -7294,7 +8024,7 @@ function renderGlassFBO() {
     // Update glass shader texture if it has one
     if(ovG.userData.glassMesh&&ovG.userData.glassMesh.material&&ovG.userData.glassMesh.material.uniforms){
       ovG.userData.glassMesh.material.uniforms.tBg.value=glassFBO.texture;
-      ovG.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth,window.innerHeight);
+      ovG.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
       ovG.userData.glassMesh.material.uniforms.time.value=performance.now()*0.001;
     }
   }
@@ -7313,7 +8043,7 @@ function renderGlassFBO() {
     var dbtn=dm.dmButtons[dbi5];
     if(dbtn.userData.glassMesh&&dbtn.userData.glassMesh.material.uniforms){
       dbtn.userData.glassMesh.material.uniforms.tBg.value=glassFBO.texture;
-      dbtn.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth,window.innerHeight);
+      dbtn.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
       dbtn.userData.glassMesh.material.uniforms.time.value=performance.now()*0.001;
     }
   }
@@ -7324,7 +8054,7 @@ function renderGlassFBO() {
     var frg=floors[fsu].glassRing;
     if(frg.userData.glassMesh&&frg.userData.glassMesh.material.uniforms){
       frg.userData.glassMesh.material.uniforms.tBg.value=glassFBO.texture;
-      frg.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth,window.innerHeight);
+      frg.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
       frg.userData.glassMesh.material.uniforms.time.value=tNow;
     }
   }
@@ -7333,7 +8063,7 @@ function renderGlassFBO() {
     var stg2=dm.starTemps[stu];
     if(stg2.userData.glassMesh&&stg2.userData.glassMesh.material.uniforms){
       stg2.userData.glassMesh.material.uniforms.tBg.value=glassFBO.texture;
-      stg2.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth,window.innerHeight);
+      stg2.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
       stg2.userData.glassMesh.material.uniforms.time.value=tNow;
     }
   }
@@ -7341,7 +8071,7 @@ function renderGlassFBO() {
     var cstg=dm.closingStarTemps[cstu];
     if(cstg.userData.glassMesh&&cstg.userData.glassMesh.material.uniforms){
       cstg.userData.glassMesh.material.uniforms.tBg.value=glassFBO.texture;
-      cstg.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth,window.innerHeight);
+      cstg.userData.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
       cstg.userData.glassMesh.material.uniforms.time.value=tNow;
     }
   }}
@@ -7678,7 +8408,7 @@ function positionCartIcon() {
   
   // Update shader
   cart.glassMesh.material.uniforms.time.value=time;
-  cart.glassMesh.material.uniforms.res.value.set(window.innerWidth,window.innerHeight);
+  cart.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
 }
 
 function toggleCartPanel() {
@@ -8939,6 +9669,7 @@ function animate(){
     }
   });
   if(switchAnim.active)animateSwitch();
+  animateImgLightbox(dt);
   if(pdv.entering)animateProductDetailEnter();
   if(pdv.exitingToDM)animateProductDetailExit();
   if(pdv.active)updateProductDetailPosition();
@@ -9004,8 +9735,8 @@ function animate(){
     camera.projectionMatrix.makePerspective(-right2+shiftX,right2+shiftX,top2+shiftY,-top2+shiftY,near,camera.far);
     camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
   } else {
-    // Mouse mode — reset FOV and position
-    camera.fov=75;
+    // Mouse mode — reset FOV and position (FOV is aspect-aware via updateCamRadius)
+    camera.fov=CAM_FOV;
     camera.userData.lastFaceY=0;
     camTiltX+=(camMouseX-camTiltX)*0.04;
     camTiltY+=(camMouseY-camTiltY)*0.04;
@@ -9402,8 +10133,10 @@ function animate(){
   updateCartImpact(dt);
   updateCartPanelFall(dt);
   updateCartDegradation(dt);
-  if(cartBouncyBall) updateCartBouncyBall(dt);
+  updateCartBouncyBalls(dt);
   updateCartShards(dt);
+  if(sceneHittablesBuilt) updateHitJiggles(dt);
+  updateFallenObjects(dt);
 
   // Update cart
   if(!cartBroken){ positionCartIcon(); positionCartPanel(); }
@@ -9420,7 +10153,7 @@ function animate(){
     bd.traverse(function(c){
       if(c.material && c.material.uniforms){
         if(c.material.uniforms.time) c.material.uniforms.time.value = bdT;
-        if(c.material.uniforms.res) c.material.uniforms.res.value.set(window.innerWidth, window.innerHeight);
+        if(c.material.uniforms.res) c.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(), window.innerHeight*renderer.getPixelRatio());
         if(c.material.uniforms.tBg && glassFBO) c.material.uniforms.tBg.value = glassFBO.texture;
       }
     });
