@@ -1,15 +1,9 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-RVHE573XLJ"></script>
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}
-    gtag('js', new Date());
-    gtag('config', 'G-RVHE573XLJ');
-  </script>
-  <meta charset="UTF-8">
-  <title>Chrysolin</title>
+<meta charset="UTF-8">
+<title>Chrysolin</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -2899,8 +2893,8 @@ function onScroll(){
 function onMD(e){e.preventDefault();pDown(e.clientX,e.clientY);}
 function updateHoverPanel(cx, cy){
   if(!pdv.active && !pdv.entering){
-    var hx=(cx/window.innerWidth)*2-1;
-    var hy=-(cy/window.innerHeight)*2+1;
+    var hx=(cx/renderer.domElement.clientWidth)*2-1;
+    var hy=-(cy/renderer.domElement.clientHeight)*2+1;
     raycaster.setFromCamera({x:hx,y:hy},camera);
     var found=null;
     for(var fi=0;fi<floors.length;fi++){
@@ -3024,7 +3018,7 @@ function onTE(e){
 function pDown(cx,cy){
   mouseDownX=cx;mouseDownY=cy;mouseDownTime=performance.now();
   // Detect glass UI press for visual feedback
-  mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+  mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
   // Ball drag — top priority once cart is broken (any of the spawned balls)
   if(cartBouncyBalls.length > 0){
@@ -3086,7 +3080,7 @@ function pDown(cx,cy){
   }
   // During product detail view: allow cart, nav, and PDV scrolling (no background spinning)
   if(pdv.active || pdv.entering || pdv.exitingToDM){
-    mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+    mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
     raycaster.setFromCamera(mouse,camera);
     // Cart drag — check panel children AND glass surface
     if(cart.panelOpen && cart.panelGroup){
@@ -3110,7 +3104,7 @@ function pDown(cx,cy){
     previousMouseY = cy; previousTime = performance.now();
     return;
   }
-  mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+  mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
   
   // Check if clicking on cart panel area for dragging (panel children OR the glass surface)
@@ -3238,7 +3232,7 @@ function updateCursor(cx,cy){
   el.classList.remove('clickable','grabbable');
   hoveredGlassMesh = null;
 
-  mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+  mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
 
   // Check nav menu (clickable)
@@ -3350,7 +3344,7 @@ function pUp(cx,cy){
   var dist=Math.sqrt(Math.pow(cx-mouseDownX,2)+Math.pow(cy-mouseDownY,2));
   var wasClick=dist<5&&(performance.now()-mouseDownTime)<300;
   if(wasClick){
-    mouse.x=(cx/window.innerWidth)*2-1;mouse.y=-(cy/window.innerHeight)*2+1;
+    mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
     raycaster.setFromCamera(mouse,camera);
 
     // Product detail view clicks
@@ -8809,8 +8803,8 @@ function startCartDrag(cx, cy) {
   // Determine whether the click landed inside the items scroll area (not the header/footer)
   cartDrag.startedInItemsArea = false;
   if(cart.panelOpen && cart.panelGroup){
-    mouse.x = (cx/window.innerWidth)*2-1;
-    mouse.y = -(cy/window.innerHeight)*2+1;
+    mouse.x = (cx/renderer.domElement.clientWidth)*2-1;
+    mouse.y = -(cy/renderer.domElement.clientHeight)*2+1;
     raycaster.setFromCamera(mouse, camera);
     var clickHits = raycaster.intersectObjects(cart.panelGroup.children, true);
     if(clickHits.length === 0 && cart.glassMesh) clickHits = raycaster.intersectObject(cart.glassMesh);
@@ -9591,8 +9585,8 @@ function init(){
   createGodRays();
   window.addEventListener('resize',onResize);window.addEventListener('scroll',onScroll);
   window.addEventListener('mousemove',function(e){
-    camMouseX=(e.clientX/window.innerWidth)*2-1;
-    camMouseY=(e.clientY/window.innerHeight)*2-1;
+    camMouseX=(e.clientX/renderer.domElement.clientWidth)*2-1;
+    camMouseY=(e.clientY/renderer.domElement.clientHeight)*2-1;
   });
   renderer.domElement.addEventListener('mousedown',onMD);renderer.domElement.addEventListener('mousemove',onMM);
   renderer.domElement.addEventListener('mouseup',onMU);renderer.domElement.addEventListener('mouseleave',onMU);
@@ -9609,8 +9603,8 @@ function init(){
     // Cart panel item-list scroll
     if(cart.panelOpen && cart.itemsGroup && cart.itemsScrollMax > 0){
       // Raycast to see if cursor is over the cart panel
-      var mx = (e.clientX/window.innerWidth)*2-1;
-      var my = -(e.clientY/window.innerHeight)*2+1;
+      var mx = (e.clientX/renderer.domElement.clientWidth)*2-1;
+      var my = -(e.clientY/renderer.domElement.clientHeight)*2+1;
       raycaster.setFromCamera({x:mx,y:my}, camera);
       var hit = false;
       if(cart.glassMesh) hit = raycaster.intersectObject(cart.glassMesh).length > 0;
