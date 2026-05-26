@@ -513,8 +513,19 @@ var gameMode = {
   savedCamQuat: new THREE.Quaternion(),
   savedTargetCameraY: 0,
   // Chase camera offsets — in tangent frame, scaled for planet
-  camBackDist: 0.22,
-  camUpDist: 0.09
+  camBackDist: 0.12,
+  camUpDist: 0.05,
+  // Touch joystick — single-finger drag from touch origin.
+  // Vertical drag = throttle (up = faster forward), horizontal drag = yaw (left/right turn).
+  // Full upward swipe past 50% of screen height engages boost.
+  touch: {
+    active: false,
+    startX: 0, startY: 0,
+    curX: 0, curY: 0,
+    throttle: 0,  // -0.6..1
+    yaw: 0,       // -1..1 (positive = turn right)
+    boost: false
+  }
 };
 
 // ══════════════════════════════════════════════
@@ -3073,6 +3084,17 @@ function onMU(e){pUp(e.clientX,e.clientY);}
 var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null, startX:0, startY:0, startTime:0, scrollMomentum:0 }; // locked: null,'scroll','wheel','vwheel'
 function onTS(e){
   e.preventDefault();
+  // Mini-game touch joystick — first finger becomes the joystick origin
+  if(gameMode.active && !gameMode.exiting && e.touches.length === 1){
+    var gt = gameMode.touch;
+    gt.active = true;
+    gt.startX = e.touches[0].clientX;
+    gt.startY = e.touches[0].clientY;
+    gt.curX = gt.startX;
+    gt.curY = gt.startY;
+    gt.throttle = 0; gt.yaw = 0; gt.boost = false;
+    return;
+  }
   // ── Lightbox pinch/pan handling ──
   if(imgLightbox.active || imgLightbox.entering || imgLightbox.exiting){
     imgLightbox.lastInteract = performance.now();
@@ -3137,6 +3159,30 @@ function onTS(e){
 }
 function onTM(e){
   e.preventDefault();
+  // Mini-game touch joystick — translate drag delta into throttle / yaw / boost
+  if(gameMode.active && gameMode.touch.active && e.touches.length === 1){
+    var gt = gameMode.touch;
+    gt.curX = e.touches[0].clientX;
+    gt.curY = e.touches[0].clientY;
+    var dx = gt.curX - gt.startX;
+    var dy = gt.startY - gt.curY; // up = positive
+    var upFrac = dy / window.innerHeight;
+    var rightFrac = dx / window.innerWidth;
+    // Throttle: 40% screen up = full forward; reverse maxes out at 25% screen down (-0.6)
+    var deadUp = 0.02, deadDown = 0.02;
+    if(upFrac > deadUp)        gt.throttle = Math.min((upFrac - deadUp) / (0.4 - deadUp), 1.0);
+    else if(upFrac < -deadDown) gt.throttle = Math.max((upFrac + deadDown) / (0.25 - deadDown), -0.6);
+    else gt.throttle = 0;
+    // Yaw: 20% screen sideways = full turn; right swipe turns the ship right
+    var deadX = 0.02;
+    if(Math.abs(rightFrac) > deadX){
+      var sign = rightFrac < 0 ? -1 : 1;
+      gt.yaw = sign * Math.min((Math.abs(rightFrac) - deadX) / (0.2 - deadX), 1.0);
+    } else gt.yaw = 0;
+    // Boost when swiped past 50% of screen upward
+    gt.boost = upFrac > 0.5;
+    return;
+  }
   // ── Lightbox pinch/pan handling ──
   // Two fingers → pinch zoom, single finger → free pan (with no clamping, so the user
   // can drag the image past the screen edges). Every move bumps lastInteract so the
@@ -3252,6 +3298,16 @@ function onTM(e){
   }
 }
 function onTE(e){
+  // Mini-game touch joystick — release on last finger up
+  if(gameMode.active && gameMode.touch.active){
+    if(e.touches.length === 0){
+      gameMode.touch.active = false;
+      gameMode.touch.throttle = 0;
+      gameMode.touch.yaw = 0;
+      gameMode.touch.boost = false;
+    }
+    return;
+  }
   // ── Lightbox: wait until all fingers are off, suppress pUp after a pinch ──
   if(imgLightbox.active || imgLightbox.entering || imgLightbox.exiting){
     imgLightbox.lastInteract = performance.now();
@@ -11181,6 +11237,11 @@ function exitGameMode() {
   gameMode.exitProg = 0;
   // Clear key state so nothing sticks after exit
   gameMode.keys.w = gameMode.keys.a = gameMode.keys.s = gameMode.keys.d = gameMode.keys.shift = false;
+  // Release the touch joystick as well
+  gameMode.touch.active = false;
+  gameMode.touch.throttle = 0;
+  gameMode.touch.yaw = 0;
+  gameMode.touch.boost = false;
 }
 
 function restoreGalleryWheel() {
@@ -11248,7 +11309,10 @@ function killGalleryEffects(gf) {
 }
 
 function computeChaseCamPose() {
-  // Returns {pos, lookAt} for the chase camera given current surfaceState
+  // Returns {pos, lookAt, up} for the chase camera given current surfaceState.
+  // The `up` is the surface normal at the ship's position; the renderer lerps
+  // camera.up toward it each frame so the view stays upright relative to the
+  // planet surface even when the ship crosses the south pole.
   var s = gameMode.surfaceState;
   var surface = gameMode.surface;
   var up = s.pos.clone().normalize();
@@ -11256,8 +11320,8 @@ function computeChaseCamPose() {
   var camPos = shipWorld.clone()
     .add(s.forward.clone().multiplyScalar(-gameMode.camBackDist))
     .add(up.clone().multiplyScalar(gameMode.camUpDist));
-  var lookAt = shipWorld.clone().add(up.clone().multiplyScalar(0.04));
-  return { pos: camPos, lookAt: lookAt };
+  var lookAt = shipWorld.clone().add(up.clone().multiplyScalar(0.015));
+  return { pos: camPos, lookAt: lookAt, up: up };
 }
 
 function animateGameTransition() {
@@ -11316,22 +11380,36 @@ function updateGamePhysicsAndCamera() {
   if(!gameMode.active) return;
   var p = gameMode.physics;
   var k = gameMode.keys;
+  var t = gameMode.touch;
   var s = gameMode.surfaceState;
   var surface = gameMode.surface;
 
-  // Boost state
-  p.isBoosting = k.shift && k.w;
+  // Derive analog input axes from whichever source is active.
+  //   fwdAxis: -0.6 (full reverse) .. 0 .. 1 (full forward)
+  //   yawAxis: -1 (left) .. 0 .. 1 (right)
+  // Touch joystick is analog; keyboard is binary (and combines additively with touch).
+  var fwdAxis = 0, yawAxis = 0;
+  if(t.active){
+    fwdAxis = t.throttle;
+    yawAxis = t.yaw;
+    p.isBoosting = t.boost;
+  } else {
+    fwdAxis = (k.w ? 1 : 0) + (k.s ? -0.6 : 0);
+    yawAxis = (k.a ? -1 : 0) + (k.d ? 1 : 0);
+    p.isBoosting = k.shift && k.w;
+  }
 
-  // Thrust ramp — same feel as Orbicule's accelerationTime/maxAccelerationTime
-  if(k.w || k.s) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1);
+  // Thrust ramp — engages whenever there's any throttle input
+  var hasFwd = Math.abs(fwdAxis) > 0.01;
+  if(hasFwd) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1);
   else p.accelerationTime = Math.max(0, p.accelerationTime - 3);
   var thrustRamp = p.accelerationTime / p.maxAccelerationTime;
   var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * thrustRamp;
   if(p.isBoosting) thrust = p.boostAccelRate;
 
-  // Update scalar speed (along forward tangent)
-  if(k.w) s.speed += thrust;
-  if(k.s) s.speed -= thrust * 0.6;
+  // Apply thrust scaled by fwdAxis — partial throttle = partial acceleration.
+  // Note: reverse uses the analog axis directly so binary S key (-0.6) still matches old behavior.
+  s.speed += thrust * fwdAxis;
   s.speed *= p.drag;
   var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
   if(s.speed > maxS) s.speed = maxS;
@@ -11340,9 +11418,8 @@ function updateGamePhysicsAndCamera() {
   // Current up = surface normal at ship's spot
   var up = s.pos.clone().normalize();
 
-  // Yaw — rotate forward around up axis
-  if(k.a) s.forward.applyAxisAngle(up, p.turnSpeed);
-  if(k.d) s.forward.applyAxisAngle(up, -p.turnSpeed);
+  // Yaw — analog (touch) or full-rate (keys). Positive yawAxis = turn right.
+  if(Math.abs(yawAxis) > 0.01) s.forward.applyAxisAngle(up, -p.turnSpeed * yawAxis);
   // Re-orthogonalize forward to stay tangent (drift correction)
   s.forward.sub(up.clone().multiplyScalar(s.forward.dot(up)));
   if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
