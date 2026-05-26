@@ -5,6 +5,14 @@
 <meta charset="UTF-8">
 <title>Chrysolin</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="preconnect" href="https://sdks.shopifycdn.com" crossorigin>
+<link rel="preconnect" href="https://cdn.shopify.com" crossorigin>
+<link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
+<link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
+<link rel="dns-prefetch" href="https://sdks.shopifycdn.com">
+<link rel="dns-prefetch" href="https://cdn.shopify.com">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 html, body { scrollbar-width: none; -ms-overflow-style: none; }
@@ -19,18 +27,16 @@ body { font-family: Arial, sans-serif; background:#0a0a0a; overflow-x: hidden; h
 <body>
 <div id="canvas-container"></div>
 <video id="faceVideo" autoplay playsinline style="display:none;"></video>
-<script src="https://sdks.shopifycdn.com/buy-button/latest/buy-button-storefront.min.js"></script>
+<script defer src="https://sdks.shopifycdn.com/buy-button/latest/buy-button-storefront.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/objects/Lensflare.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
 <script>
 // ══════════════════════════════════════════════
 // PRODUCT DATA
 // ══════════════════════════════════════════════
 var PRODUCT_DATA = { floors: [
   { label:'Pants', isSmall:true, products:[
-    {id:'p1',name:'Embroidery',price:120,designer:'Chrysolin',desc:'Hand-embroidered denim with custom threadwork. Each pair features unique patterns inspired by natural textures and organic forms.',image:'product-1776614976904-849.png',sizes:['S','M','L']},
+    {id:'p1',name:'Embroidery',price:120,designer:'Chrysolin',desc:'Hand-embroidered denim with custom threadwork. Each pair features unique patterns inspired by natural textures and organic forms.',sizes:['S','M','L']},
     {id:'p2',name:'Straight Cut',price:200,designer:'Chrysolin',desc:'Clean silhouette straight-leg pant in heavyweight cotton twill. Relaxed through the thigh with a structured drape.',sizes:['S','M','L']},
     {id:'p3',name:'Boot Cut',price:200,designer:'Chrysolin',desc:'Classic boot cut with a modern rise. Crafted from raw selvedge denim with contrast stitching details.',sizes:['S','M','L']}
   ]},
@@ -72,7 +78,7 @@ var shopifyClient = null;
 var shopifyCheckout = null;
 
 function initShopify() {
-  if (!window.ShopifyBuy) return;
+  if (!window.ShopifyBuy) { setTimeout(initShopify, 200); return; }
   shopifyClient = ShopifyBuy.buildClient({
     domain: 'nztwe0-nf.myshopify.com',
     storefrontAccessToken: '468c3e43c5e1b72800ae8af8afe2d886'
@@ -214,7 +220,6 @@ function addToShopifyCart(product, sizeLabel) {
     quantity: 1
   }]).then(function(co) {
     shopifyCheckout = co;
-    console.log('Added to cart. Items:', co.lineItems.length);
     return co;
   });
 }
@@ -280,9 +285,9 @@ function loadShopifyImages() {
 var scene, camera, renderer;
 var floors = [];
 var FLOOR_SPACING = 6.5, TOTAL_FLOORS = PRODUCT_DATA.floors.length, SCROLL_SENSITIVITY = 0.45;
-var PLANE_WIDTH = 2.5, PLANE_SPACING = 0.8;
+var PLANE_WIDTH = 3.0, PLANE_SPACING = 0.8;
 var LARGE_RADIUS = (10 * (PLANE_WIDTH + PLANE_SPACING) / (2 * Math.PI)) + 0.25;
-var SMALL_RADIUS = LARGE_RADIUS * 0.6;
+var SMALL_RADIUS = LARGE_RADIUS * 0.8;
 var VW_RADIUS_MULT = 0.62;
 var BEVEL = 0.15, BEVEL_R = 0.3, SEG_X = 32, SEG_Y = 8;
 
@@ -310,7 +315,7 @@ function setDmCenterAnimTarget(floor, target, side) {
 // Camera mouse tilt
 var camMouseX = 0, camMouseY = 0;
 var camTiltX = 0, camTiltY = 0;
-var CAM_ORBIT_RADIUS_BASE = 13.0;
+var CAM_ORBIT_RADIUS_BASE = 15.6;
 var CAM_ORBIT_RADIUS = 13.0;
 var CAM_FOV_BASE = 75;
 var CAM_FOV = 75;
@@ -358,8 +363,25 @@ function toggleFaceTracking(){
   }
 }
 
+var _mediapipeLoading = false;
+function loadMediaPipeScripts(){
+  if(_mediapipeLoading) return;
+  _mediapipeLoading = true;
+  var s1 = document.createElement('script');
+  s1.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js';
+  s1.crossOrigin = 'anonymous';
+  document.head.appendChild(s1);
+  var s2 = document.createElement('script');
+  s2.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js';
+  s2.crossOrigin = 'anonymous';
+  document.head.appendChild(s2);
+}
 function startFaceTracking(){
-  if(!window.FaceDetection){setTimeout(startFaceTracking,500);return;}
+  if(!window.FaceDetection || !window.Camera){
+    loadMediaPipeScripts();
+    setTimeout(startFaceTracking,500);
+    return;
+  }
   var video=document.getElementById('faceVideo');
   faceTrack.fd=new FaceDetection({locateFile:function(f){return'https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/'+f;}});
   faceTrack.fd.setOptions({model:'short',minDetectionConfidence:0.5});
@@ -386,7 +408,7 @@ function startFaceTracking(){
     video.srcObject=stream;video.onloadedmetadata=function(){video.play();};
     faceTrack.cam2=new Camera(video,{onFrame:async function(){if(faceTrack.enabled)await faceTrack.fd.send({image:video});},width:320,height:240});
     faceTrack.cam2.start();faceTrack.ready=true;
-  }).catch(function(err){console.log('Face tracking unavailable:',err.message);faceTrack.enabled=false;
+  }).catch(function(err){faceTrack.enabled=false;
     var btn=document.getElementById('face-toggle');if(btn)btn.style.opacity='0.3';});
 }
 var envMap, cubeRenderTarget, cubeCamera, ringMaterialsToUpdate = [];
@@ -435,12 +457,74 @@ var pdv = {
 };
 
 // ══════════════════════════════════════════════
+// MINI GAME MODE — tiny ship lives on the gallery floor's center crystal.
+// The crystal IS the planet — sphere-walking physics, camera follows in tangent frame.
+// Triggered by spinning the bottom orb wheel + holding the spin.
+// ══════════════════════════════════════════════
+var gameMode = {
+  active: false,
+  entering: false,
+  exiting: false,
+  prog: 0,                  // 0..1 entry progress
+  exitProg: 0,              // 0..1 exit progress
+  group: null,              // wrapper around ship for visibility toggle
+  ship: null,
+  shipVisual: null,
+  engineGlow: null,
+  galleryFloor: null,       // ref to the orb floor (set after createFloors)
+  // Spin-and-hold trigger state
+  chargeProg: 0,
+  chargeFillRate: 0.012,    // ~1.4s of continuous spin to commit
+  chargeDecayRate: 0.025,
+  chargeRpmThreshold: 0.45, // matches stage2 onset
+  // "Planet" surface (the center crystal)
+  surface: {
+    center: new THREE.Vector3(),   // world position of crystal center
+    radius: 0.95                   // orbit radius — just above OctahedronGeometry(0.8) vertices
+  },
+  // Position + orientation on the sphere surface (local to surface.center)
+  surfaceState: {
+    pos: new THREE.Vector3(0, 0.95, 0),    // on north pole of crystal at start
+    forward: new THREE.Vector3(1, 0, 0),   // tangent direction the ship faces
+    speed: 0                                // arc-distance per frame along forward
+  },
+  // Frozen-wheel state — saved on entry, restored on exit
+  wheelFreeze: {
+    saved: false,
+    velocity: 0,
+    rotationSpeed: 0
+  },
+  // Physics tuned to planet scale (R≈0.95)
+  physics: {
+    accelerationTime: 0,
+    maxAccelerationTime: 300,
+    thrustBase: 0.00005,
+    thrustMax: 0.0003,
+    isBoosting: false,
+    boostAccelRate: 0.0005,
+    maxSpeed: 0.007,
+    boostMaxSpeed: 0.015,
+    drag: 0.985,
+    turnSpeed: 0.04
+  },
+  keys: {w:false, a:false, s:false, d:false, shift:false},
+  // Camera state (saved on entry, restored on exit)
+  savedCamPos: new THREE.Vector3(),
+  savedCamQuat: new THREE.Quaternion(),
+  savedTargetCameraY: 0,
+  // Chase camera offsets — in tangent frame, scaled for planet
+  camBackDist: 0.22,
+  camUpDist: 0.09
+};
+
+// ══════════════════════════════════════════════
 // MORPHABLE PANEL
 // ══════════════════════════════════════════════
-function applyBevel(arr, count) {
+function applyBevel(arr, count, panelH) {
+  if(panelH === undefined) panelH = PLANE_WIDTH;
   for(var j=0;j<count;j++){
     var x=arr[j*3], y=arr[j*3+1], z=arr[j*3+2];
-    var dft=Math.abs(y-PLANE_WIDTH/2), dfb=Math.abs(y+PLANE_WIDTH/2);
+    var dft=Math.abs(y-panelH/2), dfb=Math.abs(y+panelH/2);
     var cr=Math.sqrt(x*x+z*z);
     if(cr>0){
       if(dft<BEVEL_R){var f=(BEVEL_R-dft)/BEVEL_R;var s=(cr-BEVEL*f)/cr;x*=s;z*=s;}
@@ -450,12 +534,13 @@ function applyBevel(arr, count) {
   }
 }
 
-function makePositions(radius, arcAngle) {
-  var g = new THREE.CylinderGeometry(radius,radius,PLANE_WIDTH,SEG_X,SEG_Y,true,-arcAngle/2,arcAngle);
+function makePositions(radius, arcAngle, panelH) {
+  if(panelH === undefined) panelH = PLANE_WIDTH;
+  var g = new THREE.CylinderGeometry(radius,radius,panelH,SEG_X,SEG_Y,true,-arcAngle/2,arcAngle);
   var p = g.attributes.position;
   var arr = new Float32Array(p.count*3);
   for(var i=0;i<p.count*3;i++) arr[i]=p.array[i];
-  applyBevel(arr, p.count);
+  applyBevel(arr, p.count, panelH);
   g.dispose();
   return arr;
 }
@@ -471,16 +556,20 @@ function getWhiteTex(){
   return _whiteTexForUV;
 }
 
-function createPanel(floorR, vertR) {
-  var arcF = (PLANE_WIDTH/floorR)*1.1;
-  var arcV = (PLANE_WIDTH/vertR)*1.1;
-  
-  var geo = new THREE.CylinderGeometry(floorR,floorR,PLANE_WIDTH,SEG_X,SEG_Y,true,-arcF/2,arcF);
+function createPanel(floorR, vertR, opts) {
+  opts = opts || {};
+  var pH = opts.height !== undefined ? opts.height : PLANE_WIDTH;
+  var pW = opts.width !== undefined ? opts.width : PLANE_WIDTH;
+  var coverFitVal = opts.coverFit ? 1.0 : 0.0;
+  var arcF = (pW/floorR)*1.1;
+  var arcV = (pW/vertR)*1.1;
+
+  var geo = new THREE.CylinderGeometry(floorR,floorR,pH,SEG_X,SEG_Y,true,-arcF/2,arcF);
   var pos = geo.attributes.position;
   // Apply bevel to live geo
   for(var j=0;j<pos.count;j++){
     var x=pos.array[j*3],y=pos.array[j*3+1],z=pos.array[j*3+2];
-    var dft=Math.abs(y-PLANE_WIDTH/2),dfb=Math.abs(y+PLANE_WIDTH/2);
+    var dft=Math.abs(y-pH/2),dfb=Math.abs(y+pH/2);
     var cr=Math.sqrt(x*x+z*z);
     if(cr>0){
       if(dft<BEVEL_R){var f=(BEVEL_R-dft)/BEVEL_R;var s=(cr-BEVEL*f)/cr;x*=s;z*=s;}
@@ -489,10 +578,10 @@ function createPanel(floorR, vertR) {
     pos.array[j*3]=x;pos.array[j*3+2]=z;
   }
   pos.needsUpdate=true; geo.computeVertexNormals();
-  
+
   var floorPos = new Float32Array(pos.count*3);
   for(var k=0;k<pos.count*3;k++) floorPos[k]=pos.array[k];
-  var vertPos = makePositions(vertR, arcV);
+  var vertPos = makePositions(vertR, arcV, pH);
   
   var mat = new THREE.MeshStandardMaterial({
     color:0x8899bb, transparent:true, opacity:0.82,
@@ -506,7 +595,9 @@ function createPanel(floorR, vertR) {
   mat.userData.productTex = {value:getWhiteTex()};
   mat.userData.hasProductTex = {value:0.0};
   mat.userData.productTexAspect = {value:1.0}; // image width/height ratio
-  mat.userData.panelAspect = {value: (floorR * arcF) / PLANE_WIDTH};
+  mat.userData.panelAspect = {value: (floorR * arcF) / pH};
+  mat.userData.coverFit = {value: coverFitVal};
+  mat.userData.panelHeight = pH;
   mat.userData.imgRotation = {value: 0.0}; // 0 = normal, 1 = 90deg for vertical wheel
   mat.userData.imgRotationTarget = 0.0;
   mat.userData.backTex = {value:getWhiteTex()};
@@ -529,7 +620,8 @@ function createPanel(floorR, vertR) {
     shader.uniforms.flatten = mat.userData.flatten;
     shader.uniforms.flattenZ = mat.userData.flattenZ;
     shader.uniforms.splitGap = mat.userData.splitGap;
-    shader.fragmentShader = 'uniform float holoTime;\nuniform sampler2D productTex;\nuniform float hasProductTex;\nuniform float productTexAspect;\nuniform float panelAspect;\nuniform float imgRotation;\nuniform sampler2D backTex;\nuniform float hasBackTex;\nuniform float hoverAmount;\nuniform float flatten;\nuniform float splitGap;\n' + shader.fragmentShader;
+    shader.uniforms.coverFit = mat.userData.coverFit;
+    shader.fragmentShader = 'uniform float holoTime;\nuniform sampler2D productTex;\nuniform float hasProductTex;\nuniform float productTexAspect;\nuniform float panelAspect;\nuniform float imgRotation;\nuniform sampler2D backTex;\nuniform float hasBackTex;\nuniform float hoverAmount;\nuniform float flatten;\nuniform float splitGap;\nuniform float coverFit;\n' + shader.fragmentShader;
     // Vertex shader: depress toward center on hover
     shader.vertexShader = 'uniform float hoverAmount;\nuniform float flatten;\nuniform float flattenZ;\nuniform float splitGap;\n' + shader.vertexShader;
     shader.vertexShader = shader.vertexShader.replace(
@@ -545,7 +637,7 @@ function createPanel(floorR, vertR) {
         '}',
         '// Split: push top half up, bottom half down from center',
         'if(splitGap > 0.0) {',
-        '  float halfH = ' + (PLANE_WIDTH * 0.5).toFixed(3) + ';',
+        '  float halfH = ' + (pH * 0.5).toFixed(3) + ';',
         '  float normY = (transformed.y + halfH) / (halfH * 2.0);', // 0 at bottom, 1 at top
         '  float splitDir = smoothstep(0.45, 0.55, normY) * 2.0 - 1.0;', // -1 bottom, +1 top, smooth blend at center
         '  transformed.y += splitDir * splitGap;',
@@ -649,12 +741,24 @@ function createPanel(floorR, vertR) {
         '    float rCos = cos(rAngle), rSin = sin(rAngle);',
         '    imgUV = vec2(rc.x * rCos - rc.y * rSin, rc.x * rSin + rc.y * rCos) + 0.5;',
         '    float pA = mix(panelAspect, 1.0 / panelAspect, imgRotation);',
-        '    if(pA > productTexAspect) {',
-        '      float sc = productTexAspect / pA;',
-        '      imgUV.x = imgUV.x / sc - (1.0 / sc - 1.0) * 0.5;',
+        '    if(coverFit > 0.5) {',
+        '      // COVER: image fills panel, overflow is cropped',
+        '      if(pA > productTexAspect) {',
+        '        float sc = pA / productTexAspect;',
+        '        imgUV.y = imgUV.y / sc - (1.0 / sc - 1.0) * 0.5;',
+        '      } else {',
+        '        float sc = productTexAspect / pA;',
+        '        imgUV.x = imgUV.x / sc - (1.0 / sc - 1.0) * 0.5;',
+        '      }',
         '    } else {',
-        '      float sc = pA / productTexAspect;',
-        '      imgUV.y = imgUV.y / sc - (1.0 / sc - 1.0) * 0.5;',
+        '      // CONTAIN: image fits inside panel, may letterbox',
+        '      if(pA > productTexAspect) {',
+        '        float sc = productTexAspect / pA;',
+        '        imgUV.x = imgUV.x / sc - (1.0 / sc - 1.0) * 0.5;',
+        '      } else {',
+        '        float sc = pA / productTexAspect;',
+        '        imgUV.y = imgUV.y / sc - (1.0 / sc - 1.0) * 0.5;',
+        '      }',
         '    }',
         '    vec4 imgCol = vec4(0.0);',
         '    if(imgUV.x >= 0.0 && imgUV.x <= 1.0 && imgUV.y >= 0.0 && imgUV.y <= 1.0) {',
@@ -701,12 +805,22 @@ function createPanel(floorR, vertR) {
         '  float drCos = cos(drAngle), drSin = sin(drAngle);',
         '  duv = vec2(drc.x * drCos - drc.y * drSin, drc.x * drSin + drc.y * drCos) + 0.5;',
         '  float dpA = mix(panelAspect, 1.0 / panelAspect, imgRotation);',
-        '  if(dpA > productTexAspect) {',
-        '    float dsc = productTexAspect / dpA;',
-        '    duv.x = duv.x / dsc - (1.0 / dsc - 1.0) * 0.5;',
+        '  if(coverFit > 0.5) {',
+        '    if(dpA > productTexAspect) {',
+        '      float dsc = dpA / productTexAspect;',
+        '      duv.y = duv.y / dsc - (1.0 / dsc - 1.0) * 0.5;',
+        '    } else {',
+        '      float dsc = productTexAspect / dpA;',
+        '      duv.x = duv.x / dsc - (1.0 / dsc - 1.0) * 0.5;',
+        '    }',
         '  } else {',
-        '    float dsc = dpA / productTexAspect;',
-        '    duv.y = duv.y / dsc - (1.0 / dsc - 1.0) * 0.5;',
+        '    if(dpA > productTexAspect) {',
+        '      float dsc = productTexAspect / dpA;',
+        '      duv.x = duv.x / dsc - (1.0 / dsc - 1.0) * 0.5;',
+        '    } else {',
+        '      float dsc = dpA / productTexAspect;',
+        '      duv.y = duv.y / dsc - (1.0 / dsc - 1.0) * 0.5;',
+        '    }',
         '  }',
         '  float imgA = 0.0;',
         '  if(duv.x >= 0.0 && duv.x <= 1.0 && duv.y >= 0.0 && duv.y <= 1.0) {',
@@ -1438,7 +1552,13 @@ function createFloors() {
     if(cfg.isOrbFloor){
       floors.push(createOrbFloor(y, SMALL_RADIUS, cfg.label, np, idx));
     } else {
-      floors.push(createFloor(y, r, vr, cfg.label, np, hasRings, idx));
+      // Top wheel (small, non-orb — e.g. Pants): taller, narrower, image cover-fits
+      var panelOpts = (cfg.isSmall) ? {
+        height: PLANE_WIDTH * 1.65,
+        width:  PLANE_WIDTH * 0.85,
+        coverFit: true
+      } : {};
+      floors.push(createFloor(y, r, vr, cfg.label, np, hasRings, idx, panelOpts));
     }
   });
   
@@ -2349,6 +2469,21 @@ function updateOrbs(dt){
     var rpmNorm=Math.min(rpm/200,1);
     globalRpm = rpm;
 
+    // Mini game charge — spin the bottom wheel + hold the spin to commit
+    // (must run BEFORE rpm is forced to 0 below, or the charge would never fill)
+    updateGameCharge(rpmNorm);
+
+    // While the mini-game owns the screen, force RPM-driven effects to their off state.
+    // The wheel still spins passively (rotationSpeed unchanged), orbs still orbit, but
+    // nothing in stage1/2/3 fires — no lens flare, no godrays, no scene darken, no whiteout.
+    if(gameMode.active || gameMode.entering) {
+      ud.rpmSmooth = 0;
+      ud.lastAngle = currentAngle;
+      rpm = 0;
+      rpmNorm = 0;
+      globalRpm = 0;
+    }
+
     // Three-stage brightness
     var stage1 = Math.min(rpmNorm / 0.5, 1.0); stage1 = stage1 * stage1;
     var stage2 = Math.max(Math.min((rpmNorm - 0.5) / 0.35, 1.0), 0.0);
@@ -2724,7 +2859,8 @@ function updateOrbs(dt){
   updateWeldingSparks(dt, globalRpm, orbPositions, orbVelocities);
 }
 
-function createFloor(y, radius, vRadius, label, np, hasRings, fi) {
+function createFloor(y, radius, vRadius, label, np, hasRings, fi, panelOpts) {
+  panelOpts = panelOpts || {};
   var g = new THREE.Group(); g.position.y = y;
   var ringGroups = {top:[],bottom:[]};
   
@@ -2761,7 +2897,7 @@ function createFloor(y, radius, vRadius, label, np, hasRings, fi) {
   var panels = [];
   for(var i=0;i<np;i++){
     var angle = i*as;
-    var p = createPanel(radius, vRadius);
+    var p = createPanel(radius, vRadius, panelOpts);
     p.mesh.rotation.y = angle;
     p.mesh.userData.baseAngle = angle;
     p.mesh.userData.baseRadius = radius;
@@ -3205,6 +3341,16 @@ function pDown(cx,cy){
         if(pdQvH.length>0){ pressedGlassMesh = findGlassMeshFromHit(pdQvH[0].object); break; }
       }
     }
+    if(!pressedGlassMesh){
+      for(var pdLbOi=0;pdLbOi<cartOverlays.length;pdLbOi++){
+        var pdLbOvH = raycaster.intersectObjects(cartOverlays[pdLbOi].group.children,true);
+        if(pdLbOvH.length>0){ pressedGlassMesh = findGlassMeshFromHit(pdLbOvH[0].object); break; }
+      }
+    }
+    if(!pressedGlassMesh && cart.glassMesh){
+      var pdLbCgH = raycaster.intersectObject(cart.glassMesh);
+      if(pdLbCgH.length>0) pressedGlassMesh = cart.glassMesh;
+    }
   } else {
     if(navMenu.glassMesh){
       var pdGH = raycaster.intersectObject(navMenu.glassMesh);
@@ -3390,7 +3536,7 @@ function updateCursor(cx,cy){
   mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
 
-  // Lightbox: only the three buttons get hover feedback. Everything else is inert.
+  // Lightbox: three buttons + the cart stay interactive. Everything else is inert.
   if(imgLightbox.active || imgLightbox.entering || imgLightbox.exiting){
     if(dm.active && dm.dmButtons.length>0){
       for(var lbCi=0; lbCi<dm.dmButtons.length; lbCi++){
@@ -3399,6 +3545,35 @@ function updateCursor(cx,cy){
           hoveredGlassMesh = findGlassMeshFromHit(lbCh[0].object);
           el.classList.add('clickable');
           return;
+        }
+      }
+    }
+    // Cart overlay buttons (e.g. close-cart) when panel open
+    for(var lbCoi=0;lbCoi<cartOverlays.length;lbCoi++){
+      var lbCovH=raycaster.intersectObjects(cartOverlays[lbCoi].group.children,true);
+      if(lbCovH.length>0){
+        hoveredGlassMesh = findGlassMeshFromHit(lbCovH[0].object);
+        el.classList.add('clickable');
+        return;
+      }
+    }
+    // Cart icon itself (always tappable through the lightbox)
+    if(cart.glassMesh){
+      var lbCgh = raycaster.intersectObject(cart.glassMesh);
+      if(lbCgh.length>0){
+        hoveredGlassMesh = cart.glassMesh;
+        el.classList.add('clickable');
+        return;
+      }
+    }
+    // Cart panel buttons (when open)
+    if(cart.panelGroup && cart.panelOpen){
+      var lbCph = raycaster.intersectObjects(cart.panelGroup.children, true);
+      for(var lbCph2=0;lbCph2<lbCph.length;lbCph2++){
+        var lbCheck = lbCph[lbCph2].object;
+        while(lbCheck && lbCheck !== cart.panelGroup){
+          if(lbCheck.userData.clickable){el.classList.add('clickable');return;}
+          lbCheck = lbCheck.parent;
         }
       }
     }
@@ -3556,8 +3731,64 @@ function pUp(cx,cy){
               var lbFloorCfg2 = PRODUCT_DATA.floors[dm.floorIdx];
               if(lbFloorCfg2 && lbFloorCfg2.products[dm.selIdx]) buyNowAndCheckout(lbFloorCfg2.products[dm.selIdx]);
             }
-            break;
+            isDragging=false; selectedFloor=null;
+            if(dm.draggingVW) dm.draggingVW=false;
+            renderer.domElement.parentElement.classList.remove('dragging');
+            return;
           }
+        }
+      }
+      // Cart overlay buttons (e.g. close-cart when panel open)
+      if(cart.panelOpen && cartOverlays.length>0){
+        for(var lbOvi=0;lbOvi<cartOverlays.length;lbOvi++){
+          var lbOvGroup=cartOverlays[lbOvi].group;
+          var lbOvHits=raycaster.intersectObjects(lbOvGroup.children,true);
+          if(lbOvHits.length>0){
+            if(lbOvGroup.userData.clickable&&lbOvGroup.userData.actionId){
+              var lbOvAid=lbOvGroup.userData.actionId;
+              if(lbOvAid==='close-cart'){cart.dragOffsetX=0.3;cart.dragOffsetY=0;toggleCartPanel();}
+            }
+            isDragging=false;selectedFloor=null;
+            if(dm.draggingVW)dm.draggingVW=false;
+            renderer.domElement.parentElement.classList.remove('dragging');
+            return;
+          }
+        }
+      }
+      // Cart panel buttons (when open)
+      if(cart.panelGroup && cart.panelOpen){
+        var lbCpHits=raycaster.intersectObjects(cart.panelGroup.children,true);
+        for(var lbCph3=0;lbCph3<lbCpHits.length;lbCph3++){
+          var lbCheck3=lbCpHits[lbCph3].object;
+          while(lbCheck3&&lbCheck3!==cart.panelGroup){
+            if(lbCheck3.userData.clickable&&lbCheck3.userData.actionId){
+              var lbCAid=lbCheck3.userData.actionId;
+              if(lbCAid==='close-cart'){cart.dragOffsetX=0.3;cart.dragOffsetY=0;toggleCartPanel();}
+              else if(lbCAid==='checkout'){shopifyGoToCheckout();}
+              else if(lbCAid.indexOf('remove-cart-')===0){removeFromCart(parseInt(lbCAid.replace('remove-cart-','')));}
+              else if(lbCAid.indexOf('inc-cart-')===0){incrementCartItem(parseInt(lbCAid.replace('inc-cart-','')));}
+              else if(lbCAid.indexOf('dec-cart-')===0){decrementCartItem(parseInt(lbCAid.replace('dec-cart-','')));}
+              isDragging=false;selectedFloor=null;
+              if(dm.draggingVW)dm.draggingVW=false;
+              renderer.domElement.parentElement.classList.remove('dragging');
+              return;
+            }
+            lbCheck3=lbCheck3.parent;
+          }
+        }
+      }
+      // Cart icon (open/close the panel without leaving the lightbox)
+      if(cart.glassMesh){
+        var lbCgClick = raycaster.intersectObject(cart.glassMesh);
+        if(lbCgClick.length>0){
+          if(!cart.panelAnimating){
+            if(cart.panelOpen){cart.dragOffsetX=0.3;cart.dragOffsetY=0;}
+            toggleCartPanel();
+          }
+          isDragging=false;selectedFloor=null;
+          if(dm.draggingVW)dm.draggingVW=false;
+          renderer.domElement.parentElement.classList.remove('dragging');
+          return;
         }
       }
       isDragging=false; selectedFloor=null;
@@ -3778,7 +4009,7 @@ function pUp(cx,cy){
         if(skipStar) continue;
         
         // Star click
-        if(co.geometry&&co.geometry.type==='OctahedronGeometry'&&dm.active){console.log('Section:',PRODUCT_DATA.floors[dm.floorIdx].label);break;}
+        if(co.geometry&&co.geometry.type==='OctahedronGeometry'&&dm.active){break;}
         
         // If we hit a Line or LineSegments, find sibling CylinderGeometry mesh
         if((co.type==='Line'||co.type==='LineSegments')&&co.parent){
@@ -4901,12 +5132,9 @@ function enterImgLightbox(){
   }
   imgMesh.layers.enable(1);
   imgMesh.traverse(function(c){c.layers.enable(1);});
-  // Drop the cart icon off layer 1 so it renders into the main FBO and picks up the
-  // bgBlur. The nav menu stays on layer 1 (stays sharp on top, like before).
-  if(cart.iconGroup){
-    cart.iconGroup.layers.disable(1);
-    cart.iconGroup.traverse(function(c){c.layers.disable(1);});
-  }
+  // Cart icon stays on layer 1 (sharp on top) so the user can still see and tap it
+  // through the lightbox. The hide-during-FBO-capture path below skips it so it
+  // doesn't double-render or end up inside the bgBlur.
   // Lock the page in place so the user can't scroll the camera while the lightbox is open
   imgLightbox.savedScrollY = window.pageYOffset;
   touchScroll.scrollMomentum = 0;
@@ -5042,7 +5270,7 @@ function animateImgLightbox(dt){
     var rightX =  bHalfW - btnRadius - btnEdgeMargin;
     var leftX  = -bHalfW + btnRadius + btnEdgeMargin;
     var bottomY = -bHalfH * 0.55;
-    var topY    =  bHalfH * 0.80;
+    var topY    =  bHalfH * 0.68;
     var targets = [
       // 0 = add-to-cart → bottom-left corner
       bCamCenter.clone().add(camRight.clone().multiplyScalar(leftX)).add(camUp.clone().multiplyScalar(bottomY)),
@@ -5087,10 +5315,6 @@ function animateImgLightbox(dt){
     if(imgMesh){
       imgMesh.layers.disable(1);
       imgMesh.traverse(function(c){c.layers.disable(1);});
-    }
-    if(cart.iconGroup){
-      cart.iconGroup.layers.enable(1);
-      cart.iconGroup.traverse(function(c){c.layers.enable(1);});
     }
     imgLightbox.savedScrollY = -1;
     imgLightbox.imgOrigPos = null;
@@ -10822,6 +11046,355 @@ function updateShootingStars(dt) {
 
 
 // ══════════════════════════════════════════════
+// MINI GAME MODE — IMPLEMENTATION
+// ══════════════════════════════════════════════
+// Ship geometry data (procedural, converted from GLB — pulled from Orbicule.html)
+var GAME_SHIP_POSITIONS = new Float32Array([-0.71,0.704,-1,-0.71,0.704,-1,-0.71,0.704,-1,-0.712,0.708,-0.617,-0.712,0.708,-0.617,-0.712,0.708,-0.617,-0.709,1.038,-0.812,-0.709,1.038,-0.812,-0.709,1.038,-0.812,-1.153,0.82,-0.812,-1.153,0.82,-0.812,-1.153,0.82,-0.812,-0.711,0.704,-1,-0.711,0.704,-1,-0.711,0.704,-1,-0.713,0.708,-0.617,-0.713,0.708,-0.617,-0.713,0.708,-0.617,-0.71,1.038,-0.812,-0.71,1.038,-0.812,-0.71,1.038,-0.812,-0.269,0.813,-0.808,-0.269,0.813,-0.808,-0.269,0.813,-0.808,-1.771,0.655,-0.768,-1.771,0.655,-0.768,-1.771,0.655,-0.768,-0.505,0.747,-0.348,-0.505,0.747,-0.348,-0.505,0.747,-0.348,-0.478,0.987,-0.7,-0.478,0.987,-0.7,-0.478,0.987,-0.7,-0.942,0.879,-0.551,-0.942,0.879,-0.551,-0.942,0.879,-0.551,-0.475,0.894,-0.571,-0.475,0.894,-0.571,-0.475,0.894,-0.571,-0.473,0.896,-0.572,-0.473,0.896,-0.572,-0.473,0.896,-0.572,-0.165,1.081,-0.385,-0.165,1.081,-0.385,-0.165,1.081,-0.385,-0.164,1.087,-0.39,-0.164,1.087,-0.39,-0.164,1.087,-0.39,-0.2,0.827,-0.763,-0.2,0.827,-0.763,-0.2,0.827,-0.763,-0.313,0.885,-0.697,-0.313,0.885,-0.697,-0.313,0.885,-0.697,0.281,0.992,-0.33,0.281,0.992,-0.33,0.281,0.992,-0.33,0.333,1.075,-0.237,0.333,1.075,-0.237,0.333,1.075,-0.237,-0.583,0.696,-0.501,-0.583,0.696,-0.501,-0.583,0.696,-0.501,-0.58,0.7,-0.5,-0.58,0.7,-0.5,-0.58,0.7,-0.5,-0.093,0.733,-0.086,-0.093,0.733,-0.086,-0.093,0.733,-0.086,-0.091,0.744,-0.087,-0.091,0.744,-0.087,-0.091,0.744,-0.087,-0.149,0.811,-0.802,-0.149,0.811,-0.802,-0.149,0.811,-0.802,-0.327,0.814,-0.663,-0.327,0.814,-0.663,-0.327,0.814,-0.663,0.611,0.569,-0.111,0.611,0.569,-0.111,0.611,0.569,-0.111,0.692,0.574,0.086,0.692,0.574,0.086,0.692,0.574,0.086,-0.583,0.696,-1.119,-0.583,0.696,-1.119,-0.583,0.696,-1.119,-0.58,0.7,-1.12,-0.58,0.7,-1.12,-0.58,0.7,-1.12,-0.093,0.733,-1.533,-0.093,0.733,-1.533,-0.093,0.733,-1.533,-0.091,0.744,-1.532,-0.091,0.744,-1.532,-0.091,0.744,-1.532,-0.149,0.811,-0.818,-0.149,0.811,-0.818,-0.149,0.811,-0.818,-0.327,0.814,-0.956,-0.327,0.814,-0.956,-0.327,0.814,-0.956,0.611,0.569,-1.508,0.611,0.569,-1.508,0.611,0.569,-1.508,0.692,0.574,-1.705,0.692,0.574,-1.705,0.692,0.574,-1.705,-0.475,0.894,-1.061,-0.475,0.894,-1.061,-0.475,0.894,-1.061,-0.473,0.896,-1.06,-0.473,0.896,-1.06,-0.473,0.896,-1.06,-0.165,1.081,-1.247,-0.165,1.081,-1.247,-0.165,1.081,-1.247,-0.164,1.087,-1.242,-0.164,1.087,-1.242,-0.164,1.087,-1.242,-0.2,0.827,-0.868,-0.2,0.827,-0.868,-0.2,0.827,-0.868,-0.313,0.885,-0.934,-0.313,0.885,-0.934,-0.313,0.885,-0.934,0.281,0.992,-1.302,0.281,0.992,-1.302,0.281,0.992,-1.302,0.333,1.075,-1.395,0.333,1.075,-1.395,0.333,1.075,-1.395,-0.583,0.696,-1.119,-0.583,0.696,-1.119,-0.583,0.696,-1.119,-0.58,0.7,-1.12,-0.58,0.7,-1.12,-0.58,0.7,-1.12,-0.093,0.733,-1.533,-0.093,0.733,-1.533,-0.093,0.733,-1.533,-0.091,0.744,-1.532,-0.091,0.744,-1.532,-0.091,0.744,-1.532,-0.149,0.811,-0.818,-0.149,0.811,-0.818,-0.149,0.811,-0.818,-0.327,0.814,-0.956,-0.327,0.814,-0.956,-0.327,0.814,-0.956,0.611,0.569,-1.508,0.611,0.569,-1.508,0.611,0.569,-1.508,0.692,0.574,-1.705,0.692,0.574,-1.705,0.692,0.574,-1.705,-1.771,0.655,-0.864,-1.771,0.655,-0.864,-1.771,0.655,-0.864,-0.505,0.747,-1.284,-0.505,0.747,-1.284,-0.505,0.747,-1.284,-0.478,0.987,-0.932,-0.478,0.987,-0.932,-0.478,0.987,-0.932,-0.942,0.879,-1.081,-0.942,0.879,-1.081,-0.942,0.879,-1.081]);
+var GAME_SHIP_INDICES = new Uint16Array([1,10,5,0,4,7,3,9,6,8,11,2,14,23,17,12,16,19,15,21,18,20,22,13,24,33,27,25,28,30,29,34,31,32,35,26,38,40,46,38,46,44,42,45,57,42,57,54,56,58,52,56,52,50,49,51,39,49,39,37,43,55,48,43,48,36,59,47,41,59,41,53,60,63,69,60,69,66,68,70,81,68,81,79,80,83,77,80,77,74,73,75,64,73,64,62,67,78,72,67,72,61,82,71,65,82,65,76,84,87,93,84,93,90,91,95,107,91,107,103,102,105,99,102,99,96,97,101,89,97,89,85,92,104,98,92,98,86,106,94,88,106,88,100,108,112,118,108,118,114,115,119,131,115,131,127,126,129,123,126,123,120,122,125,113,122,113,110,116,128,121,116,121,109,130,117,111,130,111,124,132,135,141,132,141,138,139,143,155,139,155,151,150,153,147,150,147,144,145,149,137,145,137,133,140,152,146,140,146,134,154,142,136,154,136,148,156,165,159,158,161,164,160,167,163,162,166,157]);
+
+function buildGameMode() {
+  // Wrapper group lets us toggle ship visibility cleanly
+  var g = new THREE.Group();
+  g.visible = false;
+
+  // Ship — procedural geometry copied from Orbicule, scaled tiny to match the crystal "planet"
+  var ship = new THREE.Group();
+  var shipVisual = new THREE.Group();
+  ship.add(shipVisual);
+
+  var shipGeo = new THREE.BufferGeometry();
+  shipGeo.setAttribute('position', new THREE.BufferAttribute(GAME_SHIP_POSITIONS, 3));
+  shipGeo.setIndex(new THREE.BufferAttribute(GAME_SHIP_INDICES, 1));
+  shipGeo.computeVertexNormals();
+  shipGeo.computeBoundingBox();
+  var shipCenter = new THREE.Vector3();
+  shipGeo.boundingBox.getCenter(shipCenter);
+  shipGeo.translate(-shipCenter.x, -shipCenter.y, -shipCenter.z);
+
+  // Brighter purple — the ship needs to read against the crystal at this scale
+  var shipMat = new THREE.MeshStandardMaterial({
+    color: 0x9977cc, transparent: true, opacity: 0.96,
+    roughness: 0.15, metalness: 0.3,
+    emissive: 0x553388, emissiveIntensity: 0.55
+  });
+  var shipMesh = new THREE.Mesh(shipGeo, shipMat);
+  shipMesh.rotation.set(0, Math.PI / 2, 0);
+  shipVisual.add(shipMesh);
+
+  var shipEdges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(shipGeo),
+    new THREE.LineBasicMaterial({color: 0xddbbff, transparent: true, opacity: 0.8})
+  );
+  shipEdges.rotation.copy(shipMesh.rotation);
+  shipVisual.add(shipEdges);
+
+  var engineGlow = new THREE.Mesh(
+    new THREE.SphereGeometry(0.4, 10, 8),
+    new THREE.MeshBasicMaterial({color: 0xaa66ff, transparent: true, opacity: 0.7})
+  );
+  engineGlow.position.z = -2.8;
+  shipVisual.add(engineGlow);
+
+  // Whole ship scales down so it looks like a tiny craft on the ~0.9-radius crystal
+  ship.scale.setScalar(0.007);
+  g.add(ship);
+
+  gameMode.group = g;
+  gameMode.ship = ship;
+  gameMode.shipVisual = shipVisual;
+  gameMode.engineGlow = engineGlow;
+
+  scene.add(g);
+}
+
+function updateGameCharge(rpmNorm) {
+  if(gameMode.active || gameMode.entering) return;
+  // Don't engage while another overlay is active — display mode, product detail, image lightbox
+  if(dm.active || dm.animating || dm.closing) return;
+  if(pdv.active || pdv.entering || pdv.exitingToDM) return;
+  if(imgLightbox.active || imgLightbox.entering || imgLightbox.exiting) return;
+  if(rpmNorm > gameMode.chargeRpmThreshold) {
+    gameMode.chargeProg = Math.min(1, gameMode.chargeProg + gameMode.chargeFillRate);
+  } else {
+    gameMode.chargeProg = Math.max(0, gameMode.chargeProg - gameMode.chargeDecayRate);
+  }
+  if(gameMode.chargeProg >= 1) enterGameMode();
+}
+
+function enterGameMode() {
+  if(gameMode.active || gameMode.entering) return;
+  if(!gameMode.group) buildGameMode();
+  gameMode.entering = true;
+  gameMode.prog = 0;
+  gameMode.savedCamPos.copy(camera.position);
+  gameMode.savedCamQuat.copy(camera.quaternion);
+  gameMode.savedTargetCameraY = targetCameraY;
+  // Lock surface center to the gallery floor's crystal in world space
+  var gf = gameMode.galleryFloor;
+  gameMode.surface.center.set(0, gf ? gf.group.position.y : 0, 0);
+  // Reset ship to north pole of the crystal, facing tangent in +X direction
+  gameMode.surfaceState.pos.set(0, gameMode.surface.radius, 0);
+  gameMode.surfaceState.forward.set(1, 0, 0);
+  gameMode.surfaceState.speed = 0;
+  gameMode.physics.accelerationTime = 0;
+  // Snap the wheel back to its passive spin: zero the user-induced velocity so the
+  // website keeps moving gently (passive rotationSpeed continues), but the burst of
+  // high-RPM lighting effects from the trigger spin doesn't linger. The per-frame
+  // override in updateOrbs forces all rpm-driven effects to their off state.
+  if(gf) {
+    gf.group.userData.velocity = 0;
+    gf.group.userData.rpmSmooth = 0;
+    gf.group.userData.lastAngle = gf.group.rotation.y;
+  }
+  // Place ship at the right world location immediately so the camera dive lands properly
+  positionShipOnSurface();
+  gameMode.group.visible = true;
+  // Release any dragging state to avoid stuck inputs
+  isDragging = false;
+  selectedFloor = null;
+  if(renderer && renderer.domElement && renderer.domElement.parentElement){
+    renderer.domElement.parentElement.classList.remove('dragging');
+  }
+}
+
+// Apply current surfaceState to the ship's world transform — used during entry and per-frame
+function positionShipOnSurface() {
+  var s = gameMode.surfaceState;
+  var surface = gameMode.surface;
+  // Re-orthogonalize forward against up so it stays tangent
+  var up = s.pos.clone().normalize();
+  s.forward.sub(up.clone().multiplyScalar(s.forward.dot(up)));
+  if(s.forward.lengthSq() < 0.0001) s.forward.set(1, 0, 0).sub(up.clone().multiplyScalar(up.x));
+  s.forward.normalize();
+  // World position
+  gameMode.ship.position.copy(surface.center).add(s.pos);
+  // Orient ship: local +Z = forward, local +Y = up. Use Matrix4.lookAt with target = -forward
+  // (Three.js convention: lookAt makes -Z point at target, so target=-forward puts +Z at forward)
+  var m = new THREE.Matrix4();
+  m.lookAt(new THREE.Vector3(0,0,0), s.forward.clone().multiplyScalar(-1), up);
+  gameMode.ship.quaternion.setFromRotationMatrix(m);
+}
+
+function exitGameMode() {
+  if(!gameMode.active || gameMode.exiting) return;
+  gameMode.exiting = true;
+  gameMode.exitProg = 0;
+  // Clear key state so nothing sticks after exit
+  gameMode.keys.w = gameMode.keys.a = gameMode.keys.s = gameMode.keys.d = gameMode.keys.shift = false;
+}
+
+function restoreGalleryWheel() {
+  if(!gameMode.wheelFreeze.saved) return;
+  var gf = gameMode.galleryFloor;
+  if(gf) {
+    gf.group.userData.rotationSpeed = gameMode.wheelFreeze.rotationSpeed;
+    // Don't restore velocity — user already let go. Passive rotationSpeed will pick it back up.
+  }
+  gameMode.wheelFreeze.saved = false;
+}
+
+// Force-reset everything that the orb-floor's per-frame RPM math drives: center star
+// glow, point light, light rays, lens flare, beam particles + bonds, godrays, screen
+// darkening, post-process whiteout/shake. Since updateOrbs is skipped during the game,
+// these would otherwise stay locked at whatever value they had at entry.
+function killGalleryEffects(gf) {
+  // Center star material → base emissive/colors
+  var star = gf.group.userData.centerStar;
+  if(star && star.children[0] && star.children[0].material) {
+    var sm = star.children[0].material;
+    if(sm.emissive) sm.emissive.setRGB(0.2, 0.15, 0.15);
+    sm.emissiveIntensity = 0.3;
+    if(sm.color) sm.color.setRGB(0.6, 0.6, 0.7);
+  }
+  // Center point light → dim
+  if(gf.group.userData.centerLight) {
+    gf.group.userData.centerLight.intensity = 0.2;
+    gf.group.userData.centerLight.distance = 20;
+    gf.group.userData.centerLight.color.setRGB(0.53, 0.67, 0.93);
+  }
+  // Lens flare → invisible
+  if(typeof updateLensFlare === 'function') updateLensFlare(0);
+  // Light rays → calm
+  if(typeof updateLightRays === 'function') updateLightRays(0, performance.now() * 0.001);
+  // God rays
+  godrayIntensity = 0;
+  smoothedRpmForPlanets = 0;
+  // Background back to default light gray
+  if(scene && scene.background && scene.background.setRGB) scene.background.setRGB(0.941, 0.941, 0.961);
+  if(scene && scene.fog && scene.fog.color) scene.fog.color.setRGB(0.941, 0.941, 0.961);
+  // Post-process effects
+  if(postQuad && postQuad.material.uniforms) {
+    if(postQuad.material.uniforms.whiteout) postQuad.material.uniforms.whiteout.value = 0;
+    if(postQuad.material.uniforms.shakeAmount) postQuad.material.uniforms.shakeAmount.value = 0;
+    if(postQuad.material.uniforms.bgBlur) postQuad.material.uniforms.bgBlur.value = 0;
+  }
+  // Kill beam particles + bond lines so they don't stay alive trailing behind
+  var B = gf.group.userData.beam;
+  if(B) {
+    for(var bi = 0; bi < B.maxP; bi++) {
+      B.alive[bi] = 0;
+      B.alpha[bi] = 0;
+      B.pos[bi*3] = 0; B.pos[bi*3+1] = 0; B.pos[bi*3+2] = 0;
+      B.vel[bi*3] = 0; B.vel[bi*3+1] = 0; B.vel[bi*3+2] = 0;
+    }
+    B.geo.attributes.position.needsUpdate = true;
+    B.geo.attributes.alpha.needsUpdate = true;
+  }
+  var BO = gf.group.userData.bonds;
+  if(BO) {
+    BO.data.length = 0;
+    BO.geo.setDrawRange(0, 0);
+  }
+}
+
+function computeChaseCamPose() {
+  // Returns {pos, lookAt} for the chase camera given current surfaceState
+  var s = gameMode.surfaceState;
+  var surface = gameMode.surface;
+  var up = s.pos.clone().normalize();
+  var shipWorld = surface.center.clone().add(s.pos);
+  var camPos = shipWorld.clone()
+    .add(s.forward.clone().multiplyScalar(-gameMode.camBackDist))
+    .add(up.clone().multiplyScalar(gameMode.camUpDist));
+  var lookAt = shipWorld.clone().add(up.clone().multiplyScalar(0.04));
+  return { pos: camPos, lookAt: lookAt };
+}
+
+function animateGameTransition() {
+  if(!gameMode.entering && !gameMode.exiting) return;
+
+  if(gameMode.entering) {
+    gameMode.prog = Math.min(1, gameMode.prog + 0.012);
+    var p = gameMode.prog;
+    var ease = p * p * (3 - 2*p);
+
+    // Camera lerps from saved orbit position toward the chase-cam target behind the ship.
+    // Ship is already positioned on the crystal (set in enterGameMode), so chase pose is stable.
+    var chase = computeChaseCamPose();
+    camera.position.lerpVectors(gameMode.savedCamPos, chase.pos, ease);
+    // Lookat lerps from "origin of gallery floor" toward "ship + slight up offset"
+    var galY = gameMode.galleryFloor ? gameMode.galleryFloor.group.position.y : 0;
+    var startLook = new THREE.Vector3(0, galY, 0);
+    var curLook = startLook.lerp(chase.lookAt, ease);
+    camera.lookAt(curLook);
+
+    if(p >= 1) {
+      gameMode.entering = false;
+      gameMode.active = true;
+      gameMode.chargeProg = 0;
+    }
+  } else if(gameMode.exiting) {
+    gameMode.exitProg = Math.min(1, gameMode.exitProg + 0.012);
+    var ep = gameMode.exitProg;
+    var ease2 = ep * ep * (3 - 2*ep);
+
+    // Camera retreats from current chase position back to the saved orbit position
+    var chase2 = computeChaseCamPose();
+    camera.position.lerpVectors(chase2.pos, gameMode.savedCamPos, ease2);
+    // Lookat lerps from ship back to floor origin
+    var galY2 = gameMode.galleryFloor ? gameMode.galleryFloor.group.position.y : 0;
+    var endLook = new THREE.Vector3(0, galY2, 0);
+    var curLook2 = chase2.lookAt.clone().lerp(endLook, ease2);
+    camera.lookAt(curLook2);
+
+    // Once we've retreated halfway, hide the ship + restore camera Y target so the normal
+    // website lerp picks up smoothly when we hand control back
+    if(ep >= 0.6 && gameMode.active) {
+      gameMode.active = false;
+      gameMode.group.visible = false;
+      restoreGalleryWheel();
+      targetCameraY = gameMode.savedTargetCameraY;
+    }
+
+    if(ep >= 1) {
+      gameMode.exiting = false;
+    }
+  }
+}
+
+function updateGamePhysicsAndCamera() {
+  if(!gameMode.active) return;
+  var p = gameMode.physics;
+  var k = gameMode.keys;
+  var s = gameMode.surfaceState;
+  var surface = gameMode.surface;
+
+  // Boost state
+  p.isBoosting = k.shift && k.w;
+
+  // Thrust ramp — same feel as Orbicule's accelerationTime/maxAccelerationTime
+  if(k.w || k.s) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1);
+  else p.accelerationTime = Math.max(0, p.accelerationTime - 3);
+  var thrustRamp = p.accelerationTime / p.maxAccelerationTime;
+  var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * thrustRamp;
+  if(p.isBoosting) thrust = p.boostAccelRate;
+
+  // Update scalar speed (along forward tangent)
+  if(k.w) s.speed += thrust;
+  if(k.s) s.speed -= thrust * 0.6;
+  s.speed *= p.drag;
+  var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
+  if(s.speed > maxS) s.speed = maxS;
+  if(s.speed < -maxS * 0.6) s.speed = -maxS * 0.6;
+
+  // Current up = surface normal at ship's spot
+  var up = s.pos.clone().normalize();
+
+  // Yaw — rotate forward around up axis
+  if(k.a) s.forward.applyAxisAngle(up, p.turnSpeed);
+  if(k.d) s.forward.applyAxisAngle(up, -p.turnSpeed);
+  // Re-orthogonalize forward to stay tangent (drift correction)
+  s.forward.sub(up.clone().multiplyScalar(s.forward.dot(up)));
+  if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+
+  // Move forward — rotate both pos and forward around (up × forward)
+  if(Math.abs(s.speed) > 0.00001) {
+    var axis = new THREE.Vector3().crossVectors(up, s.forward).normalize();
+    var angle = s.speed / surface.radius; // arc length → angular rotation
+    s.pos.applyAxisAngle(axis, angle);
+    s.forward.applyAxisAngle(axis, angle);
+    // Snap pos magnitude back to orbit radius in case of float drift
+    s.pos.normalize().multiplyScalar(surface.radius);
+  }
+
+  // Apply transform to the ship mesh
+  positionShipOnSurface();
+
+  // Engine glow scales with speed
+  if(gameMode.engineGlow) {
+    var sf = Math.abs(s.speed) / p.boostMaxSpeed;
+    gameMode.engineGlow.material.opacity = 0.5 + sf * 0.5;
+    gameMode.engineGlow.scale.setScalar(1 + sf * 0.7);
+  }
+
+  // Chase camera in tangent frame — behind ship along -forward, above along +up
+  var chase = computeChaseCamPose();
+  camera.position.lerp(chase.pos, 0.22);
+  camera.lookAt(chase.lookAt);
+}
+
+function gameKeyDown(e) {
+  if(!gameMode.active && !gameMode.entering) return;
+  var k = e.key ? e.key.toLowerCase() : '';
+  if(k === 'w' || k === 'arrowup') gameMode.keys.w = true;
+  else if(k === 'a' || k === 'arrowleft') gameMode.keys.a = true;
+  else if(k === 's' || k === 'arrowdown') gameMode.keys.s = true;
+  else if(k === 'd' || k === 'arrowright') gameMode.keys.d = true;
+  else if(k === 'shift') gameMode.keys.shift = true;
+  else if(k === 'escape') { if(gameMode.active && !gameMode.exiting) exitGameMode(); }
+  // Prevent browser default for movement keys
+  if(k === 'w' || k === 'a' || k === 's' || k === 'd' || k.indexOf('arrow') === 0) e.preventDefault();
+}
+function gameKeyUp(e) {
+  var k = e.key ? e.key.toLowerCase() : '';
+  if(k === 'w' || k === 'arrowup') gameMode.keys.w = false;
+  else if(k === 'a' || k === 'arrowleft') gameMode.keys.a = false;
+  else if(k === 's' || k === 'arrowdown') gameMode.keys.s = false;
+  else if(k === 'd' || k === 'arrowright') gameMode.keys.d = false;
+  else if(k === 'shift') gameMode.keys.shift = false;
+}
+
+// ══════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════
 function init(){
@@ -10831,7 +11404,7 @@ function init(){
   camera.layers.enable(1);
   updateCamRadius();
   camera.position.set(0,0,CAM_ORBIT_RADIUS);camera.lookAt(0,0,0);
-  renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+  renderer=new THREE.WebGLRenderer({antialias:true,alpha:true,powerPreference:'high-performance'});
   renderer.setSize(window.innerWidth,window.innerHeight);renderer.setPixelRatio(Math.min(window.devicePixelRatio,2.0));renderer.sortObjects=true;
   document.getElementById('canvas-container').appendChild(renderer.domElement);
   createEnv();scene.environment=envMap;
@@ -10883,8 +11456,8 @@ function init(){
   createBackdropBlur();
   createStarField();
   createPlanets();
-  // Set orb floor Y for light rays positioning
-  for(var ofi=0;ofi<floors.length;ofi++){ if(floors[ofi].isOrbFloor){ orbFloorY=floors[ofi].group.position.y; break; } }
+  // Set orb floor Y for light rays positioning + remember it for the mini game trigger
+  for(var ofi=0;ofi<floors.length;ofi++){ if(floors[ofi].isOrbFloor){ orbFloorY=floors[ofi].group.position.y; gameMode.galleryFloor=floors[ofi]; break; } }
   createLightRays();
   createOrbParticles();
   createWeldingSparks();
@@ -10938,6 +11511,9 @@ function init(){
     }
   },{passive:false});
   setupDeviceOrientation();
+  // Mini-game keyboard handlers (WASD + Shift + ESC) — listeners stay registered but only act while game is active
+  window.addEventListener('keydown', gameKeyDown);
+  window.addEventListener('keyup', gameKeyUp);
   startIntro();animate();
 }
 
@@ -10946,6 +11522,7 @@ function init(){
 // ══════════════════════════════════════════════
 function animate(){
   requestAnimationFrame(animate);
+  if(document.hidden) return;
   var time = performance.now() * 0.001;
   var dt = Math.min(1/30, time - (window._lastTime || time));
   window._lastTime = time;
@@ -11015,8 +11592,12 @@ function animate(){
     targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
   }
 
+  // Skip the website's camera-y/tilt/lookAt code while the mini-game owns the camera.
+  // Without this gate, the orbit-camera math fights our chase camera and the view
+  // snaps back to the website even mid-transition.
+  if(!gameMode.entering && !gameMode.active) {
   camera.position.y+=(targetCameraY-camera.position.y)*0.45;
-  
+
   // Nav scroll animation — overrides camera Y with smooth ease-out
   if(navScrollAnim.active){
     navScrollAnim.progress+=0.025;
@@ -11027,7 +11608,7 @@ function animate(){
     camera.position.y=navScrollAnim.startY+(navScrollAnim.targetY-navScrollAnim.startY)*ease;
     targetCameraY=camera.position.y; // sync so regular lerp doesn't fight it
   }
-  
+
   // ── Camera: face tracking or mouse ──
   if(faceTrack.active && faceTrack.enabled){
     var dx=(faceTrack.x-faceTrack.calX)*faceTrack.sensitivity;
@@ -11072,7 +11653,13 @@ function animate(){
   } else {
     camera.lookAt(0,camera.position.y,0);
   }
-  
+  } // end !gameMode.entering && !gameMode.active gate
+
+  // Game mode — transition + physics + camera. Runs AFTER website camera setup
+  // so it overrides position.y / lookAt that the camera-y lerp and tilt code applied.
+  if(gameMode.entering || gameMode.exiting) animateGameTransition();
+  if(gameMode.active) updateGamePhysicsAndCamera();
+
   floors.forEach(function(fl){
     var ud=fl.group.userData;
     var vel=ud.velocity;
@@ -11496,9 +12083,9 @@ function animate(){
   var lbOnFbo = imgLightbox.active || imgLightbox.entering || imgLightbox.exiting;
   var cartIconVis=cart.iconGroup?cart.iconGroup.visible:false;
   var cartPanelVis=cart.panelGroup?cart.panelGroup.visible:false;
-  // During lightbox, leave the cart icon visible so it renders into the main FBO and
-  // gets bgBlur applied (it's been knocked off layer 1, so it won't double-render).
-  if(cart.iconGroup && !lbOnFbo) cart.iconGroup.visible=false;
+  // Hide the cart icon during the main render — it's on layer 1 so the overlay pass
+  // draws it sharply on top, escaping the bgBlur even when the lightbox is open.
+  if(cart.iconGroup) cart.iconGroup.visible=false;
   if(cart.panelGroup) cart.panelGroup.visible=false;
   if(navMenu.group) navMenu.group.visible=false;
   for(var _nb3=0;_nb3<navMenu.buttons.length;_nb3++) navMenu.buttons[_nb3].group.visible=false;
