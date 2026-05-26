@@ -562,6 +562,9 @@ var gameMode = {
   savedCamPos: new THREE.Vector3(),
   savedCamQuat: new THREE.Quaternion(),
   savedTargetCameraY: 0,
+  savedCamNear: 0.1,        // restored on exit — game mode needs a much smaller near
+                            // plane (0.001) so the crystal directly under the chase
+                            // camera doesn't get clipped through.
   // Chase camera offsets — in tangent frame, scaled for planet
   camBackDist: 0.12,
   camUpDist: 0.05,
@@ -11235,15 +11238,24 @@ function enterGameMode() {
   gameMode.savedCamPos.copy(camera.position);
   gameMode.savedCamQuat.copy(camera.quaternion);
   gameMode.savedTargetCameraY = targetCameraY;
+  // Shrink the near plane way down for the duration of the game — the chase camera
+  // sits ~0.12 units from the ship which itself is right above the crystal, so the
+  // default 0.1 near plane would clip the surface right under the camera.
+  gameMode.savedCamNear = camera.near;
+  camera.near = 0.001;
+  camera.updateProjectionMatrix();
   // Lock surface center to the gallery floor's crystal in world space
   var gf = gameMode.galleryFloor;
   gameMode.surface.center.set(0, gf ? gf.group.position.y : 0, 0);
-  // Start the ship above the crystal's north pole; positionShipOnSurface() then
-  // raycasts down and snaps it to whichever facet is currently up-facing.
-  gameMode.ship.position.copy(gameMode.surface.center).add(new THREE.Vector3(0, 1.5, 0));
-  gameMode.surfaceState.forward.set(1, 0, 0);
+  // Spawn the ship above the FRONT face of the crystal (the +Z side facing the orbit
+  // camera) with its forward direction pointing along world +Y. After the raycast snap
+  // the ship sits on whichever facet that probe hits, oriented so pressing W flies it
+  // up through the website. groundNormal points outward from the crystal along +Z so
+  // the chase camera ends up below + slightly behind the ship, looking up.
+  gameMode.ship.position.copy(gameMode.surface.center).add(new THREE.Vector3(0, 0, 1.5));
+  gameMode.surfaceState.forward.set(0, 1, 0);
   gameMode.surfaceState.speed = 0;
-  gameMode.surfaceState.groundNormal.set(0, 1, 0);
+  gameMode.surfaceState.groundNormal.set(0, 0, 1);
   gameMode.surfaceState.isDrifting = false;
   gameMode.surfaceState.driftDirection = 0;
   gameMode.surfaceState.driftAngle = 0;
@@ -11566,6 +11578,9 @@ function animateGameTransition() {
       gameMode.group.visible = false;
       restoreGalleryWheel();
       targetCameraY = gameMode.savedTargetCameraY;
+      // Restore the original near plane now that the camera is back in orbit-cam range
+      camera.near = gameMode.savedCamNear;
+      camera.updateProjectionMatrix();
       // Clean up any drift particles still alive — they'd otherwise hang in mid-air
       clearGameDriftParticles();
     }
