@@ -3168,10 +3168,10 @@ function onTM(e){
     var dy = gt.startY - gt.curY; // up = positive
     var upFrac = dy / window.innerHeight;
     var rightFrac = dx / window.innerWidth;
-    // Throttle: 40% screen up = full forward; reverse maxes out at 25% screen down (-0.6)
-    var deadUp = 0.02, deadDown = 0.02;
-    if(upFrac > deadUp)        gt.throttle = Math.min((upFrac - deadUp) / (0.4 - deadUp), 1.0);
-    else if(upFrac < -deadDown) gt.throttle = Math.max((upFrac + deadDown) / (0.25 - deadDown), -0.6);
+    // Throttle: 15% screen up = full forward; reverse maxes out at 12% screen down (-0.6)
+    var deadUp = 0.015, deadDown = 0.015;
+    if(upFrac > deadUp)        gt.throttle = Math.min((upFrac - deadUp) / (0.15 - deadUp), 1.0);
+    else if(upFrac < -deadDown) gt.throttle = Math.max((upFrac + deadDown) / (0.12 - deadDown), -0.6);
     else gt.throttle = 0;
     // Yaw: 20% screen sideways = full turn; right swipe turns the ship right
     var deadX = 0.02;
@@ -3179,8 +3179,8 @@ function onTM(e){
       var sign = rightFrac < 0 ? -1 : 1;
       gt.yaw = sign * Math.min((Math.abs(rightFrac) - deadX) / (0.2 - deadX), 1.0);
     } else gt.yaw = 0;
-    // Boost when swiped past 50% of screen upward
-    gt.boost = upFrac > 0.5;
+    // Boost when swiped past 22% of screen upward
+    gt.boost = upFrac > 0.22;
     return;
   }
   // ── Lightbox pinch/pan handling ──
@@ -11340,6 +11340,10 @@ function animateGameTransition() {
     var galY = gameMode.galleryFloor ? gameMode.galleryFloor.group.position.y : 0;
     var startLook = new THREE.Vector3(0, galY, 0);
     var curLook = startLook.lerp(chase.lookAt, ease);
+    // Blend camera.up from world Y toward the surface normal as we arrive
+    var startUp = new THREE.Vector3(0, 1, 0);
+    var blendedUp = startUp.lerp(chase.up, ease);
+    camera.up.copy(blendedUp).normalize();
     camera.lookAt(curLook);
 
     if(p >= 1) {
@@ -11359,6 +11363,10 @@ function animateGameTransition() {
     var galY2 = gameMode.galleryFloor ? gameMode.galleryFloor.group.position.y : 0;
     var endLook = new THREE.Vector3(0, galY2, 0);
     var curLook2 = chase2.lookAt.clone().lerp(endLook, ease2);
+    // Bring camera.up back to world Y before the website's camera math takes over
+    var endUp = new THREE.Vector3(0, 1, 0);
+    var blendedUp2 = chase2.up.clone().lerp(endUp, ease2);
+    camera.up.copy(blendedUp2).normalize();
     camera.lookAt(curLook2);
 
     // Once we've retreated halfway, hide the ship + restore camera Y target so the normal
@@ -11444,9 +11452,13 @@ function updateGamePhysicsAndCamera() {
     gameMode.engineGlow.scale.setScalar(1 + sf * 0.7);
   }
 
-  // Chase camera in tangent frame — behind ship along -forward, above along +up
+  // Chase camera in tangent frame — behind ship along -forward, above along +up.
+  // camera.up follows the surface normal (smoothed) so the view stays upright relative
+  // to the planet — without this, crossing the south pole flips the image.
   var chase = computeChaseCamPose();
-  camera.position.lerp(chase.pos, 0.22);
+  camera.position.lerp(chase.pos, 0.18);
+  camera.up.lerp(chase.up, 0.12);
+  camera.up.normalize();
   camera.lookAt(chase.lookAt);
 }
 
