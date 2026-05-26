@@ -467,6 +467,18 @@ var gameMode = {
   exiting: false,
   prog: 0,                  // 0..1 entry progress
   exitProg: 0,              // 0..1 exit progress
+  // Pre-entry wheel deceleration — runs BEFORE entering, so the user sees the wheel
+  // rapidly spin down to a stop before the camera dives in. ~0.4s long.
+  decelerating: false,
+  decelProg: 0,             // 0..1 over the full 3-second entry
+  decelStep: 0.00555,       // ~180 frames at 60fps ≈ 3s total
+  decelHoldFrac: 0.333,     // first ~1s holds full velocity/lighting before decay starts
+  // Drift particle effects — orange streaks shed from the rear inner wing while drifting,
+  // ported from Orbicule's gunner drift (Orbicule.html:21283-21386).
+  driftFx: {
+    particles: [],
+    material: null            // lazy-initialized MeshBasicMaterial
+  },
   group: null,              // wrapper around ship for visibility toggle
   ship: null,
   shipVisual: null,
@@ -476,18 +488,32 @@ var gameMode = {
   chargeProg: 0,
   chargeFillRate: 0.012,    // ~1.4s of continuous spin to commit
   chargeDecayRate: 0.025,
-  chargeRpmThreshold: 0.45, // matches stage2 onset
+  chargeRpmThreshold: 0.9,  // doubled — requires near-max RPM spin to commit
   // "Planet" surface (the center crystal)
   surface: {
     center: new THREE.Vector3(),   // world position of crystal center
     radius: 0.95                   // orbit radius — just above OctahedronGeometry(0.8) vertices
   },
-  // Position + orientation on the sphere surface (local to surface.center)
+  // Position + orientation on the crystal surface. Ship world position is the source of
+  // truth (lives on `gameMode.ship.position`); each frame a raycast against the actual
+  // OctahedronGeometry mesh corrects the height and provides a real surface normal so the
+  // ship contours over the jagged facets instead of skating on an imaginary sphere.
   surfaceState: {
-    pos: new THREE.Vector3(0, 0.95, 0),    // on north pole of crystal at start
     forward: new THREE.Vector3(1, 0, 0),   // tangent direction the ship faces
-    speed: 0                                // arc-distance per frame along forward
+    speed: 0,                               // scalar speed along forward
+    groundNormal: new THREE.Vector3(0, 1, 0), // smoothed surface normal (matches Orbicule.html:21024)
+    hoverHeight: 0.008,                     // tiny gap between ship and surface so it sits ON it
+    // Gunner drift state — ported from Orbicule's basic gunner drift
+    isDrifting: false,
+    driftDirection: 0,                      // -1 right, +1 left
+    driftAngle: 0,                          // current visual roll/yaw angle (radians)
+    driftTargetAngle: 0,                    // target angle (driftDirection * π/2)
+    driftTime: 0,                           // frames spent in current drift
+    driftEntrySpeed: 0                      // speed when drift started
   },
+  // Tracks the gallery floor's Y rotation between frames so the ship can be rotated with
+  // the crystal as it spins (otherwise the ship would slide off its surface point).
+  lastCrystalRotY: 0,
   // Frozen-wheel state — saved on entry, restored on exit
   wheelFreeze: {
     saved: false,
@@ -505,9 +531,33 @@ var gameMode = {
     maxSpeed: 0.007,
     boostMaxSpeed: 0.015,
     drag: 0.985,
-    turnSpeed: 0.04
+    turnSpeed: 0.04,
+    // Drift tuning (matches Orbicule's basic gunner drift, scaled for tiny planet)
+    driftTurnBase: 0.012,                    // initial drift yaw rate
+    driftTurnMax: 0.05,                      // max yaw rate when fully ramped
+    driftRampTime: 150,                      // frames to reach max tightness (~2.5s)
+    driftEntrySpeedRatio: 0.6,               // must be >60% maxSpeed to enter
+    driftContinueSpeedRatio: 0.1,            // continues while above 10% maxSpeed
+    driftSustainTime: 300,                   // frames to hold entry speed before decay
+    driftDecel: 0.00003                      // per-frame speed loss in decay stage
   },
-  keys: {w:false, a:false, s:false, d:false, shift:false},
+  // Free-flight mode (toggle with P) — ship leaves the crystal and flies anywhere in 3D
+  fly: {
+    active: false,
+    vel: new THREE.Vector3(),                // world-space velocity
+    accelTime: 0,
+    thrustBase: 0.0002,
+    thrustMax: 0.0012,
+    boostThrust: 0.0030,
+    maxSpeed: 0.06,
+    boostMaxSpeed: 0.18,
+    drag: 0.992,
+    yawSpeed: 0.025,
+    pitchSpeed: 0.022,
+    camBackDist: 0.45,
+    camUpDist: 0.15
+  },
+  keys: {w:false, a:false, s:false, d:false, shift:false, q:false, e:false, space:false, ctrl:false},
   // Camera state (saved on entry, restored on exit)
   savedCamPos: new THREE.Vector3(),
   savedCamQuat: new THREE.Quaternion(),
@@ -2487,6 +2537,8 @@ function updateOrbs(dt){
     // While the mini-game owns the screen, force RPM-driven effects to their off state.
     // The wheel still spins passively (rotationSpeed unchanged), orbs still orbit, but
     // nothing in stage1/2/3 fires — no lens flare, no godrays, no scene darken, no whiteout.
+    // NOTE: the pre-entry `decelerating` phase is excluded — during that phase the wheel's
+    // natural RPM drives the lighting so brightness fades smoothly with the slow-down.
     if(gameMode.active || gameMode.entering) {
       ud.rpmSmooth = 0;
       ud.lastAngle = currentAngle;
@@ -11144,27 +11196,20 @@ function buildGameMode() {
   shipEdges.rotation.copy(shipMesh.rotation);
   shipVisual.add(shipEdges);
 
-  var engineGlow = new THREE.Mesh(
-    new THREE.SphereGeometry(0.4, 10, 8),
-    new THREE.MeshBasicMaterial({color: 0xaa66ff, transparent: true, opacity: 0.7})
-  );
-  engineGlow.position.z = -2.8;
-  shipVisual.add(engineGlow);
-
   // Whole ship scales down so it looks like a tiny craft on the ~0.9-radius crystal
-  ship.scale.setScalar(0.007);
+  ship.scale.setScalar(0.014);
   g.add(ship);
 
   gameMode.group = g;
   gameMode.ship = ship;
   gameMode.shipVisual = shipVisual;
-  gameMode.engineGlow = engineGlow;
+  gameMode.engineGlow = null;
 
   scene.add(g);
 }
 
 function updateGameCharge(rpmNorm) {
-  if(gameMode.active || gameMode.entering) return;
+  if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
   // Don't engage while another overlay is active — display mode, product detail, image lightbox
   if(dm.active || dm.animating || dm.closing) return;
   if(pdv.active || pdv.entering || pdv.exitingToDM) return;
@@ -11178,9 +11223,14 @@ function updateGameCharge(rpmNorm) {
 }
 
 function enterGameMode() {
-  if(gameMode.active || gameMode.entering) return;
+  if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
   if(!gameMode.group) buildGameMode();
-  gameMode.entering = true;
+  // Two-stage entry: first the wheel rapidly decelerates from its current burst velocity,
+  // THEN the camera dives in. Without this pre-decel, the wheel would either snap to a
+  // halt (jarring) or continue spinning while the camera zooms in (distracting).
+  gameMode.decelerating = true;
+  gameMode.decelProg = 0;
+  gameMode.entering = false;        // not yet — decel runs first
   gameMode.prog = 0;
   gameMode.savedCamPos.copy(camera.position);
   gameMode.savedCamQuat.copy(camera.quaternion);
@@ -11188,23 +11238,32 @@ function enterGameMode() {
   // Lock surface center to the gallery floor's crystal in world space
   var gf = gameMode.galleryFloor;
   gameMode.surface.center.set(0, gf ? gf.group.position.y : 0, 0);
-  // Reset ship to north pole of the crystal, facing tangent in +X direction
-  gameMode.surfaceState.pos.set(0, gameMode.surface.radius, 0);
+  // Start the ship above the crystal's north pole; positionShipOnSurface() then
+  // raycasts down and snaps it to whichever facet is currently up-facing.
+  gameMode.ship.position.copy(gameMode.surface.center).add(new THREE.Vector3(0, 1.5, 0));
   gameMode.surfaceState.forward.set(1, 0, 0);
   gameMode.surfaceState.speed = 0;
+  gameMode.surfaceState.groundNormal.set(0, 1, 0);
+  gameMode.surfaceState.isDrifting = false;
+  gameMode.surfaceState.driftDirection = 0;
+  gameMode.surfaceState.driftAngle = 0;
+  gameMode.surfaceState.driftTargetAngle = 0;
+  gameMode.surfaceState.driftTime = 0;
+  gameMode.surfaceState.driftEntrySpeed = 0;
+  // Capture the crystal's current rotation so the per-frame delta starts at 0
+  gameMode.lastCrystalRotY = gf ? gf.group.rotation.y : 0;
+  gameMode.fly.active = false;
+  gameMode.fly.vel.set(0, 0, 0);
+  gameMode.fly.accelTime = 0;
   gameMode.physics.accelerationTime = 0;
-  // Snap the wheel back to its passive spin: zero the user-induced velocity so the
-  // website keeps moving gently (passive rotationSpeed continues), but the burst of
-  // high-RPM lighting effects from the trigger spin doesn't linger. The per-frame
-  // override in updateOrbs forces all rpm-driven effects to their off state.
-  if(gf) {
-    gf.group.userData.velocity = 0;
-    gf.group.userData.rpmSmooth = 0;
-    gf.group.userData.lastAngle = gf.group.rotation.y;
-  }
-  // Place ship at the right world location immediately so the camera dive lands properly
+  // DON'T touch velocity OR rpmSmooth — animateGameDecel() lets the wheel ride its own
+  // momentum for the first 1s (lighting stays at full brightness) and then progressively
+  // ramps up the decay over the next 2s. The lighting fades naturally with the velocity
+  // because the RPM override is no longer applied during the decelerating phase.
+  // Place ship at the right world location immediately so it's ready when camera arrives.
+  // Keep ship hidden during decel — it's a tiny dot from orbital camera distance and
+  // would just be visual noise. Becomes visible at the start of the entering phase.
   positionShipOnSurface();
-  gameMode.group.visible = true;
   // Release any dragging state to avoid stuck inputs
   isDragging = false;
   selectedFloor = null;
@@ -11213,22 +11272,149 @@ function enterGameMode() {
   }
 }
 
-// Apply current surfaceState to the ship's world transform — used during entry and per-frame
+// 3-second entry sequence: holds the wheel at full RPM for ~1s (lighting stays bright),
+// then ramps up the deceleration over the next 2s while the camera simultaneously dives
+// into chase position. The damping factor accelerates over time (0.99 → 0.86) so the
+// slow-down feels like it eases in rather than slamming on the brakes.
+function animateGameDecel() {
+  if(!gameMode.decelerating) return;
+  var gf = gameMode.galleryFloor;
+  // Keep ship locked to its crystal point as the crystal spins down — otherwise the
+  // chase camera would target a stale position and snap when the active phase begins.
+  trackCrystalRotation();
+  gameMode.decelProg = Math.min(1, gameMode.decelProg + gameMode.decelStep);
+  var t = gameMode.decelProg;
+  var hold = gameMode.decelHoldFrac;
+
+  if(gf) {
+    if(t < hold) {
+      // Hold phase — leave velocity alone so RPM (and lighting) ride at current level
+    } else {
+      // Ramp phase: damping factor strengthens from a gentle 0.99 → aggressive 0.86
+      var rampT = (t - hold) / (1 - hold);  // 0..1 over the last 2s
+      var damp = 0.99 - 0.13 * rampT;
+      gf.group.userData.velocity *= damp;
+    }
+    if(Math.abs(gf.group.userData.velocity) < 0.0005) gf.group.userData.velocity = 0;
+  }
+
+  // Camera dive runs in parallel with the ramp phase
+  if(t >= hold) {
+    // Reveal ship at start of camera move
+    if(!gameMode.group.visible) gameMode.group.visible = true;
+    var camT = (t - hold) / (1 - hold);
+    var ease = camT * camT * (3 - 2 * camT);
+    var chase = computeChaseCamPose();
+    camera.position.lerpVectors(gameMode.savedCamPos, chase.pos, ease);
+    var galY = gf ? gf.group.position.y : 0;
+    var startLook = new THREE.Vector3(0, galY, 0);
+    var curLook = startLook.lerp(chase.lookAt, ease);
+    var startUp = new THREE.Vector3(0, 1, 0);
+    var blendedUp = startUp.lerp(chase.up, ease);
+    camera.up.copy(blendedUp).normalize();
+    camera.lookAt(curLook);
+  }
+
+  // Hand straight to active when the 3s are up — skip the legacy `entering` phase
+  if(t >= 1) {
+    gameMode.decelerating = false;
+    gameMode.entering = false;
+    gameMode.active = true;
+    gameMode.chargeProg = 0;
+    if(gf) gf.group.userData.velocity = 0;
+    gameMode.group.visible = true;
+  }
+}
+
+// Apply the crystal's per-frame rotation around Y to the ship so the ship stays locked
+// to its surface point as the crystal spins. Without this the ship would slide across
+// facets even when the player is stationary.
+function trackCrystalRotation() {
+  var gf = gameMode.galleryFloor;
+  if(!gf) return;
+  var floorRotY = gf.group.rotation.y;
+  var dRotY = floorRotY - gameMode.lastCrystalRotY;
+  gameMode.lastCrystalRotY = floorRotY;
+  if(Math.abs(dRotY) < 1e-6) return;
+  var yAxis = new THREE.Vector3(0, 1, 0);
+  var center = gameMode.surface.center;
+  var rel = gameMode.ship.position.clone().sub(center);
+  rel.applyAxisAngle(yAxis, dRotY);
+  gameMode.ship.position.copy(center).add(rel);
+  gameMode.surfaceState.forward.applyAxisAngle(yAxis, dRotY);
+  gameMode.surfaceState.groundNormal.applyAxisAngle(yAxis, dRotY);
+}
+
+// Raycast from outside the crystal toward its center, in the direction of `probePos`.
+// Returns the nearest hit on the crystal mesh: { point, normal } in world space.
+// Returns null if the crystal isn't built yet or the ray misses.
+function raycastShipToSurface(probePos) {
+  var gf = gameMode.galleryFloor;
+  if(!gf || !gf.group.userData.centerStar) return null;
+  var crystalGroup = gf.group.userData.centerStar;
+  // The crystal mesh is the first OctahedronGeometry child
+  var crystalMesh = null;
+  for(var i = 0; i < crystalGroup.children.length; i++) {
+    var c = crystalGroup.children[i];
+    if(c.geometry && c.geometry.type === 'OctahedronGeometry') { crystalMesh = c; break; }
+  }
+  if(!crystalMesh) return null;
+  // Make sure matrices reflect the latest floor rotation before raycasting
+  crystalGroup.updateMatrixWorld(true);
+  var center = gameMode.surface.center;
+  var toShip = probePos.clone().sub(center);
+  if(toShip.lengthSq() < 1e-6) toShip.set(0, 1, 0);
+  toShip.normalize();
+  // Start the ray well outside the crystal on the ship's side, shoot inward toward center
+  var rayOrigin = center.clone().addScaledVector(toShip, 3.0);
+  var rayDir = toShip.clone().negate();
+  raycaster.set(rayOrigin, rayDir);
+  raycaster.far = 5.0;
+  var hits = raycaster.intersectObject(crystalMesh, false);
+  if(hits.length === 0) return null;
+  var hit = hits[0];
+  var normal = hit.face.normal.clone();
+  normal.transformDirection(hit.object.matrixWorld).normalize();
+  // Ensure normal points outward (away from crystal center) — handles double-sided faces
+  var outward = hit.point.clone().sub(center).normalize();
+  if(normal.dot(outward) < 0) normal.negate();
+  return { point: hit.point.clone(), normal: normal };
+}
+
+// Snap the ship onto the actual crystal surface using a raycast, then orient it to face
+// `s.forward` with its local up matching the surface normal. Called during entry, after
+// fly→surface snap, and as a fallback (per-frame snapping happens inline in physics).
 function positionShipOnSurface() {
   var s = gameMode.surfaceState;
-  var surface = gameMode.surface;
-  // Re-orthogonalize forward against up so it stays tangent
-  var up = s.pos.clone().normalize();
-  s.forward.sub(up.clone().multiplyScalar(s.forward.dot(up)));
-  if(s.forward.lengthSq() < 0.0001) s.forward.set(1, 0, 0).sub(up.clone().multiplyScalar(up.x));
+  var probe = gameMode.ship.position.clone();
+  // If probe is exactly at the crystal center (initial state), nudge it up so the
+  // raycast direction is well-defined.
+  if(probe.distanceToSquared(gameMode.surface.center) < 1e-6) {
+    probe.copy(gameMode.surface.center).add(new THREE.Vector3(0, 1, 0));
+  }
+  var hit = raycastShipToSurface(probe);
+  if(hit) {
+    s.groundNormal.copy(hit.normal);
+    gameMode.ship.position.copy(hit.point).addScaledVector(s.groundNormal, s.hoverHeight);
+  } else {
+    // Fallback: place at top of imaginary sphere (shouldn't happen unless crystal missing)
+    gameMode.ship.position.copy(gameMode.surface.center).add(new THREE.Vector3(0, 0.95, 0));
+    s.groundNormal.set(0, 1, 0);
+  }
+  // Re-orthogonalize forward against the new up
+  s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+  if(s.forward.lengthSq() < 0.0001) s.forward.set(1, 0, 0).sub(s.groundNormal.clone().multiplyScalar(s.groundNormal.x));
   s.forward.normalize();
-  // World position
-  gameMode.ship.position.copy(surface.center).add(s.pos);
-  // Orient ship: local +Z = forward, local +Y = up. Use Matrix4.lookAt with target = -forward
-  // (Three.js convention: lookAt makes -Z point at target, so target=-forward puts +Z at forward)
+  // Orient ship: local +Z = forward, local +Y = groundNormal. lookAt makes -Z face target,
+  // so target = -forward puts ship +Z along forward.
   var m = new THREE.Matrix4();
-  m.lookAt(new THREE.Vector3(0,0,0), s.forward.clone().multiplyScalar(-1), up);
+  m.lookAt(new THREE.Vector3(0,0,0), s.forward.clone().multiplyScalar(-1), s.groundNormal);
   gameMode.ship.quaternion.setFromRotationMatrix(m);
+  // Drift visual overlay — rotate shipVisual around ship-local up (yaw) + roll into the drift
+  if(gameMode.shipVisual) {
+    gameMode.shipVisual.rotation.y = s.driftAngle;
+    gameMode.shipVisual.rotation.z = -s.driftAngle * 0.3;
+  }
 }
 
 function exitGameMode() {
@@ -11236,12 +11422,18 @@ function exitGameMode() {
   gameMode.exiting = true;
   gameMode.exitProg = 0;
   // Clear key state so nothing sticks after exit
-  gameMode.keys.w = gameMode.keys.a = gameMode.keys.s = gameMode.keys.d = gameMode.keys.shift = false;
+  var k = gameMode.keys;
+  k.w = k.a = k.s = k.d = k.shift = k.q = k.e = k.space = k.ctrl = false;
   // Release the touch joystick as well
   gameMode.touch.active = false;
   gameMode.touch.throttle = 0;
   gameMode.touch.yaw = 0;
   gameMode.touch.boost = false;
+  // Clear any visual drift roll on the ship so the exit transition shows a clean pose
+  if(gameMode.shipVisual) {
+    gameMode.shipVisual.rotation.y = 0;
+    gameMode.shipVisual.rotation.z = 0;
+  }
 }
 
 function restoreGalleryWheel() {
@@ -11309,14 +11501,12 @@ function killGalleryEffects(gf) {
 }
 
 function computeChaseCamPose() {
-  // Returns {pos, lookAt, up} for the chase camera given current surfaceState.
-  // The `up` is the surface normal at the ship's position; the renderer lerps
-  // camera.up toward it each frame so the view stays upright relative to the
-  // planet surface even when the ship crosses the south pole.
+  // Returns {pos, lookAt, up} for the chase camera. `up` is the smoothed surface normal
+  // (from the per-frame raycast) so the camera stays upright relative to whatever facet
+  // the ship is sitting on. Position is the ship's actual world position.
   var s = gameMode.surfaceState;
-  var surface = gameMode.surface;
-  var up = s.pos.clone().normalize();
-  var shipWorld = surface.center.clone().add(s.pos);
+  var up = s.groundNormal.clone();
+  var shipWorld = gameMode.ship.position.clone();
   var camPos = shipWorld.clone()
     .add(s.forward.clone().multiplyScalar(-gameMode.camBackDist))
     .add(up.clone().multiplyScalar(gameMode.camUpDist));
@@ -11376,6 +11566,8 @@ function animateGameTransition() {
       gameMode.group.visible = false;
       restoreGalleryWheel();
       targetCameraY = gameMode.savedTargetCameraY;
+      // Clean up any drift particles still alive — they'd otherwise hang in mid-air
+      clearGameDriftParticles();
     }
 
     if(ep >= 1) {
@@ -11386,6 +11578,7 @@ function animateGameTransition() {
 
 function updateGamePhysicsAndCamera() {
   if(!gameMode.active) return;
+  if(gameMode.fly.active) { updateFlightPhysicsAndCamera(); return; }
   var p = gameMode.physics;
   var k = gameMode.keys;
   var t = gameMode.touch;
@@ -11407,43 +11600,114 @@ function updateGamePhysicsAndCamera() {
     p.isBoosting = k.shift && k.w;
   }
 
-  // Thrust ramp — engages whenever there's any throttle input
+  // ── Gunner drift detection ──
+  // Drift engages when A or D pressed WITHOUT W (forward thrust) and we're moving fast enough.
+  // Touch: yaw past 60% with throttle near zero. Once drifting, continues at much lower speed
+  // threshold so the user can pivot through corners without bouncing in and out of drift state.
+  var wantsDriftLeft  = (k.a && !k.w) || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15);
+  var wantsDriftRight = (k.d && !k.w) || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15);
+  var wantsDrift = wantsDriftLeft || wantsDriftRight;
+  var spdAbs = Math.abs(s.speed);
+  var canEnter = spdAbs > p.maxSpeed * p.driftEntrySpeedRatio;
+  var canContinue = spdAbs > p.maxSpeed * p.driftContinueSpeedRatio;
+  var canDriftNow = s.isDrifting ? canContinue : canEnter;
+
+  if(wantsDrift && canDriftNow) {
+    if(!s.isDrifting) {
+      s.driftTime = 0;
+      s.driftEntrySpeed = spdAbs;
+    }
+    s.isDrifting = true;
+    s.driftTime += 1;
+    s.driftDirection = wantsDriftLeft ? 1 : -1;
+    s.driftTargetAngle = s.driftDirection * (Math.PI * 0.5);
+    // Shed orange drift streaks from the rear inner wing each frame
+    spawnGameDriftParticles();
+  } else {
+    s.isDrifting = false;
+    s.driftDirection = 0;
+    s.driftTargetAngle = 0;
+  }
+  // Smooth visual drift angle
+  s.driftAngle += (s.driftTargetAngle - s.driftAngle) * 0.12;
+
+  // Thrust ramp — engages whenever there's any throttle input (skipped while drifting:
+  // drift is pure momentum carry, matching the original Orbicule gunner feel).
   var hasFwd = Math.abs(fwdAxis) > 0.01;
-  if(hasFwd) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1);
+  if(hasFwd && !s.isDrifting) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1);
   else p.accelerationTime = Math.max(0, p.accelerationTime - 3);
   var thrustRamp = p.accelerationTime / p.maxAccelerationTime;
   var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * thrustRamp;
   if(p.isBoosting) thrust = p.boostAccelRate;
 
-  // Apply thrust scaled by fwdAxis — partial throttle = partial acceleration.
-  // Note: reverse uses the analog axis directly so binary S key (-0.6) still matches old behavior.
-  s.speed += thrust * fwdAxis;
-  s.speed *= p.drag;
-  var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
-  if(s.speed > maxS) s.speed = maxS;
-  if(s.speed < -maxS * 0.6) s.speed = -maxS * 0.6;
-
-  // Current up = surface normal at ship's spot
-  var up = s.pos.clone().normalize();
-
-  // Yaw — analog (touch) or full-rate (keys). Positive yawAxis = turn right.
-  if(Math.abs(yawAxis) > 0.01) s.forward.applyAxisAngle(up, -p.turnSpeed * yawAxis);
-  // Re-orthogonalize forward to stay tangent (drift correction)
-  s.forward.sub(up.clone().multiplyScalar(s.forward.dot(up)));
-  if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
-
-  // Move forward — rotate both pos and forward around (up × forward)
-  if(Math.abs(s.speed) > 0.00001) {
-    var axis = new THREE.Vector3().crossVectors(up, s.forward).normalize();
-    var angle = s.speed / surface.radius; // arc length → angular rotation
-    s.pos.applyAxisAngle(axis, angle);
-    s.forward.applyAxisAngle(axis, angle);
-    // Snap pos magnitude back to orbit radius in case of float drift
-    s.pos.normalize().multiplyScalar(surface.radius);
+  if(s.isDrifting) {
+    // Stages 1-3 (first driftSustainTime frames): hold entry speed — no thrust, no drag.
+    // Stage 4: gradual decay via driftDecel + light drag.
+    if(s.driftTime > p.driftSustainTime) {
+      s.speed -= Math.sign(s.speed || 1) * p.driftDecel;
+      s.speed *= 0.998;
+    }
+    // S key tightens drift — extra deceleration regardless of stage
+    if(k.s) s.speed *= 0.985;
+  } else {
+    // Normal: thrust scaled by fwdAxis, then drag.
+    s.speed += thrust * fwdAxis;
+    s.speed *= p.drag;
+    var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
+    if(s.speed > maxS) s.speed = maxS;
+    if(s.speed < -maxS * 0.6) s.speed = -maxS * 0.6;
   }
 
-  // Apply transform to the ship mesh
-  positionShipOnSurface();
+  // Carry the ship along with the crystal as it passively rotates around Y — without
+  // this the ship would slowly slide across the surface even when the player isn't moving.
+  trackCrystalRotation();
+
+  // Yaw — full drift turn rate ramps over driftRampTime; normal turn uses p.turnSpeed.
+  // Both rotate `forward` around the current ground normal (the real surface up).
+  if(s.isDrifting) {
+    var ramp = Math.min(1, s.driftTime / p.driftRampTime);
+    var driftYaw = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase) * ramp;
+    if(k.s) driftYaw *= 1.7;
+    s.forward.applyAxisAngle(s.groundNormal, driftYaw * s.driftDirection);
+  } else if(Math.abs(yawAxis) > 0.01) {
+    s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis);
+  }
+  // Re-project forward onto the current tangent plane
+  s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+  if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+
+  // Move ship in world space along the tangent direction
+  if(Math.abs(s.speed) > 0.00001) {
+    gameMode.ship.position.addScaledVector(s.forward, s.speed);
+  }
+
+  // ── Surface stickiness ──
+  // Raycast against the actual crystal mesh, snap ship to hit + small hover offset, and
+  // adopt the hit face's normal (smoothed). This is what makes the ship contour over
+  // the jagged facets instead of skating on an imaginary sphere. Matches the magnetic-
+  // surface approach from Orbicule.html:27204-27326.
+  var hit = raycastShipToSurface(gameMode.ship.position);
+  if(hit) {
+    // Smooth the normal so the orientation doesn't snap at facet boundaries (gentler
+    // smoothing at low speed, snappier when zipping over edges)
+    var normalSmooth = 0.18 + Math.min(0.20, Math.abs(s.speed) * 30);
+    s.groundNormal.lerp(hit.normal, normalSmooth).normalize();
+    // Stick to surface + hover
+    gameMode.ship.position.copy(hit.point).addScaledVector(s.groundNormal, s.hoverHeight);
+    // Re-project forward onto the (now slightly different) tangent plane
+    s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+    if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+  }
+
+  // Orient ship: local +Z = forward, local +Y = groundNormal (the actual surface up)
+  var orientM = new THREE.Matrix4();
+  orientM.lookAt(new THREE.Vector3(0,0,0), s.forward.clone().multiplyScalar(-1), s.groundNormal);
+  gameMode.ship.quaternion.setFromRotationMatrix(orientM);
+  // Drift visual overlay on shipVisual
+  if(gameMode.shipVisual) {
+    gameMode.shipVisual.rotation.y = s.driftAngle;
+    gameMode.shipVisual.rotation.z = -s.driftAngle * 0.3;
+  }
 
   // Engine glow scales with speed
   if(gameMode.engineGlow) {
@@ -11462,6 +11726,218 @@ function updateGamePhysicsAndCamera() {
   camera.lookAt(chase.lookAt);
 }
 
+// ── Free 3D flight physics + chase camera ──
+// Ship can move anywhere in world space. WASD = thrust + yaw, Q/E = pitch up/down,
+// Space/Ctrl = vertical thrust along ship-local up, Shift = boost.
+function updateFlightPhysicsAndCamera() {
+  var k = gameMode.keys;
+  var t = gameMode.touch;
+  var fly = gameMode.fly;
+  var ship = gameMode.ship;
+
+  // Read input axes — keyboard binary, touch analog
+  var fwdAxis, yawAxis;
+  if(t.active){
+    fwdAxis = t.throttle;
+    yawAxis = t.yaw;
+  } else {
+    fwdAxis = (k.w ? 1 : 0) + (k.s ? -0.6 : 0);
+    yawAxis = (k.a ? -1 : 0) + (k.d ? 1 : 0);
+  }
+  var pitchAxis = (k.q ? 1 : 0) + (k.e ? -1 : 0);    // Q = nose up, E = nose down
+  var vertAxis  = (k.space ? 1 : 0) + (k.ctrl ? -1 : 0);
+  var isBoosting = k.shift || (t.active && t.boost);
+
+  // Thrust ramp
+  if(Math.abs(fwdAxis) > 0.01) fly.accelTime = Math.min(300, fly.accelTime + 1);
+  else fly.accelTime = Math.max(0, fly.accelTime - 3);
+  var ramp = fly.accelTime / 300;
+  var thrust = fly.thrustBase + (fly.thrustMax - fly.thrustBase) * ramp;
+  if(isBoosting) thrust = fly.boostThrust;
+
+  // Apply yaw + pitch BEFORE thrust so the thrust direction matches the new orientation
+  if(Math.abs(yawAxis) > 0.01) ship.rotateY(-fly.yawSpeed * yawAxis);
+  if(Math.abs(pitchAxis) > 0.01) ship.rotateX(fly.pitchSpeed * pitchAxis);
+
+  // Thrust along ship's local +Z (the engine's forward direction)
+  var localFwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
+  if(Math.abs(fwdAxis) > 0.01) fly.vel.addScaledVector(localFwd, thrust * fwdAxis);
+
+  // Vertical thrust along ship's local +Y (so it feels like the ship is rising relative
+  // to itself, not the world — keeps controls intuitive after the ship tilts).
+  if(Math.abs(vertAxis) > 0.01) {
+    var localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(ship.quaternion);
+    fly.vel.addScaledVector(localUp, thrust * 0.7 * vertAxis);
+  }
+
+  // Drag + speed cap
+  fly.vel.multiplyScalar(fly.drag);
+  var maxV = isBoosting ? fly.boostMaxSpeed : fly.maxSpeed;
+  if(fly.vel.length() > maxV) fly.vel.setLength(maxV);
+
+  // Integrate position
+  ship.position.add(fly.vel);
+
+  // Clear visual drift roll (no drifting in flight mode)
+  if(gameMode.shipVisual) {
+    gameMode.shipVisual.rotation.y *= 0.85;
+    gameMode.shipVisual.rotation.z *= 0.85;
+  }
+
+  // Engine glow scales with velocity magnitude
+  if(gameMode.engineGlow) {
+    var sf = fly.vel.length() / fly.boostMaxSpeed;
+    gameMode.engineGlow.material.opacity = 0.5 + sf * 0.5;
+    gameMode.engineGlow.scale.setScalar(1 + sf * 0.7);
+  }
+
+  // Chase cam: behind ship along -localFwd, above along +localUp. Camera up follows
+  // the ship's local up so the view stays consistent during pitch maneuvers.
+  var camLocalUp = new THREE.Vector3(0, 1, 0).applyQuaternion(ship.quaternion);
+  var camPos = ship.position.clone()
+    .add(localFwd.clone().multiplyScalar(-fly.camBackDist))
+    .add(camLocalUp.clone().multiplyScalar(fly.camUpDist));
+  var lookAt = ship.position.clone().add(camLocalUp.clone().multiplyScalar(0.04));
+  camera.position.lerp(camPos, 0.18);
+  camera.up.lerp(camLocalUp, 0.12);
+  camera.up.normalize();
+  camera.lookAt(lookAt);
+}
+
+// ── Drift particle effects ──
+// Mix of glowing pixel chunks + tapered streaks that occasionally extend into long strings
+// trailing behind the ship. Ported from Orbicule's gunner drift (Orbicule.html:21283-21386)
+// with a pixel/streak mix tuned to read well at the tiny ship+crystal scale.
+//
+// Three categories:
+//   - PIXEL  (~45%): tiny additive-blended cube — the visible "sparks"
+//   - STREAK (~40%): short-to-medium tapered cylinder pointing along velocity
+//   - STRING (~15%): rare long streak that trails far behind for visual punch
+function spawnGameDriftParticles() {
+  var s = gameMode.surfaceState;
+  if(!s.isDrifting || gameMode.fly.active) return;
+  var ship = gameMode.ship;
+  if(!gameMode.driftFx.material) {
+    // Additive blending so particles read as glowing sparks, not solid orange dots.
+    gameMode.driftFx.material = new THREE.MeshBasicMaterial({
+      color: 0xffaa44,
+      transparent: true,
+      opacity: 1.0,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
+    });
+  }
+  var shipRight = new THREE.Vector3(1, 0, 0).applyQuaternion(ship.quaternion);
+  var shipBack  = new THREE.Vector3(0, 0, -1).applyQuaternion(ship.quaternion);
+  // Spawn count scales with drift speed — pixels fly off faster drifts
+  var spdRatio = Math.min(1, Math.abs(s.speed) / gameMode.physics.maxSpeed);
+  var count = 4 + Math.floor(Math.random() * 5 * spdRatio);
+
+  for(var i = 0; i < count; i++) {
+    var roll = Math.random();
+    var isPixel  = roll < 0.45;
+    var isString = roll > 0.85;  // 15% chance of a long trailing string
+    var particle, geo;
+
+    if(isPixel) {
+      // Tiny glowing pixel cube — these read as the bright sparks closest to the ship
+      var pixSize = 0.0014 + Math.random() * 0.0012;  // 0.0014 .. 0.0026
+      geo = new THREE.BoxGeometry(pixSize, pixSize, pixSize);
+      particle = new THREE.Mesh(geo, gameMode.driftFx.material.clone());
+    } else {
+      // Tapered streak — wider at the head, tapering to a point at the tail
+      var streakLength = isString
+        ? 0.04 + Math.random() * 0.06          // long string: 0.04 .. 0.10
+        : 0.010 + Math.random() * 0.025;       // normal streak: 0.010 .. 0.035
+      var streakWidth  = isString
+        ? 0.0006 + Math.random() * 0.0005      // thin strings
+        : 0.0010 + Math.random() * 0.0010;     // chunkier normal streaks
+      // Wide end (radius streakWidth) at the head, narrow tip (radius * 0.2) at the tail.
+      geo = new THREE.CylinderGeometry(streakWidth, streakWidth * 0.2, streakLength, 5, 1);
+      geo.translate(0, streakLength / 2, 0);
+      geo.rotateX(Math.PI / 2);
+      particle = new THREE.Mesh(geo, gameMode.driftFx.material.clone());
+    }
+
+    // Spawn at rear inner wing — side based on drift direction
+    var wingOff = -s.driftDirection * (0.005 + Math.random() * 0.003);
+    particle.position.copy(ship.position)
+      .add(shipBack.clone().multiplyScalar(0.006 + Math.random() * 0.005))
+      .add(shipRight.clone().multiplyScalar(wingOff));
+
+    // Spray mostly backward in ship space, with slight up + sideways bias
+    var sprayDir = new THREE.Vector3(
+      (Math.random() - 0.5) * 0.5 + (-s.driftDirection * 0.25),
+      0.1 + Math.random() * 0.3,
+      -0.7 - Math.random() * 0.4
+    );
+    sprayDir.applyQuaternion(ship.quaternion);
+    sprayDir.normalize();
+
+    // Strings travel faster + further; pixels are quicker but shorter-lived
+    var pSpeed;
+    if(isPixel)      pSpeed = 0.0009 + Math.random() * 0.0011;
+    else if(isString) pSpeed = 0.0020 + Math.random() * 0.0015;
+    else             pSpeed = 0.0011 + Math.random() * 0.0014;
+
+    particle.userData = {
+      velocity: sprayDir.clone().multiplyScalar(pSpeed),
+      life: 1.0,
+      // Strings linger longer; pixels fade fast
+      decay: isString ? 0.012 + Math.random() * 0.010
+           : isPixel  ? 0.030 + Math.random() * 0.025
+                      : 0.022 + Math.random() * 0.020,
+      isPixel: isPixel
+    };
+    // Orient streaks along their velocity vector. Pixels stay axis-aligned (cube has no "head").
+    if(!isPixel) particle.lookAt(particle.position.clone().add(particle.userData.velocity));
+    scene.add(particle);
+    gameMode.driftFx.particles.push(particle);
+  }
+}
+
+function updateGameDriftParticles() {
+  var arr = gameMode.driftFx.particles;
+  if(arr.length === 0) return;
+  for(var i = arr.length - 1; i >= 0; i--) {
+    var p = arr[i];
+    p.position.add(p.userData.velocity);
+    // Light gravity scaled for the tiny world
+    p.userData.velocity.y -= 0.00006;
+    // Keep streaks oriented along velocity so they always look like they're trailing
+    if(!p.userData.isPixel && p.userData.velocity.length() > 0.0001) {
+      p.lookAt(p.position.clone().add(p.userData.velocity));
+    }
+    p.userData.life -= p.userData.decay;
+    var lifeScale = Math.max(0, p.userData.life);
+    if(p.userData.isPixel) {
+      // Pixels shrink uniformly as they fade
+      p.scale.set(lifeScale, lifeScale, lifeScale);
+    } else {
+      // Streaks keep their length but slim down as they fade — looks like the trail
+      // is being "drawn" out and dissolving rather than the whole thing shrinking.
+      p.scale.set(lifeScale, lifeScale, 1);
+    }
+    p.material.opacity = lifeScale;
+    if(p.userData.life <= 0) {
+      scene.remove(p);
+      p.geometry.dispose();
+      p.material.dispose();
+      arr.splice(i, 1);
+    }
+  }
+}
+
+function clearGameDriftParticles() {
+  var arr = gameMode.driftFx.particles;
+  for(var i = 0; i < arr.length; i++) {
+    scene.remove(arr[i]);
+    if(arr[i].geometry) arr[i].geometry.dispose();
+    if(arr[i].material) arr[i].material.dispose();
+  }
+  arr.length = 0;
+}
+
 function gameKeyDown(e) {
   if(!gameMode.active && !gameMode.entering) return;
   var k = e.key ? e.key.toLowerCase() : '';
@@ -11470,9 +11946,20 @@ function gameKeyDown(e) {
   else if(k === 's' || k === 'arrowdown') gameMode.keys.s = true;
   else if(k === 'd' || k === 'arrowright') gameMode.keys.d = true;
   else if(k === 'shift') gameMode.keys.shift = true;
-  else if(k === 'escape') { if(gameMode.active && !gameMode.exiting) exitGameMode(); }
-  // Prevent browser default for movement keys
-  if(k === 'w' || k === 'a' || k === 's' || k === 'd' || k.indexOf('arrow') === 0) e.preventDefault();
+  else if(k === 'q') gameMode.keys.q = true;
+  else if(k === 'e') gameMode.keys.e = true;
+  else if(k === ' ') gameMode.keys.space = true;
+  else if(k === 'control') gameMode.keys.ctrl = true;
+  else if(k === 'p' && !e.repeat) { if(gameMode.active) toggleFlightMode(); }
+  else if(k === 'escape') {
+    if(gameMode.active && !gameMode.exiting) {
+      // If currently flying, snap back to surface first so the exit transition has a valid pose.
+      if(gameMode.fly.active) snapFromFlyToSurface();
+      exitGameMode();
+    }
+  }
+  // Prevent browser default for movement / flight-control keys
+  if(k === 'w' || k === 'a' || k === 's' || k === 'd' || k === 'q' || k === 'e' || k === ' ' || k.indexOf('arrow') === 0) e.preventDefault();
 }
 function gameKeyUp(e) {
   var k = e.key ? e.key.toLowerCase() : '';
@@ -11481,6 +11968,62 @@ function gameKeyUp(e) {
   else if(k === 's' || k === 'arrowdown') gameMode.keys.s = false;
   else if(k === 'd' || k === 'arrowright') gameMode.keys.d = false;
   else if(k === 'shift') gameMode.keys.shift = false;
+  else if(k === 'q') gameMode.keys.q = false;
+  else if(k === 'e') gameMode.keys.e = false;
+  else if(k === ' ') gameMode.keys.space = false;
+  else if(k === 'control') gameMode.keys.ctrl = false;
+}
+
+// ── Toggle flight mode: ship leaves the crystal and flies free in 3D ──
+// Takes the current surface ship world transform as the starting flight pose so the
+// transition is seamless (no teleport). On toggle off, the ship snaps to the nearest
+// point on the sphere and re-projects forward into the tangent plane.
+function toggleFlightMode() {
+  if(!gameMode.fly.active) {
+    // Surface → flight: ship.position and ship.quaternion are already set by
+    // positionShipOnSurface() from the previous frame. We just zero velocity and
+    // hand control to the flight physics path.
+    gameMode.fly.active = true;
+    gameMode.fly.vel.set(0, 0, 0);
+    gameMode.fly.accelTime = 0;
+    // Clear drift state so we don't carry visual roll into flight
+    var ss = gameMode.surfaceState;
+    ss.isDrifting = false;
+    ss.driftDirection = 0;
+    ss.driftAngle = 0;
+    ss.driftTargetAngle = 0;
+    ss.driftTime = 0;
+  } else {
+    snapFromFlyToSurface();
+  }
+}
+
+// Snap the ship from wherever it is in 3D back onto the crystal surface. Raycasts inward
+// from the current world position to find the actual facet it should land on, then
+// re-derives forward by projecting the ship's current world-space heading onto the
+// resulting tangent plane.
+function snapFromFlyToSurface() {
+  gameMode.fly.active = false;
+  var ss = gameMode.surfaceState;
+  // Take the ship's current world-space local +Z as desired heading BEFORE we change
+  // the orientation, so we can preserve aim across the snap.
+  var worldFwd = new THREE.Vector3(0, 0, 1).applyQuaternion(gameMode.ship.quaternion);
+  // Carry partial flight momentum into surface speed
+  ss.speed = gameMode.fly.vel.length() * 0.5;
+  if(ss.speed > gameMode.physics.maxSpeed) ss.speed = gameMode.physics.maxSpeed;
+  // Raycast + snap to surface (positionShipOnSurface does the full thing)
+  positionShipOnSurface();
+  // Now re-derive forward from the saved heading projected onto the new tangent plane
+  worldFwd.sub(ss.groundNormal.clone().multiplyScalar(worldFwd.dot(ss.groundNormal)));
+  if(worldFwd.lengthSq() < 0.0001) {
+    worldFwd.set(1, 0, 0).sub(ss.groundNormal.clone().multiplyScalar(ss.groundNormal.x));
+  }
+  ss.forward.copy(worldFwd).normalize();
+  // Reset crystal-rotation delta tracking
+  var gf = gameMode.galleryFloor;
+  gameMode.lastCrystalRotY = gf ? gf.group.rotation.y : 0;
+  // Re-orient with the corrected forward
+  positionShipOnSurface();
 }
 
 // ══════════════════════════════════════════════
@@ -11684,7 +12227,7 @@ function animate(){
   // Skip the website's camera-y/tilt/lookAt code while the mini-game owns the camera.
   // Without this gate, the orbit-camera math fights our chase camera and the view
   // snaps back to the website even mid-transition.
-  if(!gameMode.entering && !gameMode.active) {
+  if(!gameMode.entering && !gameMode.active && !gameMode.decelerating) {
   camera.position.y+=(targetCameraY-camera.position.y)*0.45;
 
   // Nav scroll animation — overrides camera Y with smooth ease-out
@@ -11746,8 +12289,11 @@ function animate(){
 
   // Game mode — transition + physics + camera. Runs AFTER website camera setup
   // so it overrides position.y / lookAt that the camera-y lerp and tilt code applied.
+  if(gameMode.decelerating) animateGameDecel();
   if(gameMode.entering || gameMode.exiting) animateGameTransition();
   if(gameMode.active) updateGamePhysicsAndCamera();
+  // Drift particles age every frame (even when not drifting, so existing streaks finish out)
+  updateGameDriftParticles();
 
   floors.forEach(function(fl){
     var ud=fl.group.userData;
