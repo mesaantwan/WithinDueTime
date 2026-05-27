@@ -645,7 +645,15 @@ var gameMode = {
     // distance the steady-state yaw check requires.
     driftHold: false,
     driftDir: 0,        // -1 swipe-left, +1 swipe-right; matches yaw sign convention
-    swipeChecked: false // true once we've decided whether this touch is a quick swipe
+    swipeChecked: false, // true once we've decided whether this touch is a quick swipe
+    // Analog drift-tightness, -1..+1. Only meaningful while driftHold is true.
+    // Vertical position of the finger relative to its swipe-start Y drives the
+    // value: pulled up to 12% of screen → -1 (looser than baseline, slower yaw
+    // sweep), at the start Y → 0 (the default drift the swipe initiates), pulled
+    // down to 12% → +1 (max tightness, matches keyboard S held). 0 is the
+    // resting baseline so the drift "sits in the middle" until the player
+    // deliberately adjusts vertically.
+    driftTight: 0
   }
 };
 
@@ -3217,7 +3225,7 @@ function onTS(e){
     gt.curY = gt.startY;
     gt.startTime = performance.now();
     gt.throttle = 0; gt.yaw = 0; gt.boost = false;
-    gt.driftHold = false; gt.driftDir = 0; gt.swipeChecked = false;
+    gt.driftHold = false; gt.driftDir = 0; gt.swipeChecked = false; gt.driftTight = 0;
     return;
   }
   // ── Lightbox pinch/pan handling ──
@@ -3325,6 +3333,25 @@ function onTM(e){
         gt.swipeChecked = true;
       } else if(swipeDur >= 220){
         gt.swipeChecked = true;
+      }
+    }
+    // Analog drift-tightness from vertical finger position during drift-hold.
+    // Symmetric around the swipe-start Y: up = looser (-1), down = tighter (+1),
+    // with the resting position right at the start sitting at 0 so the drift
+    // initiates at the baseline sweep. 1.5% deadzone in each direction, full
+    // travel at 12% screen height. Only computed inside driftHold so regular
+    // touch input curves stay untouched.
+    if(gt.driftHold){
+      var tightDead = 0.015;
+      var tightFull = 0.12;
+      if(upFrac > tightDead){
+        // Pulled up — loosen below baseline (negative)
+        gt.driftTight = -Math.min((upFrac - tightDead) / (tightFull - tightDead), 1.0);
+      } else if(upFrac < -tightDead){
+        // Pulled down — tighten above baseline (positive)
+        gt.driftTight = Math.min((-upFrac - tightDead) / (tightFull - tightDead), 1.0);
+      } else {
+        gt.driftTight = 0;
       }
     }
     return;
@@ -3482,6 +3509,7 @@ function onTE(e){
       gt2.driftHold = false;
       gt2.driftDir = 0;
       gt2.swipeChecked = false;
+      gt2.driftTight = 0;
     }
     return;
   }
@@ -11654,6 +11682,10 @@ function exitGameMode() {
   gameMode.touch.throttle = 0;
   gameMode.touch.yaw = 0;
   gameMode.touch.boost = false;
+  gameMode.touch.driftHold = false;
+  gameMode.touch.driftDir = 0;
+  gameMode.touch.swipeChecked = false;
+  gameMode.touch.driftTight = 0;
   // Clear airborne / jump state so re-entry starts grounded
   gameMode.surfaceState.airborne = false;
   gameMode.surfaceState.vertVel = 0;
@@ -11867,6 +11899,27 @@ function animateGameTransition() {
 
     if(ep >= 1) {
       gameMode.exiting = false;
+      // Defensive cleanup of website-side input state. Mouse events during game
+      // mode aren't gated by gameMode.active (onMD calls pDown unconditionally),
+      // so a click on a panel or wheel mid-game can leave isDragging / selectedFloor
+      // / pressedGlassMesh stuck — and once those are non-null, the next pDown/pMove
+      // sees the prior state and refuses to start a fresh interaction. Reset everything
+      // input-related so the website resumes from a clean slate. Also clears the new
+      // touch drift flags (driftHold/driftDir/swipeChecked) which exitGameMode itself
+      // doesn't touch.
+      var et = gameMode.touch;
+      et.active = false;
+      et.throttle = 0; et.yaw = 0; et.boost = false;
+      et.driftHold = false; et.driftDir = 0; et.swipeChecked = false; et.driftTight = 0;
+      isDragging = false;
+      selectedFloor = null;
+      hoveredPanel = null;
+      hoveredGlassMesh = null;
+      pressedGlassMesh = null;
+      if(dm) dm.draggingVW = false;
+      if(renderer && renderer.domElement && renderer.domElement.parentElement){
+        renderer.domElement.parentElement.classList.remove('dragging');
+      }
     }
   }
 }
@@ -11965,6 +12018,16 @@ function updateGamePhysicsAndCamera() {
   var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * thrustRamp;
   if(p.isBoosting) thrust = p.boostAccelRate;
 
+  // Drift-tightness, -1..+1. Touch driftHold supplies the full symmetric range
+  // (up = looser/negative, down = tighter/positive, resting = 0 baseline);
+  // keyboard S is still a binary tighten that overrides touch up to +1 so the
+  // keyboard endpoint behaves exactly as before. Used below to scale the yaw
+  // rate continuously (0.3× at -1, 1.0× at 0, 1.7× at +1) and to bleed speed
+  // only when tightening above baseline.
+  var driftTight = 0;
+  if(t.active && t.driftHold) driftTight = t.driftTight;
+  if(k.s) driftTight = Math.max(driftTight, 1);
+
   if(s.isDrifting) {
     // Stages 1-3 (first driftSustainTime frames): hold entry speed — no thrust, no drag.
     // Stage 4: gradual decay via driftDecel + light drag.
@@ -11972,8 +12035,9 @@ function updateGamePhysicsAndCamera() {
       s.speed -= Math.sign(s.speed || 1) * p.driftDecel;
       s.speed *= 0.998;
     }
-    // S key tightens drift — extra deceleration regardless of stage
-    if(k.s) s.speed *= 0.985;
+    // Tightness bleeds extra speed each frame regardless of stage. At driftTight=1
+    // this matches the old keyboard `* 0.985`; at 0 it's a no-op.
+    if(driftTight > 0) s.speed *= (1 - driftTight * 0.015);
   } else {
     // Normal: thrust scaled by fwdAxis. Drag + speed cap only apply while the
     // player is actively giving throttle input. Pressing W (or analog touch
@@ -12018,7 +12082,9 @@ function updateGamePhysicsAndCamera() {
   if(s.isDrifting) {
     var ramp = Math.min(1, s.driftTime / p.driftRampTime);
     var driftYaw = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase) * ramp;
-    if(k.s) driftYaw *= 1.7;
+    // Tightness scales the yaw rate from 1.0× (loose, base sweep) up to 1.7×
+    // (full tighten — matches the keyboard's previous behavior at driftTight=1).
+    driftYaw *= (1 + driftTight * 0.7);
     s.forward.applyAxisAngle(s.groundNormal, driftYaw * s.driftDirection);
   } else if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01) {
     s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis);
