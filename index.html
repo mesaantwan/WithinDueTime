@@ -528,6 +528,14 @@ var gameMode = {
     driftTargetAngle: 0,                    // target angle (driftDirection * π/2)
     driftTime: 0,                           // frames spent in current drift
     driftEntrySpeed: 0,                     // speed when drift started
+    // Coast hold + linear decay. While the player is supplying any throttle
+    // (forward or reverse), this resets to 0. The moment they let go, it ticks
+    // up every frame; the speed stays pinned at whatever value it had at
+    // release for `coastHoldFrames` frames, then bleeds off linearly at
+    // `coastLinearDecel` per frame until it hits zero. Replaces the old
+    // multiplicative `* p.drag` decay so coasting feels like a glide rather
+    // than a quick fade.
+    coastFrames: 0,
     // Jump state — Space (keyboard) or quick swipe-up-release (touch) launches the ship
     // along the current surface normal. Gravity (toward crystal center) pulls it back.
     airborne: false,
@@ -568,6 +576,12 @@ var gameMode = {
     maxSpeed: 0.007,
     boostMaxSpeed: 0.015,
     drag: 0.985,
+    // Coast tuning. Hold full momentum for 4s at 60fps after the player lets
+    // go, then peel speed off linearly. `coastLinearDecel` is per-frame:
+    // 0.00005 takes ~140 frames (~2.3s) to bring maxSpeed to zero, and ~5s
+    // from boostMaxSpeed.
+    coastHoldFrames: 240,
+    coastLinearDecel: 0.00005,
     turnSpeed: 0.04,
     // Drift tuning (matches Orbicule's basic gunner drift, scaled for tiny planet)
     driftTurnBase: 0.012,                    // initial drift yaw rate
@@ -622,7 +636,16 @@ var gameMode = {
     startTime: 0, // ms timestamp for swipe-jump (quick-swipe-release) classification
     throttle: 0,  // -0.6..1
     yaw: 0,       // -1..1 (positive = turn right)
-    boost: false
+    boost: false,
+    // Quick-swipe drift: detected during touchmove when the finger moves
+    // horizontally past a threshold within a short window. While driftHold is
+    // true and the finger is still down, drift is forced regardless of the
+    // usual yaw/throttle thresholds, so a fast flick + hold initiates the slide
+    // without needing the user to first drag past the 12.8% screen-width
+    // distance the steady-state yaw check requires.
+    driftHold: false,
+    driftDir: 0,        // -1 swipe-left, +1 swipe-right; matches yaw sign convention
+    swipeChecked: false // true once we've decided whether this touch is a quick swipe
   }
 };
 
@@ -3194,6 +3217,7 @@ function onTS(e){
     gt.curY = gt.startY;
     gt.startTime = performance.now();
     gt.throttle = 0; gt.yaw = 0; gt.boost = false;
+    gt.driftHold = false; gt.driftDir = 0; gt.swipeChecked = false;
     return;
   }
   // ── Lightbox pinch/pan handling ──
@@ -3269,9 +3293,12 @@ function onTM(e){
     var dy = gt.startY - gt.curY; // up = positive
     var upFrac = dy / window.innerHeight;
     var rightFrac = dx / window.innerWidth;
-    // Throttle: 15% screen up = full forward; reverse maxes out at 12% screen down (-0.6)
-    var deadUp = 0.015, deadDown = 0.015;
-    if(upFrac > deadUp)        gt.throttle = Math.min((upFrac - deadUp) / (0.15 - deadUp), 1.0);
+    // Throttle: 7% screen up = full forward (tight curve so a small flick already maxes out
+    // the throttle and the rest of the upward travel is just headroom for the boost trigger);
+    // reverse still uses the original 12%-screen-down ramp because false reverses are more
+    // annoying than a slightly less sensitive backstep.
+    var deadUp = 0.012, deadDown = 0.015;
+    if(upFrac > deadUp)        gt.throttle = Math.min((upFrac - deadUp) / (0.07 - deadUp), 1.0);
     else if(upFrac < -deadDown) gt.throttle = Math.max((upFrac + deadDown) / (0.12 - deadDown), -0.6);
     else gt.throttle = 0;
     // Yaw: 20% screen sideways = full turn; right swipe turns the ship right
@@ -3282,6 +3309,24 @@ function onTM(e){
     } else gt.yaw = 0;
     // Boost when swiped past 22% of screen upward
     gt.boost = upFrac > 0.22;
+    // Quick-swipe drift detection — fires once per touch. If the finger moves
+    // sideways past ~6% of screen width within 220ms (and dominantly horizontal,
+    // so it doesn't fight the swipe-up-jump gesture), lock into drift-hold for
+    // the rest of the touch. The hold path bypasses the 12.8% yaw threshold so
+    // drift kicks in immediately on the flick instead of waiting for the user
+    // to drag further. After the 220ms window closes without a qualifying
+    // motion, mark as checked so we stop testing.
+    if(!gt.swipeChecked){
+      var swipeDur = performance.now() - gt.startTime;
+      var swipePx = Math.abs(dx);
+      if(swipeDur < 220 && swipePx > window.innerWidth * 0.06 && swipePx > Math.abs(dy) * 1.4){
+        gt.driftHold = true;
+        gt.driftDir = dx < 0 ? -1 : 1;  // left swipe → drift left (matches yaw < 0)
+        gt.swipeChecked = true;
+      } else if(swipeDur >= 220){
+        gt.swipeChecked = true;
+      }
+    }
     return;
   }
   // ── Lightbox pinch/pan handling ──
@@ -3434,6 +3479,9 @@ function onTE(e){
       gt2.throttle = 0;
       gt2.yaw = 0;
       gt2.boost = false;
+      gt2.driftHold = false;
+      gt2.driftDir = 0;
+      gt2.swipeChecked = false;
     }
     return;
   }
@@ -11339,6 +11387,7 @@ function enterGameMode() {
   gameMode.surfaceState.driftTargetAngle = 0;
   gameMode.surfaceState.driftTime = 0;
   gameMode.surfaceState.driftEntrySpeed = 0;
+  gameMode.surfaceState.coastFrames = 0;
   gameMode.surfaceState.airborne = false;
   gameMode.surfaceState.vertVel = 0;
   gameMode.surfaceState.airTime = 0;
@@ -11380,16 +11429,14 @@ function animateGameDecel() {
   if(!gameMode.decelerating) return;
   var gf = gameMode.galleryFloor;
   var d = gameMode.decel;
-  // Track crystal rotation every frame — including during 'dive' — so the ship stays
-  // attached to its surface point the whole way in. Previously this was skipped during
-  // dive to avoid the camera being swept around the crystal by residual user-velocity,
-  // but that left the ship frozen in world space while the crystal kept spinning
-  // (passive + damping vel) underneath, so by end of dive the orientation/position was
-  // stale and the first active-mode frame snapped the whole pose into place. The DAMP
-  // stage already bleeds user velocity below diveRpmThreshold before dive starts, so
-  // what's left is mostly the small passive rotation — slow enough that letting the
-  // chase pose drift along with it reads as a smooth settle instead of a dizzy spin.
-  trackCrystalRotation();
+  // HOLD/DAMP: track the floor's Y rotation so the ship stays attached to its surface
+  // point as the wheel spins down. Skipped during 'dive' — see the dive-stage snap
+  // below, which uses a raycast against the actual crystal mesh instead. (The floor's
+  // Y rotation isn't really crystal motion anyway: the crystal's local rotation.y
+  // counter-rotates fl.group.rotation.y at line ~12683, so the crystal stays world-Y
+  // fixed. What actually moves the surface during decel is the X-axis tumble at
+  // centerStar.rotation.x += vel*0.5, which a Y-only tracker can't follow.)
+  if(d.stage !== 'dive') trackCrystalRotation();
   d.stageFrames += 1;
 
   // ── HOLD ── velocity (and therefore RPM + lighting) ride at peak for ~1s
@@ -11432,6 +11479,26 @@ function animateGameDecel() {
       gf.group.userData.velocity *= d.diveDamp;
       if(Math.abs(gf.group.userData.velocity) < 0.0005) gf.group.userData.velocity = 0;
     }
+    // Anchor the ship to the actual crystal surface this frame — the crystal is still
+    // tumbling around its X axis from residual velocity (centerStar.rotation.x += vel*0.5),
+    // so the facet under the ship moves each frame. Raycasting + smoothed-normal snap is
+    // the same logic active-mode uses; doing it here keeps the ship in its true game-state
+    // pose throughout the dive, so the chase target stays valid and there's nothing for
+    // the first active frame to "fix" (which is the clip-and-reset jitter at the tail end).
+    var sst = gameMode.surfaceState;
+    var diveHit = raycastShipToSurface(gameMode.ship.position);
+    if(diveHit) {
+      sst.groundNormal.lerp(diveHit.normal, 0.25).normalize();
+      gameMode.ship.position.copy(diveHit.point).addScaledVector(sst.groundNormal, sst.hoverHeight);
+      sst.forward.sub(sst.groundNormal.clone().multiplyScalar(sst.forward.dot(sst.groundNormal)));
+      if(sst.forward.lengthSq() > 0.0001) sst.forward.normalize();
+      var diveOrient = new THREE.Matrix4();
+      diveOrient.lookAt(new THREE.Vector3(0,0,0), sst.forward.clone().multiplyScalar(-1), sst.groundNormal);
+      gameMode.ship.quaternion.setFromRotationMatrix(diveOrient);
+    }
+    // Keep lastCrystalRotY current so the first active-mode trackCrystalRotation() call
+    // sees a delta of ~0 instead of the floor's accumulated dive-duration rotation.
+    if(gf) gameMode.lastCrystalRotY = gf.group.rotation.y;
     d.diveProg = Math.min(1, d.diveProg + 1 / d.diveDuration);
     var p = d.diveProg;
     // Cubic-out — fast initial swoop, settles gently on the chase pose
@@ -11852,8 +11919,18 @@ function updateGamePhysicsAndCamera() {
   // Drift engages when A or D pressed WITHOUT W (forward thrust) and we're moving fast enough.
   // Touch: yaw past 60% with throttle near zero. Once drifting, continues at much lower speed
   // threshold so the user can pivot through corners without bouncing in and out of drift state.
-  var wantsDriftLeft  = (k.a && !k.w) || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15);
-  var wantsDriftRight = (k.d && !k.w) || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15);
+  // Drift triggers from any of three sources:
+  //   (1) keyboard A/D held without W
+  //   (2) sustained yaw drag past 60% with throttle near zero (the original full-pull gesture)
+  //   (3) touch driftHold flag — set by a quick-swipe-and-hold in onTM. This makes drift
+  //       initiation feel snappy on touch: a brief horizontal flick locks the slide in
+  //       instead of requiring a deep yaw drag, and ends naturally on finger lift.
+  var wantsDriftLeft  = (k.a && !k.w)
+                      || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15)
+                      || (t.active && t.driftHold && t.driftDir < 0);
+  var wantsDriftRight = (k.d && !k.w)
+                      || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15)
+                      || (t.active && t.driftHold && t.driftDir > 0);
   var wantsDrift = wantsDriftLeft || wantsDriftRight;
   var spdAbs = Math.abs(s.speed);
   var canEnter = spdAbs > p.maxSpeed * p.driftEntrySpeedRatio;
@@ -11898,12 +11975,36 @@ function updateGamePhysicsAndCamera() {
     // S key tightens drift — extra deceleration regardless of stage
     if(k.s) s.speed *= 0.985;
   } else {
-    // Normal: thrust scaled by fwdAxis, then drag.
+    // Normal: thrust scaled by fwdAxis. Drag + speed cap only apply while the
+    // player is actively giving throttle input. Pressing W (or analog touch
+    // fwd/reverse) resets the coast counter, applies the usual drag, and
+    // clamps to maxSpeed/boostMaxSpeed so accel curves still settle at the
+    // natural top speed.
+    //
+    // The moment they let go, no force at all touches s.speed — drag, thrust,
+    // AND the speed cap are skipped — so the ship literally coasts at the
+    // exact velocity it had at release for coastHoldFrames frames. (Without
+    // skipping the cap, a release-from-boost would have clipped speed from
+    // boostMaxSpeed down to maxSpeed instantly the moment isBoosting flipped
+    // false, which is what was eating momentum on release.) After the hold,
+    // speed peels off linearly at coastLinearDecel per frame until it hits 0.
     s.speed += thrust * fwdAxis;
-    s.speed *= p.drag;
-    var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
-    if(s.speed > maxS) s.speed = maxS;
-    if(s.speed < -maxS * 0.6) s.speed = -maxS * 0.6;
+    if(hasFwd) {
+      s.coastFrames = 0;
+      s.speed *= p.drag;
+      var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
+      if(s.speed > maxS) s.speed = maxS;
+      if(s.speed < -maxS * 0.6) s.speed = -maxS * 0.6;
+    } else {
+      s.coastFrames += 1;
+      if(s.coastFrames > p.coastHoldFrames) {
+        if(s.speed > 0) {
+          s.speed = Math.max(0, s.speed - p.coastLinearDecel);
+        } else if(s.speed < 0) {
+          s.speed = Math.min(0, s.speed + p.coastLinearDecel);
+        }
+      }
+    }
   }
 
   // Carry the ship along with the crystal as it passively rotates around Y — without
