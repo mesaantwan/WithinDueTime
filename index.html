@@ -646,6 +646,13 @@ var gameMode = {
     driftHold: false,
     driftDir: 0,        // -1 swipe-left, +1 swipe-right; matches yaw sign convention
     swipeChecked: false, // true once we've decided whether this touch is a quick swipe
+    // Joystick mode flag. Set true when the initial touch lands on the
+    // portrait-only on-screen joystick (see gameJoystick); the physics path
+    // uses it to swap a high-cap asymptotic acceleration in place of the
+    // normal clamped maxSpeed, so holding the stick forward builds momentum
+    // gradually toward a higher terminal instead of slamming into the cap.
+    // Cleared on touchend and game exit.
+    useJoystick: false,
     // Analog drift-tightness, -1..+1. Only meaningful while driftHold is true.
     // Vertical position of the finger relative to its swipe-start Y drives the
     // value: pulled up to 12% of screen → -1 (looser than baseline, slower yaw
@@ -3226,6 +3233,20 @@ function onTS(e){
     gt.startTime = performance.now();
     gt.throttle = 0; gt.yaw = 0; gt.boost = false;
     gt.driftHold = false; gt.driftDir = 0; gt.swipeChecked = false; gt.driftTight = 0;
+    // Portrait-only on-screen joystick — if the touch lands inside the base,
+    // capture it as a joystick touch. updateJoystickFromTouch writes throttle
+    // + yaw straight into gt, bypassing the screen-relative swipe path that
+    // runs below (which still handles drift-swipes for touches that land off
+    // the joystick).
+    gt.useJoystick = false;
+    if(gameJoystick.visible && gameJoystick.basePxR > 0){
+      var jdx = gt.startX - gameJoystick.basePxX;
+      var jdy = gt.startY - gameJoystick.basePxY;
+      if(jdx*jdx + jdy*jdy < gameJoystick.basePxR * gameJoystick.basePxR){
+        gt.useJoystick = true;
+        updateJoystickFromTouch(gt.startX, gt.startY);
+      }
+    }
     return;
   }
   // ── Lightbox pinch/pan handling ──
@@ -3297,6 +3318,14 @@ function onTM(e){
     var gt = gameMode.touch;
     gt.curX = e.touches[0].clientX;
     gt.curY = e.touches[0].clientY;
+    // Portrait on-screen joystick — sticks to the fixed base position; the
+    // finger drags the stick, not the throttle ramp. Skip the whole
+    // screen-relative swipe path below so the joystick stays the sole driver
+    // of throttle + yaw while it's being held.
+    if(gt.useJoystick){
+      updateJoystickFromTouch(gt.curX, gt.curY);
+      return;
+    }
     var dx = gt.curX - gt.startX;
     var dy = gt.startY - gt.curY; // up = positive
     var upFrac = dy / window.innerHeight;
@@ -3502,6 +3531,19 @@ function onTE(e){
         // Right swipe = roll right (-1), left swipe = roll left (+1) — matches A/D mapping
         triggerBarrelRoll(swipeDx > 0 ? -1 : 1);
       }
+      // Quick downward swipe-release while airborne = slam to the surface.
+      // Mirror of the swipe-up-jump trigger (positive swipeDy fires a jump on
+      // the ground; negative swipeDy fires a slam in the air). Same time +
+      // dominance thresholds keep the gesture set self-consistent — a fast
+      // flick down has to be both vertical-dominant and shorter than 280ms,
+      // otherwise it falls through to whatever the per-frame throttle/yaw
+      // was already doing.
+      else if(swipeDur < 280 &&
+              swipeDy < -window.innerHeight * 0.06 &&
+              Math.abs(swipeDy) > Math.abs(swipeDx) * 1.2 &&
+              gameMode.surfaceState.airborne){
+        triggerSlam();
+      }
       gt2.active = false;
       gt2.throttle = 0;
       gt2.yaw = 0;
@@ -3510,6 +3552,10 @@ function onTE(e){
       gt2.driftDir = 0;
       gt2.swipeChecked = false;
       gt2.driftTight = 0;
+      gt2.useJoystick = false;
+      // Snap the stick back to center on release so it doesn't hang offset
+      // on the next touch capture.
+      gameJoystick.stickX = 0; gameJoystick.stickY = 0;
     }
     return;
   }
@@ -7003,6 +7049,149 @@ function createGlassShaderMaterial() {
 }
 
 // ══════════════════════════════════════════════
+// MINI-GAME JOYSTICK (portrait-only on-screen control)
+// Stationary glass base at the bottom of the screen with a smaller glass stick
+// that follows the player's finger. Only built/positioned/raycasted while the
+// screen aspect is portrait — landscape players keep the full-screen swipe
+// joystick they already had. Output writes throttle/yaw into gameMode.touch
+// just like the swipe path does, so all downstream physics (drift detection,
+// coast, momentum) work unchanged.
+// ══════════════════════════════════════════════
+var gameJoystick = {
+  group: null, base: null, stick: null,
+  visible: false,
+  // Screen-pixel hit-test cache, refreshed each frame the joystick is shown.
+  // Touchstart uses these to decide whether a tap captures the joystick or
+  // falls through to the regular swipe path.
+  basePxX: 0, basePxY: 0, basePxR: 0,
+  // Normalized stick offset, -1..+1 along each axis (up = +Y). Drives both
+  // the visual stick mesh position and the throttle/yaw values written into
+  // gameMode.touch.
+  stickX: 0, stickY: 0,
+  // World units — radius of the base circle and how far the stick is allowed
+  // to travel from center. The stick mesh is half the base; the travel limit
+  // is 80% of the base radius so the stick visually stays inside the bowl.
+  baseWorldR: 0.95,
+  stickTravelWorld: 0.95 * 0.6
+};
+
+function createGameJoystick(){
+  var g = new THREE.Group();
+  // Base: larger glass circle — sits flush with the screen plane.
+  var base = createGlassCircleBtn(gameJoystick.baseWorldR);
+  g.add(base);
+  // Stick: smaller glass circle, floats slightly in front so it reads as a
+  // separate piece on top of the base.
+  var stick = createGlassCircleBtn(gameJoystick.baseWorldR * 0.5);
+  stick.position.z = 0.10;
+  g.add(stick);
+  // Mark for layer-1 rendering so it draws sharp on top of the post-process
+  // chain, same as the cart icon and nav menu.
+  g.layers.enable(1);
+  g.traverse(function(c){ c.layers.enable(1); });
+  g.visible = false;
+  scene.add(g);
+  gameJoystick.group = g;
+  gameJoystick.base = base;
+  gameJoystick.stick = stick;
+}
+
+function positionGameJoystick(){
+  if(!gameJoystick.group) return;
+  // Only show in portrait + when the mini-game is actively playable. During
+  // entry/exit transitions we hide it so the camera animation isn't fighting
+  // a stationary UI element on screen.
+  var portrait = camera.aspect < 1.0;
+  var shouldShow = portrait && gameMode.active && !gameMode.exiting && !gameMode.fly.active;
+  if(gameJoystick.group.visible !== shouldShow) gameJoystick.group.visible = shouldShow;
+  gameJoystick.visible = shouldShow;
+  if(!shouldShow){
+    // Reset stick visual when hidden so it doesn't pop offset on reappear.
+    gameJoystick.stickX = 0; gameJoystick.stickY = 0;
+    if(gameJoystick.stick) gameJoystick.stick.position.set(0, 0, 0.10);
+    return;
+  }
+  // Place at bottom-center of the camera-relative plane, at the same depth
+  // as the other UI overlays (cart icon, nav menu).
+  var dist = 4.5;
+  var fovRad = camera.fov * Math.PI / 180;
+  var halfH = Math.tan(fovRad/2) * dist;
+  // Bottom margin = baseWorldR + a bit of breathing room.
+  var jsLocalY = -halfH + gameJoystick.baseWorldR + 0.45;
+  var camFwd = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+  var camUp = new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion);
+  var basePos = camera.position.clone()
+    .add(camFwd.clone().multiplyScalar(dist))
+    .add(camUp.clone().multiplyScalar(jsLocalY));
+  gameJoystick.group.position.copy(basePos);
+  gameJoystick.group.quaternion.copy(camera.quaternion);
+  // Apply the live stick offset (normalized -1..+1) to the stick mesh in
+  // local space — Y is inverted from screen-space because up is +Y here.
+  if(gameJoystick.stick){
+    gameJoystick.stick.position.set(
+      gameJoystick.stickX * gameJoystick.stickTravelWorld,
+      gameJoystick.stickY * gameJoystick.stickTravelWorld,
+      0.10
+    );
+  }
+  // Cache the base's screen-pixel center + radius for cheap touchstart hit
+  // tests. Pixel radius is derived from world radius via the per-frame world-
+  // to-pixel ratio at the joystick's depth.
+  var screen = basePos.clone().project(camera);
+  gameJoystick.basePxX = (screen.x * 0.5 + 0.5) * window.innerWidth;
+  gameJoystick.basePxY = (1 - (screen.y * 0.5 + 0.5)) * window.innerHeight;
+  var pxPerWorld = window.innerHeight / (Math.tan(fovRad/2) * dist * 2);
+  gameJoystick.basePxR = gameJoystick.baseWorldR * pxPerWorld;
+  // Refresh the glass shader uniforms (time + res + tBg) so the refraction
+  // stays animated and references the latest scene FBO.
+  var tNow = performance.now() * 0.001;
+  gameJoystick.group.traverse(function(c){
+    if(c.material && c.material.uniforms){
+      var u = c.material.uniforms;
+      if(u.time) u.time.value = tNow;
+      if(u.res) u.res.value.set(window.innerWidth * renderer.getPixelRatio(), window.innerHeight * renderer.getPixelRatio());
+      if(u.tBg && glassFBO) u.tBg.value = glassFBO.texture;
+    }
+  });
+}
+
+// Touch helper — given a current touch position in screen pixels, update the
+// stick offset and derive throttle/yaw with the requested sensitivity:
+//   - Stick saturates throttle at ~30% of its max travel, so a small nudge
+//     up already maxes the throttle input.
+//   - Yaw uses a slightly wider 50% travel so steering still has resolution.
+//   - Reverse range capped at -0.6 to match the keyboard's S-key throttle.
+function updateJoystickFromTouch(tx, ty){
+  if(!gameJoystick.visible) return;
+  var dx = tx - gameJoystick.basePxX;
+  var dy = ty - gameJoystick.basePxY;
+  var maxOff = gameJoystick.basePxR * 0.6;
+  var d = Math.sqrt(dx*dx + dy*dy);
+  if(d > maxOff && d > 0){
+    dx *= maxOff / d;
+    dy *= maxOff / d;
+  }
+  // Normalize and flip Y so up-on-screen → +Y.
+  gameJoystick.stickX = dx / maxOff;
+  gameJoystick.stickY = -dy / maxOff;
+  var gt = gameMode.touch;
+  // Throttle — saturates at 30% stick travel up; reverse at 30% down (capped -0.6).
+  var sy = gameJoystick.stickY;
+  var sensFwd = 0.30;
+  if(sy > 0)      gt.throttle = Math.min(sy / sensFwd, 1.0);
+  else if(sy < 0) gt.throttle = Math.max(sy / sensFwd, -0.6);
+  else            gt.throttle = 0;
+  // Yaw — 5% deadzone, full at 50% lateral travel.
+  var sx = gameJoystick.stickX;
+  var yawDead = 0.05, yawFull = 0.5;
+  if(sx >  yawDead)      gt.yaw = Math.min(( sx - yawDead) / (yawFull - yawDead), 1.0);
+  else if(sx < -yawDead) gt.yaw = Math.max(( sx + yawDead) / (yawFull - yawDead), -1.0);
+  else                   gt.yaw = 0;
+  // Joystick doesn't engage boost; momentum buildup replaces the boost feel.
+  gt.boost = false;
+}
+
+// ══════════════════════════════════════════════
 // NAVIGATION MENU (glass button, top-left)
 // ══════════════════════════════════════════════
 var navMenu = {
@@ -9471,6 +9660,10 @@ function renderGlassFBO() {
   cart.iconGroup.visible=false;
   if(cart.panelGroup)cart.panelGroup.visible=false;
   if(navMenu.group)navMenu.group.visible=false;
+  // Game joystick — hide during the refraction capture so its glass mesh
+  // doesn't sample itself through the FBO and ghost into a recursive blur.
+  var gjFboVis = gameJoystick.group ? gameJoystick.group.visible : false;
+  if(gameJoystick.group) gameJoystick.group.visible = false;
   for(var _nb=0;_nb<navMenu.buttons.length;_nb++) navMenu.buttons[_nb].group.visible=false;
   // Hide overlay glass buttons during FBO capture
   for(var oi=0;oi<cartOverlays.length;oi++) cartOverlays[oi].group.visible=false;
@@ -9515,6 +9708,7 @@ function renderGlassFBO() {
   for(var sti4=0;sti4<dm.starTemps.length;sti4++) dm.starTemps[sti4].visible=true;
   if(dm.closingStarTemps){for(var csti2=0;csti2<dm.closingStarTemps.length;csti2++) dm.closingStarTemps[csti2].visible=true;}
   if(altImgBar.group) altImgBar.group.visible = _aibFboVis;
+  if(gameJoystick.group) gameJoystick.group.visible = gjFboVis;
   cart.iconGroup.visible = !cartBroken;
   if(cart.panelGroup){
     var raw=cartMorphT;
@@ -11686,6 +11880,8 @@ function exitGameMode() {
   gameMode.touch.driftDir = 0;
   gameMode.touch.swipeChecked = false;
   gameMode.touch.driftTight = 0;
+  gameMode.touch.useJoystick = false;
+  gameJoystick.stickX = 0; gameJoystick.stickY = 0;
   // Clear airborne / jump state so re-entry starts grounded
   gameMode.surfaceState.airborne = false;
   gameMode.surfaceState.vertVel = 0;
@@ -11911,6 +12107,8 @@ function animateGameTransition() {
       et.active = false;
       et.throttle = 0; et.yaw = 0; et.boost = false;
       et.driftHold = false; et.driftDir = 0; et.swipeChecked = false; et.driftTight = 0;
+      et.useJoystick = false;
+      gameJoystick.stickX = 0; gameJoystick.stickY = 0;
       isDragging = false;
       selectedFloor = null;
       hoveredPanel = null;
@@ -12057,8 +12255,17 @@ function updateGamePhysicsAndCamera() {
       s.coastFrames = 0;
       s.speed *= p.drag;
       var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
+      // Joystick mode: raise the forward cap so thrust + drag asymptote toward
+      // a higher equilibrium instead of slamming the player into maxSpeed. With
+      // thrustMax=0.0003 and drag=0.985 the natural terminal is ~0.02; a 0.03
+      // cap leaves room for that asymptote to develop, giving the requested
+      // "hold the stick and momentum builds at a negative-exponential rate"
+      // feel without needing a separate boost trigger. Reverse stays clamped
+      // to the original ratio so backing up doesn't gain unbounded speed.
+      if(t.active && t.useJoystick) maxS = Math.max(maxS, 0.03);
       if(s.speed > maxS) s.speed = maxS;
-      if(s.speed < -maxS * 0.6) s.speed = -maxS * 0.6;
+      var maxR = (p.isBoosting ? p.boostMaxSpeed : p.maxSpeed) * 0.6;
+      if(s.speed < -maxR) s.speed = -maxR;
     } else {
       s.coastFrames += 1;
       if(s.coastFrames > p.coastHoldFrames) {
@@ -12432,6 +12639,25 @@ function triggerBarrelRoll(direction){
   s.barrelRoll.lateralDir.copy(right);
 }
 
+// Slam toward the surface from mid-air. Sets a strong negative vertVel along
+// the locked jumpAxis so the ship pile-drives downward instead of arcing back
+// at its natural fall rate; gravity continues to compound the descent each
+// frame, so the existing landing raycast catches the ship within a handful
+// of frames and snaps it flat on whatever facet is below. No-op if grounded
+// or in fly mode. Cancels any in-flight barrel roll so a downward swipe
+// reads as a deliberate straight-down action rather than fighting a spin.
+function triggerSlam(){
+  if(!gameMode.active || gameMode.fly.active) return;
+  var s = gameMode.surfaceState;
+  if(!s.airborne) return;
+  // ~1.4× jumpImpulse worth of downward velocity — still overwhelms residual
+  // upward motion at jump apex if the player slams while rising, but lands
+  // with noticeably less smack than the original 2.85× tune.
+  s.vertVel = -0.04;
+  s.barrelRoll.active = false;
+  s.barrelRoll.progress = 0;
+}
+
 function gameKeyDown(e) {
   if(!gameMode.active && !gameMode.entering) return;
   var k = e.key ? e.key.toLowerCase() : '';
@@ -12605,6 +12831,7 @@ function init(){
   loadProductImages();
   createCartIcon();
   createNavMenu();
+  createGameJoystick();
   setupIntersectionGlow();
   createGlassFBO();
   createBackdropBlur();
@@ -13209,6 +13436,7 @@ function animate(){
   updateCartItemClipPlanes();
   updateCartItemGlassUniforms(time);
   positionNavMenu();
+  positionGameJoystick();
   updateOrbs(dt);
   // Cart shake AFTER updateOrbs so it doesn't get overwritten by orb stage shake
   updateCartShake(dt);
@@ -13249,6 +13477,10 @@ function animate(){
   for(var _oi=0;_oi<cartOverlays.length;_oi++) cartOverlays[_oi].group.visible=false;
   var pdvVis=pdv.group?pdv.group.visible:false;
   if(pdv.group) pdv.group.visible=false;
+  // Game joystick — same treatment as cart/nav: hide for the post-FBO capture
+  // so the blurred copy doesn't shadow the sharp layer-1 overlay pass.
+  var gjVis = gameJoystick.group ? gameJoystick.group.visible : false;
+  if(gameJoystick.group) gameJoystick.group.visible = false;
   // Lightbox only: hide the product image + the three buttons during the post-process
   // capture so the bgBlur doesn't soften them. They re-render crisply in the layer-1
   // overlay pass. This block only runs while the lightbox is on screen so the normal
@@ -13282,6 +13514,7 @@ function animate(){
   if(cart.panelGroup) cart.panelGroup.visible=cartPanelVis;
   if(navMenu.group) navMenu.group.visible=true;
   if(pdv.group) pdv.group.visible=pdvVis;
+  if(gameJoystick.group) gameJoystick.group.visible=gjVis;
   for(var _nb4=0;_nb4<navMenu.buttons.length;_nb4++){
     var nbE=navMenu.morphT<.5?4*navMenu.morphT*navMenu.morphT*navMenu.morphT:1-Math.pow(-2*navMenu.morphT+2,3)/2;
     navMenu.buttons[_nb4].group.visible=nbE>0.6;
