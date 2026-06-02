@@ -509,8 +509,13 @@ var gameMode = {
   chargeRpmThreshold: 0.9,  // doubled — requires near-max RPM spin to commit
   // "Planet" surface (the center crystal)
   surface: {
-    center: new THREE.Vector3(),   // world position of crystal center
-    radius: 0.95                   // orbit radius — just above OctahedronGeometry(0.8) vertices
+    center: new THREE.Vector3(),   // world position of the ACTIVE crystal's center
+    radius: 0.95,                  // orbit radius — just above OctahedronGeometry(0.8) vertices
+    crystal: null,                 // the centerStar group the ship is currently bound to (dynamic —
+                                   // free-fall can re-bind it to any floor's crystal on landing)
+    floor: null,                   // floor object owning the active crystal (for spin tracking)
+    gripRange: 0.85                // how far the magnetic ground-below ray reaches (so the ship
+                                   // can grip down into the hallway instead of being pulled to centre)
   },
   // Position + orientation on the crystal surface. Ship world position is the source of
   // truth (lives on `gameMode.ship.position`); each frame a raycast against the actual
@@ -539,6 +544,15 @@ var gameMode = {
     // Jump state — Space (keyboard) or quick swipe-up-release (touch) launches the ship
     // along the current surface normal. Gravity (toward crystal center) pulls it back.
     airborne: false,
+    // Two distinct airborne sub-states (Orbicule-style land-locked vs free-falling):
+    //   freeFalling === false → a clean vertical HOP that stays "land-locked": it rises
+    //     along jumpAxis and magnetically re-sticks to the facet directly below. This is
+    //     the original good surface feel — a normal jump never flings you into orbit.
+    //   freeFalling === true  → genuine DETACHMENT: gravity from the nearest planet/crystal
+    //     pulls fly.vel, planet collisions apply, and the magnetic raycast catches a landing
+    //     when you drift back near a surface. Entered by launching fast off a ramp/edge,
+    //     or by toggling out of P-flight mode.
+    freeFalling: false,
     vertVel: 0,                              // velocity along jumpAxis (positive = away from crystal)
     airTime: 0,                              // frames since takeoff (safety landing after maxAirTime)
     jumpAxis: new THREE.Vector3(0, 1, 0),    // surface normal locked at takeoff
@@ -592,13 +606,38 @@ var gameMode = {
     driftSustainTime: 300,                   // frames to hold entry speed before decay
     driftDecel: 0.00003,                     // per-frame speed loss in decay stage
     // Jump tuning — scaled for tiny planet (R≈0.95). Impulse ≈ 4 ship-lengths of hop.
-    jumpImpulse: 0.028,                      // initial vertical velocity along ground normal
+    jumpImpulse: 0.028,                      // initial vertical velocity along ground normal (correctphysics value — lower, controllable hop)
     jumpGravity: 0.0011,                     // per-frame velocity decrement (pull toward crystal)
     jumpMaxAirTime: 240                      // forced landing if airborne longer than this
   },
   // Edge-triggered jump request — set by keyboard Space (non-repeat) or a quick upward
   // swipe-release on touch, consumed once per frame in updateGamePhysicsAndCamera.
   wantJump: false,
+  // Timestamps (ms) of the last A / D keydown, used to fire a "jump barrel roll" combo:
+  // if A or D is held — or was tapped within 0.3s before — when a jump fires, the ship
+  // hops and instantly barrel-rolls in that direction.
+  lastATime: -1e9,
+  lastDTime: -1e9,
+  jumpRollWindow: 300,   // ms before a jump that an A/D tap still counts as a roll combo
+  // ── TARDIS portal ── a crystal indent that tunnels in, crosses an invisible seam
+  // (pure-translation fold), continues far longer than the crystal could hold, and opens
+  // into a crystal dome you drop into. Region A (entrance tunnel) is real at the crystal;
+  // Region B (continuation + dome) lives at x≈DX, past camera.far so it's hidden in play.
+  portal: {
+    built: false, inside: false, inB: false,   // inside = interior mode; inB = in Region B
+    p1: null, p2: null, regionA: null, regionB: null,
+    rt1: null, rt2: null, vCam: null,
+    D: new THREE.Vector3(),                 // translation Region A → Region B
+    gy: 0,                                  // crystal/tunnel centre-line height
+    HW: 0.085, HH: 0.085,                   // tunnel half-width (x) / half-height (y) — small bore
+    mouthZ: 0.72, portalZ: 0.12, corrEndZ: -4.0,    // tunnel mouth (inside +Z surface), seam, corridor end (z)
+    DX: 300,                                // Region B x-offset
+    domeR: 1.5, domeDrop: 2.0, domeFloorY: 0, domeCz: -3,  // dome radius / ceiling-drop / floor / centre z (crystal-scale)
+    holeDir: new THREE.Vector3(), holeScale: 0.26, indentDepth: 0.3,  // small central hole: size fraction of the face / tunnel depth
+    vel: new THREE.Vector3(),               // ship velocity while inside
+    prevSeamSide: 0, prevMouthSide: 0, prevMouthOut: 0, // crossing-detection history
+    fog: null, bg: null
+  },
   // Free-flight mode (toggle with P) — ship leaves the crystal and flies anywhere in 3D
   fly: {
     active: false,
@@ -3224,6 +3263,13 @@ function onTS(e){
   e.preventDefault();
   // Mini-game touch joystick — first finger becomes the joystick origin
   if(gameMode.active && !gameMode.exiting && e.touches.length === 1){
+    // Tapping a game UI element (menu/cart icon or an open window) routes to the
+    // normal pointer handlers instead of capturing the joystick.
+    if(gameUITouchHitTest(e.touches[0].clientX, e.touches[0].clientY)){
+      gameMode.touch.uiTouch = true;
+      pDown(e.touches[0].clientX, e.touches[0].clientY);
+      return;
+    }
     var gt = gameMode.touch;
     gt.active = true;
     gt.startX = e.touches[0].clientX;
@@ -3313,6 +3359,11 @@ function onTS(e){
 }
 function onTM(e){
   e.preventDefault();
+  // In-game UI touch (window drag / button) — route to pointer move
+  if(gameMode.active && gameMode.touch.uiTouch){
+    if(e.touches.length === 1) pMove(e.touches[0].clientX, e.touches[0].clientY);
+    return;
+  }
   // Mini-game touch joystick — translate drag delta into throttle / yaw / boost
   if(gameMode.active && gameMode.touch.active && e.touches.length === 1){
     var gt = gameMode.touch;
@@ -3500,6 +3551,12 @@ function onTM(e){
   }
 }
 function onTE(e){
+  // In-game UI touch release — route to pointer up (handles taps + window drag end)
+  if(gameMode.active && gameMode.touch.uiTouch){
+    gameMode.touch.uiTouch = false;
+    if(e.changedTouches && e.changedTouches.length > 0) pUp(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+    return;
+  }
   // Mini-game touch joystick — release on last finger up
   if(gameMode.active && gameMode.touch.active){
     if(e.touches.length === 0){
@@ -3635,6 +3692,18 @@ function pDown(cx,cy){
         renderer.domElement.parentElement.classList.add('dragging');
         return;
       }
+    }
+  }
+  // In-game glass windows: dragging a window's title bar takes priority
+  if(gameMode.active && !gameMode.exiting){
+    var gwTitle = gameUIHitTitle(cx, cy);
+    if(gwTitle){
+      gameUI.drag.active = true; gameUI.drag.win = gwTitle;
+      gameUI.drag.startX = cx; gameUI.drag.startY = cy;
+      gameUI.drag.startOffX = gwTitle.offX; gameUI.drag.startOffY = gwTitle.offY;
+      isDragging = true;
+      renderer.domElement.parentElement.classList.add('dragging');
+      return;
     }
   }
   pressedGlassMesh = null;
@@ -3779,6 +3848,14 @@ function pDown(cx,cy){
 }
 
 function pMove(cx,cy){
+  // In-game window drag — move the panel by the title-bar grab delta
+  if(gameUI.drag.active && gameUI.drag.win){
+    var gdx = (cx - gameUI.drag.startX) / window.innerWidth;
+    var gdy = -(cy - gameUI.drag.startY) / window.innerHeight;
+    gameUI.drag.win.offX = gameUI.drag.startOffX + gdx;
+    gameUI.drag.win.offY = gameUI.drag.startOffY + gdy;
+    return;
+  }
   if(ballDrag.active && ballDrag.ball){
     // Generous tolerance — only when cursor drifts >60px from the anchor
     // do we count it as "moving" (partial drain, anchor follows). Small jitter
@@ -3963,6 +4040,13 @@ function updateCursor(cx,cy){
 
 function pUp(cx,cy){
   pressedGlassMesh = null;
+  // Release in-game window drag
+  if(gameUI.drag.active){
+    gameUI.drag.active = false; gameUI.drag.win = null;
+    isDragging = false;
+    renderer.domElement.parentElement.classList.remove('dragging');
+    return;
+  }
   // Release ball drag — either throw-into-scene (charged octahedron) or normal release
   if(ballDrag.active && ballDrag.ball){
     var heldBall = ballDrag.ball;
@@ -3998,6 +4082,15 @@ function pUp(cx,cy){
   if(wasClick){
     mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
     raycaster.setFromCamera(mouse,camera);
+
+    // In-game glass windows intercept clicks (options/inventory windows + their icons)
+    if(gameMode.active && !gameMode.exiting){
+      if(handleGameUIClick()){
+        isDragging=false; selectedFloor=null;
+        renderer.domElement.parentElement.classList.remove('dragging');
+        return;
+      }
+    }
 
     // Lightbox is open: ONLY the three lightbox buttons are interactive. Everything
     // else (cart, nav, scene panels) is unreachable so clicks meant for the close X
@@ -7102,7 +7195,7 @@ function positionGameJoystick(){
   // entry/exit transitions we hide it so the camera animation isn't fighting
   // a stationary UI element on screen.
   var portrait = camera.aspect < 1.0;
-  var shouldShow = portrait && gameMode.active && !gameMode.exiting && !gameMode.fly.active;
+  var shouldShow = portrait && gameMode.active && !gameMode.exiting && !gameMode.fly.active && gameMode.joystickEnabled !== false;
   if(gameJoystick.group.visible !== shouldShow) gameJoystick.group.visible = shouldShow;
   gameJoystick.visible = shouldShow;
   if(!shouldShow){
@@ -7189,6 +7282,292 @@ function updateJoystickFromTouch(tx, ty){
   else                   gt.yaw = 0;
   // Joystick doesn't engage boost; momentum buildup replaces the boost feel.
   gt.boost = false;
+}
+
+// ══════════════════════════════════════════════
+// IN-GAME GLASS WINDOWS (options menu + inventory)
+// While the mini-game owns the screen, the top-left menu icon opens an OPTIONS
+// window and the top-right cart icon opens an INVENTORY window. Both are large
+// draggable glass panels: a clean slate of refraction glass with a title bar
+// (the drag handle) and an X close button in the top-right corner, built from
+// the same shader as the cart/PDV panels.
+// ══════════════════════════════════════════════
+var GAMEWIN_DIST = 4.5;
+var gameUI = {
+  options: null,
+  inventory: null,
+  drag: { active:false, win:null, startX:0, startY:0, startOffX:0, startOffY:0 }
+};
+
+function disposeGameUITree(obj){
+  obj.traverse(function(c){
+    if(c.geometry) c.geometry.dispose();
+    if(c.material){ if(c.material.map) c.material.map.dispose(); c.material.dispose(); }
+  });
+}
+
+// Small clickable glass button with a centered text label.
+function gameUIButton(w, h, label, actionId, frost){
+  var g = new THREE.Group();
+  var panel = createPdvGlassPanel(w, h, frost === undefined ? 0.42 : frost, 0.06);
+  panel.userData.actionId = actionId;
+  panel.userData.clickable = true;
+  g.add(panel);
+  if(label){
+    var txt = pdvTextMesh(label, {cw:512, ch:96, font:'600 34px Arial', color:'#2a3248', align:'center', w:w*0.86, h:h*0.5});
+    txt.position.z = 0.05;
+    g.add(txt);
+  }
+  g.userData.actionId = actionId;
+  g.userData.clickable = true;
+  return g;
+}
+
+function makeGameWindow(kind, title, W, H){
+  var win = {kind:kind, W:W, H:H, open:false, anim:0, target:0, offX:0, offY:0,
+             group:null, body:null, content:null, titleBar:null, titleText:null, closeBtn:null};
+  var g = new THREE.Group();
+  win.group = g;
+
+  // Big clean glass slate
+  var body = createPdvGlassPanel(W, H, 0.30, 0.16);
+  g.add(body); win.body = body;
+
+  var topY = H/2 - 0.42;
+  // Title bar = drag handle (leaves room on the right for the X button)
+  var tbW = W - 1.1, tbH = 0.52, tbX = -0.28;
+  var tb = createGlassHighlight(tbW, tbH, {opacity:0.7, cornerRadius:0.1, blur:0.025, frost:0.8});
+  tb.position.set(tbX, topY, 0.05);
+  tb.userData.isTitleBar = true;
+  g.add(tb); win.titleBar = tb;
+
+  var tt = pdvTextMesh(title, {cw:512, ch:96, font:'700 44px Arial', color:'#2a3248', align:'center', w:tbW*0.7, h:tbH*0.62});
+  tt.position.set(tbX, topY, 0.08);
+  tt.userData.isTitleBar = true;
+  g.add(tt); win.titleText = tt;
+
+  // X close button, top-right
+  var xb = createPdvGlassPanel(0.52, 0.52, 0.42, 0.08);
+  xb.userData.actionId = 'gamewin-close';
+  xb.userData.clickable = true;
+  xb.position.set(W/2 - 0.42, topY, 0.05);
+  g.add(xb); win.closeBtn = xb;
+  var xLabel = pdvTextMesh('✕', {cw:64, ch:64, font:'500 42px Arial', color:'#2a3248', align:'center', w:0.32, h:0.32});
+  xLabel.position.set(W/2 - 0.42, topY, 0.08);
+  xLabel.userData.actionId = 'gamewin-close';
+  xLabel.userData.clickable = true;
+  g.add(xLabel);
+
+  g.layers.enable(1);
+  g.traverse(function(c){ c.layers.enable(1); });
+  g.visible = false;
+  scene.add(g);
+  return win;
+}
+
+function ensureGameWindows(){
+  if(!gameUI.options)   gameUI.options   = makeGameWindow('options', 'OPTIONS', 4.4, 4.2);
+  if(!gameUI.inventory) gameUI.inventory = makeGameWindow('inventory', 'INVENTORY', 4.2, 3.8);
+}
+
+function buildOptionsContent(win){
+  if(win.content){ win.group.remove(win.content); disposeGameUITree(win.content); }
+  win.content = new THREE.Group();
+  win.group.add(win.content);
+  var W = win.W, H = win.H;
+  var rowH = 0.5, gap = 0.14;
+  var y = H/2 - 1.0;
+
+  // Stepper rows: −/+ around a value. CAMERA ZOOM = how close the chase cam sits
+  // to the ship (lower = closer); FOV = camera field of view.
+  var rows = [
+    {label:'CAMERA ZOOM', val:gameMode.camBackDist.toFixed(2), dec:'opt-zoom-dec', inc:'opt-zoom-inc'},
+    {label:'FOV',         val:Math.round(camera.fov) + '',     dec:'opt-fov-dec',  inc:'opt-fov-inc'}
+  ];
+  rows.forEach(function(r){
+    var lbl = pdvTextMesh(r.label, {cw:400, ch:64, font:'600 28px Arial', color:'#2a3248', align:'left', w:W*0.40, h:rowH*0.62});
+    lbl.position.set(-W*0.5 + 0.35 + W*0.20, y, 0.05);
+    win.content.add(lbl);
+
+    var dec = gameUIButton(0.5, rowH, '−', r.dec, 0.42);
+    dec.position.set(W*0.06, y, 0.02);
+    win.content.add(dec);
+
+    var valTxt = pdvTextMesh(r.val, {cw:200, ch:64, font:'600 30px Arial', color:'#2a3248', align:'center', w:0.7, h:rowH*0.62});
+    valTxt.position.set(W*0.24, y, 0.05);
+    win.content.add(valTxt);
+
+    var inc = gameUIButton(0.5, rowH, '+', r.inc, 0.42);
+    inc.position.set(W*0.42, y, 0.02);
+    win.content.add(inc);
+    y -= rowH + gap;
+  });
+
+  var joyBtn = gameUIButton(W*0.72, rowH, 'JOYSTICK: ' + (gameMode.joystickEnabled === false ? 'OFF' : 'ON'), 'opt-joy', 0.46);
+  joyBtn.position.set(0, y, 0.02); win.content.add(joyBtn); y -= rowH + gap;
+
+  var flyBtn = gameUIButton(W*0.72, rowH, 'FLIGHT MODE: ' + (gameMode.fly.active ? 'ON' : 'OFF'), 'opt-fly', 0.46);
+  flyBtn.position.set(0, y, 0.02); win.content.add(flyBtn); y -= rowH + gap;
+
+  var exitBtn = gameUIButton(W*0.72, rowH, 'EXIT GAME', 'opt-exit', 0.5);
+  exitBtn.position.set(0, y, 0.02); win.content.add(exitBtn);
+
+  win.content.layers.enable(1);
+  win.content.traverse(function(c){ c.layers.enable(1); });
+}
+
+function buildInventoryContent(win){
+  if(win.content){ win.group.remove(win.content); disposeGameUITree(win.content); }
+  win.content = new THREE.Group();
+  win.group.add(win.content);
+  var cols = 4, rows = 4, slot = 0.52, sgap = 0.14;
+  var gridW = cols*slot + (cols-1)*sgap;
+  var startX = -gridW/2 + slot/2;
+  var startY = gridW/2 - slot/2 - 0.25;
+  for(var r=0;r<rows;r++){
+    for(var c=0;c<cols;c++){
+      var s = createPdvGlassPanel(slot, slot, 0.5, 0.06);
+      s.position.set(startX + c*(slot+sgap), startY - r*(slot+sgap), 0.02);
+      win.content.add(s);
+    }
+  }
+  win.content.layers.enable(1);
+  win.content.traverse(function(c){ c.layers.enable(1); });
+}
+
+function toggleGameWindow(kind){
+  ensureGameWindows();
+  var win = (kind === 'options') ? gameUI.options : gameUI.inventory;
+  if(win.open){
+    win.open = false; win.target = 0;
+  } else {
+    if(kind === 'options') buildOptionsContent(win);
+    else buildInventoryContent(win);
+    win.open = true; win.target = 1;
+    win.offX = 0; win.offY = 0;
+  }
+}
+
+function closeGameWindow(win){ if(win){ win.open = false; win.target = 0; } }
+
+function handleGameOption(actionId){
+  if(actionId === 'opt-zoom-dec')      gameMode.camBackDist = Math.max(0.04, gameMode.camBackDist - 0.02); // closer
+  else if(actionId === 'opt-zoom-inc') gameMode.camBackDist = Math.min(0.50, gameMode.camBackDist + 0.02); // farther
+  else if(actionId === 'opt-fov-dec'){ camera.fov = Math.max(40, camera.fov - 5); camera.updateProjectionMatrix(); }
+  else if(actionId === 'opt-fov-inc'){ camera.fov = Math.min(120, camera.fov + 5); camera.updateProjectionMatrix(); }
+  else if(actionId === 'opt-joy')      gameMode.joystickEnabled = (gameMode.joystickEnabled === false);
+  else if(actionId === 'opt-fly')      toggleFlightMode();
+  else if(actionId === 'opt-exit'){ closeGameWindow(gameUI.options); closeGameWindow(gameUI.inventory); exitGameMode(); return; }
+  if(gameUI.options && gameUI.options.open) buildOptionsContent(gameUI.options);
+}
+
+// Returns the window whose title bar was hit (for drag), or null.
+function gameUIHitTitle(cx, cy){
+  mouse.x = (cx/renderer.domElement.clientWidth)*2 - 1;
+  mouse.y = -(cy/renderer.domElement.clientHeight)*2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  var wins = [gameUI.options, gameUI.inventory];
+  for(var i=0;i<wins.length;i++){
+    var win = wins[i];
+    if(!win || !win.open || !win.group.visible) continue;
+    var objs = [win.titleBar];
+    if(win.titleText) objs.push(win.titleText);
+    if(raycaster.intersectObjects(objs, true).length > 0) return win;
+  }
+  return null;
+}
+
+// True if a tap at (cx,cy) lands on game UI (menu/cart icon or an open window),
+// so touch handling routes to the pointer handlers instead of the joystick.
+function gameUITouchHitTest(cx, cy){
+  mouse.x = (cx/renderer.domElement.clientWidth)*2 - 1;
+  mouse.y = -(cy/renderer.domElement.clientHeight)*2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  if(navMenu.glassMesh && raycaster.intersectObject(navMenu.glassMesh).length > 0) return true;
+  if(cart.glassMesh && raycaster.intersectObject(cart.glassMesh).length > 0) return true;
+  var wins = [gameUI.options, gameUI.inventory];
+  for(var i=0;i<wins.length;i++){
+    var win = wins[i];
+    if(!win || !win.open || !win.group.visible) continue;
+    if(raycaster.intersectObjects(win.group.children, true).length > 0) return true;
+  }
+  return false;
+}
+
+// Handle a click while in game mode, using the raycaster pUp already set.
+// Returns true if the click was consumed by game UI.
+function handleGameUIClick(){
+  var wins = [gameUI.options, gameUI.inventory];
+  for(var i=0;i<wins.length;i++){
+    var win = wins[i];
+    if(!win || !win.open || !win.group.visible) continue;
+    var hits = raycaster.intersectObjects(win.group.children, true);
+    if(hits.length === 0) continue;
+    var obj = hits[0].object;
+    while(obj && obj !== win.group){
+      if(obj.userData && obj.userData.actionId){
+        var aid = obj.userData.actionId;
+        if(aid === 'gamewin-close'){ closeGameWindow(win); return true; }
+        handleGameOption(aid);
+        return true;
+      }
+      obj = obj.parent;
+    }
+    // Clicked the window body but not a control — consume so it doesn't pass through
+    return true;
+  }
+  // Icons toggle their window
+  if(navMenu.glassMesh && raycaster.intersectObject(navMenu.glassMesh).length > 0){ toggleGameWindow('options'); return true; }
+  if(cart.glassMesh && raycaster.intersectObject(cart.glassMesh).length > 0){ toggleGameWindow('inventory'); return true; }
+  return false;
+}
+
+function positionGameWindow(win){
+  var fovRad = camera.fov * Math.PI / 180;
+  var halfH = Math.tan(fovRad/2) * GAMEWIN_DIST;
+  var halfW = halfH * camera.aspect;
+  var cx = win.offX * halfW * 2;
+  var cy = win.offY * halfH * 2;
+  var pw = win.W*0.5, ph = win.H*0.5, m = 0.1;
+  if(pw < halfW - m){ var lim = halfW - m - pw; cx = Math.max(-lim, Math.min(lim, cx)); }
+  if(ph < halfH - m){ var lim2 = halfH - m - ph; cy = Math.max(-lim2, Math.min(lim2, cy)); }
+  var camFwd = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+  var camRight = new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion);
+  var camUp = new THREE.Vector3(0,1,0).applyQuaternion(camera.quaternion);
+  var pos = camera.position.clone()
+    .add(camFwd.multiplyScalar(GAMEWIN_DIST))
+    .add(camRight.multiplyScalar(cx))
+    .add(camUp.multiplyScalar(cy));
+  win.group.position.copy(pos);
+  win.group.quaternion.copy(camera.quaternion);
+  var ease = win.anim < 0.5 ? 2*win.anim*win.anim : 1 - Math.pow(-2*win.anim+2, 2)/2;
+  var s = 0.82 + 0.18*ease;
+  win.group.scale.set(s, s, s);
+}
+
+function updateGameWindows(){
+  if(!gameUI.options && !gameUI.inventory) return;
+  var wins = [gameUI.options, gameUI.inventory];
+  var t = performance.now() * 0.001;
+  var px = window.innerWidth * renderer.getPixelRatio();
+  var py = window.innerHeight * renderer.getPixelRatio();
+  for(var i=0;i<wins.length;i++){
+    var win = wins[i];
+    if(!win) continue;
+    if(win.anim < win.target) win.anim = Math.min(win.target, win.anim + 0.12);
+    else if(win.anim > win.target) win.anim = Math.max(win.target, win.anim - 0.12);
+    var vis = win.anim > 0.005;
+    win.group.visible = vis;
+    if(!vis) continue;
+    positionGameWindow(win);
+    win.group.traverse(function(c){
+      if(c.material && c.material.uniforms){
+        if(c.material.uniforms.time) c.material.uniforms.time.value = t;
+        if(c.material.uniforms.res) c.material.uniforms.res.value.set(px, py);
+        if(c.material.uniforms.tBg && glassFBO) c.material.uniforms.tBg.value = glassFBO.texture;
+      }
+    });
+  }
 }
 
 // ══════════════════════════════════════════════
@@ -9664,6 +10043,11 @@ function renderGlassFBO() {
   // doesn't sample itself through the FBO and ghost into a recursive blur.
   var gjFboVis = gameJoystick.group ? gameJoystick.group.visible : false;
   if(gameJoystick.group) gameJoystick.group.visible = false;
+  // In-game windows — hide during refraction capture
+  var gwoFbo = gameUI.options && gameUI.options.group ? gameUI.options.group.visible : false;
+  var gwiFbo = gameUI.inventory && gameUI.inventory.group ? gameUI.inventory.group.visible : false;
+  if(gameUI.options && gameUI.options.group) gameUI.options.group.visible = false;
+  if(gameUI.inventory && gameUI.inventory.group) gameUI.inventory.group.visible = false;
   for(var _nb=0;_nb<navMenu.buttons.length;_nb++) navMenu.buttons[_nb].group.visible=false;
   // Hide overlay glass buttons during FBO capture
   for(var oi=0;oi<cartOverlays.length;oi++) cartOverlays[oi].group.visible=false;
@@ -9709,6 +10093,8 @@ function renderGlassFBO() {
   if(dm.closingStarTemps){for(var csti2=0;csti2<dm.closingStarTemps.length;csti2++) dm.closingStarTemps[csti2].visible=true;}
   if(altImgBar.group) altImgBar.group.visible = _aibFboVis;
   if(gameJoystick.group) gameJoystick.group.visible = gjFboVis;
+  if(gameUI.options && gameUI.options.group) gameUI.options.group.visible = gwoFbo;
+  if(gameUI.inventory && gameUI.inventory.group) gameUI.inventory.group.visible = gwiFbo;
   cart.iconGroup.visible = !cartBroken;
   if(cart.panelGroup){
     var raw=cartMorphT;
@@ -11591,9 +11977,19 @@ function enterGameMode() {
   gameMode.savedCamNear = camera.near;
   camera.near = 0.001;
   camera.updateProjectionMatrix();
-  // Lock surface center to the gallery floor's crystal in world space
+  // Lock surface center to the gallery floor's crystal in world space, and bind the
+  // active crystal to it. Free-fall can later re-bind these to any other floor's crystal.
   var gf = gameMode.galleryFloor;
-  gameMode.surface.center.set(0, gf ? gf.group.position.y : 0, 0);
+  gameMode.surface.crystal = (gf && gf.group.userData.centerStar) ? gf.group.userData.centerStar : null;
+  gameMode.surface.floor = gf;
+  // Use the crystal mesh's ACTUAL world position (the centerStar sits ~1.5 below the floor
+  // origin), not the floor Y — otherwise the radial ray + grip fallback aim at the wrong point.
+  if(gameMode.surface.crystal){
+    gameMode.surface.crystal.updateMatrixWorld(true);
+    gameMode.surface.crystal.getWorldPosition(gameMode.surface.center);
+  } else {
+    gameMode.surface.center.set(0, gf ? gf.group.position.y : 0, 0);
+  }
   // Spawn the ship above the FRONT face of the crystal (the +Z side facing the orbit
   // camera) with its forward direction pointing along world +Y. After the raycast snap
   // the ship sits on whichever facet that probe hits, oriented so pressing W flies it
@@ -11611,6 +12007,7 @@ function enterGameMode() {
   gameMode.surfaceState.driftEntrySpeed = 0;
   gameMode.surfaceState.coastFrames = 0;
   gameMode.surfaceState.airborne = false;
+  gameMode.surfaceState.freeFalling = false;
   gameMode.surfaceState.vertVel = 0;
   gameMode.surfaceState.airTime = 0;
   gameMode.surfaceState.barrelRoll.active = false;
@@ -11767,7 +12164,7 @@ function animateGameDecel() {
 // to its surface point as the crystal spins. Without this the ship would slide across
 // facets even when the player is stationary.
 function trackCrystalRotation() {
-  var gf = gameMode.galleryFloor;
+  var gf = gameMode.surface.floor || gameMode.galleryFloor;
   if(!gf) return;
   var floorRotY = gf.group.rotation.y;
   var dRotY = floorRotY - gameMode.lastCrystalRotY;
@@ -11792,32 +12189,65 @@ function trackCrystalRotation() {
   gameMode.ship.quaternion.premultiply(yQuat);
 }
 
+// Collect every floor's center crystal (octahedron) with its current world-space center.
+// Free-fall uses this so ALL crystals act as gravity wells + collidable/landable surfaces,
+// not just the gallery floor the game launched on. Result is rebuilt each call (a handful
+// of floors, only while free-falling) so it always reflects current world positions.
+var _gameCrystals = [];
+function getGameCrystals() {
+  _gameCrystals.length = 0;
+  for(var i = 0; i < floors.length; i++) {
+    var fl = floors[i];
+    if(!fl.group || !fl.group.userData.centerStar) continue;
+    var grp = fl.group.userData.centerStar;
+    var mesh = null;
+    for(var c = 0; c < grp.children.length; c++) {
+      var ch = grp.children[c];
+      if(ch.geometry && (ch.geometry.type === 'OctahedronGeometry' || ch.userData.isGameCrystal)) { mesh = ch; break; }
+    }
+    if(!mesh) continue;
+    grp.updateMatrixWorld(true);
+    var center = new THREE.Vector3();
+    grp.getWorldPosition(center);
+    _gameCrystals.push({ floor: fl, group: grp, mesh: mesh, center: center });
+  }
+  return _gameCrystals;
+}
+
 // Raycast from outside the crystal toward its center, in the direction of `probePos`.
 // Returns the nearest hit on the crystal mesh: { point, normal } in world space.
 // Returns null if the crystal isn't built yet or the ray misses.
-function raycastShipToSurface(probePos) {
-  var gf = gameMode.galleryFloor;
-  if(!gf || !gf.group.userData.centerStar) return null;
-  var crystalGroup = gf.group.userData.centerStar;
+// crystalGroupOpt/centerOpt default to the ACTIVE crystal (gameMode.surface.*), so the
+// land-locked physics follow whatever crystal the ship is bound to; free-fall passes a
+// specific crystal to test landings against any of them.
+function raycastShipToSurface(probePos, crystalGroupOpt, centerOpt) {
+  var crystalGroup = crystalGroupOpt || gameMode.surface.crystal ||
+    (gameMode.galleryFloor && gameMode.galleryFloor.group.userData.centerStar);
+  if(!crystalGroup) return null;
   // The crystal mesh is the first OctahedronGeometry child
   var crystalMesh = null;
   for(var i = 0; i < crystalGroup.children.length; i++) {
     var c = crystalGroup.children[i];
-    if(c.geometry && c.geometry.type === 'OctahedronGeometry') { crystalMesh = c; break; }
+    if(c.geometry && (c.geometry.type === 'OctahedronGeometry' || c.userData.isGameCrystal)) { crystalMesh = c; break; }
   }
   if(!crystalMesh) return null;
   // Make sure matrices reflect the latest floor rotation before raycasting
   crystalGroup.updateMatrixWorld(true);
-  var center = gameMode.surface.center;
+  var center = centerOpt || gameMode.surface.center;
   var toShip = probePos.clone().sub(center);
   if(toShip.lengthSq() < 1e-6) toShip.set(0, 1, 0);
   toShip.normalize();
   // Start the ray well outside the crystal on the ship's side, shoot inward toward center
   var rayOrigin = center.clone().addScaledVector(toShip, 3.0);
   var rayDir = toShip.clone().negate();
+  var _savedRayFar = raycaster.far;
   raycaster.set(rayOrigin, rayDir);
   raycaster.far = 5.0;
   var hits = raycaster.intersectObject(crystalMesh, false);
+  // Restore far immediately — this is the shared global raycaster, and leaving it
+  // clamped at 5.0 makes between-frame UI click/tap raycasts (HUD icons sit ~6 units
+  // from the chase camera) silently miss while in game.
+  raycaster.far = _savedRayFar;
   if(hits.length === 0) return null;
   var hit = hits[0];
   var normal = hit.face.normal.clone();
@@ -11826,6 +12256,95 @@ function raycastShipToSurface(probePos) {
   var outward = hit.point.clone().sub(center).normalize();
   if(normal.dot(outward) < 0) normal.negate();
   return { point: hit.point.clone(), normal: normal };
+}
+
+// Orbicule-style ground finder (Orbicule.html:27204-27326). Casts DOWN along the current
+// ground normal to grip whatever surface is directly beneath, then a forward-down probe for
+// surface transitions ahead (driving into the hallway), then a toward-centre fallback. This
+// is what lets the ship stick to the hallway floor instead of being pulled to the crystal's
+// centre. Returns { point, normal, dist } in world space, or null if nothing is below.
+// ── Analytic hallway-tube collision (Phase A) ──────────────────────────────────────────
+// The carved hallway is a thin tube along the hole axis. Raycasting its ~44 thin tris is
+// unreliable (the ship punches through into the crystal solid). Instead, when the ship is
+// inside the tube volume, grip the tube WALL analytically: clamp the distance-to-axis and
+// point the ground normal toward the axis (driving the inside of a pipe). Pure math — no
+// raycast can miss. Returns {target, normal, axial} when inside the tube, else null.
+function hallwayTubeGrip(probePos){
+  var P = gameMode.portal;
+  if(!P || !P.built || !P.crystal || !P.holeFloorCenter || P.hallMouth == null) return null;
+  var cs = P.crystal; cs.updateMatrixWorld(true);
+  // hole axis in world (spins with the crystal), pointing OUTWARD toward the surface mouth
+  var aHat = P.holeDir.clone().transformDirection(cs.matrixWorld).normalize();
+  var C = new THREE.Vector3(); cs.getWorldPosition(C);   // crystal rotation centre (world)
+  var rel = probePos.clone().sub(C);
+  var axial = rel.dot(aHat);
+  var perp = rel.clone().addScaledVector(aHat, -axial);
+  var perpDist = perp.length();
+  // Inside the tube? Near the axis (perp small) AND axially within the carved span. On a flat
+  // face the ship is far from the hole axis in perp terms, so this cleanly excludes it.
+  if(perpDist > P.tubeR * 2.2) return null;
+  if(axial > P.hallMouth + 0.05) return null;            // out past the mouth → hand off to face grip
+  // The floor is a SOLID CAP (clamped below), so keep gripping even if a fast frame pushes the
+  // ship a little past it — the clamp snaps it right back. A generous margin prevents escape.
+  if(axial < P.axialFloor - 0.25) return null;
+  var hover = gameMode.surfaceState.hoverHeight;
+  // perp direction (outward from the axis); guard the on-axis degenerate case
+  var perpHat;
+  if(perpDist > 1e-4){ perpHat = perp.clone().multiplyScalar(1/perpDist); }
+  else {
+    var gn = gameMode.surfaceState.groundNormal.clone();
+    gn.addScaledVector(aHat, -gn.dot(aHat));             // strip the axial component
+    perpHat = gn.lengthSq() > 1e-6 ? gn.normalize().negate() : new THREE.Vector3(1,0,0);
+  }
+  var ringR = Math.max(0.001, P.tubeR - hover);          // ship hovers just off the wall
+  // Don't let the ship drive below the floor cap; clamp axial to the floor.
+  var axialClamped = Math.max(axial, P.axialFloor);
+  var target = C.clone().addScaledVector(aHat, axialClamped).addScaledVector(perpHat, ringR);
+  var normal = perpHat.clone().negate();                 // wall → axis = up (toward the ship)
+  return { target: target, normal: normal, axial: axialClamped,
+           aHat: aHat, C: C, axialFloor: P.axialFloor }; // frame for the hard floor clamp
+}
+
+function raycastGroundBelow(probePos, downDir, fwdDir, speed) {
+  var crystalGroup = gameMode.surface.crystal ||
+    (gameMode.galleryFloor && gameMode.galleryFloor.group.userData.centerStar);
+  if(!crystalGroup) return null;
+  var crystalMesh = null;
+  for(var i = 0; i < crystalGroup.children.length; i++) {
+    var c = crystalGroup.children[i];
+    if(c.geometry && (c.geometry.type === 'OctahedronGeometry' || c.userData.isGameCrystal)) { crystalMesh = c; break; }
+  }
+  if(!crystalMesh) return null;
+  crystalGroup.updateMatrixWorld(true);
+  var maxDist = gameMode.surface.gripRange;       // long enough to drop into the hallway
+  var savedFar = raycaster.far;
+  var best = null, bestDist = Infinity, hits;
+  // Ray 1: straight down along the current ground normal
+  raycaster.set(probePos, downDir); raycaster.far = maxDist;
+  hits = raycaster.intersectObject(crystalMesh, false);
+  if(hits.length){ best = hits[0]; bestDist = hits[0].distance; }
+  // Ray 2: forward-down probe (catches the floor dropping away ahead, e.g. the hallway lip)
+  if(speed > 0.0004 && fwdDir && fwdDir.lengthSq() > 1e-6){
+    var probeDir = fwdDir.clone().normalize().addScaledVector(downDir, 0.6).normalize();
+    raycaster.set(probePos, probeDir); raycaster.far = maxDist;
+    hits = raycaster.intersectObject(crystalMesh, false);
+    if(hits.length && hits[0].distance < bestDist){ best = hits[0]; bestDist = hits[0].distance; }
+  }
+  // Ray 3: toward the crystal centre (fallback over ridges/vertices)
+  if(!best){
+    var toC = gameMode.surface.center.clone().sub(probePos);
+    if(toC.lengthSq() > 1e-6){
+      raycaster.set(probePos, toC.normalize()); raycaster.far = maxDist + 0.5;
+      hits = raycaster.intersectObject(crystalMesh, false);
+      if(hits.length){ best = hits[0]; bestDist = hits[0].distance; }
+    }
+  }
+  raycaster.far = savedFar;
+  if(!best) return null;
+  var n = best.face.normal.clone().transformDirection(best.object.matrixWorld).normalize();
+  var toShip = probePos.clone().sub(best.point);     // normal should point up toward the ship
+  if(n.dot(toShip) < 0) n.negate();
+  return { point: best.point.clone(), normal: n, dist: bestDist };
 }
 
 // Snap the ship onto the actual crystal surface using a raycast, then orient it to face
@@ -11866,6 +12385,17 @@ function positionShipOnSurface() {
 
 function exitGameMode() {
   if(!gameMode.active || gameMode.exiting) return;
+  // If quitting from inside the portal, pop back to the crystal first so the exit
+  // transition starts from a valid pose near the gallery floor.
+  if(gameMode.portal && gameMode.portal.inside){
+    if(gameMode.portal.inB) gameMode.ship.position.sub(gameMode.portal.D);
+    gameMode.portal.inside = false;
+    gameMode.portal.inB = false;
+    gameMode.portal.vel.set(0, 0, 0);
+    gameMode.fly.vel.set(0, 0, 0);
+    if(gameMode.portal.p1) gameMode.portal.p1.visible = false;
+    if(gameMode.portal.p2) gameMode.portal.p2.visible = false;
+  }
   gameMode.exiting = true;
   gameMode.exitProg = 0;
   // Clear key state so nothing sticks after exit
@@ -11881,9 +12411,15 @@ function exitGameMode() {
   gameMode.touch.swipeChecked = false;
   gameMode.touch.driftTight = 0;
   gameMode.touch.useJoystick = false;
+  gameMode.touch.uiTouch = false;
   gameJoystick.stickX = 0; gameJoystick.stickY = 0;
+  // Close any in-game windows on exit
+  if(gameUI.options){ gameUI.options.open = false; gameUI.options.target = 0; }
+  if(gameUI.inventory){ gameUI.inventory.open = false; gameUI.inventory.target = 0; }
+  gameUI.drag.active = false; gameUI.drag.win = null;
   // Clear airborne / jump state so re-entry starts grounded
   gameMode.surfaceState.airborne = false;
+  gameMode.surfaceState.freeFalling = false;
   gameMode.surfaceState.vertVel = 0;
   gameMode.surfaceState.airTime = 0;
   gameMode.surfaceState.barrelRoll.active = false;
@@ -12122,19 +12658,41 @@ function animateGameTransition() {
   }
 }
 
+// ══════════════════════════════════════════════
+// SURFACE PHYSICS (rewritten from scratch, modeled on Orbicule's
+// updatePhysics — Orbicule.html:27107-27474)
+//
+// One velocity vector (gameMode.fly.vel) shared with fly mode for
+// continuity. Two control paths within surface mode:
+//
+//   GROUNDED — walking on the crystal. Uses s.speed (scalar along
+//   s.forward) for tangential movement. Drift mechanic intact. Per-
+//   frame raycast determines whether we're still on the surface; if
+//   we've walked / been pushed past the snap range, we transition to
+//   airborne (carrying tangential momentum into fly.vel).
+//
+//   AIRBORNE — gravity from the nearest planet pulls fly.vel toward
+//   its center. Collision push-out prevents tunneling through the
+//   crystal or background planets. Magnetic raycast catches landings
+//   when the ship gets back within snap range — strips normal vel,
+//   projects tangential back into s.speed for walking, returns to
+//   grounded.
+//
+// Jumps are just an upward impulse into fly.vel that flips airborne
+// true; the airborne branch handles the arc and re-landing uniformly.
+// ══════════════════════════════════════════════
 function updateGamePhysicsAndCamera() {
   if(!gameMode.active) return;
   if(gameMode.fly.active) { updateFlightPhysicsAndCamera(); return; }
+
   var p = gameMode.physics;
   var k = gameMode.keys;
   var t = gameMode.touch;
   var s = gameMode.surfaceState;
-  var surface = gameMode.surface;
+  var fly = gameMode.fly;
+  var ship = gameMode.ship;
 
-  // Derive analog input axes from whichever source is active.
-  //   fwdAxis: -0.6 (full reverse) .. 0 .. 1 (full forward)
-  //   yawAxis: -1 (left) .. 0 .. 1 (right)
-  // Touch joystick is analog; keyboard is binary (and combines additively with touch).
+  // === Read input axes ===
   var fwdAxis = 0, yawAxis = 0;
   if(t.active){
     fwdAxis = t.throttle;
@@ -12146,15 +12704,18 @@ function updateGamePhysicsAndCamera() {
     p.isBoosting = k.shift && k.w;
   }
 
-  // ── Jump trigger ──
-  // Edge-triggered from Space (keyboard) or quick-swipe-up-release (touch). Lock the takeoff
-  // axis to the current ground normal so the ship rises straight up off whatever facet it's
-  // standing on, and gravity pulls back along that same axis — feels stable even though the
-  // crystal beneath rotates.
+  // === Jump trigger → clean vertical HOP (land-locked) ===
+  // A normal jump is a predictable hop straight up off the current facet along a
+  // takeoff axis locked to the surface normal — NOT a launch into gravity-well
+  // free-fall. The hop branch below integrates it and magnetically re-sticks on the
+  // way down. This restores the original good movement the gravity rewrite had
+  // overwritten. (You still reach free-fall by launching fast off a ramp/edge or
+  // toggling P-flight — see the detachment logic in the grounded + airborne blocks.)
   if(gameMode.wantJump){
     gameMode.wantJump = false;
     if(!s.airborne){
       s.airborne = true;
+      s.freeFalling = false;
       s.vertVel = p.jumpImpulse;
       s.airTime = 0;
       s.jumpAxis.copy(s.groundNormal).normalize();
@@ -12163,224 +12724,353 @@ function updateGamePhysicsAndCamera() {
       s.driftDirection = 0;
       s.driftTargetAngle = 0;
       s.driftTime = 0;
+      // ── Jump barrel-roll combo ──
+      // If a turn key is held — or was tapped within jumpRollWindow ms before this jump —
+      // immediately barrel roll in that direction (A = +1 / left, D = -1 / right). Both
+      // hot → whichever was pressed most recently wins. Now that we're airborne the roll
+      // fires instantly off the hop, so the ship jumps and spins in one motion.
+      var nowJ = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      var aHot = gameMode.keys.a || (nowJ - gameMode.lastATime) < gameMode.jumpRollWindow;
+      var dHot = gameMode.keys.d || (nowJ - gameMode.lastDTime) < gameMode.jumpRollWindow;
+      var rollDir = 0;
+      if(aHot && dHot) rollDir = (gameMode.lastATime >= gameMode.lastDTime) ? 1 : -1;
+      else if(aHot) rollDir = 1;
+      else if(dHot) rollDir = -1;
+      if(rollDir !== 0) triggerBarrelRoll(rollDir);
     }
   }
 
-  // ── Gunner drift detection ──
-  // Drift engages when A or D pressed WITHOUT W (forward thrust) and we're moving fast enough.
-  // Touch: yaw past 60% with throttle near zero. Once drifting, continues at much lower speed
-  // threshold so the user can pivot through corners without bouncing in and out of drift state.
-  // Drift triggers from any of three sources:
-  //   (1) keyboard A/D held without W
-  //   (2) sustained yaw drag past 60% with throttle near zero (the original full-pull gesture)
-  //   (3) touch driftHold flag — set by a quick-swipe-and-hold in onTM. This makes drift
-  //       initiation feel snappy on touch: a brief horizontal flick locks the slide in
-  //       instead of requiring a deep yaw drag, and ends naturally on finger lift.
-  var wantsDriftLeft  = (k.a && !k.w)
-                      || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15)
-                      || (t.active && t.driftHold && t.driftDir < 0);
-  var wantsDriftRight = (k.d && !k.w)
-                      || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15)
-                      || (t.active && t.driftHold && t.driftDir > 0);
-  var wantsDrift = wantsDriftLeft || wantsDriftRight;
-  var spdAbs = Math.abs(s.speed);
-  var canEnter = spdAbs > p.maxSpeed * p.driftEntrySpeedRatio;
-  var canContinue = spdAbs > p.maxSpeed * p.driftContinueSpeedRatio;
-  var canDriftNow = s.isDrifting ? canContinue : canEnter;
+  // ═══════════════════════════════════════════════
+  // LAND-LOCKED — grounded OR mid-hop. Runs the full surface-movement path
+  // (drift, thrust, yaw, tangential move) so a jump keeps its forward momentum
+  // and steering in the air, exactly like the original good movement. The
+  // vertical behaviour then splits: hop when airborne, magnetic stick when grounded.
+  // ═══════════════════════════════════════════════
+  if(!s.freeFalling){
+    // ── Drift detection (unchanged from original gunner drift) ──
+    var wantsDriftLeft  = (k.a && !k.w)
+                        || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15)
+                        || (t.active && t.driftHold && t.driftDir < 0);
+    var wantsDriftRight = (k.d && !k.w)
+                        || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15)
+                        || (t.active && t.driftHold && t.driftDir > 0);
+    var wantsDrift = wantsDriftLeft || wantsDriftRight;
+    var spdAbs = Math.abs(s.speed);
+    var canEnter = spdAbs > p.maxSpeed * p.driftEntrySpeedRatio;
+    var canContinue = spdAbs > p.maxSpeed * p.driftContinueSpeedRatio;
+    var canDriftNow = s.isDrifting ? canContinue : canEnter;
 
-  if(wantsDrift && canDriftNow && !s.airborne) {
-    if(!s.isDrifting) {
-      s.driftTime = 0;
-      s.driftEntrySpeed = spdAbs;
-    }
-    s.isDrifting = true;
-    s.driftTime += 1;
-    s.driftDirection = wantsDriftLeft ? 1 : -1;
-    s.driftTargetAngle = s.driftDirection * (Math.PI * 0.5);
-    // Shed orange drift streaks from the rear inner wing each frame
-    spawnGameDriftParticles();
-  } else {
-    s.isDrifting = false;
-    s.driftDirection = 0;
-    s.driftTargetAngle = 0;
-  }
-  // Smooth visual drift angle
-  s.driftAngle += (s.driftTargetAngle - s.driftAngle) * 0.12;
-
-  // Thrust ramp — engages whenever there's any throttle input (skipped while drifting:
-  // drift is pure momentum carry, matching the original Orbicule gunner feel).
-  var hasFwd = Math.abs(fwdAxis) > 0.01;
-  if(hasFwd && !s.isDrifting) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1);
-  else p.accelerationTime = Math.max(0, p.accelerationTime - 3);
-  var thrustRamp = p.accelerationTime / p.maxAccelerationTime;
-  var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * thrustRamp;
-  if(p.isBoosting) thrust = p.boostAccelRate;
-
-  // Drift-tightness, -1..+1. Touch driftHold supplies the full symmetric range
-  // (up = looser/negative, down = tighter/positive, resting = 0 baseline);
-  // keyboard S is still a binary tighten that overrides touch up to +1 so the
-  // keyboard endpoint behaves exactly as before. Used below to scale the yaw
-  // rate continuously (0.3× at -1, 1.0× at 0, 1.7× at +1) and to bleed speed
-  // only when tightening above baseline.
-  var driftTight = 0;
-  if(t.active && t.driftHold) driftTight = t.driftTight;
-  if(k.s) driftTight = Math.max(driftTight, 1);
-
-  if(s.isDrifting) {
-    // Stages 1-3 (first driftSustainTime frames): hold entry speed — no thrust, no drag.
-    // Stage 4: gradual decay via driftDecel + light drag.
-    if(s.driftTime > p.driftSustainTime) {
-      s.speed -= Math.sign(s.speed || 1) * p.driftDecel;
-      s.speed *= 0.998;
-    }
-    // Tightness bleeds extra speed each frame regardless of stage. At driftTight=1
-    // this matches the old keyboard `* 0.985`; at 0 it's a no-op.
-    if(driftTight > 0) s.speed *= (1 - driftTight * 0.015);
-  } else {
-    // Normal: thrust scaled by fwdAxis. Drag + speed cap only apply while the
-    // player is actively giving throttle input. Pressing W (or analog touch
-    // fwd/reverse) resets the coast counter, applies the usual drag, and
-    // clamps to maxSpeed/boostMaxSpeed so accel curves still settle at the
-    // natural top speed.
-    //
-    // The moment they let go, no force at all touches s.speed — drag, thrust,
-    // AND the speed cap are skipped — so the ship literally coasts at the
-    // exact velocity it had at release for coastHoldFrames frames. (Without
-    // skipping the cap, a release-from-boost would have clipped speed from
-    // boostMaxSpeed down to maxSpeed instantly the moment isBoosting flipped
-    // false, which is what was eating momentum on release.) After the hold,
-    // speed peels off linearly at coastLinearDecel per frame until it hits 0.
-    s.speed += thrust * fwdAxis;
-    if(hasFwd) {
-      s.coastFrames = 0;
-      s.speed *= p.drag;
-      var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
-      // Joystick mode: raise the forward cap so thrust + drag asymptote toward
-      // a higher equilibrium instead of slamming the player into maxSpeed. With
-      // thrustMax=0.0003 and drag=0.985 the natural terminal is ~0.02; a 0.03
-      // cap leaves room for that asymptote to develop, giving the requested
-      // "hold the stick and momentum builds at a negative-exponential rate"
-      // feel without needing a separate boost trigger. Reverse stays clamped
-      // to the original ratio so backing up doesn't gain unbounded speed.
-      if(t.active && t.useJoystick) maxS = Math.max(maxS, 0.03);
-      if(s.speed > maxS) s.speed = maxS;
-      var maxR = (p.isBoosting ? p.boostMaxSpeed : p.maxSpeed) * 0.6;
-      if(s.speed < -maxR) s.speed = -maxR;
+    if(wantsDrift && canDriftNow && !s.airborne) {
+      if(!s.isDrifting) {
+        s.driftTime = 0;
+        s.driftEntrySpeed = spdAbs;
+      }
+      s.isDrifting = true;
+      s.driftTime += 1;
+      s.driftDirection = wantsDriftLeft ? 1 : -1;
+      s.driftTargetAngle = s.driftDirection * (Math.PI * 0.5);
+      spawnGameDriftParticles();
     } else {
-      s.coastFrames += 1;
-      if(s.coastFrames > p.coastHoldFrames) {
-        if(s.speed > 0) {
-          s.speed = Math.max(0, s.speed - p.coastLinearDecel);
-        } else if(s.speed < 0) {
-          s.speed = Math.min(0, s.speed + p.coastLinearDecel);
+      s.isDrifting = false;
+      s.driftDirection = 0;
+      s.driftTargetAngle = 0;
+    }
+    s.driftAngle += (s.driftTargetAngle - s.driftAngle) * 0.12;
+
+    // ── Thrust ramp + s.speed update ──
+    var hasFwd = Math.abs(fwdAxis) > 0.01;
+    if(hasFwd && !s.isDrifting) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1);
+    else p.accelerationTime = Math.max(0, p.accelerationTime - 3);
+    var thrustRamp = p.accelerationTime / p.maxAccelerationTime;
+    var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * thrustRamp;
+    if(p.isBoosting) thrust = p.boostAccelRate;
+
+    var driftTight = 0;
+    if(t.active && t.driftHold) driftTight = t.driftTight;
+    if(k.s) driftTight = Math.max(driftTight, 1);
+
+    if(s.isDrifting) {
+      if(s.driftTime > p.driftSustainTime) {
+        s.speed -= Math.sign(s.speed || 1) * p.driftDecel;
+        s.speed *= 0.998;
+      }
+      if(driftTight > 0) s.speed *= (1 - driftTight * 0.015);
+    } else {
+      s.speed += thrust * fwdAxis;
+      if(hasFwd) {
+        s.coastFrames = 0;
+        s.speed *= p.drag;
+        var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
+        if(t.active && t.useJoystick) maxS = Math.max(maxS, 0.03);
+        if(s.speed > maxS) s.speed = maxS;
+        var maxR = (p.isBoosting ? p.boostMaxSpeed : p.maxSpeed) * 0.6;
+        if(s.speed < -maxR) s.speed = -maxR;
+      } else {
+        s.coastFrames += 1;
+        if(s.coastFrames > p.coastHoldFrames) {
+          if(s.speed > 0) s.speed = Math.max(0, s.speed - p.coastLinearDecel);
+          else if(s.speed < 0) s.speed = Math.min(0, s.speed + p.coastLinearDecel);
         }
       }
     }
+
+    // Keep the ship attached to the crystal as the gallery floor spins
+    trackCrystalRotation();
+
+    // ── Yaw (rotates s.forward around groundNormal) ──
+    if(s.isDrifting) {
+      var ramp = Math.min(1, s.driftTime / p.driftRampTime);
+      var driftYaw = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase) * ramp;
+      driftYaw *= (1 + driftTight * 0.7);
+      s.forward.applyAxisAngle(s.groundNormal, driftYaw * s.driftDirection);
+    } else if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01) {
+      s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis);
+    }
+    s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+    if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+
+    // ── Move ship tangentially along s.forward. Runs in the air too, so a hop
+    //    carries its forward momentum and can still be steered (yaw above) —
+    //    that's the air control the gravity rewrite had lost. ──
+    if(Math.abs(s.speed) > 0.00001) {
+      ship.position.addScaledVector(s.forward, s.speed);
+    }
+
+    if(s.airborne){
+      // ── HOP (clean, predictable): rise/fall along the locked takeoff axis with a
+      //    gentle constant gravity, so you fall slowly enough to line up a landing,
+      //    a barrel roll, or a downward slam. No gravity wells in a normal jump. ──
+      s.vertVel -= p.jumpGravity;
+      ship.position.addScaledVector(s.jumpAxis, s.vertVel);
+      s.airTime += 1;
+      if(s.barrelRoll.active){
+        s.barrelRoll.progress = Math.min(1, s.barrelRoll.progress + 1 / s.barrelRoll.duration);
+        var hopBrP = s.barrelRoll.progress;
+        var hopLateral = s.barrelRoll.lateralPeak * (1 - hopBrP) * (1 - hopBrP);
+        ship.position.addScaledVector(s.barrelRoll.lateralDir, hopLateral);
+        if(hopBrP >= 1){ s.barrelRoll.active = false; s.barrelRoll.progress = 0; }
+      }
+      // Measure height above the surface every frame. A normal hop tops out around
+      // ~0.36 along the takeoff axis; if we're well past that, the forward momentum
+      // has carried us off the planet's edge. Rather than fall forever along the
+      // locked axis, hand control to gravity-well free-fall so we get pulled back
+      // toward the nearest planet/crystal.
+      var hopLandHit = raycastShipToSurface(ship.position);
+      var hopAlt = hopLandHit ? ship.position.clone().sub(hopLandHit.point).dot(hopLandHit.normal) : Infinity;
+      var FALL_OFF_ALT = 0.5;   // safely above a normal hop apex — tune if jumps feel cut short
+      if(hopAlt > FALL_OFF_ALT){
+        // Fell off the planet → become free-falling. Carry the hop's current motion
+        // (vertical along the takeoff axis + tangential forward) into world-space
+        // fly.vel so the handoff is seamless; gravity wells take it from here.
+        fly.vel.copy(s.jumpAxis).multiplyScalar(s.vertVel);
+        fly.vel.addScaledVector(s.forward, s.speed);
+        s.freeFalling = true;
+        s.vertVel = 0;
+        s.speed = 0;
+        s.airTime = 0;
+        s.barrelRoll.active = false;
+        s.barrelRoll.progress = 0;
+      } else if((s.vertVel < 0 || s.airTime > p.jumpMaxAirTime) && hopLandHit && hopAlt <= s.hoverHeight + 0.0005){
+        // Normal landing — snap flat onto the facet below.
+        s.groundNormal.copy(hopLandHit.normal).normalize();
+        ship.position.copy(hopLandHit.point).addScaledVector(s.groundNormal, s.hoverHeight);
+        s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+        if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+        s.airborne = false;
+        s.vertVel = 0;
+        s.airTime = 0;
+        s.barrelRoll.active = false;
+        s.barrelRoll.progress = 0;
+      }
+    } else {
+      // ── Magnetic surface stick + edge/ramp detachment ──
+    // Raycast inward for the facet directly below and decide whether we're still
+    // land-locked or have launched off into free-fall:
+    //   • within snap range        → stick firmly (stay land-locked). This is the
+    //                                 clean correctphysics contour-over-facets feel.
+    //   • beyond range, moving fast → launched off a ramp/edge → DETACH into free-fall
+    //   • beyond range, moving slow → just crept over an edge → ease down onto the
+    //                                 surface, stay land-locked (no accidental fling)
+    //   • no surface at all         → DETACH into free-fall
+    // Orbicule magnetic grip: cast DOWN along the current ground normal (+ forward-down
+    // probe + centre fallback) and stick to whatever is beneath — NO gravity while grounded.
+    // This grips the hallway floor as you drive in, instead of the radial ray pulling you to
+    // the crystal centre. We only detach into free-fall when there's genuinely nothing below.
+    var downDir = s.groundNormal.clone().negate();
+    // Inside the carved hallway? Grip its wall analytically (robust tube collision) instead of
+    // raycasting the thin tris. This is what stops the ship falling through into the crystal.
+    var tube = hallwayTubeGrip(ship.position);
+    var hit = tube || raycastGroundBelow(ship.position, downDir, s.forward, Math.abs(s.speed));
+    if(tube) {
+      // Snap firmly to the tube wall (high lerp — the wall is exact, no overshoot risk).
+      s.groundNormal.lerp(tube.normal, 0.45).normalize();
+      ship.position.lerp(tube.target, 0.6);
+      // Hard floor cap: never let the ship sit below the modeled hallway floor, whatever the
+      // lerp spring does — this is what stops it driving down through into the crystal solid.
+      var axNow = ship.position.clone().sub(tube.C).dot(tube.aHat);
+      if(axNow < tube.axialFloor) ship.position.addScaledVector(tube.aHat, tube.axialFloor - axNow);
+      s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+      if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+      var vNt = fly.vel.dot(s.groundNormal);
+      if(vNt < 0) fly.vel.sub(s.groundNormal.clone().multiplyScalar(vNt));
+      fly.vel.multiplyScalar(0.85);
+    } else if(hit) {
+      var normalSmooth = 0.18 + Math.min(0.20, Math.abs(s.speed) * 30);
+      s.groundNormal.lerp(hit.normal, normalSmooth).normalize();
+      // Lerp onto the surface so dropping into the hallway is a smooth grip, not a snap.
+      var target = hit.point.clone().addScaledVector(s.groundNormal, s.hoverHeight);
+      ship.position.lerp(target, 0.55);
+      s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+      if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+      var vN = fly.vel.dot(s.groundNormal);
+      if(vN < 0) fly.vel.sub(s.groundNormal.clone().multiplyScalar(vN));
+      fly.vel.multiplyScalar(0.85);
+    } else {
+      // Nothing beneath within grip range → detach into free-fall (carry walking momentum).
+      s.airborne = true;
+      s.freeFalling = true;
+      s.airTime = 0;
+      fly.vel.copy(s.forward).multiplyScalar(s.speed);
+      fly.vel.addScaledVector(s.groundNormal, 0.002);
+      s.speed = 0;
+    }
+    }
   }
 
-  // Carry the ship along with the crystal as it passively rotates around Y — without
-  // this the ship would slowly slide across the surface even when the player isn't moving.
-  trackCrystalRotation();
-
-  // Yaw — full drift turn rate ramps over driftRampTime; normal turn uses p.turnSpeed.
-  // Both rotate `forward` around the current ground normal (the real surface up).
-  // Yaw is suppressed mid-barrel-roll so the lateral dash doesn't fight the same
-  // input that triggered it (A/D presses both fire the roll and the yaw otherwise).
-  if(s.isDrifting) {
-    var ramp = Math.min(1, s.driftTime / p.driftRampTime);
-    var driftYaw = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase) * ramp;
-    // Tightness scales the yaw rate from 1.0× (loose, base sweep) up to 1.7×
-    // (full tighten — matches the keyboard's previous behavior at driftTight=1).
-    driftYaw *= (1 + driftTight * 0.7);
-    s.forward.applyAxisAngle(s.groundNormal, driftYaw * s.driftDirection);
-  } else if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01) {
-    s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis);
-  }
-  // Re-project forward onto the current tangent plane
-  s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
-  if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
-
-  // Move ship in world space along the tangent direction
-  if(Math.abs(s.speed) > 0.00001) {
-    gameMode.ship.position.addScaledVector(s.forward, s.speed);
-  }
-
-  if(s.airborne){
-    // ── Airborne: integrate vertical motion, skip ground snap until we land ──
-    s.vertVel -= p.jumpGravity;
-    gameMode.ship.position.addScaledVector(s.jumpAxis, s.vertVel);
+  else {
+    // ═══════════════════════════════════════════════
+    // FREE-FALL — gravity wells + collision + magnetic landing. Reached only by
+    // launching fast off a ramp/edge or by exiting P-flight; the land-locked walk +
+    // hop path above is left completely intact, so ordinary jumps stay light and
+    // controllable. Uses fly.vel (world-space) under real gravity toward the nearest
+    // planet, with collision push-out and a magnetic catch back onto the surface.
+    // ═══════════════════════════════════════════════
     s.airTime += 1;
 
-    // ── Barrel roll animation ──
-    // Advance the visual roll progress and apply the lateral dash. Lateral velocity
-    // peaks at trigger and decays quadratically so the ship feels punchy at the
-    // start of the roll and settles before landing.
+    // ── Nearest gravity source: EVERY floor crystal + alive background planets ──
+    // Whichever well is closest pulls the ship; nearCrystal is remembered so the
+    // collision + landing step below tests against that same crystal.
+    var crystals = getGameCrystals();
+    var gravC = gameMode.surface.center;
+    var gravR = gameMode.surface.radius;
+    var gravDist = Infinity;
+    var nearCrystal = null;
+    for(var ci = 0; ci < crystals.length; ci++){
+      var cdst = ship.position.distanceTo(crystals[ci].center);
+      if(cdst < gravDist){ gravDist = cdst; gravC = crystals[ci].center; gravR = gameMode.surface.radius; nearCrystal = crystals[ci]; }
+    }
+    for(var gi = 0; gi < planets.length; gi++){
+      var gp = planets[gi];
+      if(!gp.alive || !gp.mesh) continue;
+      var gd = ship.position.distanceTo(gp.mesh.position);
+      if(gd < gravDist){ gravDist = gd; gravC = gp.mesh.position; gravR = gp.radius; nearCrystal = null; }
+    }
+    if(gravDist === Infinity) gravDist = ship.position.distanceTo(gravC);
+
+    // ── Gravity → fly.vel (stronger near surfaces, capped at the top) ──
+    var gravAlt = Math.max(gravDist - gravR, 0.01);
+    var gravStr = Math.min(0.0008 * (1 + 4 / gravAlt), 0.003);
+    var gravDir = gravC.clone().sub(ship.position).normalize();
+    fly.vel.addScaledVector(gravDir, gravStr);
+
+    // ── Air drag + fall-speed cap so one frame can't tunnel through ──
+    fly.vel.multiplyScalar(0.992);
+    var maxAirVel = 0.08;
+    if(fly.vel.length() > maxAirVel) fly.vel.setLength(maxAirVel);
+
+    // ── Integrate ──
+    ship.position.add(fly.vel);
+
+    // ── Barrel roll lateral dash ──
     if(s.barrelRoll.active){
       s.barrelRoll.progress = Math.min(1, s.barrelRoll.progress + 1 / s.barrelRoll.duration);
       var brP = s.barrelRoll.progress;
       var lateralAmt = s.barrelRoll.lateralPeak * (1 - brP) * (1 - brP);
-      gameMode.ship.position.addScaledVector(s.barrelRoll.lateralDir, lateralAmt);
-      if(brP >= 1){
+      ship.position.addScaledVector(s.barrelRoll.lateralDir, lateralAmt);
+      if(brP >= 1){ s.barrelRoll.active = false; s.barrelRoll.progress = 0; }
+    }
+
+    // ── Background planet collision (sphere vs sphere) ──
+    // Background planets ARE spheres, so a sphere collision matches their
+    // visible shape. Small shipR padding for visible bounce.
+    var bgShipR = 0.04;
+    for(var bi = 0; bi < planets.length; bi++){
+      var bp = planets[bi];
+      if(!bp.alive || !bp.mesh) continue;
+      var bpDist = ship.position.distanceTo(bp.mesh.position);
+      var bpMin = bp.radius + bgShipR;
+      if(bpDist < bpMin && bpDist > 0.0001){
+        var bpOut = ship.position.clone().sub(bp.mesh.position).normalize();
+        ship.position.copy(bp.mesh.position).addScaledVector(bpOut, bpMin);
+        var bpVN = fly.vel.dot(bpOut);
+        if(bpVN < 0) fly.vel.sub(bpOut.clone().multiplyScalar(bpVN));
+      }
+    }
+
+    // ── Crystal raycast: handles BOTH collision + magnetic landing ──
+    // The crystal is an octahedron, not a sphere — its vertices are at
+    // ~0.78 but face centers are deeper. A sphere collision with radius
+    // 0.95 (the old approach) pushed the ship OUTSIDE the actual mesh,
+    // beyond snap range, creating an "invisible barrier" you slide along
+    // because the magnetic stick can never grab the real surface.
+    //
+    // Fix: use the actual raycast hit point. Signed altitude (positive =
+    // above the mesh surface, negative = inside it). One raycast handles
+    // both jobs:
+    //   collision — if altitude < 0, ship penetrated, push to surface
+    //   landing  — if close + moving toward, magnetic stick
+    var landHit = nearCrystal ? raycastShipToSurface(ship.position, nearCrystal.group, nearCrystal.center) : null;
+    if(landHit){
+      var altitude = ship.position.clone().sub(landHit.point).dot(landHit.normal);
+
+      // Collision against the actual mesh
+      if(altitude < 0){
+        ship.position.copy(landHit.point).addScaledVector(landHit.normal, 0.001);
+        altitude = 0.001;
+        var pushVN = fly.vel.dot(landHit.normal);
+        if(pushVN < 0) fly.vel.sub(landHit.normal.clone().multiplyScalar(pushVN));
+      }
+
+      // Magnetic landing — close enough + moving toward the surface (not
+      // on the way up from a jump). landHit.normal points outward, so
+      // fly.vel.dot(normal) > 0 = rising (skip), <= 0 = falling/hovering.
+      var movingTowardSurface = fly.vel.dot(landHit.normal) <= 0;
+      if(altitude <= s.hoverHeight * 12 && movingTowardSurface){
+        // Re-bind the active surface to whatever crystal we just landed on, so the
+        // land-locked walk/hop physics (raycast, spin tracking, camera) follow it.
+        gameMode.surface.crystal = nearCrystal.group;
+        gameMode.surface.floor = nearCrystal.floor;
+        gameMode.surface.center.copy(nearCrystal.center);
+        gameMode.lastCrystalRotY = nearCrystal.floor.group.rotation.y;
+        s.groundNormal.lerp(landHit.normal, 0.3).normalize();
+        var landTarget = landHit.point.clone().addScaledVector(s.groundNormal, s.hoverHeight);
+        ship.position.lerp(landTarget, 0.5);
+        var vN2 = fly.vel.dot(s.groundNormal);
+        if(vN2 < 0) fly.vel.sub(s.groundNormal.clone().multiplyScalar(vN2));
+        s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+        if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+        s.speed = fly.vel.dot(s.forward);
+        fly.vel.set(0, 0, 0);
+        s.airborne = false;
+        s.freeFalling = false;
+        s.airTime = 0;
         s.barrelRoll.active = false;
         s.barrelRoll.progress = 0;
       }
     }
-
-    // Look for landing once we're descending (or after the safety timeout).
-    if(s.vertVel < 0 || s.airTime > p.jumpMaxAirTime){
-      var landHit = raycastShipToSurface(gameMode.ship.position);
-      if(landHit){
-        // Signed height of the ship above the actual hit point, measured along the
-        // hit-face normal — positive while above, ≤ hoverHeight means we've landed.
-        var rel = gameMode.ship.position.clone().sub(landHit.point);
-        var heightAbove = rel.dot(landHit.normal);
-        if(heightAbove <= s.hoverHeight + 0.0005){
-          s.groundNormal.copy(landHit.normal).normalize();
-          gameMode.ship.position.copy(landHit.point).addScaledVector(s.groundNormal, s.hoverHeight);
-          s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
-          if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
-          s.airborne = false;
-          s.vertVel = 0;
-          s.airTime = 0;
-          // Drop the barrel roll on touchdown — the visual override below will reset
-          // shipVisual.rotation.z so the ship lands flat on the new facet.
-          s.barrelRoll.active = false;
-          s.barrelRoll.progress = 0;
-        }
-      }
-    }
-  } else {
-    // ── Surface stickiness ──
-    // Raycast against the actual crystal mesh, snap ship to hit + small hover offset, and
-    // adopt the hit face's normal (smoothed). This is what makes the ship contour over
-    // the jagged facets instead of skating on an imaginary sphere. Matches the magnetic-
-    // surface approach from Orbicule.html:27204-27326.
-    var hit = raycastShipToSurface(gameMode.ship.position);
-    if(hit) {
-      // Smooth the normal so the orientation doesn't snap at facet boundaries (gentler
-      // smoothing at low speed, snappier when zipping over edges)
-      var normalSmooth = 0.18 + Math.min(0.20, Math.abs(s.speed) * 30);
-      s.groundNormal.lerp(hit.normal, normalSmooth).normalize();
-      // Stick to surface + hover
-      gameMode.ship.position.copy(hit.point).addScaledVector(s.groundNormal, s.hoverHeight);
-      // Re-project forward onto the (now slightly different) tangent plane
-      s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
-      if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
-    }
   }
 
-  // Orient ship: local +Z = forward, local +Y = groundNormal (the actual surface up)
+  // === Orient ship: local +Z = forward, local +Y = groundNormal ===
+  s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+  if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
   var orientM = new THREE.Matrix4();
   orientM.lookAt(new THREE.Vector3(0,0,0), s.forward.clone().multiplyScalar(-1), s.groundNormal);
-  gameMode.ship.quaternion.setFromRotationMatrix(orientM);
-  // Visual overlay on shipVisual. Barrel roll takes over .z entirely while active —
-  // multiple full revolutions around the ship's forward axis — and yaw goes flat for
-  // the duration. Otherwise the drift code drives yaw/roll as normal.
+  ship.quaternion.setFromRotationMatrix(orientM);
+
+  // === Visual overlays (drift roll + barrel roll) ===
   if(gameMode.shipVisual) {
     if(s.barrelRoll.active){
-      var rollEase = s.barrelRoll.progress; // linear — feels constant-rate, like a real barrel roll
-      // Negative Z rotation around forward sends the LEFT wing up and over (right roll).
-      // Positive sends the right wing over (left roll). So negate direction when writing.
+      var rollEase = s.barrelRoll.progress;
       gameMode.shipVisual.rotation.z = -s.barrelRoll.direction * s.barrelRoll.rotations * Math.PI * 2 * rollEase;
       gameMode.shipVisual.rotation.y = 0;
     } else {
@@ -12389,16 +13079,14 @@ function updateGamePhysicsAndCamera() {
     }
   }
 
-  // Engine glow scales with speed
+  // === Engine glow scales with speed ===
   if(gameMode.engineGlow) {
     var sf = Math.abs(s.speed) / p.boostMaxSpeed;
     gameMode.engineGlow.material.opacity = 0.5 + sf * 0.5;
     gameMode.engineGlow.scale.setScalar(1 + sf * 0.7);
   }
 
-  // Chase camera in tangent frame — behind ship along -forward, above along +up.
-  // camera.up follows the surface normal (smoothed) so the view stays upright relative
-  // to the planet — without this, crossing the south pole flips the image.
+  // === Chase camera ===
   var chase = computeChaseCamPose();
   camera.position.lerp(chase.pos, 0.18);
   camera.up.lerp(chase.up, 0.12);
@@ -12406,9 +13094,13 @@ function updateGamePhysicsAndCamera() {
   camera.lookAt(chase.lookAt);
 }
 
-// ── Free 3D flight physics + chase camera ──
-// Ship can move anywhere in world space. WASD = thrust + yaw, Q/E = pitch up/down,
-// Space/Ctrl = vertical thrust along ship-local up, Shift = boost.
+// ── Free 3D flight physics + chase camera (no gravity, no collision) ──
+// Mirrors Orbicule's flightMode branch (Orbicule.html:27117-27197):
+// WASD = thrust + yaw, Q/E = pitch, Space/Ctrl = vertical, Shift = boost.
+// Gravity is OFF in fly mode — that's the whole point of the toggle.
+// Collision is OFF too — you can fly through anything. Pressing P again
+// hands control back to surface mode (gravity returns), and the ship
+// keeps its current position — no teleport.
 function updateFlightPhysicsAndCamera() {
   var k = gameMode.keys;
   var t = gameMode.touch;
@@ -12435,16 +13127,15 @@ function updateFlightPhysicsAndCamera() {
   var thrust = fly.thrustBase + (fly.thrustMax - fly.thrustBase) * ramp;
   if(isBoosting) thrust = fly.boostThrust;
 
-  // Apply yaw + pitch BEFORE thrust so the thrust direction matches the new orientation
+  // Yaw + pitch BEFORE thrust so the thrust direction matches new orientation
   if(Math.abs(yawAxis) > 0.01) ship.rotateY(-fly.yawSpeed * yawAxis);
   if(Math.abs(pitchAxis) > 0.01) ship.rotateX(fly.pitchSpeed * pitchAxis);
 
-  // Thrust along ship's local +Z (the engine's forward direction)
+  // Thrust along ship's local +Z
   var localFwd = new THREE.Vector3(0, 0, 1).applyQuaternion(ship.quaternion);
   if(Math.abs(fwdAxis) > 0.01) fly.vel.addScaledVector(localFwd, thrust * fwdAxis);
 
-  // Vertical thrust along ship's local +Y (so it feels like the ship is rising relative
-  // to itself, not the world — keeps controls intuitive after the ship tilts).
+  // Vertical thrust along ship's local +Y (intuitive after tilts)
   if(Math.abs(vertAxis) > 0.01) {
     var localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(ship.quaternion);
     fly.vel.addScaledVector(localUp, thrust * 0.7 * vertAxis);
@@ -12471,8 +13162,7 @@ function updateFlightPhysicsAndCamera() {
     gameMode.engineGlow.scale.setScalar(1 + sf * 0.7);
   }
 
-  // Chase cam: behind ship along -localFwd, above along +localUp. Camera up follows
-  // the ship's local up so the view stays consistent during pitch maneuvers.
+  // Chase cam: behind ship along -localFwd, above along +localUp
   var camLocalUp = new THREE.Vector3(0, 1, 0).applyQuaternion(ship.quaternion);
   var camPos = ship.position.clone()
     .add(localFwd.clone().multiplyScalar(-fly.camBackDist))
@@ -12631,9 +13321,11 @@ function triggerBarrelRoll(direction){
   s.barrelRoll.progress = 0;
   // World-space "right" relative to the ship's current orientation
   var right = new THREE.Vector3(1, 0, 0).applyQuaternion(gameMode.ship.quaternion);
-  // Project onto the tangent plane of jumpAxis so the dash doesn't add a vertical
-  // component (otherwise it'd fight gravity / extend airtime weirdly)
-  right.sub(s.jumpAxis.clone().multiplyScalar(right.dot(s.jumpAxis)));
+  // Project onto the tangent plane of groundNormal so the dash stays
+  // horizontal and doesn't fight gravity. (Old code used s.jumpAxis which
+  // the new physics no longer maintains; groundNormal is the latest valid
+  // "up" relative to the surface we took off from.)
+  right.sub(s.groundNormal.clone().multiplyScalar(right.dot(s.groundNormal)));
   if(right.lengthSq() < 0.0001) right.set(1, 0, 0);
   right.normalize().multiplyScalar(direction);
   s.barrelRoll.lateralDir.copy(right);
@@ -12650,10 +13342,16 @@ function triggerSlam(){
   if(!gameMode.active || gameMode.fly.active) return;
   var s = gameMode.surfaceState;
   if(!s.airborne) return;
-  // ~1.4× jumpImpulse worth of downward velocity — still overwhelms residual
-  // upward motion at jump apex if the player slams while rising, but lands
-  // with noticeably less smack than the original 2.85× tune.
-  s.vertVel = -0.04;
+  if(s.freeFalling){
+    // Free-fall slam — drive fly.vel hard toward the nearest surface (down the
+    // current ground normal). Gravity keeps compounding it, so the magnetic
+    // landing raycast catches the ship within a few frames.
+    gameMode.fly.vel.addScaledVector(s.groundNormal, -0.05);
+  } else {
+    // Hop slam — ~1.4× jumpImpulse of downward velocity along the locked jumpAxis,
+    // enough to overwhelm residual upward motion at the apex without a huge smack.
+    s.vertVel = -0.04;
+  }
   s.barrelRoll.active = false;
   s.barrelRoll.progress = 0;
 }
@@ -12664,12 +13362,14 @@ function gameKeyDown(e) {
   if(k === 'w' || k === 'arrowup') gameMode.keys.w = true;
   else if(k === 'a' || k === 'arrowleft') {
     gameMode.keys.a = true;
+    if(!e.repeat) gameMode.lastATime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     // direction=+1 picks ship-local +X which maps to screen-left from the chase-cam view
     if(!e.repeat && gameMode.surfaceState.airborne) triggerBarrelRoll(1);
   }
   else if(k === 's' || k === 'arrowdown') gameMode.keys.s = true;
   else if(k === 'd' || k === 'arrowright') {
     gameMode.keys.d = true;
+    if(!e.repeat) gameMode.lastDTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     // direction=-1 picks ship-local -X = screen-right
     if(!e.repeat && gameMode.surfaceState.airborne) triggerBarrelRoll(-1);
   }
@@ -12709,34 +13409,61 @@ function gameKeyUp(e) {
   else if(k === 'control') gameMode.keys.ctrl = false;
 }
 
-// ── Toggle flight mode: ship leaves the crystal and flies free in 3D ──
-// Takes the current surface ship world transform as the starting flight pose so the
-// transition is seamless (no teleport). On toggle off, the ship snaps to the nearest
-// point on the sphere and re-projects forward into the tangent plane.
+// ── Toggle flight mode (Orbicule.html:27117 pattern) ──
+// P toggles between two modes; ship stays in place either way.
+//   ON  → fly mode. Gravity OFF, free 3D thrust controls. Ship can
+//          fly anywhere with no forces acting on it.
+//   OFF → surface mode. Gravity ON, no thrust controls. Ship enters
+//          airborne state in surface mode at its current position —
+//          gravity pulls it toward the nearest planet, magnetic stick
+//          catches it when close enough to walk. No teleport.
 function toggleFlightMode() {
+  if(gameMode.portal && gameMode.portal.inside) return;  // P does nothing inside the portal
   if(!gameMode.fly.active) {
-    // Surface → flight: ship.position and ship.quaternion are already set by
-    // positionShipOnSurface() from the previous frame. We just zero velocity and
-    // hand control to the flight physics path.
+    // Surface → Fly: turn off gravity, keep current position + orientation.
+    // User now controls thrust directly via WASD/Q/E/Space/Ctrl/Shift.
     gameMode.fly.active = true;
     gameMode.fly.vel.set(0, 0, 0);
     gameMode.fly.accelTime = 0;
-    // Clear drift state so we don't carry visual roll into flight
     var ss = gameMode.surfaceState;
+    ss.speed = 0;
+    ss.coastFrames = 0;
     ss.isDrifting = false;
     ss.driftDirection = 0;
     ss.driftAngle = 0;
     ss.driftTargetAngle = 0;
     ss.driftTime = 0;
-    // Cancel any in-progress jump or barrel roll — fly mode does its own free 3D motion
     ss.airborne = false;
-    ss.vertVel = 0;
     ss.airTime = 0;
     ss.barrelRoll.active = false;
     ss.barrelRoll.progress = 0;
     gameMode.wantJump = false;
   } else {
-    snapFromFlyToSurface();
+    // Fly → Surface: turn ON gravity, lose flight controls, same position.
+    // Enter airborne state so surface mode treats us as falling (gravity
+    // applies, magnetic stick will catch us when close to a planet). We
+    // preserve fly.vel as the ship's current momentum so the transition
+    // is continuous — if you were moving when you toggled, you keep moving.
+    gameMode.fly.active = false;
+    var ss = gameMode.surfaceState;
+    ss.airborne = true;
+    ss.freeFalling = true;   // exit P-flight straight into gravity-well free-fall
+    ss.airTime = 0;
+    ss.speed = 0;
+    ss.coastFrames = 0;
+    ss.isDrifting = false;
+    ss.driftDirection = 0;
+    ss.driftAngle = 0;
+    ss.driftTargetAngle = 0;
+    ss.driftTime = 0;
+    // Carry ship's current world orientation into surface state — keeps the
+    // chase camera + ship orient from lurching on the first surface frame.
+    // forward = ship local +Z, groundNormal = ship local +Y.
+    var wq = gameMode.ship.quaternion;
+    var fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(wq);
+    var up = new THREE.Vector3(0, 1, 0).applyQuaternion(wq);
+    ss.forward.copy(fwd).normalize();
+    ss.groundNormal.copy(up).normalize();
   }
 }
 
@@ -12772,6 +13499,718 @@ function snapFromFlyToSurface() {
   gameMode.lastCrystalRotY = gf ? gf.group.rotation.y : 0;
   // Re-orient with the corrected forward
   positionShipOnSurface();
+}
+
+// ══════════════════════════════════════════════
+// TARDIS PORTAL — invisible seam: crystal indent → tunnel → (seamless fold) → longer
+// tunnel → crystal dome you drop into. Pure-translation portal so gravity (−Y) stays
+// consistent across the seam. Region A (the entrance tunnel) is real geometry at the
+// crystal; Region B (the continuation + dome) lives far away (x≈DX, past camera.far so
+// it's invisible during normal play) and is reached by teleporting +D across the seam.
+// ══════════════════════════════════════════════
+var PORTAL_LAYER = 2;
+// User-modeled gallery crystal (octahedron r=0.8 with a hallway carved in Blender), as a
+// flat non-indexed triangle position array (replaces the procedural crystal in buildPortal).
+var CRYSTAL_PORTAL_POS = [0.56568,0.56568,0,0.56568,0,0.56568,0.8,0,0,0.56568,0.56568,0,0,0.56568,0.56568,0.56568,0,0.56568,0,0.8,0,0,0.56568,0.56568,0.56568,0.56568,0,0,0.56568,0.56568,0,0,0.8,0.56568,0,0.56568,0.56568,0,0.56568,0.56568,-0.56568,0,0.8,0,0,0.56568,0,0.56568,0,-0.56568,0.56568,0.56568,-0.56568,0,0,0,0.8,0,-0.56568,0.56568,0.56568,0,0.56568,0,-0.56568,0.56568,0,-0.8,0,0.56568,-0.56568,0,0.56568,-0.56568,0,0.56568,0,-0.56568,0.8,0,0,0.56568,-0.56568,0,0,-0.56568,-0.56568,0.56568,0,-0.56568,0,-0.8,0,0,-0.56568,-0.56568,0.56568,-0.56568,0,0,-0.56568,-0.56568,0,0,-0.8,0.56568,0,-0.56568,0.56568,0,-0.56568,0.56568,0.56568,0,0.8,0,0,0.56568,0,-0.56568,0,0.56568,-0.56568,0.56568,0.56568,0,0,0,-0.8,0,0.56568,-0.56568,0.56568,0,-0.56568,0,0.56568,-0.56568,0,0.8,0,0.56568,0.56568,0,-0.56568,0.56568,0,-0.56568,0,-0.56568,-0.8,0,0,-0.56568,0.56568,0,0,0.56568,-0.56568,-0.56568,0,-0.56568,0,0.8,0,0,0.56568,-0.56568,-0.56568,0.56568,0,0,0.56568,-0.56568,0,0,-0.8,-0.56568,0,-0.56568,-0.56568,0,-0.56568,-0.56568,-0.56568,0,-0.8,0,0,-0.56568,0,-0.56568,0,-0.56568,-0.56568,-0.56568,-0.56568,0,0,0,-0.8,0,-0.56568,-0.56568,-0.56568,0,-0.56568,0,-0.56568,-0.56568,0,-0.8,0,-0.56568,-0.56568,0,-0.56568,-0.56568,0,-0.56568,0,0.56568,-0.8,0,0,-0.56568,-0.56568,0,0,-0.56568,0.56568,-0.56568,0,0.56568,0,-0.8,0,0,-0.56568,0.56568,-0.56568,-0.56568,0,0,-0.56568,0.56568,0,0,0.8,-0.56568,0,0.56568,-0.56568,0,0.56568,-0.56568,0.56568,0,-0.8,0,0,-0.12367,0.42044,0.44521,-0.44366,0.42044,0.12521,-0.03646,0.01325,-0.28199,-0.12367,0.42044,0.44521,-0.03646,0.01325,-0.28199,0.28353,0.01325,0.03801,0,0,0.8,0,0.56568,0.56568,-0.56568,0,0.56568,0,0.56568,0.56568,0,0.8,0,-0.56568,0.56568,0,-0.44366,0.10045,0.44521,-0.44366,0.42044,0.12521,-0.56568,0.56568,0,-0.44366,0.10045,0.44521,-0.56568,0.56568,0,-0.56568,0,0.56568,-0.12367,0.42044,0.44521,-0.44366,0.10045,0.44521,-0.56568,0,0.56568,-0.12367,0.42044,0.44521,-0.56568,0,0.56568,0,0.56568,0.56568,-0.44366,0.42044,0.12521,-0.12367,0.42044,0.44521,0,0.56568,0.56568,-0.44366,0.42044,0.12521,0,0.56568,0.56568,-0.56568,0.56568,0,-0.03646,-0.30675,0.03801,0.28353,0.01325,0.03801,-0.03646,0.01325,-0.28199,-0.44366,0.10045,0.44521,-0.12367,0.42044,0.44521,0.28353,0.01325,0.03801,-0.44366,0.10045,0.44521,0.28353,0.01325,0.03801,-0.03646,-0.30675,0.03801,-0.44366,0.42044,0.12521,-0.44366,0.10045,0.44521,-0.03646,-0.30675,0.03801,-0.44366,0.42044,0.12521,-0.03646,-0.30675,0.03801,-0.03646,0.01325,-0.28199];
+
+function portalCrystalMat(side){
+  return new THREE.MeshStandardMaterial({
+    color: 0x9a9aa2, metalness: 1.0, roughness: 0.08,
+    envMap: (typeof cubeRenderTarget !== 'undefined' && cubeRenderTarget) ? cubeRenderTarget.texture : null,
+    envMapIntensity: 1.5, flatShading: true,
+    emissive: 0x12121a, emissiveIntensity: 0.7,
+    side: side || THREE.DoubleSide
+  });
+}
+
+// Open box tunnel along Z (floor/ceiling/left/right, both ends open), centered on
+// (cx,cy), spanning z0..z1, half-width HW (x), half-height HH (y).
+function buildPortalTube(grp, cx, cy, z0, z1, HW, HH, mat){
+  var len = Math.abs(z1 - z0), zc = (z0 + z1) / 2;
+  var fl = new THREE.Mesh(new THREE.PlaneGeometry(2*HW, len), mat); fl.rotation.x = -Math.PI/2; fl.position.set(cx, cy-HH, zc); grp.add(fl);
+  var ce = new THREE.Mesh(new THREE.PlaneGeometry(2*HW, len), mat); ce.rotation.x =  Math.PI/2; ce.position.set(cx, cy+HH, zc); grp.add(ce);
+  var lw = new THREE.Mesh(new THREE.PlaneGeometry(len, 2*HH), mat); lw.rotation.y =  Math.PI/2; lw.position.set(cx-HW, cy, zc); grp.add(lw);
+  var rw = new THREE.Mesh(new THREE.PlaneGeometry(len, 2*HH), mat); rw.rotation.y = -Math.PI/2; rw.position.set(cx+HW, cy, zc); grp.add(rw);
+}
+
+// Screen-space portal material: samples a render target at the fragment's screen position,
+// so the seam shows exactly what the virtual camera sees behind it — invisible when the
+// geometry on both sides matches.
+function portalSeamMat(rt){
+  return new THREE.ShaderMaterial({
+    uniforms: { portalTex: { value: rt.texture } },
+    vertexShader: 'varying vec4 vClip; void main(){ vClip = projectionMatrix * modelViewMatrix * vec4(position,1.0); gl_Position = vClip; }',
+    fragmentShader: 'uniform sampler2D portalTex; varying vec4 vClip; void main(){ vec2 uv = (vClip.xy / vClip.w) * 0.5 + 0.5; gl_FragColor = texture2D(portalTex, uv); }',
+    side: THREE.DoubleSide, depthWrite: true
+  });
+}
+
+// ── Debug wireframe overlay (testing) ── set PORTAL_DEBUG_WIRE = false to restore the real
+// crystal/dome materials. When on, the crystal+hallway and the Region B dome/tunnel render as
+// semi-transparent faces with bright wireframe edges so every polygon is visible.
+var PORTAL_DEBUG_WIRE = true;
+function applyDebugWire(root, faceColor, lineColor){
+  // KEEP the real glass/mirror crystal material (don't replace it — replacing the material
+  // type tripped the cube-camera/godray passes and froze the render). Instead overlay a
+  // bright wireframe as a separate LineSegments child so every polygon edge is visible on
+  // top of the reflective crystal. DoubleSide keeps the surface raycast (collision) solid.
+  var meshes = [];
+  root.traverse(function(o){ if(o.isMesh && o.material && o.userData.__wired !== true) meshes.push(o); });
+  meshes.forEach(function(m){
+    m.material.side = THREE.DoubleSide;
+    var wf = new THREE.LineSegments(
+      new THREE.WireframeGeometry(m.geometry),
+      new THREE.LineBasicMaterial({ color: lineColor, depthTest: true })
+    );
+    wf.layers.mask = m.layers.mask;
+    wf.renderOrder = 2;
+    m.add(wf);
+    m.userData.__wired = true;
+  });
+}
+
+// Procedural scratches + grain for the crystal. Returns two MATCHED textures (same scratch
+// pattern): a grayscale ROUGHNESS/BUMP map (scratches frost + distort the reflection) and a
+// COLOR map (dark scratch tint so the wear is visible even when the reflection is flat).
+function makeCrystalTextures(){
+  var W = 512;
+  var rc = document.createElement('canvas'); rc.width = rc.height = W; var rx = rc.getContext('2d');
+  var cc = document.createElement('canvas'); cc.width = cc.height = W; var cx = cc.getContext('2d');
+  rx.fillStyle = '#3a3a3a'; rx.fillRect(0, 0, W, W);     // smooth-ish roughness base
+  cx.fillStyle = '#9a9aa2'; cx.fillRect(0, 0, W, W);     // crystal colour base
+  [[rx, 55], [cx, 28]].forEach(function(pr){ var ctx = pr[0], amt = pr[1], im = ctx.getImageData(0,0,W,W), d = im.data; for(var i=0;i<d.length;i+=4){ var n=(Math.random()-0.5)*amt; d[i]+=n; d[i+1]+=n; d[i+2]+=n; } ctx.putImageData(im,0,0); });
+  for(var s = 0; s < 80; s++){
+    var a = Math.random()*Math.PI, l = 50 + Math.random()*380, sx = Math.random()*W, sy = Math.random()*W,
+        lw = 0.4 + Math.random()*1.5, al = (0.25 + Math.random()*0.5).toFixed(2),
+        ex = sx + Math.cos(a)*l, ey = sy + Math.sin(a)*l;
+    rx.strokeStyle = 'rgba(215,215,215,'+al+')'; rx.lineWidth = lw; rx.beginPath(); rx.moveTo(sx,sy); rx.lineTo(ex,ey); rx.stroke();
+    cx.strokeStyle = 'rgba(60,60,72,'+al+')';    cx.lineWidth = lw; cx.beginPath(); cx.moveTo(sx,sy); cx.lineTo(ex,ey); cx.stroke();
+  }
+  function mk(cv){ var t = new THREE.CanvasTexture(cv); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(2.5, 2.5); return t; }
+  return { rough: mk(rc), color: mk(cc) };
+}
+
+function buildPortal(){
+  var P = gameMode.portal;
+  if(P.built) return;
+  var gf = gameMode.galleryFloor;
+  if(!gf) return;
+  // Anchor everything to the ACTUAL crystal mesh, not the floor group — the centerStar
+  // sits 1.5 below the floor origin, and it spins around Y. Region A + the seam are
+  // parented to it (built in its local frame, cy = 0) so they're embedded in the crystal
+  // and rotate with it instead of floating as a fixed chimney.
+  var cs = gf.group.userData.centerStar;
+  cs.updateMatrixWorld(true);
+  var csWorld = new THREE.Vector3(); cs.getWorldPosition(csWorld);
+  P.crystal = cs;
+  P.gy = csWorld.y;       // crystal's true world height (≈ floorY − 1.5)
+  var gy = P.gy;
+
+  P.D.set(P.DX, 0, 0);   // translation Region A → Region B
+
+  // Reuse the crystal's OWN material so the tunnel/dome read as the same crystal.
+  var octa = null;
+  cs.children.forEach(function(c){ if(c.geometry && c.geometry.type === 'OctahedronGeometry') octa = c; });
+  function crystalMat(side){
+    var m = (octa && octa.material) ? octa.material.clone() : portalCrystalMat(side);
+    m.side = side; return m;
+  }
+
+  // ── Region A: swap in the user's Blender-modeled crystal (octahedron r=0.8 with the
+  // hallway carved into the (-1,1,1) face). It replaces the procedural octahedron and is
+  // tagged isGameCrystal so collision + gravity still find it (its geometry type is no
+  // longer 'OctahedronGeometry'). The hallway is part of the mesh → spins with the crystal,
+  // same material, and the surface raycast follows the ship into it. ──
+  var dHat = new THREE.Vector3(-1, 1, 1).normalize();   // hallway face direction (local)
+  P.holeDir.copy(dHat);
+  (function loadCrystalPortal(){
+    var ng = new THREE.BufferGeometry();
+    ng.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(CRYSTAL_PORTAL_POS), 3));
+    ng.computeVertexNormals();
+    ng.computeBoundingSphere();
+    octa.geometry.dispose();
+    octa.geometry = ng;
+    octa.userData.isGameCrystal = true;
+    // Double-sided so the surface raycast hits every triangle regardless of Blender's
+    // winding (otherwise back-facing faces silently drop collision), and so the hallway's
+    // inward-facing walls are visible from inside.
+    if(octa.material){
+      octa.material.side = THREE.DoubleSide;
+      // Tame the overblown mirror: dimmer reflections, blurred (higher roughness), and a
+      // scratches+grain roughness map on top. Region B clones this material below, so the
+      // dome inherits the same look.
+      var tex = makeCrystalTextures();
+      octa.material.envMapIntensity = 1.25;    // tone down the overblown brightness (was 1.8)
+      octa.material.roughness = 0.22;          // blur the reflection (was 0.03 = mirror)
+      octa.material.roughnessMap = tex.rough;  // scratches/grain frost the reflection where they are
+      octa.material.bumpMap = tex.rough;       // and visibly distort it
+      octa.material.bumpScale = 0.0016;
+      octa.material.map = tex.color;           // dark scratch tint so the wear shows on a flat env
+      octa.material.needsUpdate = true;
+    }
+    if(PORTAL_DEBUG_WIRE) applyDebugWire(octa, 0, 0xff2255);   // crystal + hallway: bold magenta wireframe
+    // Hallway floor = the deepest verts along the hole direction (where the seam will go).
+    var p = ng.attributes.position, v = new THREE.Vector3(), acc = new THREE.Vector3(), cnt = 0, minR = Infinity;
+    for(var i = 0; i < p.count; i++){ v.fromBufferAttribute(p, i); minR = Math.min(minR, v.length()); }
+    for(var i = 0; i < p.count; i++){ v.fromBufferAttribute(p, i); if(v.length() < minR + 0.08){ acc.add(v); cnt++; } }
+    P.holeFloorCenter = cnt ? acc.multiplyScalar(1/cnt) : dHat.clone().multiplyScalar(0.3);
+    // Seam sits PARTWAY down the hallway: a distance along holeDir between the deep floor
+    // and the 0.8 surface. hallwayR is the hallway's cross-section radius (perp to holeDir),
+    // used to test whether the ship is actually inside the hallway when it crosses.
+    P.seamRadius = (P.holeFloorCenter.length() + 0.8) * 0.5;
+    P.hallwayR = 0.12;   // tight: only count as entering when actually in the hole, not near it
+    // ── Analytic tube bounds (Phase A collision) ── axial = projection onto holeDir. The
+    // carved hallway is a tube running from the deep floor (min axial) out to the face mouth
+    // (max axial among verts near the hole axis). Collision grips this tube analytically
+    // instead of raycasting the ~44 thin carved tris (which the ship falls through).
+    P.axialFloor = P.holeFloorCenter.dot(P.holeDir);
+    var _mouth = P.axialFloor, _wallR = 0, _wallN = 0, _vt = new THREE.Vector3();
+    for(var j = 0; j < p.count; j++){
+      _vt.fromBufferAttribute(p, j);
+      var _ax = _vt.dot(P.holeDir);
+      var _pd = _vt.clone().addScaledVector(P.holeDir, -_ax).length();
+      if(_pd < 0.30){
+        if(_ax > _mouth) _mouth = _ax;                          // mouth = furthest-out tube vert
+        if(_ax > P.axialFloor + 0.04){ _wallR += _pd; _wallN++; } // avg wall radius (skip floor verts)
+      }
+    }
+    P.hallMouth = _mouth;
+    // Collision tube radius = real modeled wall radius (kept separate from hallwayR, which the
+    // proven entry-detection gate uses as a tight threshold and must not change).
+    P.tubeR = _wallN > 0 ? Math.max(0.06, _wallR / _wallN) : 0.14;
+    P.prevEntryAxial = 999;
+    P.entryCooldown = 0; P.exitCooldown = 0;
+    // Dome surface-drive state — the ship magnetically sticks to the dome's concave inner
+    // wall and drives along it (like the crystal's exterior, inverted), instead of free-flying.
+    P.dome = { fwd: new THREE.Vector3(1,0,0), speed: 0, vel: new THREE.Vector3(), hoverHeight: 0.06, airborne: false, spaceWas: false };
+  })();
+  P.regionA = null;
+
+  // ── Region B: continuation tunnel + dome, far away on PORTAL_LAYER ──
+  var matB = crystalMat(THREE.DoubleSide);
+  var matDome = crystalMat(THREE.BackSide);
+  var matFloor = crystalMat(THREE.DoubleSide);
+  var gB = new THREE.Group();
+  buildPortalTube(gB, P.DX, gy, P.portalZ, P.corrEndZ, P.HW, P.HH, matB);
+  P.domeFloorY = gy - P.domeDrop;
+  var domeCy = P.domeFloorY + P.domeR;
+  var dome = new THREE.Mesh(new THREE.SphereGeometry(P.domeR, 48, 32), matDome);
+  dome.position.set(P.DX, domeCy, P.domeCz);
+  gB.add(dome);
+  var floor = new THREE.Mesh(new THREE.CircleGeometry(P.domeR * 0.985, 64), matFloor);
+  floor.rotation.x = -Math.PI/2;
+  floor.position.set(P.DX, P.domeFloorY, P.domeCz);
+  gB.add(floor);
+  // interior lights (layer 2) so the crystal reads with shading
+  var l1 = new THREE.PointLight(0xbcd0ff, 1.4, 60); l1.position.set(P.DX, gy, P.corrEndZ); gB.add(l1);
+  var l2 = new THREE.PointLight(0x88aaff, 1.6, 80); l2.position.set(P.DX, domeCy, P.domeCz); gB.add(l2);
+  if(PORTAL_DEBUG_WIRE) applyDebugWire(gB, 0x224a3a, 0x66ff99);   // Region B dome/tunnel: green faces / green wire
+  gB.traverse(function(o){ o.layers.set(PORTAL_LAYER); });
+  scene.add(gB); P.regionB = gB;
+
+  // ── Render targets + virtual camera ──
+  var pr = Math.min(window.devicePixelRatio, 2.0);
+  var rw = Math.max(2, Math.floor(window.innerWidth * pr)), rh = Math.max(2, Math.floor(window.innerHeight * pr));
+  var rtOpts = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBFormat };
+  P.rt1 = new THREE.WebGLRenderTarget(rw, rh, rtOpts);   // Region B (seen through P1)
+  P.rt2 = new THREE.WebGLRenderTarget(rw, rh, rtOpts);   // Region A / crystal world (seen through P2)
+  P.vCam = new THREE.PerspectiveCamera(camera.fov, camera.aspect, 0.001, 20000);
+
+  // ── Portal anchors + seam disks (rotation-correct, spin-aware) ──
+  // A general portal needs the FULL transform of each mouth, not just a translation: the
+  // virtual camera is  vCam = M_dst · R180 · M_src⁻¹ · camera  (R180 = 180° about the mouth's
+  // up axis, because you look INTO one mouth and OUT the other). Translation-only breaks the
+  // instant the crystal spins — which is exactly why the old scaffold was deferred.
+  // Source mouth: partway down the hallway (seamRadius along holeDir), its +Z facing OUTWARD
+  // (+holeDir) toward the approaching player. Parented to the crystal so it spins with it.
+  P.srcAnchor = new THREE.Object3D();
+  P.srcAnchor.position.copy(P.holeDir).multiplyScalar(P.seamRadius);
+  P.srcAnchor.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), P.holeDir.clone().normalize());
+  cs.add(P.srcAnchor);
+  // Destination mouth: a DOORWAY standing on the dome FLOOR (+Z edge), its +Z facing INWARD
+  // across the floor — so you walk straight THROUGH it onto the floor (no drop), it looks into
+  // the whole room, and the oblique clip (Phase C) at this plane keeps the interior while
+  // culling anything behind it. The real modeled room will define this precisely later.
+  P.dstAnchor = new THREE.Object3D();
+  P.dstAnchor.position.set(P.DX, P.domeFloorY + 0.14, P.domeCz + P.domeR * 0.92);
+  P.dstAnchor.quaternion.setFromAxisAngle(new THREE.Vector3(0,1,0), Math.PI);  // +Z → −Z (into dome), up preserved
+  P.dstAnchor.layers.set(PORTAL_LAYER);
+  scene.add(P.dstAnchor);
+  // Seam disks sized to the hallway bore. portalSeamMat samples the RT with screen-space UVs,
+  // so the disk shows exactly what the virtual camera rendered — a true window, no rim.
+  var seamR = P.tubeR * 1.08;
+  P.p1 = new THREE.Mesh(new THREE.CircleGeometry(seamR, 48), portalSeamMat(P.rt1));
+  P.p1.renderOrder = 3; P.p1.visible = false; P.p1.layers.set(0);
+  P.srcAnchor.add(P.p1);   // glued to the hole as the crystal spins
+  P.p2 = new THREE.Mesh(new THREE.CircleGeometry(seamR, 48), portalSeamMat(P.rt2));
+  P.p2.renderOrder = 3; P.p2.visible = false; P.p2.layers.set(PORTAL_LAYER);
+  P.dstAnchor.add(P.p2);
+  P.seamRenderOn = true;   // Phase B: drive the seam render every frame near the mouth
+
+  P.fog = new THREE.FogExp2(0x0a0a16, 0.012);
+  P.bg = new THREE.Color(0x0a0a16);
+  P.built = true;
+}
+
+function renderPortalRT(rt, useInteriorFog){
+  var P = gameMode.portal;
+  var sb = scene.background, sf = scene.fog;
+  if(useInteriorFog){ scene.background = P.bg; scene.fog = P.fog; }
+  var prev = renderer.getRenderTarget();
+  renderer.setRenderTarget(rt);
+  renderer.clear();
+  renderer.render(scene, P.vCam);
+  renderer.setRenderTarget(prev);
+  scene.background = sb; scene.fog = sf;
+}
+
+// Refresh the seam render target each frame with the rotation-correct virtual camera:
+//   vCam = M_dst · R180 · M_src⁻¹ · camera
+// so the seam shows Region B exactly as it would look if you kept going straight through —
+// and it stays correct while the crystal (and the source mouth on it) spins.
+var _portalFlip = new THREE.Matrix4().makeRotationY(Math.PI);
+var _portalM = new THREE.Matrix4(), _portalInvSrc = new THREE.Matrix4(), _portalScl = new THREE.Vector3();
+var _portalMouthW = new THREE.Vector3(), _portalQ = new THREE.Quaternion();
+var _ocN = new THREE.Vector3(), _ocP = new THREE.Vector3(), _ocNV = new THREE.Vector3(),
+    _ocPV = new THREE.Vector3(), _ocPlane = new THREE.Vector4(), _ocQ = new THREE.Vector4(),
+    _ocNmat = new THREE.Matrix3();
+// Oblique near-plane clipping (Lengyel). Skew vCam's near plane onto the destination mouth
+// plane so nothing BEHIND that plane (geometry on the far side of where you emerge) leaks into
+// the portal view. planePointW on the plane; planeNormalW points into the KEPT half-space (the
+// direction the virtual camera looks into the region). Modifies cam.projectionMatrix in place;
+// must be called AFTER updateProjectionMatrix() and AFTER the camera's world matrix is set.
+function applyObliqueNearClip(cam, planePointW, planeNormalW){
+  _ocNmat.getNormalMatrix(cam.matrixWorldInverse);            // world→view normal transform
+  _ocNV.copy(planeNormalW).applyMatrix3(_ocNmat).normalize(); // plane normal in view space
+  _ocPV.copy(planePointW).applyMatrix4(cam.matrixWorldInverse);
+  _ocPlane.set(_ocNV.x, _ocNV.y, _ocNV.z, -_ocNV.dot(_ocPV)); // (n, -n·p) in view space
+  var e = cam.projectionMatrix.elements, p = _ocPlane;
+  _ocQ.set((Math.sign(p.x) + e[8]) / e[0],
+           (Math.sign(p.y) + e[9]) / e[5],
+           -1.0,
+           (1.0 + e[10]) / e[14]);
+  var s = 2.0 / p.dot(_ocQ);
+  e[2]  = p.x * s;
+  e[6]  = p.y * s;
+  e[10] = p.z * s + 1.0;
+  e[14] = p.w * s;
+}
+function setVCamThroughPortal(Msrc, Mdst){
+  // place the virtual camera at the real camera's pose, transformed through the portal pair
+  _portalM.copy(Mdst).multiply(_portalFlip)
+          .multiply(_portalInvSrc.copy(Msrc).invert())
+          .multiply(camera.matrixWorld);
+  _portalM.decompose(gameMode.portal.vCam.position, gameMode.portal.vCam.quaternion, _portalScl);
+  gameMode.portal.vCam.updateMatrixWorld(true);
+}
+// Seamless transform-teleport: move the ship + camera + velocities through the portal pair by
+// the SAME transform the virtual camera used (T = M_to · R180 · M_from⁻¹). Because the camera
+// lands exactly where the virtual camera was, the first frame after the cross matches the seam
+// view you were just looking at — no visual pop. (The placeholder dome then settles you with
+// its own gravity; the real modeled room will honor the emergence pose fully.)
+var _teleT = new THREE.Matrix4(), _teleInv = new THREE.Matrix4(), _teleR = new THREE.Matrix3(), _teleQ = new THREE.Quaternion();
+function teleportPortal(fromA, toA){
+  var s = gameMode.surfaceState;
+  fromA.updateMatrixWorld(true); toA.updateMatrixWorld(true);
+  _teleT.copy(toA.matrixWorld).multiply(_portalFlip).multiply(_teleInv.copy(fromA.matrixWorld).invert());
+  _teleR.setFromMatrix4(_teleT);
+  _teleQ.setFromRotationMatrix(_teleT);
+  gameMode.ship.position.applyMatrix4(_teleT);
+  camera.position.applyMatrix4(_teleT);
+  camera.quaternion.premultiply(_teleQ);
+  gameMode.fly.vel.applyMatrix3(_teleR);
+  s.forward.applyMatrix3(_teleR); if(s.forward.lengthSq() > 1e-6) s.forward.normalize();
+  s.groundNormal.applyMatrix3(_teleR); if(s.groundNormal.lengthSq() > 1e-6) s.groundNormal.normalize();
+  camera.updateMatrixWorld(true);
+}
+function updatePortalWindow(){
+  var P = gameMode.portal;
+  if(P.p1) P.p1.visible = false;
+  if(P.p2) P.p2.visible = false;
+  if(!P.built || !P.seamRenderOn) return;
+  P.srcAnchor.updateMatrixWorld(true);
+  P.dstAnchor.updateMatrixWorld(true);
+  // Proximity gate: only pay for the extra scene pass when near the relevant mouth (you're on
+  // the crystal near the hole, or inside the dome). Skip it when free-flying far elsewhere.
+  var _mouth = P.inB ? P.dstAnchor : P.srcAnchor;
+  if(_portalMouthW.setFromMatrixPosition(_mouth.matrixWorld).distanceTo(camera.position) > 4.0) return;
+  P.vCam.fov = camera.fov; P.vCam.aspect = camera.aspect; P.vCam.updateProjectionMatrix();
+  if(!P.inB){
+    // From the crystal, looking THROUGH the source mouth into Region B (the dome, layer 2).
+    setVCamThroughPortal(P.srcAnchor.matrixWorld, P.dstAnchor.matrixWorld);
+    // clip at the destination doorway: keep the dome interior (dst +Z), cull anything behind it
+    _ocN.set(0,0,1).applyQuaternion(P.dstAnchor.getWorldQuaternion(_portalQ)).normalize();
+    _portalMouthW.setFromMatrixPosition(P.dstAnchor.matrixWorld);
+    applyObliqueNearClip(P.vCam, _portalMouthW, _ocN);
+    P.vCam.layers.set(PORTAL_LAYER);
+    renderPortalRT(P.rt1, true);
+    P.p1.visible = true;
+  } else {
+    // Inside Region B, looking back through the dest mouth into the crystal world (layers 0/1).
+    setVCamThroughPortal(P.dstAnchor.matrixWorld, P.srcAnchor.matrixWorld);
+    // clip at the source mouth: keep the outward (crystal-exterior) side the camera emerges into
+    _ocN.set(0,0,1).applyQuaternion(P.srcAnchor.getWorldQuaternion(_portalQ)).normalize();
+    _portalMouthW.setFromMatrixPosition(P.srcAnchor.matrixWorld);
+    applyObliqueNearClip(P.vCam, _portalMouthW, _ocN);
+    P.vCam.layers.set(0); P.vCam.layers.enable(1);
+    renderPortalRT(P.rt2, false);
+    P.p2.visible = true;
+  }
+}
+
+function portalWithinTube(cx){
+  var p = gameMode.ship.position;
+  return Math.abs(p.x - cx) < gameMode.portal.HW && Math.abs(p.y - gameMode.portal.gy) < gameMode.portal.HH;
+}
+
+// Rotation-aware entry. The hallway is on the spinning crystal's holeDir face, so we work
+// in the crystal's LOCAL frame: transform the ship into it, and detect it crossing the seam
+// plane (partway down the hallway) heading inward while inside the hallway cross-section.
+// Then teleport into Region B (the placeholder dome). No gravity weirdness in the crystal
+// hallway — that's just normal free-flight approach.
+function portalRegionBEntrance(){
+  var P = gameMode.portal;
+  return new THREE.Vector3(P.DX, P.domeFloorY + 2*P.domeR - 0.7, P.domeCz);   // near the dome ceiling, centred
+}
+// World-space seam crossing. The seam is the disk at srcAnchor (it spins with the crystal).
+// We trigger when the ship physically crosses that disk plane heading INWARD, anywhere within
+// the hole bore — grounded OR flying. Anti-false-trigger: require real WORLD-space inward
+// motion. A stationary ship has ~0 world velocity even as the spinning seam sweeps past it, so
+// the spin can never fake a crossing (which the old local-frame gate struggled with).
+var _peSeam = new THREE.Vector3(), _peAxis = new THREE.Vector3(), _peQ = new THREE.Quaternion(),
+    _peRel = new THREE.Vector3(), _pePerp = new THREE.Vector3(), _peVel = new THREE.Vector3();
+function checkPortalEntry(){
+  var P = gameMode.portal, ship = gameMode.ship;
+  if(!P.built || P.inside){ P._prevSigned = null; P._prevWorld = null; return; }
+  if(P.entryCooldown > 0) P.entryCooldown--;   // brief grace after exiting so you don't bounce back in
+  P.srcAnchor.updateMatrixWorld(true);
+  _peSeam.setFromMatrixPosition(P.srcAnchor.matrixWorld);                       // seam centre (world)
+  _peAxis.set(0,0,1).applyQuaternion(P.srcAnchor.getWorldQuaternion(_peQ)).normalize(); // outward normal
+  _peRel.copy(ship.position).sub(_peSeam);
+  var signed = _peRel.dot(_peAxis);                       // >0 = outside the seam, <=0 = past it inward
+  var perp = _pePerp.copy(_peRel).addScaledVector(_peAxis, -signed).length();
+  var inward = P._prevWorld ? -_peVel.copy(ship.position).sub(P._prevWorld).dot(_peAxis) : 0;
+  var crossedIn = (P._prevSigned != null && P._prevSigned > 0 && signed <= 0);
+  if(P.entryCooldown <= 0 && crossedIn && perp < P.tubeR * 1.15 && inward > 0.0006){
+    enterRegionB();
+    return;
+  }
+  P._prevSigned = signed;
+  P._prevWorld = (P._prevWorld || new THREE.Vector3()).copy(ship.position);
+}
+var _portalInv = new THREE.Matrix4();
+
+function enterRegionB(){
+  var P = gameMode.portal, s = gameMode.surfaceState, ship = gameMode.ship;
+  P.inside = true; P.inB = true;
+  // Seamless cross: transform ship + camera + velocity through the portal so the camera lands
+  // exactly on the virtual-camera view you were just looking at (no visual pop at the seam).
+  teleportPortal(P.srcAnchor, P.dstAnchor);
+  // Land as a GROUNDED WALK onto the dome floor (doorway feel): flatten to the floor, keep your
+  // heading + speed. No drop, no airborne flail, no "random" landing — you continue straight in.
+  var v = gameMode.fly.vel;
+  _peVel.set(v.x, 0, v.z);                                   // horizontal momentum through the doorway
+  s.speed = Math.min(_peVel.length(), gameMode.physics.maxSpeed);
+  if(_peVel.lengthSq() > 1e-8){ s.forward.copy(_peVel).normalize(); }
+  else { s.forward.y = 0; if(s.forward.lengthSq() < 1e-6) s.forward.set(0,0,1); s.forward.normalize(); }
+  s.groundNormal.set(0,1,0);
+  ship.position.y = P.domeFloorY + s.hoverHeight;
+  s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.coastFrames = 0;
+  s.isDrifting = false; s.driftDirection = 0; s.driftAngle = 0; s.driftTargetAngle = 0; s.driftTime = 0;
+  s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+  gameMode.fly.active = false; gameMode.fly.vel.set(0,0,0); gameMode.wantJump = false;
+  P.exitCooldown = 90;
+}
+
+function leaveToCrystal(){
+  var P = gameMode.portal, ship = gameMode.ship, cs = P.crystal, s = gameMode.surfaceState;
+  P.inside = false; P.inB = false;
+  cs.updateMatrixWorld(true);
+  // pop back OUTSIDE the crystal hole, heading outward into crystal free-fall (gravity reels
+  // you in). The crystal physics re-derive groundNormal from the surface raycast.
+  ship.position.copy(P.holeDir).multiplyScalar(1.35).applyMatrix4(cs.matrixWorld);
+  var outW = P.holeDir.clone().transformDirection(cs.matrixWorld).normalize();
+  gameMode.fly.vel.copy(outW).multiplyScalar(0.04);
+  s.airborne = true; s.freeFalling = true; s.airTime = 0; s.speed = 0; s.isDrifting = false;
+  s.groundNormal.copy(outW);
+  s.forward.set(0,1,0); s.forward.sub(outW.clone().multiplyScalar(s.forward.dot(outW)));
+  if(s.forward.lengthSq() < 1e-4) s.forward.set(1,0,0).sub(outW.clone().multiplyScalar(outW.x));
+  s.forward.normalize();
+  P.entryCooldown = 110; P.prevEntryAxial = 999;
+  if(P.p1) P.p1.visible = false; if(P.p2) P.p2.visible = false;
+  camera.position.copy(ship.position).addScaledVector(outW, 0.18); camera.up.set(0,1,0); camera.lookAt(ship.position);
+}
+
+// Dome interior — the SAME land-locked drive the crystal uses (gameMode.surfaceState + the
+// shared physics params), just on a FLAT FLOOR with −Y gravity. Drift, thrust, yaw, barrel
+// roll, jump all behave identically to the crystal. A glowing pad on the floor is the exit.
+function updatePortalInterior(){
+  var P = gameMode.portal, p = gameMode.physics, k = gameMode.keys, t = gameMode.touch, s = gameMode.surfaceState, ship = gameMode.ship;
+  var cx = P.DX, cz = P.domeCz, floorY = P.domeFloorY, roomR = P.domeR;
+  s.groundNormal.set(0, 1, 0);   // flat floor, up = +Y
+
+  // input (identical to crystal)
+  var fwdAxis = 0, yawAxis = 0;
+  if(t.active){ fwdAxis = t.throttle; yawAxis = t.yaw; p.isBoosting = t.boost; }
+  else { fwdAxis = (k.w?1:0)+(k.s?-0.6:0); yawAxis = (k.a?-1:0)+(k.d?1:0); p.isBoosting = k.shift && k.w; }
+
+  // jump → hop (+ jump barrel-roll combo, same as crystal)
+  if(gameMode.wantJump){
+    gameMode.wantJump = false;
+    if(!s.airborne){
+      s.airborne = true; s.freeFalling = false; s.vertVel = p.jumpImpulse; s.airTime = 0; s.jumpAxis.set(0,1,0);
+      s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; s.driftTime = 0;
+      var nowJ = (typeof performance!=='undefined'?performance.now():Date.now());
+      var aH = k.a || (nowJ-gameMode.lastATime)<gameMode.jumpRollWindow, dH = k.d || (nowJ-gameMode.lastDTime)<gameMode.jumpRollWindow, rd = 0;
+      if(aH&&dH) rd = (gameMode.lastATime>=gameMode.lastDTime)?1:-1; else if(aH) rd = 1; else if(dH) rd = -1;
+      if(rd!==0) triggerBarrelRoll(rd);
+    }
+  }
+
+  // ── drift detection (copied from crystal) ──
+  var wantsDriftLeft  = (k.a && !k.w) || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15) || (t.active && t.driftHold && t.driftDir < 0);
+  var wantsDriftRight = (k.d && !k.w) || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15) || (t.active && t.driftHold && t.driftDir > 0);
+  var wantsDrift = wantsDriftLeft || wantsDriftRight;
+  var spdAbs = Math.abs(s.speed);
+  var canDriftNow = s.isDrifting ? (spdAbs > p.maxSpeed*p.driftContinueSpeedRatio) : (spdAbs > p.maxSpeed*p.driftEntrySpeedRatio);
+  if(wantsDrift && canDriftNow && !s.airborne){
+    if(!s.isDrifting){ s.driftTime = 0; s.driftEntrySpeed = spdAbs; }
+    s.isDrifting = true; s.driftTime += 1; s.driftDirection = wantsDriftLeft ? 1 : -1; s.driftTargetAngle = s.driftDirection*(Math.PI*0.5);
+    spawnGameDriftParticles();
+  } else { s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; }
+  s.driftAngle += (s.driftTargetAngle - s.driftAngle) * 0.12;
+
+  // ── thrust + speed (copied) ──
+  var hasFwd = Math.abs(fwdAxis) > 0.01;
+  if(hasFwd && !s.isDrifting) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1); else p.accelerationTime = Math.max(0, p.accelerationTime - 3);
+  var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * (p.accelerationTime / p.maxAccelerationTime);
+  if(p.isBoosting) thrust = p.boostAccelRate;
+  var driftTight = 0; if(t.active && t.driftHold) driftTight = t.driftTight; if(k.s) driftTight = Math.max(driftTight, 1);
+  if(s.isDrifting){
+    if(s.driftTime > p.driftSustainTime){ s.speed -= Math.sign(s.speed || 1) * p.driftDecel; s.speed *= 0.998; }
+    if(driftTight > 0) s.speed *= (1 - driftTight * 0.015);
+  } else {
+    s.speed += thrust * fwdAxis;
+    if(hasFwd){ s.coastFrames = 0; s.speed *= p.drag; var maxS = p.isBoosting?p.boostMaxSpeed:p.maxSpeed; if(t.active && t.useJoystick) maxS = Math.max(maxS, 0.03); if(s.speed > maxS) s.speed = maxS; var maxRv = (p.isBoosting?p.boostMaxSpeed:p.maxSpeed)*0.6; if(s.speed < -maxRv) s.speed = -maxRv; }
+    else { s.coastFrames += 1; if(s.coastFrames > p.coastHoldFrames){ if(s.speed > 0) s.speed = Math.max(0, s.speed - p.coastLinearDecel); else if(s.speed < 0) s.speed = Math.min(0, s.speed + p.coastLinearDecel); } }
+  }
+
+  // ── yaw + tangential move (copied) ──
+  if(s.isDrifting){ var ramp = Math.min(1, s.driftTime/p.driftRampTime); var dY = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase)*ramp; dY *= (1 + driftTight*0.7); s.forward.applyAxisAngle(s.groundNormal, dY * s.driftDirection); }
+  else if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01){ s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis); }
+  s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+  if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+  if(Math.abs(s.speed) > 0.00001) ship.position.addScaledVector(s.forward, s.speed);
+
+  // ── vertical: hop (−Y gravity) or stick to the flat floor ──
+  if(s.airborne){
+    s.vertVel -= p.jumpGravity; ship.position.y += s.vertVel; s.airTime += 1;
+    if(s.barrelRoll.active){ s.barrelRoll.progress = Math.min(1, s.barrelRoll.progress + 1/s.barrelRoll.duration); var brP = s.barrelRoll.progress; var lat = s.barrelRoll.lateralPeak*(1-brP)*(1-brP); ship.position.addScaledVector(s.barrelRoll.lateralDir, lat); if(brP >= 1){ s.barrelRoll.active = false; s.barrelRoll.progress = 0; } }
+    if((s.vertVel < 0 || s.airTime > p.jumpMaxAirTime) && ship.position.y <= floorY + s.hoverHeight + 0.0005){
+      ship.position.y = floorY + s.hoverHeight; s.airborne = false; s.vertVel = 0; s.airTime = 0; s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+    }
+  } else {
+    ship.position.y = floorY + s.hoverHeight;
+  }
+
+  // ── soft radial wall ──
+  var dx = ship.position.x - cx, dz = ship.position.z - cz, rad = Math.hypot(dx, dz), maxRad = roomR - 0.04;
+  if(rad > maxRad && rad > 1e-4){ var scl = maxRad/rad; ship.position.x = cx + dx*scl; ship.position.z = cz + dz*scl; if((s.forward.x*dx + s.forward.z*dz) > 0) s.speed *= 0.6; }
+
+  // ── orient + drift visuals + engine glow (same as crystal) ──
+  var oM = new THREE.Matrix4(); oM.lookAt(new THREE.Vector3(), s.forward.clone().multiplyScalar(-1), s.groundNormal); ship.quaternion.setFromRotationMatrix(oM);
+  if(gameMode.shipVisual){ if(s.barrelRoll.active){ gameMode.shipVisual.rotation.z = -s.barrelRoll.direction*s.barrelRoll.rotations*Math.PI*2*s.barrelRoll.progress; gameMode.shipVisual.rotation.y = 0; } else { gameMode.shipVisual.rotation.y = s.driftAngle; gameMode.shipVisual.rotation.z = -s.driftAngle*0.3; } }
+  if(gameMode.engineGlow){ var sf = Math.abs(s.speed)/p.boostMaxSpeed; gameMode.engineGlow.material.opacity = 0.5+sf*0.5; gameMode.engineGlow.scale.setScalar(1+sf*0.7); }
+
+  // ── chase camera (tangent frame, like the crystal) ──
+  var camPos = ship.position.clone().addScaledVector(s.forward, -gameMode.camBackDist).addScaledVector(s.groundNormal, gameMode.camUpDist);
+  camera.position.lerp(camPos, 0.18); camera.up.lerp(s.groundNormal, 0.12); camera.up.normalize();
+  camera.lookAt(ship.position.clone().addScaledVector(s.forward, gameMode.camBackDist*0.5));
+
+  // ── exit: drive onto the return pad (placed behind the spawn-facing direction) ──
+  if(P.exitCooldown > 0){ P.exitCooldown--; }
+  else if(Math.hypot(ship.position.x - cx, ship.position.z - (cz - roomR*0.6)) < 0.22){ leaveToCrystal(); }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════
+// PORTAL TEST SANDBOX (temporary). A flat plane (Region A) with a doorway into a room
+// (Region B). BOTH sides use the same flat-floor walk, connected by the proven portal
+// transform — so the crossing is same-physics → same-physics and genuinely seamless.
+// Fully decoupled from the crystal (no spin, no radial gravity) so the portal can be
+// troubleshot in isolation. Toggle with PORTAL_TEST_MODE.
+// ════════════════════════════════════════════════════════════════════════════════════
+var PORTAL_TEST_MODE = true;
+var TEST_Y = 1000;   // high above the website content so nothing else is ever in frame
+
+// flat-floor walk on one region (same model as the dome interior, minus its exit pad)
+function flatDrive(cx, cz, floorY, roomR){
+  var p = gameMode.physics, k = gameMode.keys, t = gameMode.touch, s = gameMode.surfaceState, ship = gameMode.ship;
+  s.groundNormal.set(0,1,0);
+  var fwdAxis=0, yawAxis=0;
+  if(t.active){ fwdAxis=t.throttle; yawAxis=t.yaw; p.isBoosting=t.boost; }
+  else { fwdAxis=(k.w?1:0)+(k.s?-0.6:0); yawAxis=(k.a?-1:0)+(k.d?1:0); p.isBoosting=k.shift&&k.w; }
+  if(gameMode.wantJump){
+    gameMode.wantJump=false;
+    if(!s.airborne){ s.airborne=true; s.freeFalling=false; s.vertVel=p.jumpImpulse; s.airTime=0; s.jumpAxis.set(0,1,0);
+      s.isDrifting=false; s.driftDirection=0; s.driftTargetAngle=0; s.driftTime=0;
+      var nowJ=(typeof performance!=='undefined'?performance.now():Date.now());
+      var aH=k.a||(nowJ-gameMode.lastATime)<gameMode.jumpRollWindow, dH=k.d||(nowJ-gameMode.lastDTime)<gameMode.jumpRollWindow, rd=0;
+      if(aH&&dH) rd=(gameMode.lastATime>=gameMode.lastDTime)?1:-1; else if(aH) rd=1; else if(dH) rd=-1;
+      if(rd!==0) triggerBarrelRoll(rd);
+    }
+  }
+  var wantsDriftLeft=(k.a&&!k.w)||(t.active&&t.yaw<-0.6&&Math.abs(t.throttle)<0.15)||(t.active&&t.driftHold&&t.driftDir<0);
+  var wantsDriftRight=(k.d&&!k.w)||(t.active&&t.yaw>0.6&&Math.abs(t.throttle)<0.15)||(t.active&&t.driftHold&&t.driftDir>0);
+  var wantsDrift=wantsDriftLeft||wantsDriftRight, spdAbs=Math.abs(s.speed);
+  var canDriftNow=s.isDrifting?(spdAbs>p.maxSpeed*p.driftContinueSpeedRatio):(spdAbs>p.maxSpeed*p.driftEntrySpeedRatio);
+  if(wantsDrift&&canDriftNow&&!s.airborne){
+    if(!s.isDrifting){ s.driftTime=0; s.driftEntrySpeed=spdAbs; }
+    s.isDrifting=true; s.driftTime+=1; s.driftDirection=wantsDriftLeft?1:-1; s.driftTargetAngle=s.driftDirection*(Math.PI*0.5);
+    spawnGameDriftParticles();
+  } else { s.isDrifting=false; s.driftDirection=0; s.driftTargetAngle=0; }
+  s.driftAngle+=(s.driftTargetAngle-s.driftAngle)*0.12;
+  var hasFwd=Math.abs(fwdAxis)>0.01;
+  if(hasFwd&&!s.isDrifting) p.accelerationTime=Math.min(p.maxAccelerationTime,p.accelerationTime+1); else p.accelerationTime=Math.max(0,p.accelerationTime-3);
+  var thrust=p.thrustBase+(p.thrustMax-p.thrustBase)*(p.accelerationTime/p.maxAccelerationTime);
+  if(p.isBoosting) thrust=p.boostAccelRate;
+  var driftTight=0; if(t.active&&t.driftHold) driftTight=t.driftTight; if(k.s) driftTight=Math.max(driftTight,1);
+  if(s.isDrifting){
+    if(s.driftTime>p.driftSustainTime){ s.speed-=Math.sign(s.speed||1)*p.driftDecel; s.speed*=0.998; }
+    if(driftTight>0) s.speed*=(1-driftTight*0.015);
+  } else {
+    s.speed+=thrust*fwdAxis;
+    if(hasFwd){ s.coastFrames=0; s.speed*=p.drag; var maxS=p.isBoosting?p.boostMaxSpeed:p.maxSpeed; if(t.active&&t.useJoystick) maxS=Math.max(maxS,0.03); if(s.speed>maxS) s.speed=maxS; var maxRv=(p.isBoosting?p.boostMaxSpeed:p.maxSpeed)*0.6; if(s.speed<-maxRv) s.speed=-maxRv; }
+    else { s.coastFrames+=1; if(s.coastFrames>p.coastHoldFrames){ if(s.speed>0) s.speed=Math.max(0,s.speed-p.coastLinearDecel); else if(s.speed<0) s.speed=Math.min(0,s.speed+p.coastLinearDecel); } }
+  }
+  if(s.isDrifting){ var ramp=Math.min(1,s.driftTime/p.driftRampTime); var dY=p.driftTurnBase+(p.driftTurnMax-p.driftTurnBase)*ramp; dY*=(1+driftTight*0.7); s.forward.applyAxisAngle(s.groundNormal,dY*s.driftDirection); }
+  else if(!s.barrelRoll.active&&Math.abs(yawAxis)>0.01){ s.forward.applyAxisAngle(s.groundNormal,-p.turnSpeed*yawAxis); }
+  s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+  if(s.forward.lengthSq()>0.0001) s.forward.normalize();
+  if(Math.abs(s.speed)>0.00001) ship.position.addScaledVector(s.forward,s.speed);
+  if(s.airborne){
+    s.vertVel-=p.jumpGravity; ship.position.y+=s.vertVel; s.airTime+=1;
+    if(s.barrelRoll.active){ s.barrelRoll.progress=Math.min(1,s.barrelRoll.progress+1/s.barrelRoll.duration); var brP=s.barrelRoll.progress; var lat=s.barrelRoll.lateralPeak*(1-brP)*(1-brP); ship.position.addScaledVector(s.barrelRoll.lateralDir,lat); if(brP>=1){ s.barrelRoll.active=false; s.barrelRoll.progress=0; } }
+    if((s.vertVel<0||s.airTime>p.jumpMaxAirTime)&&ship.position.y<=floorY+s.hoverHeight+0.0005){ ship.position.y=floorY+s.hoverHeight; s.airborne=false; s.vertVel=0; s.airTime=0; s.barrelRoll.active=false; s.barrelRoll.progress=0; }
+  } else { ship.position.y=floorY+s.hoverHeight; }
+  var dx=ship.position.x-cx, dz=ship.position.z-cz, rad=Math.hypot(dx,dz), maxRad=roomR-0.04;
+  if(rad>maxRad&&rad>1e-4){ var scl=maxRad/rad; ship.position.x=cx+dx*scl; ship.position.z=cz+dz*scl; if((s.forward.x*dx+s.forward.z*dz)>0) s.speed*=0.6; }
+  var oM=new THREE.Matrix4(); oM.lookAt(new THREE.Vector3(),s.forward.clone().multiplyScalar(-1),s.groundNormal); ship.quaternion.setFromRotationMatrix(oM);
+  if(gameMode.shipVisual){ if(s.barrelRoll.active){ gameMode.shipVisual.rotation.z=-s.barrelRoll.direction*s.barrelRoll.rotations*Math.PI*2*s.barrelRoll.progress; gameMode.shipVisual.rotation.y=0; } else { gameMode.shipVisual.rotation.y=s.driftAngle; gameMode.shipVisual.rotation.z=-s.driftAngle*0.3; } }
+  var camPos=ship.position.clone().addScaledVector(s.forward,-gameMode.camBackDist).addScaledVector(s.groundNormal,gameMode.camUpDist);
+  camera.position.lerp(camPos,0.18); camera.up.lerp(s.groundNormal,0.12); camera.up.normalize();
+  camera.lookAt(ship.position.clone().addScaledVector(s.forward,gameMode.camBackDist*0.5));
+}
+
+// world-space doorway crossing → seamless transform-teleport, emerge GROUNDED walking on the
+// destination floor with heading + speed preserved (no jolt). Symmetric (works both ways).
+function testCross(fromA, toA, dstFloorY){
+  var P=gameMode.portal, ship=gameMode.ship, s=gameMode.surfaceState;
+  if(P.crossCooldown>0){ P.crossCooldown--; }
+  fromA.updateMatrixWorld(true);
+  _peSeam.setFromMatrixPosition(fromA.matrixWorld);
+  _peAxis.set(0,0,1).applyQuaternion(fromA.getWorldQuaternion(_peQ)).normalize();
+  _peRel.copy(ship.position).sub(_peSeam);
+  var signed=_peRel.dot(_peAxis);
+  var perp=_pePerp.copy(_peRel).addScaledVector(_peAxis,-signed).length();
+  var inward=P._prevWorld?-_peVel.copy(ship.position).sub(P._prevWorld).dot(_peAxis):0;
+  var crossedIn=(P._prevSigned!=null&&P._prevSigned>0&&signed<=0);
+  if(P.crossCooldown<=0&&crossedIn&&perp<P.tubeR*1.3&&inward>0.0003){
+    gameMode.fly.vel.copy(s.forward).multiplyScalar(s.speed);   // stash walking velocity for the transform
+    teleportPortal(fromA, toA);                                  // position+camera+velocity through the portal
+    _peVel.set(gameMode.fly.vel.x, 0, gameMode.fly.vel.z);
+    s.speed=Math.min(_peVel.length(), gameMode.physics.boostMaxSpeed);
+    if(_peVel.lengthSq()>1e-8) s.forward.copy(_peVel).normalize();
+    else { s.forward.y=0; if(s.forward.lengthSq()<1e-6) s.forward.set(0,0,1); s.forward.normalize(); }
+    s.groundNormal.set(0,1,0); ship.position.y=dstFloorY+s.hoverHeight;
+    s.airborne=false; s.freeFalling=false; s.vertVel=0; gameMode.fly.vel.set(0,0,0);
+    P.inB=!P.inB; P.crossCooldown=15; P._prevSigned=null; P._prevWorld=null;
+    return;
+  }
+  P._prevSigned=signed; P._prevWorld=(P._prevWorld||new THREE.Vector3()).copy(ship.position);
+}
+
+function updatePortalTest(){
+  var P=gameMode.portal;
+  if(!P.inB){ flatDrive(P.tAcfg.cx,P.tAcfg.cz,P.tAcfg.floorY,P.tAcfg.R); testCross(P.srcAnchor,P.dstAnchor,P.tBcfg.floorY); }
+  else      { flatDrive(P.tBcfg.cx,P.tBcfg.cz,P.tBcfg.floorY,P.tBcfg.R); testCross(P.dstAnchor,P.srcAnchor,P.tAcfg.floorY); }
+}
+
+// a simple lit room: floor disc + ring wall (+ optional ceiling) + landmark pillars
+function buildTestRoom(cx, cy, cz, R, layer, opts){
+  var grp=new THREE.Group();
+  var floor=new THREE.Mesh(new THREE.CircleGeometry(R,64),
+    new THREE.MeshStandardMaterial({color:opts.floor, roughness:0.9, emissive:opts.floorEmis||0x000000, emissiveIntensity:0.3, side:THREE.DoubleSide}));
+  floor.rotation.x=-Math.PI/2; floor.position.set(cx,cy,cz); grp.add(floor);
+  var wallH=opts.wallH||0.8;
+  var wall=new THREE.Mesh(new THREE.CylinderGeometry(R,R,wallH,64,1,true),
+    new THREE.MeshStandardMaterial({color:opts.wall, roughness:0.85, emissive:opts.wallEmis||0x000000, emissiveIntensity:0.22, side:THREE.BackSide}));
+  wall.position.set(cx,cy+wallH/2,cz); grp.add(wall);
+  if(opts.ceiling){ var ceil=new THREE.Mesh(new THREE.CircleGeometry(R,64),
+      new THREE.MeshStandardMaterial({color:opts.wall, roughness:0.9, emissive:opts.wallEmis||0x000000, emissiveIntensity:0.18, side:THREE.BackSide}));
+    ceil.rotation.x=Math.PI/2; ceil.position.set(cx,cy+wallH,cz); grp.add(ceil); }
+  for(var i=0;i<opts.pillars.length;i++){ var pc=opts.pillars[i];
+    var pm=new THREE.Mesh(new THREE.BoxGeometry(0.07,0.34,0.07),
+      new THREE.MeshStandardMaterial({color:pc.c, emissive:pc.c, emissiveIntensity:0.7}));
+    pm.position.set(cx+pc.x,cy+0.17,cz+pc.z); grp.add(pm); }
+  var pl=new THREE.PointLight(opts.light||0xffffff,1.3,R*5); pl.position.set(cx,cy+wallH*0.85,cz); grp.add(pl);
+  var amb=new THREE.AmbientLight(0x556070,0.9); grp.add(amb);
+  grp.traverse(function(o){ o.layers.set(layer); });
+  scene.add(grp); return grp;
+}
+
+// thin emissive rectangular frame around a doorway opening, parented to its anchor
+function buildDoorFrame(anchor, w, h, color, layer){
+  var mat=new THREE.MeshStandardMaterial({color:color, emissive:color, emissiveIntensity:0.8});
+  var th=0.018, fr=new THREE.Group();
+  [[0,h/2,w+2*th,th],[0,-h/2,w+2*th,th]].forEach(function(c){ var m=new THREE.Mesh(new THREE.BoxGeometry(c[2],c[3],th),mat); m.position.set(c[0],c[1],0); fr.add(m); });
+  [[-w/2,0],[w/2,0]].forEach(function(c){ var m=new THREE.Mesh(new THREE.BoxGeometry(th,h,th),mat); m.position.set(c[0],c[1],0); fr.add(m); });
+  fr.traverse(function(o){ o.layers.set(layer); });
+  anchor.add(fr);
+}
+
+function buildPortalTestbed(){
+  var P=gameMode.portal;
+  if(P.testBuilt) return;
+  var DW=0.34, DH=0.30, doorY=0.15, R=1.5;
+  P.tAcfg={cx:0,   cz:0, floorY:TEST_Y, R:R};
+  P.tBcfg={cx:300, cz:0, floorY:TEST_Y, R:R};
+  // Region A (start, open plane, layer 0) and Region B (a closed room, PORTAL_LAYER)
+  P.regionA_test=buildTestRoom(0,  TEST_Y,0,R,0,         {floor:0x2a2f3a,floorEmis:0x0e121a,wall:0x1c2230,wallEmis:0x080c14,wallH:0.7,ceiling:false,light:0xaac0ff,pillars:[{x:0,z:1.25,c:0x44ff88},{x:1.25,z:0,c:0xff8844},{x:-1.25,z:0,c:0x4488ff}]});
+  P.regionB_test=buildTestRoom(300,TEST_Y,0,R,PORTAL_LAYER,{floor:0x3a2f2a,floorEmis:0x1a1310,wall:0x342618,wallEmis:0x16100a,wallH:0.95,ceiling:true, light:0xffd0a0,pillars:[{x:0,z:1.2,c:0xff44aa},{x:1.0,z:0.7,c:0xaaff44},{x:-1.0,z:0.7,c:0x44aaff}]});
+  // doorways standing on each floor, facing +Z (you approach from the +Z side, walk −Z through)
+  P.srcAnchor=new THREE.Object3D(); P.srcAnchor.position.set(0,  TEST_Y+doorY,-0.9); scene.add(P.srcAnchor);
+  P.dstAnchor=new THREE.Object3D(); P.dstAnchor.position.set(300,TEST_Y+doorY,-0.9); scene.add(P.dstAnchor);
+  buildDoorFrame(P.srcAnchor,DW,DH,0x66ccff,0);
+  buildDoorFrame(P.dstAnchor,DW,DH,0xffaa66,PORTAL_LAYER);
+  var pr=Math.min(window.devicePixelRatio,2.0);
+  var rw=Math.max(2,Math.floor(window.innerWidth*pr)), rh=Math.max(2,Math.floor(window.innerHeight*pr));
+  var o={minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBAFormat};
+  P.rt1=new THREE.WebGLRenderTarget(rw,rh,o); P.rt2=new THREE.WebGLRenderTarget(rw,rh,o);
+  P.vCam=new THREE.PerspectiveCamera(camera.fov,camera.aspect,0.001,20000);
+  P.p1=new THREE.Mesh(new THREE.PlaneGeometry(DW,DH),portalSeamMat(P.rt1)); P.p1.renderOrder=3; P.p1.visible=false; P.p1.layers.set(0); P.srcAnchor.add(P.p1);
+  P.p2=new THREE.Mesh(new THREE.PlaneGeometry(DW,DH),portalSeamMat(P.rt2)); P.p2.renderOrder=3; P.p2.visible=false; P.p2.layers.set(PORTAL_LAYER); P.dstAnchor.add(P.p2);
+  P.tubeR=Math.max(DW,DH)*0.6;
+  P.bg=new THREE.Color(0x06070c); P.fog=new THREE.FogExp2(0x06070c,0.06);
+  P.seamRenderOn=true; P.built=true; P.testMode=true; P.testBuilt=true;
+  P.crossCooldown=0; P._prevSigned=null; P._prevWorld=null; P.inB=false;
+}
+
+function enterPortalTestMode(){
+  if(!gameMode.group) buildGameMode();
+  buildPortalTestbed();
+  var s=gameMode.surfaceState, P=gameMode.portal;
+  gameMode.group.visible=true;
+  gameMode.ship.position.set(0, TEST_Y + s.hoverHeight, 0.6);
+  s.forward.set(0,0,-1); s.groundNormal.set(0,1,0); s.speed=0; s.coastFrames=0;
+  s.airborne=false; s.freeFalling=false; s.vertVel=0; s.airTime=0; s.isDrifting=false; s.driftAngle=0; s.driftTargetAngle=0;
+  s.barrelRoll.active=false; s.barrelRoll.progress=0;
+  gameMode.fly.active=false; gameMode.fly.vel.set(0,0,0); gameMode.wantJump=false;
+  P.inB=false; P._prevSigned=null; P._prevWorld=null; P.crossCooldown=0;
+  gameMode.active=true; gameMode.entering=false; gameMode.decelerating=false; gameMode.exiting=false;
+  if(gameMode.savedCamNear==null) gameMode.savedCamNear=camera.near;
+  camera.near=0.001; camera.updateProjectionMatrix();
+  camera.position.set(0, TEST_Y + s.hoverHeight + gameMode.camUpDist, 0.6 + gameMode.camBackDist);
+  camera.up.set(0,1,0); camera.lookAt(gameMode.ship.position);
 }
 
 // ══════════════════════════════════════════════
@@ -13040,7 +14479,15 @@ function animate(){
   // so it overrides position.y / lookAt that the camera-y lerp and tilt code applied.
   if(gameMode.decelerating) animateGameDecel();
   if(gameMode.entering || gameMode.exiting) animateGameTransition();
-  if(gameMode.active) updateGamePhysicsAndCamera();
+  if(gameMode.active){
+    buildPortal();
+    if(gameMode.portal.inside){
+      updatePortalInterior();
+    } else {
+      updateGamePhysicsAndCamera();
+      checkPortalEntry();
+    }
+  }
   // Drift particles age every frame (even when not drifting, so existing streaks finish out)
   updateGameDriftParticles();
 
@@ -13437,6 +14884,7 @@ function animate(){
   updateCartItemGlassUniforms(time);
   positionNavMenu();
   positionGameJoystick();
+  updateGameWindows();
   updateOrbs(dt);
   // Cart shake AFTER updateOrbs so it doesn't get overwritten by orb stage shake
   updateCartShake(dt);
@@ -13481,6 +14929,11 @@ function animate(){
   // so the blurred copy doesn't shadow the sharp layer-1 overlay pass.
   var gjVis = gameJoystick.group ? gameJoystick.group.visible : false;
   if(gameJoystick.group) gameJoystick.group.visible = false;
+  // In-game windows — hidden in the postFBO pass, redrawn sharp in the layer-1 overlay
+  var gwoVis = gameUI.options && gameUI.options.group ? gameUI.options.group.visible : false;
+  var gwiVis = gameUI.inventory && gameUI.inventory.group ? gameUI.inventory.group.visible : false;
+  if(gameUI.options && gameUI.options.group) gameUI.options.group.visible = false;
+  if(gameUI.inventory && gameUI.inventory.group) gameUI.inventory.group.visible = false;
   // Lightbox only: hide the product image + the three buttons during the post-process
   // capture so the bgBlur doesn't soften them. They re-render crisply in the layer-1
   // overlay pass. This block only runs while the lightbox is on screen so the normal
@@ -13500,10 +14953,30 @@ function animate(){
     }
   }
 
-  // Render scene (without cart) to post-processing FBO
+  // Portal: refresh the seam render targets (P1/P2) while in game, hide them otherwise.
+  if(gameMode.portal.built){
+    if(gameMode.active){
+      updatePortalWindow();
+    } else {
+      if(gameMode.portal.p1) gameMode.portal.p1.visible = false;
+      if(gameMode.portal.p2) gameMode.portal.p2.visible = false;
+    }
+  }
+
+  // Portal pass: render Region B from the rotation-correct virtual camera into the seam's
+  // render target BEFORE the main pass, so the seam disk shows the continuation this frame.
+  if(gameMode.active && gameMode.portal.built) updatePortalWindow();
+
+  // Render scene (without cart) to post-processing FBO. While inside the portal, swap in
+  // the interior fog/background so the dome/tunnel read right and the crystal world (now
+  // ~300 units away, past the far plane) fully drops out.
   renderer.setRenderTarget(postFBO);
   renderer.clear();
+  var _pIn = gameMode.portal.built && gameMode.portal.inside;
+  var _pBg, _pFog;
+  if(_pIn){ _pBg = scene.background; _pFog = scene.fog; scene.background = gameMode.portal.bg; scene.fog = gameMode.portal.fog; }
   renderer.render(scene,camera);
+  if(_pIn){ scene.background = _pBg; scene.fog = _pFog; }
   renderer.setRenderTarget(null);
 
   // Restore UI visibility
@@ -13515,6 +14988,8 @@ function animate(){
   if(navMenu.group) navMenu.group.visible=true;
   if(pdv.group) pdv.group.visible=pdvVis;
   if(gameJoystick.group) gameJoystick.group.visible=gjVis;
+  if(gameUI.options && gameUI.options.group) gameUI.options.group.visible=gwoVis;
+  if(gameUI.inventory && gameUI.inventory.group) gameUI.inventory.group.visible=gwiVis;
   for(var _nb4=0;_nb4<navMenu.buttons.length;_nb4++){
     var nbE=navMenu.morphT<.5?4*navMenu.morphT*navMenu.morphT*navMenu.morphT:1-Math.pow(-2*navMenu.morphT+2,3)/2;
     navMenu.buttons[_nb4].group.visible=nbE>0.6;
