@@ -295,6 +295,10 @@ var raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
 var isDragging = false, selectedFloor = null;
 var mouseDownX = 0, mouseDownY = 0, mouseDownTime = 0;
 var previousMouseX = 0, previousMouseY = 0, previousTime = 0;
+// Short sliding-window history of the wheel-drag finger position {x,t}. The spin velocity is
+// measured across this window (not a single jittery move-delta), so the same physical swipe
+// gives a consistent result instead of randomly spiking to max or barely moving.
+var floorDragHist = [];
 
 var hoveredPanel = null; // currently hovered panel mesh
 var hoveredGlassMesh = null; // currently hovered glass UI element
@@ -1831,7 +1835,8 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
   var bpMat=new THREE.ShaderMaterial({
     uniforms:{
       pixelRatio:{value:Math.min(window.devicePixelRatio,2.0)},
-      uRPM:{value:0.0}
+      uRPM:{value:0.0},
+      uFlash:{value:0.0}
     },
     vertexShader:[
       'attribute float alpha;',
@@ -1848,7 +1853,9 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
       '  vDensity=density;',
       '  vCenterDist=centerDist;',
       '  vRPM=uRPM;',
-      '  gl_PointSize=(2.5+density*0.5)*pixelRatio;',
+      '  // Big soft blobs that heavily OVERLAP → read as one connected molten mass, not dots.',
+      '  // Densest clumps swell most (metaball-ish), so the body looks gooey and interconnected.',
+      '  gl_PointSize=(6.0+density*1.8+uRPM*4.0)*pixelRatio;',
       '  gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);',
       '}'
     ].join('\n'),
@@ -1857,10 +1864,12 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
       'varying float vDensity;',
       'varying float vCenterDist;',
       'varying float vRPM;',
+      'uniform float uFlash;',
       'void main(){',
       '  float d=length(gl_PointCoord-0.5)*2.0;',
       '  if(d>1.0)discard;',
-      '  float glow=1.0-d*d;',
+      '  // Soft gaussian-ish falloff so overlapping blobs fuse smoothly (molten, not dotty).',
+      '  float glow=pow(1.0-d,1.9);',
       '  // White-bright at center, progressively bluer at edges',
       '  vec3 white=vec3(0.95,0.96,1.0);',
       '  vec3 brightBlue=vec3(0.75,0.85,1.0);',
@@ -1880,7 +1889,14 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
       '  vec3 purple=vec3(0.65,0.55,0.92);',
       '  float rpmFade=clamp(vRPM/3.0,0.0,1.0);',
       '  col=mix(col,purple,rpmFade*0.3);',
-      '  gl_FragColor=vec4(col,glow*vA);',
+      '  // Energy brightness grows with RPM; a hot white core blooms at each blob centre.',
+      '  col*=0.7+vRPM*1.1;',
+      '  col=mix(col,vec3(1.0),(1.0-d)*0.35*vRPM);',
+      '  // ── Crystal power SURGE ── on each crystal tapped the whole beam flares white-hot.',
+      '  col*=1.0+uFlash*4.0;',
+      '  col=mix(col,vec3(1.0),clamp(uFlash*1.2,0.0,0.85));',
+      '  float a=glow*vA*(0.85+vRPM*0.5)*(1.0+uFlash*1.2);',
+      '  gl_FragColor=vec4(col,a);',
       '}'
     ].join('\n'),
     transparent:true,depthWrite:false
@@ -1888,6 +1904,10 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
   
   var beamPoints=new THREE.Points(bpGeo,bpMat);
   beamPoints.position.y=y; // offset to floor's world Y since it's in scene, not group
+  // The particles move every frame and now climb far up the column, but the geometry's bounding
+  // sphere was computed once at the base — so frustum culling would drop the whole beam the moment
+  // the emission point scrolled off-screen. Disable culling so the climbing beam stays visible.
+  beamPoints.frustumCulled=false;
   scene.add(beamPoints);
   
   // Section energy — tracks RPM propagation up the beam
@@ -1943,13 +1963,15 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
       '  vec3 purple=vec3(0.65,0.55,0.92);',
       '  float rpmFade=clamp(uRPM/3.0,0.0,1.0);',
       '  col=mix(col,purple,rpmFade*0.3);',
-      '  gl_FragColor=vec4(col,vA*0.5);',
+      '  col*=0.95+uRPM*0.9;',
+      '  gl_FragColor=vec4(col,vA*(0.75+uRPM*0.35));',   // brighter molten strands, visible at any spin
       '}'
     ].join('\n'),
     transparent:true,depthWrite:false
   });
   var bondLines=new THREE.LineSegments(bondGeo,bondMat);
   bondLines.position.y=y;
+  bondLines.frustumCulled=false;   // same reason as beamPoints — dynamic, climbs off the base
   scene.add(bondLines);
   
   // Track how many bonds each particle has (for chain limit of 5)
@@ -2192,6 +2214,24 @@ function generateRingTexture(size) {
   return new THREE.CanvasTexture(c);
 }
 
+// Anamorphic horizontal streak — the cinematic blue bar through a bright light (realistic flare).
+function generateStreakTexture(size) {
+  var c = document.createElement('canvas'); c.width=size; c.height=size;
+  var ctx = c.getContext('2d'); var half=size/2;
+  var grad = ctx.createLinearGradient(0,0,size,0);
+  grad.addColorStop(0.0,'rgba(130,170,255,0)');
+  grad.addColorStop(0.5,'rgba(215,232,255,1)');
+  grad.addColorStop(1.0,'rgba(130,170,255,0)');
+  ctx.fillStyle = grad;
+  for(var k=-5;k<=5;k++){                       // stacked bands → soft vertical falloff
+    var a = Math.max(0, 1 - Math.abs(k)/5); ctx.globalAlpha = a*a;
+    var bh = size*0.007;
+    ctx.fillRect(0, half + k*bh - bh*0.5, size, bh);
+  }
+  ctx.globalAlpha = 1;
+  return new THREE.CanvasTexture(c);
+}
+
 function createLensFlare() {
   if(!THREE.Lensflare) return;
   lensFlare = new THREE.Lensflare();
@@ -2202,6 +2242,12 @@ function createLensFlare() {
   var softTex = generateFlareTexture(128, 0.6, 0.7, 1.0, 0.6);
   var ringTex = generateRingTexture(128);
   var tinyTex = generateFlareTexture(64, 0.9, 0.85, 0.7, 0.8);
+
+  // Anamorphic streak — wide horizontal blue bar across the core (cinematic, on the light)
+  var streakTex = generateStreakTexture(256);
+  var eStreak = new THREE.LensflareElement(streakTex, 700, 0, new THREE.Color(0.6, 0.75, 1.0));
+  lensFlare.addElement(eStreak);
+  lensFlareElements.push({el:eStreak, baseSize:700, baseColor:new THREE.Color(0.6, 0.75, 1.0)});
 
   // Main bright core — big, centered on light
   var e0 = new THREE.LensflareElement(mainTex, 300, 0, new THREE.Color(0.7, 0.8, 1.0));
@@ -2242,28 +2288,23 @@ function createLensFlare() {
   }
 }
 
-function updateLensFlare(rpmNorm) {
+// Adaptive camera lens flare bound to the MAIN crystal's light. THREE.Lensflare already tracks
+// the light's projected screen position (so it follows the crystal as the camera orbits and
+// fades when occluded); here we drive its size/brightness/colour off the crystal's actual light
+// value — subtle at the baseline, blooming big and white-hot on each power pulse, blown out at
+// the whiteout climax.
+function updateLensFlare(lightVal, climax) {
   if(!lensFlare || !lensFlareElements.length) return;
-  var s1 = Math.min(rpmNorm / 0.5, 1.0); s1 = s1 * s1;
-  var s2 = Math.max(Math.min((rpmNorm - 0.5) / 0.35, 1.0), 0.0);
-  var s3 = Math.max((rpmNorm - 0.85) / 0.15, 0.0);
-
-  // Scale all elements with RPM — invisible at rest, grows through stages
-  var scaleMult = s1 * 0.3 + s2 * 1.5 + s3 * 4.0;
-  // Color shifts: blue in stage2, white in stage3
-  var whiteShift = s3;
-
+  lightVal = lightVal || 0; climax = climax || 0;
+  var intensity = lightVal * 1.15 + climax * climax * 2.6;   // tracks the crystal's light + climax
+  var scaleMult = Math.max(0, intensity) * 1.45;
+  var whiteShift = Math.min(lightVal * 0.7 + climax, 1.0);   // white-hot when the crystal is bright
   for(var i=0;i<lensFlareElements.length;i++){
     var le = lensFlareElements[i];
     le.el.size = le.baseSize * scaleMult;
-    // Shift toward white in stage 3
-    var r = le.baseColor.r + whiteShift * (1.0 - le.baseColor.r) * 0.7;
-    var g = le.baseColor.g + whiteShift * (1.0 - le.baseColor.g) * 0.7;
-    var b = le.baseColor.b + whiteShift * (1.0 - le.baseColor.b) * 0.4;
-    // Intensify blue in stage 2
-    r -= s2 * 0.1;
-    g += s2 * 0.05;
-    b += s2 * 0.15;
+    var r = le.baseColor.r + whiteShift * (1.0 - le.baseColor.r) * 0.85;
+    var g = le.baseColor.g + whiteShift * (1.0 - le.baseColor.g) * 0.85;
+    var b = le.baseColor.b + whiteShift * (1.0 - le.baseColor.b) * 0.5;
     le.el.color.setRGB(Math.max(0,Math.min(1,r)), Math.max(0,Math.min(1,g)), Math.max(0,Math.min(1,b)));
   }
 }
@@ -2627,6 +2668,181 @@ function renderGodRays(){
   renderer.setRenderTarget(null);
 }
 
+// ── Spin crescendo tuning ──────────────────────────────────────────────────────────────
+// The dramatic build that plays as you spin the wheel up: brightness → the screen goes BLACK
+// and HOLDS → the crystal's light floods/whites-out the screen → the game commits. This runs
+// on its OWN, EXTENDED rpm range (separate from the beam/spin physics, which stay on /200), so
+// the darkness can hold much longer and the whiteout demands a far higher, harder spin.
+// All thresholds are fractions of SEQ_MAXRPM, i.e. raw rpm = fraction * SEQ_MAXRPM.
+var SEQ_MAXRPM   = 480;   // rpm at which the crescendo is fully maxed
+var SEQ_BRIGHT   = 0.12;  // brightness ramp completes here              (~rpm 58)
+var SEQ_DARK_LO  = 0.03;  // darkness begins almost as soon as you spin  (~rpm 14)
+var SEQ_DARK_HI  = 0.18;  // screen fully black here, very quickly        (~rpm 86)
+var SEQ_WHITE_LO = 0.82;  // (legacy seqNorm whiteout window — superseded by BEAM_TOP_RPM below)
+var SEQ_WHITE_HI = 1.00;
+// The beam climbs at HALF the old rate: its tip reaches the top crystal at BEAM_TOP_RPM (double
+// the old ~480). The whiteout + game-entry are now tied to this same climb, so the screen
+// brightens as the beam nears the top and the game starts the instant it reaches the top crystal.
+var BEAM_TOP_RPM = 960;   // rpm at which the beam tip reaches the top crystal → game start
+// (entry still uses gameMode.chargeRpmThreshold, now measured against seqNorm — see below)
+
+// ── Stage 1: CRYSTAL CHAIN ──────────────────────────────────────────────────────────────
+// As the gallery beam climbs (its tip = seqNorm × beamHeight), it passes the crystals stacked
+// on the floors above, one by one nearest-first. Each is a node with the beam-local height at
+// which the tip reaches it. Stage 1 just detects the hit and lights the crystal (placeholder);
+// Stages 2-4 will hang the "mining" spark, spin-up, screen-brighten and sun-ray off `reached`.
+var crystalChain = null;
+// Stage 2 (revised): the main (gallery) crystal's light RATCHETS UP in steps as the beam mines
+// each crystal. It sits dim early, and every time the beam reaches a new crystal it PULSES —
+// overshoots then settles to a new, higher baseline (a sudden boost of power that sticks).
+// e.g. ~5% before crystal 1 → spikes to ~25% on contact → settles to ~15%, repeated per crystal.
+var mainPower = 0;             // current main-crystal light level
+var mainFlash = 0;             // power above the baseline (surges the beam so the pulse is visible)
+var mainHoldT = 0;             // counts down the "held at max" window after each contact
+var MAIN_BASE = 0.05;          // baseline before any crystal is mined
+var MAIN_STEP = 0.10;          // baseline gained per crystal mined
+var MAIN_MAX = 1.15;           // FULL-power light the crystal jumps to & HOLDS on contact
+var MAIN_HOLD = 1.0;           // seconds it stays at full power before settling
+// Stage 3: 0→1 how lit the whole screen is from the reached crystals spinning up (drives the
+// background brightening back out of the dark as more crystals reach super-fast spin).
+var crystalScreenBright = 0;
+// Stage 4: a wide vertical shaft of light each crystal fires once it hits max spin — a bright
+// camera-facing billboard (additive) with a soft core/edges, "as wide as the crystal".
+var _srPos = new THREE.Vector3();
+var SUNRAY_WIDTH = 3.4;     // plane width; the bright core is ~half this (≈ a crystal's width)
+var SUNRAY_HEIGHT = 20.0;   // shaft length
+function makeSunRay(){
+  var mat = new THREE.ShaderMaterial({
+    uniforms:{ uIntensity:{value:0}, uTime:{value:0} },
+    vertexShader:'varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+    fragmentShader:[
+      'varying vec2 vUv; uniform float uIntensity, uTime;',
+      'void main(){',
+      '  float xd=abs(vUv.x-0.5)*2.0;',                       // 0 centre → 1 edge
+      '  float core=1.0-smoothstep(0.42,1.0,xd);',            // flat-bright core, soft falloff
+      '  float spike=pow(1.0-xd,6.0);',                       // hot centre line
+      '  float yd=abs(vUv.y-0.5)*2.0;',
+      '  float vfade=1.0-smoothstep(0.35,1.0,yd);',           // soft ends
+      '  float shimmer=0.85+0.15*sin(vUv.y*45.0-uTime*7.0);',
+      '  float a=(core*0.8+spike)*vfade*shimmer*uIntensity;',
+      '  vec3 col=mix(vec3(0.7,0.85,1.0), vec3(1.0,1.0,1.0), clamp(core+spike,0.0,1.0));',
+      '  gl_FragColor=vec4(col, a);',
+      '}'
+    ].join('\n'),
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending, side:THREE.DoubleSide
+  });
+  var m = new THREE.Mesh(new THREE.PlaneGeometry(1,1), mat);
+  m.frustumCulled=false; m.visible=false; m.renderOrder=2;
+  scene.add(m);
+  return m;
+}
+function buildCrystalChain(){
+  var gf = gameMode.galleryFloor; if(!gf || !gf.group.userData.beam) return null;
+  var gY = gf.group.position.y;
+  var bh = gf.group.userData.beam.beamHeight;
+  var nodes = [];
+  floors.forEach(function(f){
+    if(f===gf) return;
+    var ly = f.group.position.y - gY;                 // crystal height in the beam's local frame
+    if(ly>0.2 && ly<=bh+0.5){
+      var cs = f.group.userData.centerStar;
+      var mesh = (cs && cs.children[0]) ? cs.children[0] : null;           // the octahedron crystal
+      var mat = mesh ? mesh.material : null;
+      nodes.push({ floor:f, localY:ly, reached:false, mesh:mesh, mat:mat, spin:0, prox:0, ownLight:0, sunray:makeSunRay() });
+    }
+  });
+  nodes.sort(function(a,b){ return a.localY-b.localY; });   // nearest (lowest) first
+  return nodes;
+}
+function updateCrystalChain(tipY, seqNorm, dt, beamClimb){
+  if(!crystalChain) crystalChain = buildCrystalChain();
+  if(!crystalChain || !crystalChain.length) return;
+  if(seqNorm < 0.04){                                        // wheel stopped → disconnect & re-arm
+    for(var z=0;z<crystalChain.length;z++){ var cz=crystalChain[z];
+      cz.reached=false; cz.spin=0; cz.prox=0; cz.ownLight=0;
+      if(cz.sunray) cz.sunray.visible=false; }
+    crystalScreenBright = 0; mainPower = 0; mainFlash = 0; mainHoldT = 0;
+    return;
+  }
+  var topIdx = crystalChain.length-1;                        // the highest crystal (reached last)
+  var SPIN_MAX = 0.5;                                        // post-contact super-fast spin
+  var PRE_SPIN = 0.14;                                       // pre-contact spin, grows with proximity
+  var APPROACH = 9.0;                                        // how far below a crystal it starts powering up
+  var ELECTRIC_BASE = 0.10;                                  // faint base electric shine on each crystal
+  var PROX_GLOW = 0.7;                                       // glow gained as the beam approaches (pre-contact)
+  var OWN_MAX = 1.3, OWN_BASE = 0.45, OWN_COOL = 0.05;       // crystal's own light: flash bright → cool to base
+  // Product-wheel spin at full: BOTTOM crystal (nearest) spins much faster than the TOP one.
+  var FLOOR_SPIN_BOTTOM = 0.40, FLOOR_SPIN_TOP = 0.08;
+  var NCH = crystalChain.length;
+  var nowT = performance.now()*0.001;
+  var brightSum = 0, reachedCount = 0;
+  for(var i=0;i<crystalChain.length;i++){
+    var n=crystalChain[i];
+    // ── Proximity ── 0 when the beam tip is APPROACH below the crystal, 1 at/after it. This is
+    // what powers the crystal up THROUGH PROXIMITY: it glows + starts spinning before contact.
+    var prox = Math.max(0, Math.min((tipY - (n.localY - APPROACH)) / APPROACH, 1));
+    n.prox = prox;
+    // ── Contact ── the moment the beam reaches the crystal: it emits its OWN light, instantly
+    // bright (OWN_MAX), and the main crystal flares + holds.
+    if(!n.reached && tipY >= n.localY){
+      n.reached=true; n.ownLight = OWN_MAX; mainHoldT = MAIN_HOLD;
+      if(i===topIdx) enterGameMode();                        // top crystal → start the game
+    }
+    if(n.reached) reachedCount++;
+    // Own light cools toward a steady base after contact (instant-bright → ~1s cool-down).
+    var ownTarget = n.reached ? OWN_BASE : 0;
+    n.ownLight += (ownTarget - n.ownLight) * OWN_COOL;
+    // Spin: eases toward a small proximity-driven pre-spin, then to full speed after contact.
+    var spinTarget = n.reached ? SPIN_MAX : prox*PRE_SPIN;
+    n.spin += (spinTarget - n.spin) * 0.045;
+    if(n.mesh){ n.mesh.rotation.y += n.spin; n.mesh.rotation.x += n.spin*0.5; }
+    // ── Crystal light ── base electric shine + proximity glow + its own emitted light, with an
+    // electric flicker. Brightens blue→white-hot as it powers up. Re-applied every frame (the
+    // per-floor brightness code resets idle crystals; this runs during the gallery floor, last).
+    var L = ELECTRIC_BASE + prox*PROX_GLOW + n.ownLight;
+    if(n.mat){
+      var shimmer = 0.82 + 0.18*Math.sin(nowT*34.0 + n.localY*6.3);
+      n.mat.emissive.setRGB(0.30 + L*0.45, 0.50 + L*0.42, 1.0);
+      n.mat.emissiveIntensity = L * 8.0 * shimmer;
+    }
+    // Product panels spin up with the crystal (proximity pre-spin → fast after contact), in the
+    // wheel's idle direction, bottom-faster gradient. Centre star re-countered so it stays put.
+    var t = n.spin/SPIN_MAX;
+    var fg = n.floor.group, fdir = (fg.userData.rotationSpeed < 0) ? -1 : 1;
+    var frac = (NCH>1) ? i/(NCH-1) : 0;
+    var nodeSpinMax = FLOOR_SPIN_BOTTOM + (FLOOR_SPIN_TOP - FLOOR_SPIN_BOTTOM)*frac;
+    fg.rotation.y += t * nodeSpinMax * fdir;
+    if(fg.userData.centerStar) fg.userData.centerStar.rotation.y = -fg.rotation.y;
+    // ── Electric shine shaft ── an electric beam of light from the crystal that GROWS in size
+    // and strength as the beam approaches (prox²), then flares on contact (ownLight) and settles
+    // into the crystal's own steady emission. This is the "connection of energy" reaching out.
+    if(n.sunray){
+      var sunI = prox*prox*0.55 + n.ownLight*0.9;
+      if(sunI > 0.02){
+        n.sunray.visible=true;
+        n.mesh.getWorldPosition(_srPos);
+        n.sunray.position.copy(_srPos);
+        n.sunray.rotation.set(0, Math.atan2(camera.position.x-_srPos.x, camera.position.z-_srPos.z), 0);
+        var grow = 0.35 + Math.min(sunI,1.6)*0.55;          // shaft grows as it strengthens
+        n.sunray.scale.set(SUNRAY_WIDTH*grow, SUNRAY_HEIGHT*grow, 1);
+        n.sunray.material.uniforms.uIntensity.value = sunI;
+        n.sunray.material.uniforms.uTime.value = nowT;
+      } else n.sunray.visible=false;
+    }
+    brightSum += prox*0.35 + n.ownLight*0.5;                  // screen lights up via approach + emission
+  }
+  crystalScreenBright = Math.min(brightSum / crystalChain.length, 1.0);
+  // ── Main-crystal power ── each new crystal makes the light JUMP to full power and HOLD there
+  // for ~1s (mainHoldT), then it settles down to a new, higher baseline that ratchets with the
+  // crystals mined. The 5% base eases in over the early climb so the crystal is dim until mining.
+  mainHoldT = Math.max(0, mainHoldT - dt);
+  var startGate = Math.min(Math.max((beamClimb||0)/0.2, 0), 1);
+  var mpBase = MAIN_BASE*startGate + reachedCount*MAIN_STEP;
+  if(mainHoldT > 0){ mainPower = MAIN_MAX; }                  // held at full power for the hold window
+  else { mainPower += (mpBase - mainPower) * 0.10; if(mainPower < mpBase) mainPower = mpBase; }
+  mainFlash = Math.max(0, mainPower - mpBase);                // power above baseline → beam surge
+}
+
 // ══════════════════════════════════════════════
 // UPDATE ORBS (merged: 3-stage brightness + curve deformation + beam particles)
 // ══════════════════════════════════════════════
@@ -2652,12 +2868,17 @@ function updateOrbs(dt){
     var instantRPM=deltaAngle*60*60/(2*Math.PI);
     ud.rpmSmooth+=(instantRPM-(ud.rpmSmooth||0))*0.1;
     var rpm=ud.rpmSmooth||0;
-    var rpmNorm=Math.min(rpm/200,1);
+    var rpmNorm=Math.min(rpm/200,1);            // beam/streak/planets
+    // Extended crescendo normalization — drives the brightness→black build (darkness comes on
+    // fast). The whiteout/climax is now driven instead by the BEAM CLIMB (below), which reaches
+    // the top crystal at BEAM_TOP_RPM — half the old rate.
+    var seqNorm=Math.min(rpm/SEQ_MAXRPM,1);
+    var beamClimb=Math.min(rpm/BEAM_TOP_RPM,1);   // 0 → 1 as the beam tip climbs to the top crystal
     globalRpm = rpm;
 
-    // Mini game charge — spin the bottom wheel + hold the spin to commit
+    // Mini game charge — spin the wheel up past the (now much higher) whiteout RPM + hold to commit
     // (must run BEFORE rpm is forced to 0 below, or the charge would never fill)
-    updateGameCharge(rpmNorm);
+    updateGameCharge(seqNorm);
 
     // While the mini-game owns the screen, force RPM-driven effects to their off state.
     // The wheel still spins passively (rotationSpeed unchanged), orbs still orbit, but
@@ -2669,35 +2890,54 @@ function updateOrbs(dt){
       ud.lastAngle = currentAngle;
       rpm = 0;
       rpmNorm = 0;
+      seqNorm = 0;
       globalRpm = 0;
     }
 
-    // Three-stage brightness
-    var stage1 = Math.min(rpmNorm / 0.5, 1.0); stage1 = stage1 * stage1;
-    var stage2 = Math.max(Math.min((rpmNorm - 0.5) / 0.35, 1.0), 0.0);
-    var stage3 = Math.max((rpmNorm - 0.85) / 0.15, 0.0);
+    // Three-stage crescendo (driven by the EXTENDED seqNorm): brightness ramp → the screen
+    // goes black and HOLDS through the long plateau between SEQ_DARK_HI and SEQ_WHITE_LO →
+    // the crystal's light whites-out the screen at very high rpm.
+    var stage1 = Math.min(seqNorm / SEQ_BRIGHT, 1.0); stage1 = stage1 * stage1;
+    var stage2 = Math.max(Math.min((seqNorm - SEQ_DARK_LO) / (SEQ_DARK_HI - SEQ_DARK_LO), 1.0), 0.0);
+    // Whiteout/climax follows the BEAM CLIMB now: ramps over the last 15% before the top crystal,
+    // peaking exactly as the beam reaches it (= game start).
+    var stage3 = Math.max(Math.min((beamClimb - 0.85) / 0.15, 1.0), 0.0);
 
-    // Center star glow — 3-stage
+    // Center star glow. For the GALLERY main crystal the emissive is driven by mainPower (the
+    // stepped, pulsing power level that ratchets up as the beam mines each crystal) plus the
+    // stage3 whiteout blaze at the very top — so it starts dim and steps up. Other floors keep
+    // their (idle) stage-based glow.
     var star=ud.centerStar;
+    var isGal = (fl===gameMode.galleryFloor);
     if(star&&star.children[0]&&star.children[0].material){
       var sm=star.children[0].material;
       sm.emissive=sm.emissive||new THREE.Color(0x334466);
-      var eR = 0.2 + stage1*0.3 + stage2*0.3 + stage3*2.5;
-      var eG = 0.15 + stage1*0.25 + stage2*0.5 + stage3*2.5;
-      var eB = 0.15 + stage1*0.2 + stage2*0.9 + stage3*2.5;
+      var eR,eG,eB,eInt;
+      if(isGal){
+        var mp = mainPower;
+        eR = 0.2 + mp*1.6 + stage3*2.5;
+        eG = 0.15 + mp*2.0 + stage3*2.5;
+        eB = 0.15 + mp*2.8 + stage3*2.5;
+        eInt = 0.3 + mp*16.0 + stage3*30.0;
+      } else {
+        eR = 0.2 + stage1*0.3 + stage2*0.3 + stage3*2.5;
+        eG = 0.15 + stage1*0.25 + stage2*0.5 + stage3*2.5;
+        eB = 0.15 + stage1*0.2 + stage2*0.9 + stage3*2.5;
+        eInt = 0.3 + stage1*2.0 + stage2*5.0 + stage3*30.0;
+      }
       sm.emissive.setRGB(eR, eG, eB);
-      sm.emissiveIntensity = 0.3 + stage1*2.0 + stage2*5.0 + stage3*30.0;
+      sm.emissiveIntensity = eInt;
       var baseR = 0.6 + stage2*0.15 + stage3*0.25;
       var baseG = 0.6 + stage2*0.3 + stage3*0.1;
       var baseB = 0.7 + stage2*0.3 + stage3*0.0;
       sm.color.setRGB(baseR, baseG, baseB);
     }
-    if(ud.centerLight){
-      ud.centerLight.intensity = 0.2 + stage1*2.0 + stage2*6.0 + stage3*40.0;
-      ud.centerLight.distance = 20 + stage1*15 + stage2*40 + stage3*120;
-      var lcR = 0.53 + stage2*0.1 + stage3*0.37;
-      var lcG = 0.67 + stage2*0.15 + stage3*0.18;
-      var lcB = 0.93 + stage2*0.07 + stage3*0.0;
+    if(ud.centerLight){   // only the gallery crystal has a centre light → drive it from mainPower
+      ud.centerLight.intensity = 0.2 + mainPower*13.0 + stage3*40.0;
+      ud.centerLight.distance = 20 + mainPower*55 + stage3*120;
+      var lcR = 0.53 + stage3*0.37;
+      var lcG = 0.67 + stage3*0.18;
+      var lcB = 0.93;
       ud.centerLight.color.setRGB(lcR, lcG, lcB);
     }
 
@@ -2711,25 +2951,34 @@ function updateOrbs(dt){
     var bgBase = 0xf0f0f5;
     var bgR2 = ((bgBase>>16)&0xff)/255, bgG2 = ((bgBase>>8)&0xff)/255, bgB2 = (bgBase&0xff)/255;
     var darkT = stage2;
-    var tR2 = bgR2 * (1 - darkT*0.92);
-    var tG2 = bgG2 * (1 - darkT*0.93);
-    var tB2 = bgB2 * (1 - darkT*0.90);
+    var tR2 = bgR2 * (1 - darkT*0.96);
+    var tG2 = bgG2 * (1 - darkT*0.97);
+    var tB2 = bgB2 * (1 - darkT*0.95);
+    // Stage 3: the spinning crystals light the screen back UP out of the dark — the more crystals
+    // reach super-fast spin (crystalScreenBright → 1), the brighter the backdrop glows.
+    var cb = crystalScreenBright;
+    tR2 += (0.78 - tR2) * cb;
+    tG2 += (0.82 - tG2) * cb;
+    tB2 += (1.00 - tB2) * cb;
     scene.background.setRGB(tR2, tG2, tB2);
     scene.fog.color.setRGB(tR2, tG2, tB2);
 
     // Whiteout overlay — only stage 3
     if(postQuad && postQuad.material.uniforms.whiteout){
       postQuad.material.uniforms.whiteout.value = stage3 * stage3;
-      postQuad.material.uniforms.shakeAmount.value = stage2 * 0.02 + stage3 * 0.04;
+      // Screen shake — holds off until the climb is underway (~rpm 115), then builds with the
+      // climb, peaking near the top. Starts later and tops out a touch lower than before.
+      postQuad.material.uniforms.shakeAmount.value = Math.max(0.0, beamClimb - 0.12) * 0.11;
       postQuad.material.uniforms.shakeTime.value = time * 60.0;
     }
 
     // God rays
     godrayIntensity = stage1 * 0.4 + stage2 * 1.8 + stage3 * 1.0;
 
-    // Light rays
-    updateLightRays(rpmNorm, time);
-    updateLensFlare(rpmNorm);
+    // Light rays ride the crescendo; the lens flare is bound to the MAIN crystal's light value
+    // (mainPower) so it blooms with each power pulse, plus the stage3 whiteout climax.
+    updateLightRays(seqNorm, time);
+    if(fl===gameMode.galleryFloor) updateLensFlare(mainPower, stage3);
 
     // Smoothed RPM for planets
     smoothedRpmForPlanets += (rpmNorm - smoothedRpmForPlanets) * 0.02;
@@ -2737,27 +2986,39 @@ function updateOrbs(dt){
     // ── BEAM PARTICLE SYSTEM ──
     var B=ud.beam;
     if(B){
-      var se=B.sectionEnergy, st=B.sectionSpawnTimer, ns=B.numSections, sh=B.sectionH;
-      for(var si=0;si<ns;si++) se[si]=rpmNorm;
-      var BASE_PARTICLES=1000;
-      var MAX_EXTRA=12000;
+      // ── FOUNTAIN JET ── particles blast out of the base "nozzle" (the spawn point) like
+      // water from a hose: launched UP with a spread, gravity arcs them back down, and they
+      // recycle. Power (count), speed (launch velocity) and reach all grow with RPM, so the
+      // jet climbs from a small base bubble at rest to a full column-height blast at max spin.
+      var BASE_PARTICLES=300;     // resting jet is a small bubble at the base
+      var MAX_EXTRA=13000;        // full spin → a powerful, tall stream
       var targetCount=Math.min(B.maxP, Math.floor(BASE_PARTICLES+rpmNorm*MAX_EXTRA));
+      // ── Stage 1: the beam TIP climbs with the spin ── its height tracks beamClimb (rpm /
+      // BEAM_TOP_RPM), so it grows from a base bubble to the full column at HALF the old rate,
+      // passing each stacked crystal in turn and reaching the top crystal at BEAM_TOP_RPM.
+      // Particles are capped at this tip, so the visible top == beamTipY (what the chain keys off).
+      var beamTipY = Math.max(0.4, beamClimb * B.beamHeight);
       var aliveCount=0;
       for(var ci=0;ci<B.maxP;ci++){if(B.alive[ci])aliveCount++;}
       if(aliveCount<targetCount){
-        var toSpawn=Math.min(targetCount-aliveCount, 40);
+        // Emit faster when there's more power behind the jet (snappier blast at high RPM).
+        var toSpawn=Math.min(targetCount-aliveCount, Math.floor(30+rpmNorm*140));
         for(var sp3=0;sp3<toSpawn;sp3++){
-          var totalE=0;
-          for(var sei=0;sei<ns;sei++) totalE+=se[sei];
-          var pick=Math.random()*Math.max(totalE,0.01);
-          var si3=0, acc=0;
-          for(si3=0;si3<ns;si3++){acc+=se[si3];if(acc>=pick)break;}
-          if(si3>=ns) si3=Math.floor(Math.random()*ns);
           for(var fp=0;fp<B.maxP;fp++){
             if(!B.alive[fp]){
               B.alive[fp]=1; B.section[fp]=0;
-              B.pos[fp*3]=0; B.pos[fp*3+1]=Math.random()*B.beamHeight; B.pos[fp*3+2]=0;
-              B.alpha[fp]=0.8; break;
+              // Tight cluster right at the nozzle
+              B.pos[fp*3]   = (Math.random()-0.5)*0.08;
+              B.pos[fp*3+1] = Math.random()*0.15;
+              B.pos[fp*3+2] = 0;
+              // Upward launch speed scales with the climb so particles reach the climbing tip.
+              // ~14% of particles "fly out" sideways (escaping droplets) with a wider kick.
+              var jet = 0.14 + beamClimb*2.4;
+              var fly = Math.random() < 0.14;
+              B.vel[fp*3]   = (Math.random()-0.5) * (fly ? (0.18+rpmNorm*0.40) : (0.04+rpmNorm*0.12));
+              B.vel[fp*3+1] = jet * (0.75+Math.random()*0.5) * (fly?0.55:1.0);
+              B.vel[fp*3+2] = 0;
+              B.alpha[fp]=0.85; break;
             }
           }
         }
@@ -2772,30 +3033,43 @@ function updateOrbs(dt){
           }
         }
       }
+      var GRAV=0.011;                       // pulls the fountain back down into its arc
       for(var pi=0;pi<B.maxP;pi++){
         if(!B.alive[pi]) continue;
-        var px=B.pos[pi*3], py3=B.pos[pi*3+1];
-        var vx=B.vel[pi*3], vy=B.vel[pi*3+1];
-        if(vx===0&&vy===0&&B.vel[pi*3+2]===0){
-          var spawnKick=0.1+rpmNorm*0.4;
-          B.vel[pi*3]=(Math.random()-0.5)*spawnKick;
-          B.vel[pi*3+1]=0.01+rpmNorm*0.04+Math.random()*0.02;
-        }
-        B.vel[pi*3]-=px*0.006;
-        var upRPM=Math.max(0,rpmNorm-0.5);
-        B.vel[pi*3+1]+=upRPM*upRPM*0.003;
-        var jitScale=0.006+rpmNorm*0.02;
-        B.vel[pi*3]+=(Math.random()-0.5)*jitScale;
-        B.vel[pi*3+1]+=(Math.random()-0.5)*jitScale*0.7;
-        var absX=Math.abs(B.pos[pi*3]);
-        var stickiness=absX<0.15 ? 0.88 : (absX<0.4 ? 0.94 : 0.99);
-        B.vel[pi*3]*=stickiness; B.vel[pi*3+1]*=stickiness;
-        B.pos[pi*3]+=B.vel[pi*3]; B.pos[pi*3+1]+=B.vel[pi*3+1];
+        var px=B.pos[pi*3];
+        // Gravity → ballistic arc (the launch velocity was set at spawn time).
+        B.vel[pi*3+1]-=GRAV;
+        // Cohesion toward the central axis — pulls inward MUCH harder near the TIP so the
+        // column narrows and comes to a point instead of a flat cap (adaptive thickness:
+        // wide/thick at the base, tapering to a point at the top).
+        var hf = B.pos[pi*3+1]/Math.max(beamTipY,1.0);   // 0 base → 1 tip
+        B.vel[pi*3]-=px*(0.012 + hf*hf*0.11);
+        // Turbulence — churns harder as RPM climbs, for an energetic fluid surface.
+        var turb=0.004+rpmNorm*0.03;
+        B.vel[pi*3]  +=(Math.random()-0.5)*turb;
+        B.vel[pi*3+1]+=(Math.random()-0.5)*turb*0.6;
+        // Fluid drag.
+        B.vel[pi*3]  *=0.985;
+        B.vel[pi*3+1]*=0.992;
+        // Integrate (kept in the camera-facing X/Y plane — Z stays 0 like before).
+        B.pos[pi*3]  +=B.vel[pi*3];
+        B.pos[pi*3+1]+=B.vel[pi*3+1];
         B.pos[pi*3+2]=0; B.vel[pi*3+2]=0;
-        if(B.pos[pi*3+1]<0){B.pos[pi*3+1]=0;B.vel[pi*3+1]*=-0.5;}
-        if(B.pos[pi*3+1]>B.beamHeight){B.pos[pi*3+1]=0;B.vel[pi*3+1]*=0.3;B.pos[pi*3]=0;}
+        // Recycle: fell back below the nozzle, or blasted past the climbing TIP — return to the
+        // pool so it re-emits from the base. Capping at beamTipY makes the visible top track the
+        // spin exactly (so it reaches each crystal right when the chain logic says it does).
+        if(B.pos[pi*3+1]<0 || B.pos[pi*3+1]>beamTipY){
+          B.alive[pi]=0; B.alpha[pi]=0;
+          B.pos[pi*3]=0; B.pos[pi*3+1]=0; B.pos[pi*3+2]=0;
+          B.vel[pi*3]=0; B.vel[pi*3+1]=0; B.vel[pi*3+2]=0;
+          continue;
+        }
+        // Brightest at the dense core/base; tapers out over the top ~25% so the beam dissolves
+        // to a soft point at the tip rather than a hard flat cap.
         var distFromCenter=Math.abs(B.pos[pi*3]);
-        B.alpha[pi]=Math.max(0.02, 0.9/(1+distFromCenter*distFromCenter*1.2));
+        var tipFade = hf<0.75 ? 1.0 : Math.max(0.0, 1.0-(hf-0.75)/0.25);
+        var heightFade=(1.0 - hf*0.30) * tipFade;
+        B.alpha[pi]=Math.max(0.0, (0.95/(1+distFromCenter*distFromCenter*1.4))*heightFade);
       }
       for(var ri=0;ri<B.maxP;ri+=2){
         if(!B.alive[ri]) continue;
@@ -2812,7 +3086,7 @@ function updateOrbs(dt){
       }
       var BO=ud.bonds;
       if(BO){
-        var BOND_FORM_DIST=0.6, BOND_BREAK_DIST=1.5;
+        var BOND_FORM_DIST=0.72, BOND_BREAK_DIST=1.6, BOND_MAX_PER=5;   // denser, stringier web
         var BOND_FORM_DIST2=BOND_FORM_DIST*BOND_FORM_DIST, BOND_BREAK_DIST2=BOND_BREAK_DIST*BOND_BREAK_DIST;
         for(var bc=0;bc<B.maxP;bc++) BO.particleBondCount[bc]=0;
         for(var bi2=0;bi2<BO.data.length;bi2++){ BO.particleBondCount[BO.data[bi2].a]++; BO.particleBondCount[BO.data[bi2].b]++; }
@@ -2823,13 +3097,13 @@ function updateOrbs(dt){
           if(bddx*bddx+bddy*bddy>BOND_BREAK_DIST2){BO.data.splice(bi3,1);}
         }
         if(BO.data.length<BO.maxBonds){
-          var formsPerFrame=Math.min(50, BO.maxBonds-BO.data.length);
+          var formsPerFrame=Math.min(90, BO.maxBonds-BO.data.length);
           for(var fi2=0;fi2<formsPerFrame;fi2++){
             var pa2=Math.floor(Math.random()*B.maxP);
-            if(!B.alive[pa2]||BO.particleBondCount[pa2]>=3) continue;
+            if(!B.alive[pa2]||BO.particleBondCount[pa2]>=BOND_MAX_PER) continue;
             for(var pn=1;pn<20;pn++){
               var pb2=(pa2+pn)%B.maxP;
-              if(!B.alive[pb2]||pb2===pa2||BO.particleBondCount[pb2]>=3) continue;
+              if(!B.alive[pb2]||pb2===pa2||BO.particleBondCount[pb2]>=BOND_MAX_PER) continue;
               var fdx=B.pos[pa2*3]-B.pos[pb2*3]; var fdy=B.pos[pa2*3+1]-B.pos[pb2*3+1];
               var fd2=fdx*fdx+fdy*fdy;
               if(fd2<BOND_FORM_DIST2&&fd2>0.001){
@@ -2880,6 +3154,9 @@ function updateOrbs(dt){
       if(BO) BO.mat.uniforms.uRPM.value=rpmNorm;
       B.geo.attributes.position.needsUpdate=true; B.geo.attributes.alpha.needsUpdate=true;
       B.geo.attributes.density.needsUpdate=true; B.geo.attributes.centerDist.needsUpdate=true;
+      // ── Stage 1-3: the gallery beam climbing past the stacked crystals (+ their ignite/spin) ──
+      if(fl===gameMode.galleryFloor) updateCrystalChain(beamTipY, seqNorm, dt, beamClimb);
+      B.mat.uniforms.uFlash.value = (fl===gameMode.galleryFloor) ? mainFlash : 0.0;
     }
 
     // Wobbly orbit tilt
@@ -3842,7 +4119,7 @@ function pDown(cx,cy){
     while(obj.parent){if(obj.userData.label)break;obj=obj.parent;}
     if(obj.userData.label){
       var fd=floors.find(function(f){return f.group===obj;});
-      if(fd){var fi=floors.indexOf(fd);if(!introAnim.revealed[fi]&&!introAnim.animating[fi])introAnim.animating[fi]=true;isDragging=true;selectedFloor=fd;previousMouseX=cx;previousTime=performance.now();selectedFloor.group.userData.inputVel=0;renderer.domElement.parentElement.classList.add('dragging');}
+      if(fd){var fi=floors.indexOf(fd);if(!introAnim.revealed[fi]&&!introAnim.animating[fi])introAnim.animating[fi]=true;isDragging=true;selectedFloor=fd;previousMouseX=cx;previousTime=performance.now();selectedFloor.group.userData.inputVel=0;floorDragHist=[{x:cx,t:performance.now()}];renderer.domElement.parentElement.classList.add('dragging');}
     }
   }
 }
@@ -3891,11 +4168,23 @@ function pMove(cx,cy){
   }
   if(isDragging&&dm.draggingVW){var dy=cy-previousMouseY;if(Math.abs(dy)>0.5){var directVW=dy*0.002;dm.vWheel.rotation.x+=directVW;dm.vwVel=directVW*0.5;}previousMouseY=cy;previousTime=performance.now();return;}
   if(isDragging&&selectedFloor){
-    var dx=cx-previousMouseX;var dt2=(performance.now()-previousTime)||1;
-    // Compute what the user's finger/mouse velocity is in rotation units
-    var inputVel=dx/dt2*0.04;
+    var nowT=performance.now();
+    // ── Windowed swipe velocity ── measure finger speed over the last ~60ms of motion rather
+    // than the noisy delta since the previous event. A single move-pair landing sub-ms apart
+    // would otherwise read as a huge velocity (instant max RPM), while a sparse pair reads as
+    // near-zero (barely moves) — that timing jitter is exactly the inconsistency. Averaging
+    // over a fixed time window makes the same physical swipe register the same every time.
+    floorDragHist.push({x:cx,t:nowT});
+    while(floorDragHist.length>1 && nowT-floorDragHist[0].t>60) floorDragHist.shift();
+    var f0=floorDragHist[0];
+    var wdt=Math.max(nowT-f0.t, 12);   // floor the window so a fresh drag can't divide by ~0
+    var wdx=cx-f0.x;
+    var inputVel=wdx/wdt*0.04;
+    inputVel=Math.max(-3.0,Math.min(3.0,inputVel));   // safety clamp against any residual spike
+    // (The gallery/crystal wheel builds RPM by ACCUMULATING momentum in the physics loop — see
+    // GALLERY_ACCEL — so no swipe-speed scaling is applied here.)
     selectedFloor.group.userData.inputVel=inputVel;
-    previousMouseX=cx;previousTime=performance.now();
+    previousMouseX=cx;previousTime=nowT;
     return;
   }
   // Not dragging — update cursor based on what's under mouse
@@ -11942,22 +12231,13 @@ function buildGameMode() {
   scene.add(g);
 }
 
-function updateGameCharge(rpmNorm) {
-  if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
-  // Don't engage while another overlay is active — display mode, product detail, image lightbox
-  if(dm.active || dm.animating || dm.closing) return;
-  if(pdv.active || pdv.entering || pdv.exitingToDM) return;
-  if(imgLightbox.active || imgLightbox.entering || imgLightbox.exiting) return;
-  if(rpmNorm > gameMode.chargeRpmThreshold) {
-    gameMode.chargeProg = Math.min(1, gameMode.chargeProg + gameMode.chargeFillRate);
-  } else {
-    gameMode.chargeProg = Math.max(0, gameMode.chargeProg - gameMode.chargeDecayRate);
-  }
-  if(gameMode.chargeProg >= 1) enterGameMode();
-}
+// Game entry is now triggered by the beam reaching the TOP crystal (see updateCrystalChain),
+// not by holding a high RPM. This legacy charge function is left as a no-op.
+function updateGameCharge(rpmNorm) { return; }
 
 function enterGameMode() {
   if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
+  if(PORTAL_TEST_MODE){ enterPortalTestMode(); return; }   // TEMP: jump straight into the flat portal sandbox
   if(!gameMode.group) buildGameMode();
   // Two-stage entry: first the wheel rapidly decelerates from its current burst velocity,
   // THEN the camera dives in. Without this pre-decel, the wheel would either snap to a
@@ -11985,6 +12265,15 @@ function enterGameMode() {
   // Use the crystal mesh's ACTUAL world position (the centerStar sits ~1.5 below the floor
   // origin), not the floor Y — otherwise the radial ray + grip fallback aim at the wrong point.
   if(gameMode.surface.crystal){
+    // Lock the crystal so the carved hole faces STRAIGHT UP (+Y) for the whole game, regardless of
+    // how the wheel was spun before entry. holeUpQuat is the crystal's fixed world orientation; the
+    // per-frame floor loop re-applies it (countering the floor's Y spin) so it never drifts.
+    var holeDirLocal = new THREE.Vector3(-1, 1, 1).normalize();
+    gameMode.portal.holeUpQuat = new THREE.Quaternion().setFromUnitVectors(holeDirLocal, new THREE.Vector3(0, 1, 0));
+    gf.group.updateMatrixWorld(true);
+    gameMode.surface.crystal.quaternion.copy(
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), -gf.group.rotation.y).multiply(gameMode.portal.holeUpQuat)
+    );
     gameMode.surface.crystal.updateMatrixWorld(true);
     gameMode.surface.crystal.getWorldPosition(gameMode.surface.center);
   } else {
@@ -12269,6 +12558,26 @@ function raycastShipToSurface(probePos, crystalGroupOpt, centerOpt) {
 // inside the tube volume, grip the tube WALL analytically: clamp the distance-to-axis and
 // point the ground normal toward the axis (driving the inside of a pipe). Pure math — no
 // raycast can miss. Returns {target, normal, axial} when inside the tube, else null.
+// When GROUNDED near the carved hole, bridge across the opening: keep the ship on the outer
+// surface (face normal = holeDir) and skim over the hole instead of a grip pulling it into the
+// tube and flipping it inside. You ENTER the hole by FLYING in (airborne — the grounded grip
+// doesn't run then). Returns {normal} when over the hole on the outer side, else null.
+var _bridgeInv = new THREE.Matrix4(), _bridgeLp = new THREE.Vector3(), _bridgePerp = new THREE.Vector3();
+function crystalHoleBridge(probePos){
+  var P = gameMode.portal;
+  if(!P || !P.built || !P.crystal || P.hallMouth == null) return null;
+  var cs = P.crystal; cs.updateMatrixWorld(true);
+  _bridgeInv.copy(cs.matrixWorld).invert();
+  _bridgeLp.copy(probePos).applyMatrix4(_bridgeInv);
+  var axial = _bridgeLp.dot(P.holeDir);
+  _bridgePerp.copy(_bridgeLp).addScaledVector(P.holeDir, -axial);
+  if(_bridgePerp.length() > P.tubeR * 1.3) return null;        // not over the hole bore
+  if(axial < P.axialFloor - 0.05) return null;                 // below the floor / opposite side of the crystal
+  var man = Math.abs(_bridgeLp.x) + Math.abs(_bridgeLp.y) + Math.abs(_bridgeLp.z);
+  if(man < 0.6) return null;                                   // deep inside the tube (flew in) — don't bridge
+  return { normal: P.holeDir.clone().transformDirection(cs.matrixWorld).normalize() };
+}
+
 function hallwayTubeGrip(probePos){
   var P = gameMode.portal;
   if(!P || !P.built || !P.crystal || !P.holeFloorCenter || P.hallMouth == null) return null;
@@ -12280,13 +12589,13 @@ function hallwayTubeGrip(probePos){
   var axial = rel.dot(aHat);
   var perp = rel.clone().addScaledVector(aHat, -axial);
   var perpDist = perp.length();
-  // Inside the tube? Near the axis (perp small) AND axially within the carved span. On a flat
-  // face the ship is far from the hole axis in perp terms, so this cleanly excludes it.
-  if(perpDist > P.tubeR * 2.2) return null;
-  if(axial > P.hallMouth + 0.05) return null;            // out past the mouth → hand off to face grip
-  // The floor is a SOLID CAP (clamped below), so keep gripping even if a fast frame pushes the
-  // ship a little past it — the clamp snaps it right back. A generous margin prevents escape.
-  if(axial < P.axialFloor - 0.25) return null;
+  // Tight to the actual bore (just past the wall radius). This is the whole fix for the
+  // "flip to the inside" bug: the OLD threshold (tubeR*2.2 ≈ 0.57) reached out across the wide
+  // outer face around the hole and yanked the ship off it, flipping it inward. The bore is only
+  // ~tubeR; anything wider is solid face and is handled by the normal surface grip.
+  if(perpDist > P.tubeR * 1.05) return null;
+  if(axial > P.hallMouth + 0.03) return null;            // out past the mouth → hand off to face grip
+  if(axial < P.axialFloor - 0.25) return null;           // solid floor cap (clamped below)
   var hover = gameMode.surfaceState.hoverHeight;
   // perp direction (outward from the axis); guard the on-axis degenerate case
   var perpHat;
@@ -12305,6 +12614,80 @@ function hallwayTubeGrip(probePos){
            aHat: aHat, C: C, axialFloor: P.axialFloor }; // frame for the hard floor clamp
 }
 
+// ── Closest point on a triangle (Ericson, Real-Time Collision Detection) ──
+var _cpAB=new THREE.Vector3(),_cpAC=new THREE.Vector3(),_cpAP=new THREE.Vector3(),
+    _cpBP=new THREE.Vector3(),_cpCP=new THREE.Vector3(),_cpE=new THREE.Vector3();
+function closestPtTri(p,a,b,c,out){
+  _cpAB.subVectors(b,a); _cpAC.subVectors(c,a); _cpAP.subVectors(p,a);
+  var d1=_cpAB.dot(_cpAP), d2=_cpAC.dot(_cpAP);
+  if(d1<=0&&d2<=0){ out.copy(a); return; }
+  _cpBP.subVectors(p,b); var d3=_cpAB.dot(_cpBP), d4=_cpAC.dot(_cpBP);
+  if(d3>=0&&d4<=d3){ out.copy(b); return; }
+  var vc=d1*d4-d3*d2;
+  if(vc<=0&&d1>=0&&d3<=0){ out.copy(a).addScaledVector(_cpAB, d1/(d1-d3)); return; }
+  _cpCP.subVectors(p,c); var d5=_cpAB.dot(_cpCP), d6=_cpAC.dot(_cpCP);
+  if(d6>=0&&d5<=d6){ out.copy(c); return; }
+  var vb=d5*d2-d1*d6;
+  if(vb<=0&&d2>=0&&d6<=0){ out.copy(a).addScaledVector(_cpAC, d2/(d2-d6)); return; }
+  var va=d3*d6-d5*d4;
+  if(va<=0&&(d4-d3)>=0&&(d5-d6)>=0){ _cpE.subVectors(c,b); out.copy(b).addScaledVector(_cpE,(d4-d3)/((d4-d3)+(d5-d6))); return; }
+  var denom=1/(va+vb+vc);
+  out.copy(a).addScaledVector(_cpAB, vb*denom).addScaledVector(_cpAC, vc*denom);
+}
+// Nearest point on the crystal mesh (outer faces AND carved hallway walls/floor) to `probePos`.
+// Returns {point, normal, dist} in world; normal points from the surface toward the ship (its
+// "up"). Robust for the carved shape: the nearest surface is the one directly under the ship, so
+// it can't grab the far inner side and flip you, and it walks the tunnel walls the same as the face.
+var _cpInv=new THREE.Matrix4(), _cpLp=new THREE.Vector3(), _cpTa=new THREE.Vector3(),
+    _cpTb=new THREE.Vector3(), _cpTc=new THREE.Vector3(), _cpOut=new THREE.Vector3(),
+    _cpBest=new THREE.Vector3(), _cpNL=new THREE.Vector3();
+function closestPointOnCrystal(probePos){
+  var grp = gameMode.surface.crystal || (gameMode.galleryFloor && gameMode.galleryFloor.group.userData.centerStar);
+  if(!grp) return null;
+  var mesh=null;
+  for(var i=0;i<grp.children.length;i++){ var c=grp.children[i];
+    if(c.geometry && (c.geometry.type==='OctahedronGeometry'||c.userData.isGameCrystal)){ mesh=c; break; } }
+  if(!mesh || !mesh.geometry.attributes.position) return null;
+  mesh.updateMatrixWorld(true);
+  _cpInv.copy(mesh.matrixWorld).invert();
+  _cpLp.copy(probePos).applyMatrix4(_cpInv);
+  var pos=mesh.geometry.attributes.position, bestD2=Infinity;
+  for(var t=0; t+2<pos.count; t+=3){
+    _cpTa.fromBufferAttribute(pos,t); _cpTb.fromBufferAttribute(pos,t+1); _cpTc.fromBufferAttribute(pos,t+2);
+    closestPtTri(_cpLp,_cpTa,_cpTb,_cpTc,_cpOut);
+    var d2=_cpLp.distanceToSquared(_cpOut);
+    if(d2<bestD2){ bestD2=d2; _cpBest.copy(_cpOut); }
+  }
+  if(bestD2===Infinity) return null;
+  _cpNL.subVectors(_cpLp,_cpBest);
+  if(_cpNL.lengthSq()<1e-10) _cpNL.copy(_cpLp);   // ship exactly on the surface → fall back to radial
+  _cpNL.normalize();
+  var point=_cpBest.clone().applyMatrix4(mesh.matrixWorld);
+  var normal=_cpNL.clone().transformDirection(mesh.matrixWorld).normalize();
+  return { point: point, normal: normal, dist: point.distanceTo(probePos) };
+}
+
+// Nearest point on a flat array of WORLD-space triangles (9 floats per tri). Returns shared temps
+// {point, normal, dist}; normal points from the surface toward the probe. Used for the dome chute,
+// whose triangles are the exact portal-image of the crystal tunnel walls.
+var _ctA=new THREE.Vector3(), _ctB=new THREE.Vector3(), _ctC=new THREE.Vector3(),
+    _ctOut=new THREE.Vector3(), _ctBest=new THREE.Vector3(), _ctN=new THREE.Vector3(),
+    _ctRet={point:_ctBest, normal:_ctN, dist:0};
+function closestPointOnTris(p, arr){
+  if(!arr || arr.length < 9) return null;
+  var bestD2=Infinity;
+  for(var i=0;i+8<arr.length;i+=9){
+    _ctA.set(arr[i],arr[i+1],arr[i+2]); _ctB.set(arr[i+3],arr[i+4],arr[i+5]); _ctC.set(arr[i+6],arr[i+7],arr[i+8]);
+    closestPtTri(p,_ctA,_ctB,_ctC,_ctOut);
+    var d2=p.distanceToSquared(_ctOut);
+    if(d2<bestD2){ bestD2=d2; _ctBest.copy(_ctOut); }
+  }
+  if(bestD2===Infinity) return null;
+  _ctN.subVectors(p,_ctBest); if(_ctN.lengthSq()<1e-10) _ctN.set(0,1,0); _ctN.normalize();
+  _ctRet.dist=Math.sqrt(bestD2);
+  return _ctRet;
+}
+
 function raycastGroundBelow(probePos, downDir, fwdDir, speed) {
   var crystalGroup = gameMode.surface.crystal ||
     (gameMode.galleryFloor && gameMode.galleryFloor.group.userData.centerStar);
@@ -12319,24 +12702,34 @@ function raycastGroundBelow(probePos, downDir, fwdDir, speed) {
   var maxDist = gameMode.surface.gripRange;       // long enough to drop into the hallway
   var savedFar = raycaster.far;
   var best = null, bestDist = Infinity, hits;
+  // The crystal mesh is DoubleSide (so the carved tunnel walls render), which means a ray can hit
+  // the FAR INNER surface across the hole. Only accept hits on the SHIP'S side of the centre so
+  // the grip can never stick to the inside of the crystal.
+  var ctr = gameMode.surface.center;
+  var sdx = probePos.x-ctr.x, sdy = probePos.y-ctr.y, sdz = probePos.z-ctr.z;
+  function nearestOuter(hh){
+    for(var qi=0; qi<hh.length; qi++){ var hp = hh[qi].point;
+      if((hp.x-ctr.x)*sdx + (hp.y-ctr.y)*sdy + (hp.z-ctr.z)*sdz > 0) return hh[qi]; }
+    return null;
+  }
   // Ray 1: straight down along the current ground normal
   raycaster.set(probePos, downDir); raycaster.far = maxDist;
-  hits = raycaster.intersectObject(crystalMesh, false);
-  if(hits.length){ best = hits[0]; bestDist = hits[0].distance; }
+  var h1 = nearestOuter(raycaster.intersectObject(crystalMesh, false));
+  if(h1){ best = h1; bestDist = h1.distance; }
   // Ray 2: forward-down probe (catches the floor dropping away ahead, e.g. the hallway lip)
   if(speed > 0.0004 && fwdDir && fwdDir.lengthSq() > 1e-6){
     var probeDir = fwdDir.clone().normalize().addScaledVector(downDir, 0.6).normalize();
     raycaster.set(probePos, probeDir); raycaster.far = maxDist;
-    hits = raycaster.intersectObject(crystalMesh, false);
-    if(hits.length && hits[0].distance < bestDist){ best = hits[0]; bestDist = hits[0].distance; }
+    var h2 = nearestOuter(raycaster.intersectObject(crystalMesh, false));
+    if(h2 && h2.distance < bestDist){ best = h2; bestDist = h2.distance; }
   }
   // Ray 3: toward the crystal centre (fallback over ridges/vertices)
   if(!best){
-    var toC = gameMode.surface.center.clone().sub(probePos);
+    var toC = ctr.clone().sub(probePos);
     if(toC.lengthSq() > 1e-6){
       raycaster.set(probePos, toC.normalize()); raycaster.far = maxDist + 0.5;
-      hits = raycaster.intersectObject(crystalMesh, false);
-      if(hits.length){ best = hits[0]; bestDist = hits[0].distance; }
+      var h3 = nearestOuter(raycaster.intersectObject(crystalMesh, false));
+      if(h3){ best = h3; bestDist = h3.distance; }
     }
   }
   raycaster.far = savedFar;
@@ -12896,43 +13289,26 @@ function updateGamePhysicsAndCamera() {
     // probe + centre fallback) and stick to whatever is beneath — NO gravity while grounded.
     // This grips the hallway floor as you drive in, instead of the radial ray pulling you to
     // the crystal centre. We only detach into free-fall when there's genuinely nothing below.
-    var downDir = s.groundNormal.clone().negate();
-    // Inside the carved hallway? Grip its wall analytically (robust tube collision) instead of
-    // raycasting the thin tris. This is what stops the ship falling through into the crystal.
-    var tube = hallwayTubeGrip(ship.position);
-    var hit = tube || raycastGroundBelow(ship.position, downDir, s.forward, Math.abs(s.speed));
-    if(tube) {
-      // Snap firmly to the tube wall (high lerp — the wall is exact, no overshoot risk).
-      s.groundNormal.lerp(tube.normal, 0.45).normalize();
-      ship.position.lerp(tube.target, 0.6);
-      // Hard floor cap: never let the ship sit below the modeled hallway floor, whatever the
-      // lerp spring does — this is what stops it driving down through into the crystal solid.
-      var axNow = ship.position.clone().sub(tube.C).dot(tube.aHat);
-      if(axNow < tube.axialFloor) ship.position.addScaledVector(tube.aHat, tube.axialFloor - axNow);
-      s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
-      if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
-      var vNt = fly.vel.dot(s.groundNormal);
-      if(vNt < 0) fly.vel.sub(s.groundNormal.clone().multiplyScalar(vNt));
-      fly.vel.multiplyScalar(0.85);
-    } else if(hit) {
+    // Closest-point-on-crystal grip: stick to the NEAREST surface — the outer octahedron face when
+    // you're out there, the triangular HALLWAY walls/floor once you've gone in. Robust for the
+    // carved shape: the nearest surface is whatever's directly under the ship, so it can never grab
+    // the far inner side and flip you, and you walk straight off the face down into the hallway.
+    var cp = closestPointOnCrystal(ship.position);
+    if(cp) {
       var normalSmooth = 0.18 + Math.min(0.20, Math.abs(s.speed) * 30);
-      s.groundNormal.lerp(hit.normal, normalSmooth).normalize();
-      // Lerp onto the surface so dropping into the hallway is a smooth grip, not a snap.
-      var target = hit.point.clone().addScaledVector(s.groundNormal, s.hoverHeight);
-      ship.position.lerp(target, 0.55);
+      s.groundNormal.lerp(cp.normal, normalSmooth).normalize();
+      var target = cp.point.clone().addScaledVector(s.groundNormal, s.hoverHeight);
+      ship.position.lerp(target, 0.5);
       s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
       if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
       var vN = fly.vel.dot(s.groundNormal);
       if(vN < 0) fly.vel.sub(s.groundNormal.clone().multiplyScalar(vN));
       fly.vel.multiplyScalar(0.85);
     } else {
-      // Nothing beneath within grip range → detach into free-fall (carry walking momentum).
-      s.airborne = true;
-      s.freeFalling = true;
-      s.airTime = 0;
+      // Crystal missing (shouldn't happen) → detach into free-fall (carry walking momentum).
+      s.airborne = true; s.freeFalling = true; s.airTime = 0;
       fly.vel.copy(s.forward).multiplyScalar(s.speed);
-      fly.vel.addScaledVector(s.groundNormal, 0.002);
-      s.speed = 0;
+      fly.vel.addScaledVector(s.groundNormal, 0.002); s.speed = 0;
     }
     }
   }
@@ -12967,15 +13343,18 @@ function updateGamePhysicsAndCamera() {
     }
     if(gravDist === Infinity) gravDist = ship.position.distanceTo(gravC);
 
-    // ── Gravity → fly.vel (stronger near surfaces, capped at the top) ──
+    // ── Gravity → fly.vel ──
+    // Matched to a JUMP's fall: same per-frame pull as the hop gravity, and the terminal speed capped
+    // just above the jump impulse — so a free fall feels exactly like falling back down from a jump,
+    // not the much faster plummet it used to be.
     var gravAlt = Math.max(gravDist - gravR, 0.01);
-    var gravStr = Math.min(0.0008 * (1 + 4 / gravAlt), 0.003);
+    var gravStr = p.jumpGravity;                 // same acceleration as a jump
     var gravDir = gravC.clone().sub(ship.position).normalize();
     fly.vel.addScaledVector(gravDir, gravStr);
 
-    // ── Air drag + fall-speed cap so one frame can't tunnel through ──
+    // ── Air drag + fall-speed cap (terminal velocity) ── jump-fall speed (≈ jump impulse), small margin
     fly.vel.multiplyScalar(0.992);
-    var maxAirVel = 0.08;
+    var maxAirVel = p.jumpImpulse * 1.15;
     if(fly.vel.length() > maxAirVel) fly.vel.setLength(maxAirVel);
 
     // ── Integrate ──
@@ -13088,9 +13467,14 @@ function updateGamePhysicsAndCamera() {
 
   // === Chase camera ===
   var chase = computeChaseCamPose();
-  camera.position.lerp(chase.pos, 0.18);
-  camera.up.lerp(chase.up, 0.12);
-  camera.up.normalize();
+  if(gameMode.portal.snapCam){
+    // first frame after a portal cross — snap straight to the chase pose so there's no roll/glide
+    camera.position.copy(chase.pos); camera.up.copy(chase.up).normalize();
+    gameMode.portal.snapCam = false;
+  } else {
+    camera.position.lerp(chase.pos, 0.18);
+    camera.up.lerp(chase.up, 0.12); camera.up.normalize();
+  }
   camera.lookAt(chase.lookAt);
 }
 
@@ -13168,9 +13552,14 @@ function updateFlightPhysicsAndCamera() {
     .add(localFwd.clone().multiplyScalar(-fly.camBackDist))
     .add(camLocalUp.clone().multiplyScalar(fly.camUpDist));
   var lookAt = ship.position.clone().add(camLocalUp.clone().multiplyScalar(0.04));
-  camera.position.lerp(camPos, 0.18);
-  camera.up.lerp(camLocalUp, 0.12);
-  camera.up.normalize();
+  if(gameMode.portal && gameMode.portal.snapCam){
+    // first frame after a portal cross while flying — snap so the view is continuous
+    camera.position.copy(camPos); camera.up.copy(camLocalUp).normalize();
+    gameMode.portal.snapCam = false;
+  } else {
+    camera.position.lerp(camPos, 0.18);
+    camera.up.lerp(camLocalUp, 0.12); camera.up.normalize();
+  }
   camera.lookAt(lookAt);
 }
 
@@ -13366,7 +13755,12 @@ function gameKeyDown(e) {
     // direction=+1 picks ship-local +X which maps to screen-left from the chase-cam view
     if(!e.repeat && gameMode.surfaceState.airborne) triggerBarrelRoll(1);
   }
-  else if(k === 's' || k === 'arrowdown') gameMode.keys.s = true;
+  else if(k === 's' || k === 'arrowdown') {
+    gameMode.keys.s = true;
+    // Airborne (hop or free-fall): S slams the ship down — same as the touch swipe-down.
+    // On the ground S stays reverse throttle (triggerSlam no-ops when not airborne).
+    if(!e.repeat && gameMode.active && !gameMode.fly.active && gameMode.surfaceState.airborne) triggerSlam();
+  }
   else if(k === 'd' || k === 'arrowright') {
     gameMode.keys.d = true;
     if(!e.repeat) gameMode.lastDTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -13418,7 +13812,6 @@ function gameKeyUp(e) {
 //          gravity pulls it toward the nearest planet, magnetic stick
 //          catches it when close enough to walk. No teleport.
 function toggleFlightMode() {
-  if(gameMode.portal && gameMode.portal.inside) return;  // P does nothing inside the portal
   if(!gameMode.fly.active) {
     // Surface → Fly: turn off gravity, keep current position + orientation.
     // User now controls thrust directly via WASD/Q/E/Space/Ctrl/Shift.
@@ -13548,7 +13941,7 @@ function portalSeamMat(rt){
 // ── Debug wireframe overlay (testing) ── set PORTAL_DEBUG_WIRE = false to restore the real
 // crystal/dome materials. When on, the crystal+hallway and the Region B dome/tunnel render as
 // semi-transparent faces with bright wireframe edges so every polygon is visible.
-var PORTAL_DEBUG_WIRE = true;
+var PORTAL_DEBUG_WIRE = false;   // overlay every crystal/dome polygon with a bright wireframe (debug)
 function applyDebugWire(root, faceColor, lineColor){
   // KEEP the real glass/mirror crystal material (don't replace it — replacing the material
   // type tripped the cube-camera/godray passes and froze the render). Instead overlay a
@@ -13654,11 +14047,7 @@ function buildPortal(){
     for(var i = 0; i < p.count; i++){ v.fromBufferAttribute(p, i); minR = Math.min(minR, v.length()); }
     for(var i = 0; i < p.count; i++){ v.fromBufferAttribute(p, i); if(v.length() < minR + 0.08){ acc.add(v); cnt++; } }
     P.holeFloorCenter = cnt ? acc.multiplyScalar(1/cnt) : dHat.clone().multiplyScalar(0.3);
-    // Seam sits PARTWAY down the hallway: a distance along holeDir between the deep floor
-    // and the 0.8 surface. hallwayR is the hallway's cross-section radius (perp to holeDir),
-    // used to test whether the ship is actually inside the hallway when it crosses.
-    P.seamRadius = (P.holeFloorCenter.length() + 0.8) * 0.5;
-    P.hallwayR = 0.12;   // tight: only count as entering when actually in the hole, not near it
+    P.hallwayR = 0.12;
     // ── Analytic tube bounds (Phase A collision) ── axial = projection onto holeDir. The
     // carved hallway is a tube running from the deep floor (min axial) out to the face mouth
     // (max axial among verts near the hole axis). Collision grips this tube analytically
@@ -13675,9 +14064,27 @@ function buildPortal(){
       }
     }
     P.hallMouth = _mouth;
-    // Collision tube radius = real modeled wall radius (kept separate from hallwayR, which the
-    // proven entry-detection gate uses as a tight threshold and must not change).
+    // Collision tube radius = real modeled wall radius.
     P.tubeR = _wallN > 0 ? Math.max(0.06, _wallR / _wallN) : 0.14;
+    // Seam sits HALFWAY down the carved tunnel (between the deep floor and the surface mouth),
+    // perpendicular to holeDir — invisible, well inside the hole.
+    P.seamRadius = P.axialFloor + (P.hallMouth - P.axialFloor) * 0.5;
+    // ── Triangular cross-section ── the hallway is a 3-sided prism. Collect the carved tunnel
+    // verts (perp < 0.35 from the hole axis — the octahedron's own faces sit at perp ≥ 0.46),
+    // take the MOUTH ring (max axial), and store their positions in the seam's LOCAL 2D frame so
+    // the visible portal AND the entry trigger match the real triangular hole exactly.
+    var _qH = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,0,1), P.holeDir.clone().normalize());
+    var _lX = new THREE.Vector3(1,0,0).applyQuaternion(_qH), _lY = new THREE.Vector3(0,1,0).applyQuaternion(_qH);
+    var _hall = [], _hv = new THREE.Vector3();
+    for(var hi = 0; hi < p.count; hi++){ _hv.fromBufferAttribute(p, hi);
+      var _hax = _hv.dot(P.holeDir), _hpp = _hv.clone().addScaledVector(P.holeDir, -_hax).length();
+      if(_hpp < 0.35) _hall.push({ v: _hv.clone(), ax: _hax }); }
+    var _mAx = _hall.reduce(function(m,o){ return Math.max(m, o.ax); }, -1e9);
+    P.seamTri = []; var _seenTri = {};
+    for(var ki = 0; ki < _hall.length && P.seamTri.length < 3; ki++){ if(_hall[ki].ax > _mAx - 0.12){
+      var _pv = _hall[ki].v.clone().addScaledVector(P.holeDir, -_hall[ki].v.dot(P.holeDir));
+      var _tx = _pv.dot(_lX), _ty = _pv.dot(_lY), _kk = _tx.toFixed(3) + ',' + _ty.toFixed(3);
+      if(!_seenTri[_kk]){ _seenTri[_kk] = 1; P.seamTri.push([_tx, _ty]); } } }
     P.prevEntryAxial = 999;
     P.entryCooldown = 0; P.exitCooldown = 0;
     // Dome surface-drive state — the ship magnetically sticks to the dome's concave inner
@@ -13691,7 +14098,7 @@ function buildPortal(){
   var matDome = crystalMat(THREE.BackSide);
   var matFloor = crystalMat(THREE.DoubleSide);
   var gB = new THREE.Group();
-  buildPortalTube(gB, P.DX, gy, P.portalZ, P.corrEndZ, P.HW, P.HH, matB);
+  P.matB = matB;   // crystal material reused for the continuation chute (built after dstAnchor)
   P.domeFloorY = gy - P.domeDrop;
   var domeCy = P.domeFloorY + P.domeR;
   var dome = new THREE.Mesh(new THREE.SphereGeometry(P.domeR, 48, 32), matDome);
@@ -13701,8 +14108,9 @@ function buildPortal(){
   floor.rotation.x = -Math.PI/2;
   floor.position.set(P.DX, P.domeFloorY, P.domeCz);
   gB.add(floor);
-  // interior lights (layer 2) so the crystal reads with shading
-  var l1 = new THREE.PointLight(0xbcd0ff, 1.4, 60); l1.position.set(P.DX, gy, P.corrEndZ); gB.add(l1);
+  // interior lights (layer 2) so the crystal reads with shading — one up at the ceiling chute,
+  // one filling the dome.
+  var l1 = new THREE.PointLight(0xbcd0ff, 1.4, 60); l1.position.set(P.DX, domeCy + P.domeR*0.6, P.domeCz); gB.add(l1);
   var l2 = new THREE.PointLight(0x88aaff, 1.6, 80); l2.position.set(P.DX, domeCy, P.domeCz); gB.add(l2);
   if(PORTAL_DEBUG_WIRE) applyDebugWire(gB, 0x224a3a, 0x66ff99);   // Region B dome/tunnel: green faces / green wire
   gB.traverse(function(o){ o.layers.set(PORTAL_LAYER); });
@@ -13727,24 +14135,107 @@ function buildPortal(){
   P.srcAnchor.position.copy(P.holeDir).multiplyScalar(P.seamRadius);
   P.srcAnchor.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), P.holeDir.clone().normalize());
   cs.add(P.srcAnchor);
-  // Destination mouth: a DOORWAY standing on the dome FLOOR (+Z edge), its +Z facing INWARD
-  // across the floor — so you walk straight THROUGH it onto the floor (no drop), it looks into
-  // the whole room, and the oblique clip (Phase C) at this plane keeps the interior while
-  // culling anything behind it. The real modeled room will define this precisely later.
+  // Destination mouth: a TRIANGULAR HOLE in the SIDE WALL of the dome (not the ceiling), placed
+  // FLUSH on the inner sphere surface. The chute runs TANGENTIALLY DOWN the wall (not inward toward
+  // the centre), so its opening stays flush with the perimeter and you slide down the inner surface
+  // instead of being shot into the open middle.
+  var domeCy = P.domeFloorY + P.domeR;                         // sphere centre
+  var holeOut = new THREE.Vector3(0, 0.4, 1).normalize();      // outward wall normal at the hole (upper +Z side)
   P.dstAnchor = new THREE.Object3D();
-  P.dstAnchor.position.set(P.DX, P.domeFloorY + 0.14, P.domeCz + P.domeR * 0.92);
-  P.dstAnchor.quaternion.setFromAxisAngle(new THREE.Vector3(0,1,0), Math.PI);  // +Z → −Z (into dome), up preserved
+  P.dstAnchor.position.set(P.DX + holeOut.x*P.domeR*0.96, domeCy + holeOut.y*P.domeR*0.96, P.domeCz + holeOut.z*P.domeR*0.96);  // just inside the wall so the whole tunnel sits inside the sphere
+  // Entry direction = down along the wall (tangent) but leaning INWARD, so the tunnel tunnels INTO
+  // the sphere (hugging just inside the wall) instead of splaying out across the surface, and opens
+  // flush on the inner wall. The outward-poking half of the imaged tunnel is clipped below.
+  var down = new THREE.Vector3(0,-1,0);
+  var entryDir = down.clone().addScaledVector(holeOut, -down.dot(holeOut)).normalize();   // tangent-down
+  entryDir.addScaledVector(holeOut, -0.55).normalize();        // lean inward → tunnels into the sphere
+  P.dstAnchor.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), entryDir);
   P.dstAnchor.layers.set(PORTAL_LAYER);
   scene.add(P.dstAnchor);
-  // Seam disks sized to the hallway bore. portalSeamMat samples the RT with screen-space UVs,
-  // so the disk shows exactly what the virtual camera rendered — a true window, no rim.
-  var seamR = P.tubeR * 1.08;
-  P.p1 = new THREE.Mesh(new THREE.CircleGeometry(seamR, 48), portalSeamMat(P.rt1));
+  P.domeTopY = P.dstAnchor.position.y;                         // hole height (kept for references)
+  // Seam shaped to the carved hole: a TRIANGLE matching the tunnel's 3-sided cross-section
+  // (P.seamTri = 3 corners in the seam's local 2D frame). portalSeamMat samples the RT with
+  // screen-space UVs, so the seam shows exactly what the virtual camera rendered — a true
+  // window, no rim. Falls back to a disk if the triangle couldn't be derived.
+  // mirror=false → the source triangle; mirror=true → its X-mirror. Under the portal fold
+  // (R180 about Y) the source seam vertex (tx,ty) maps to (−tx,ty), so the X-mirrored triangle IS
+  // the exact portal-image of the source hole. Building p2 from it makes the dome-top hole line up
+  // rotationally with the crystal hole when you look back through it.
+  function makeSeamGeo(mirror){
+    if(P.seamTri && P.seamTri.length === 3){
+      var t = P.seamTri, sx = mirror ? -1 : 1, g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(
+        [sx*t[0][0],t[0][1],0, sx*t[1][0],t[1][1],0, sx*t[2][0],t[2][1],0], 3));
+      g.setIndex(mirror ? [0,2,1] : [0,1,2]); g.computeVertexNormals(); return g;
+    }
+    return new THREE.CircleGeometry(P.tubeR * 1.08, 32);
+  }
+  P.seamR = P.tubeR * 1.08;   // fallback trigger radius if the triangle is missing
+  P.p1 = new THREE.Mesh(makeSeamGeo(false), portalSeamMat(P.rt1));
   P.p1.renderOrder = 3; P.p1.visible = false; P.p1.layers.set(0);
   P.srcAnchor.add(P.p1);   // glued to the hole as the crystal spins
-  P.p2 = new THREE.Mesh(new THREE.CircleGeometry(seamR, 48), portalSeamMat(P.rt2));
+  P.p2 = new THREE.Mesh(makeSeamGeo(true), portalSeamMat(P.rt2));   // mirrored = portal-image of the crystal hole
   P.p2.renderOrder = 3; P.p2.visible = false; P.p2.layers.set(PORTAL_LAYER);
   P.dstAnchor.add(P.p2);
+
+  // ── Continuation chute ── built as the EXACT portal-image of the crystal's carved tunnel walls
+  // (the seam→floor segment), baked into dome space by the portal transform T = M_dst·R180·M_src⁻¹.
+  // Because it's literally the same triangles the crystal collision uses (just folded through the
+  // portal), the dome geometry AND collision continue the crystal hallway with zero break — when
+  // you cross the (invisible) seam your grounded grip lands on the matching wall with the same
+  // normal/position/momentum, so there's no jump. Opens into the dome where the tunnel floor was.
+  (function buildSeamShaft(){
+    var octa=null; cs.children.forEach(function(c){ if(c.geometry && (c.userData.isGameCrystal || c.geometry.type==='OctahedronGeometry')) octa=c; });
+    P.shaftTriM = null; P.chuteTris = null; P.shaft = null;
+    if(!octa || !octa.geometry.attributes.position) return;
+    P.srcAnchor.updateMatrixWorld(true); P.dstAnchor.updateMatrixWorld(true); cs.updateMatrixWorld(true);
+    var T = new THREE.Matrix4().copy(P.dstAnchor.matrixWorld).multiply(_portalFlip)
+              .multiply(new THREE.Matrix4().copy(P.srcAnchor.matrixWorld).invert());   // crystal world → dome world
+    var pos = octa.geometry.attributes.position, hd = P.holeDir;
+    var va=new THREE.Vector3(), vb=new THREE.Vector3(), vc=new THREE.Vector3(), cen=new THREE.Vector3(), tmp=new THREE.Vector3();
+    // Capture the WHOLE carved tunnel — every wall triangle (centroid near the hole axis, so outer
+    // octahedron faces are excluded by perp), skipping only the floor cap so the chute stays open at
+    // the bottom. Long walls span mouth→floor, so test the tri's top vertex against the floor cap
+    // rather than the centroid (a centroid band would drop most of them — that's why it had gaps).
+    var capAx = P.axialFloor + 0.06;
+    var verts=[];
+    for(var i=0; i+2<pos.count; i+=3){
+      va.fromBufferAttribute(pos,i); vb.fromBufferAttribute(pos,i+1); vc.fromBufferAttribute(pos,i+2);
+      cen.copy(va).add(vb).add(vc).multiplyScalar(1/3);
+      var ax = cen.dot(hd), perp = tmp.copy(cen).addScaledVector(hd, -ax).length();
+      var maxAx = Math.max(va.dot(hd), vb.dot(hd), vc.dot(hd));
+      if(perp < 0.34 && maxAx > capAx){                 // a tunnel WALL tri (not the floor cap, not an outer face)
+        [va,vb,vc].forEach(function(v){
+          tmp.copy(v).applyMatrix4(cs.matrixWorld).applyMatrix4(T);   // crystal-local → crystal-world → dome-world
+          verts.push(tmp.x, tmp.y, tmp.z);
+        });
+      }
+    }
+    if(verts.length < 9) return;
+    P.chuteTris = new Float32Array(verts);                  // baked dome-world tris (collision source)
+    P.shaftLen = P.seamRadius - P.axialFloor;               // axial length of the chute (seam → floor)
+    P.shaftTriM = true;                                     // marker that the chute exists
+    P.exitTri = (P.seamTri && P.seamTri.length===3) ? P.seamTri.map(function(c){ return [-c[0], c[1]]; }) : null;  // dst-seam bounds for the reverse exit
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(P.chuteTris, 3));
+    g.computeVertexNormals();
+    // Clip away the half of the imaged tunnel that pokes OUT past the seam (the mouth-image), so only
+    // the part that tunnels INTO the sphere is drawn. Plane sits just behind the seam, keeping +Z.
+    var entryWorld = new THREE.Vector3(0,0,1).applyQuaternion(P.dstAnchor.quaternion).normalize();
+    var clipPt = P.dstAnchor.position.clone().addScaledVector(entryWorld, -0.02);
+    var chuteMat = P.matB.clone();
+    chuteMat.side = THREE.DoubleSide;
+    chuteMat.clippingPlanes = [ new THREE.Plane().setFromNormalAndCoplanarPoint(entryWorld, clipPt) ];
+    chuteMat.clipShadows = false;
+    chuteMat.needsUpdate = true;
+    if(renderer) renderer.localClippingEnabled = true;
+    var m = new THREE.Mesh(g, chuteMat);
+    m.layers.set(PORTAL_LAYER);
+    if(PORTAL_DEBUG_WIRE) applyDebugWire(m, 0x224a3a, 0x66ff99);
+    scene.add(m);
+    P.shaft = m;
+  })();
+
   P.seamRenderOn = true;   // Phase B: drive the seam render every frame near the mouth
 
   P.fog = new THREE.FogExp2(0x0a0a16, 0.012);
@@ -13769,6 +14260,7 @@ function renderPortalRT(rt, useInteriorFog){
 // so the seam shows Region B exactly as it would look if you kept going straight through —
 // and it stays correct while the crystal (and the source mouth on it) spins.
 var _portalFlip = new THREE.Matrix4().makeRotationY(Math.PI);
+var _holeUpYTmp = new THREE.Quaternion(), _yAxisTmp = new THREE.Vector3();   // reused for the hole-up crystal lock
 var _portalM = new THREE.Matrix4(), _portalInvSrc = new THREE.Matrix4(), _portalScl = new THREE.Vector3();
 var _portalMouthW = new THREE.Vector3(), _portalQ = new THREE.Quaternion();
 var _ocN = new THREE.Vector3(), _ocP = new THREE.Vector3(), _ocNV = new THREE.Vector3(),
@@ -13803,6 +14295,29 @@ function setVCamThroughPortal(Msrc, Mdst){
   _portalM.decompose(gameMode.portal.vCam.position, gameMode.portal.vCam.quaternion, _portalScl);
   gameMode.portal.vCam.updateMatrixWorld(true);
 }
+// Portal avatar: a clone of the ship body, transformed through the portal onto the DESTINATION
+// layer, so as the real ship dives into the seam you see it continue OUT the other side through
+// the portal — covering the gap while the chase camera (behind the ship) catches up and crosses.
+var _cloneT = new THREE.Matrix4(), _cloneInv = new THREE.Matrix4();
+function updateShipClone(Msrc, Mdst, destLayer){
+  var P = gameMode.portal;
+  if(!gameMode.ship) return;
+  var body = P._shipBody;
+  if(!body){ gameMode.ship.traverse(function(o){ if(!body && o.isMesh) body = o; }); P._shipBody = body; }
+  if(!body) return;
+  if(!P.shipClone){
+    P.shipClone = new THREE.Mesh(body.geometry, body.material);
+    P.shipClone.matrixAutoUpdate = false;
+    P.shipClone.frustumCulled = false;
+    scene.add(P.shipClone);
+  }
+  body.updateMatrixWorld(true);
+  _cloneT.copy(Mdst).multiply(_portalFlip).multiply(_cloneInv.copy(Msrc).invert());
+  P.shipClone.matrix.multiplyMatrices(_cloneT, body.matrixWorld);
+  P.shipClone.matrixWorldNeedsUpdate = true;
+  P.shipClone.layers.set(destLayer);
+  P.shipClone.visible = true;
+}
 // Seamless transform-teleport: move the ship + camera + velocities through the portal pair by
 // the SAME transform the virtual camera used (T = M_to · R180 · M_from⁻¹). Because the camera
 // lands exactly where the virtual camera was, the first frame after the cross matches the seam
@@ -13816,8 +14331,13 @@ function teleportPortal(fromA, toA){
   _teleR.setFromMatrix4(_teleT);
   _teleQ.setFromRotationMatrix(_teleT);
   gameMode.ship.position.applyMatrix4(_teleT);
+  gameMode.ship.quaternion.premultiply(_teleQ);   // fold the ship's ORIENTATION too — flight mode's
+                                                  // camera reads it directly (surface mode rebuilds it
+                                                  // each frame, so this is harmless there)
   camera.position.applyMatrix4(_teleT);
   camera.quaternion.premultiply(_teleQ);
+  camera.up.applyMatrix3(_teleR).normalize();   // carry the camera's up-vector through the fold too,
+                                                // so the view doesn't roll while it re-settles after the cross
   gameMode.fly.vel.applyMatrix3(_teleR);
   s.forward.applyMatrix3(_teleR); if(s.forward.lengthSq() > 1e-6) s.forward.normalize();
   s.groundNormal.applyMatrix3(_teleR); if(s.groundNormal.lengthSq() > 1e-6) s.groundNormal.normalize();
@@ -13827,6 +14347,7 @@ function updatePortalWindow(){
   var P = gameMode.portal;
   if(P.p1) P.p1.visible = false;
   if(P.p2) P.p2.visible = false;
+  if(P.shipClone) P.shipClone.visible = false;
   if(!P.built || !P.seamRenderOn) return;
   P.srcAnchor.updateMatrixWorld(true);
   P.dstAnchor.updateMatrixWorld(true);
@@ -13842,6 +14363,7 @@ function updatePortalWindow(){
     _ocN.set(0,0,1).applyQuaternion(P.dstAnchor.getWorldQuaternion(_portalQ)).normalize();
     _portalMouthW.setFromMatrixPosition(P.dstAnchor.matrixWorld);
     applyObliqueNearClip(P.vCam, _portalMouthW, _ocN);
+    updateShipClone(P.srcAnchor.matrixWorld, P.dstAnchor.matrixWorld, PORTAL_LAYER);  // ship seen through the seam
     P.vCam.layers.set(PORTAL_LAYER);
     renderPortalRT(P.rt1, true);
     P.p1.visible = true;
@@ -13852,6 +14374,7 @@ function updatePortalWindow(){
     _ocN.set(0,0,1).applyQuaternion(P.srcAnchor.getWorldQuaternion(_portalQ)).normalize();
     _portalMouthW.setFromMatrixPosition(P.srcAnchor.matrixWorld);
     applyObliqueNearClip(P.vCam, _portalMouthW, _ocN);
+    updateShipClone(P.dstAnchor.matrixWorld, P.srcAnchor.matrixWorld, 0);  // ship seen back through the seam
     P.vCam.layers.set(0); P.vCam.layers.enable(1);
     renderPortalRT(P.rt2, false);
     P.p2.visible = true;
@@ -13878,25 +14401,41 @@ function portalRegionBEntrance(){
 // motion. A stationary ship has ~0 world velocity even as the spinning seam sweeps past it, so
 // the spin can never fake a crossing (which the old local-frame gate struggled with).
 var _peSeam = new THREE.Vector3(), _peAxis = new THREE.Vector3(), _peQ = new THREE.Quaternion(),
-    _peRel = new THREE.Vector3(), _pePerp = new THREE.Vector3(), _peVel = new THREE.Vector3();
+    _peRel = new THREE.Vector3(), _pePerp = new THREE.Vector3(), _peVel = new THREE.Vector3(),
+    _peRight = new THREE.Vector3(), _peUp = new THREE.Vector3();
+// point-in-triangle (2D), tri = [[x,y],[x,y],[x,y]]
+function pointInSeamTri(px, py, t){
+  var d1 = (px-t[1][0])*(t[0][1]-t[1][1]) - (t[0][0]-t[1][0])*(py-t[1][1]);
+  var d2 = (px-t[2][0])*(t[1][1]-t[2][1]) - (t[1][0]-t[2][0])*(py-t[2][1]);
+  var d3 = (px-t[0][0])*(t[2][1]-t[0][1]) - (t[2][0]-t[0][0])*(py-t[0][1]);
+  var neg = (d1<0)||(d2<0)||(d3<0), pos = (d1>0)||(d2>0)||(d3>0);
+  return !(neg && pos);
+}
 function checkPortalEntry(){
-  var P = gameMode.portal, ship = gameMode.ship;
-  if(!P.built || P.inside){ P._prevSigned = null; P._prevWorld = null; return; }
+  var P = gameMode.portal;
+  if(!P.built || P.inside || !P.srcAnchor){ P._prevSigned = null; P._prevWorld = null; return; }
   if(P.entryCooldown > 0) P.entryCooldown--;   // brief grace after exiting so you don't bounce back in
   P.srcAnchor.updateMatrixWorld(true);
-  _peSeam.setFromMatrixPosition(P.srcAnchor.matrixWorld);                       // seam centre (world)
-  _peAxis.set(0,0,1).applyQuaternion(P.srcAnchor.getWorldQuaternion(_peQ)).normalize(); // outward normal
-  _peRel.copy(ship.position).sub(_peSeam);
+  _peSeam.setFromMatrixPosition(P.srcAnchor.matrixWorld);
+  P.srcAnchor.getWorldQuaternion(_peQ);
+  _peAxis.set(0,0,1).applyQuaternion(_peQ).normalize();                          // outward normal
+  // Trigger on the CAMERA crossing the seam (seamless viewpoint), within the TRIANGULAR hole —
+  // so flying in through the opening teleports, but skimming past the side does not. The clone
+  // (updateShipClone) keeps the ship visible through the portal until the camera follows.
+  _peRel.copy(camera.position).sub(_peSeam);
   var signed = _peRel.dot(_peAxis);                       // >0 = outside the seam, <=0 = past it inward
-  var perp = _pePerp.copy(_peRel).addScaledVector(_peAxis, -signed).length();
-  var inward = P._prevWorld ? -_peVel.copy(ship.position).sub(P._prevWorld).dot(_peAxis) : 0;
+  var lx = _peRel.dot(_peRight.set(1,0,0).applyQuaternion(_peQ));
+  var ly = _peRel.dot(_peUp.set(0,1,0).applyQuaternion(_peQ));
+  var inBounds = (P.seamTri && P.seamTri.length === 3) ? pointInSeamTri(lx, ly, P.seamTri)
+                 : (lx*lx + ly*ly) <= (P.seamR || P.tubeR) * (P.seamR || P.tubeR);
+  var inward = P._prevWorld ? -_peVel.copy(camera.position).sub(P._prevWorld).dot(_peAxis) : 0;
   var crossedIn = (P._prevSigned != null && P._prevSigned > 0 && signed <= 0);
-  if(P.entryCooldown <= 0 && crossedIn && perp < P.tubeR * 1.15 && inward > 0.0006){
+  if(P.entryCooldown <= 0 && crossedIn && inBounds && inward > 0.0004){
     enterRegionB();
     return;
   }
   P._prevSigned = signed;
-  P._prevWorld = (P._prevWorld || new THREE.Vector3()).copy(ship.position);
+  P._prevWorld = (P._prevWorld || new THREE.Vector3()).copy(camera.position);
 }
 var _portalInv = new THREE.Matrix4();
 
@@ -13906,20 +14445,29 @@ function enterRegionB(){
   // Seamless cross: transform ship + camera + velocity through the portal so the camera lands
   // exactly on the virtual-camera view you were just looking at (no visual pop at the seam).
   teleportPortal(P.srcAnchor, P.dstAnchor);
-  // Land as a GROUNDED WALK onto the dome floor (doorway feel): flatten to the floor, keep your
-  // heading + speed. No drop, no airborne flail, no "random" landing — you continue straight in.
-  var v = gameMode.fly.vel;
-  _peVel.set(v.x, 0, v.z);                                   // horizontal momentum through the doorway
-  s.speed = Math.min(_peVel.length(), gameMode.physics.maxSpeed);
-  if(_peVel.lengthSq() > 1e-8){ s.forward.copy(_peVel).normalize(); }
-  else { s.forward.y = 0; if(s.forward.lengthSq() < 1e-6) s.forward.set(0,0,1); s.forward.normalize(); }
-  s.groundNormal.set(0,1,0);
-  ship.position.y = P.domeFloorY + s.hoverHeight;
+  // Emerge GRIPPED to the chute wall and keep driving DOWN it — a seamless continuation of the
+  // crystal hallway. Momentum is PRESERVED exactly: teleportPortal already folded the heading
+  // (s.forward) and velocity through the portal, and s.speed (the scalar drive momentum) is
+  // unchanged, so you carry on at the same speed/direction with no reset. (If you flew in, fold the
+  // flight velocity into s.speed too so flying entry keeps its momentum.)
+  P._wasInChute = true;
+  var cpg = closestPointOnDome(ship.position);   // portal-image chute → groundNormal = folded crystal normal
+  if(cpg){ s.groundNormal.copy(cpg.normal).normalize(); ship.position.copy(cpg.point).addScaledVector(s.groundNormal, s.hoverHeight); }
+  else s.groundNormal.set(0,1,0);
+  s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));   // project the folded heading onto the wall
+  if(s.forward.lengthSq() < 1e-6){
+    var axisW = new THREE.Vector3(0,0,1).transformDirection(P.dstAnchor.matrixWorld);   // fallback: down the chute
+    s.forward.copy(axisW).addScaledVector(s.groundNormal, -axisW.dot(s.groundNormal));
+    if(s.forward.lengthSq() < 1e-6) s.forward.set(1,0,0);
+  }
+  s.forward.normalize();
+  var vAlong = gameMode.fly.vel.dot(s.forward);                        // any flight momentum along the heading
+  if(vAlong > s.speed) s.speed = Math.min(vAlong, gameMode.physics.boostMaxSpeed);
   s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.coastFrames = 0;
   s.isDrifting = false; s.driftDirection = 0; s.driftAngle = 0; s.driftTargetAngle = 0; s.driftTime = 0;
   s.barrelRoll.active = false; s.barrelRoll.progress = 0;
   gameMode.fly.active = false; gameMode.fly.vel.set(0,0,0); gameMode.wantJump = false;
-  P.exitCooldown = 90;
+  P.exitCooldown = 90; P.snapCam = true;
 }
 
 function leaveToCrystal(){
@@ -13941,13 +14489,194 @@ function leaveToCrystal(){
   camera.position.copy(ship.position).addScaledVector(outW, 0.18); camera.up.set(0,1,0); camera.lookAt(ship.position);
 }
 
-// Dome interior — the SAME land-locked drive the crystal uses (gameMode.surfaceState + the
-// shared physics params), just on a FLAT FLOOR with −Y gravity. Drift, thrust, yaw, barrel
-// roll, jump all behave identically to the crystal. A glowing pad on the floor is the exit.
+// ── Reverse portal crossing ── go BACK through the portal: fly up the chute and out the ceiling
+// hole. Triggered on the SHIP crossing the DESTINATION seam outward through the hole. (Camera-based
+// fails here: the flight camera trails with a lateral offset bigger than the hole, so it passes
+// BESIDE the opening and never crosses — the ship would fly forever. The tiny ship threads the hole
+// reliably.) Seamlessness is kept instead by carrying the flight mode + momentum through the cross
+// (teleportPortal folds the camera too), so the framing matches on both sides.
+var _exRel = new THREE.Vector3(), _exVel = new THREE.Vector3();
+function checkPortalExit(){
+  var P = gameMode.portal;
+  if(!P.built || !P.inside || !P.inB || !P.dstAnchor){ P._exPrevSigned = null; P._exPrevWorld = null; return; }
+  if(P.exitCooldown > 0){ P.exitCooldown--; P._exPrevSigned = null; P._exPrevWorld = null; return; }  // grace right after entering
+  P.dstAnchor.updateMatrixWorld(true);
+  _peSeam.setFromMatrixPosition(P.dstAnchor.matrixWorld);
+  P.dstAnchor.getWorldQuaternion(_peQ);
+  _peAxis.set(0,0,1).applyQuaternion(_peQ).normalize();                       // dst +Z = down into the dome
+  _exRel.copy(gameMode.ship.position).sub(_peSeam);                           // SHIP vs seam (threads the hole)
+  var signed = _exRel.dot(_peAxis);                                           // >0 inside the dome, <=0 out through the hole
+  var lx = _exRel.dot(_peRight.set(1,0,0).applyQuaternion(_peQ));
+  var ly = _exRel.dot(_peUp.set(0,1,0).applyQuaternion(_peQ));
+  var inBounds = (P.exitTri && P.exitTri.length === 3) ? pointInSeamTri(lx, ly, P.exitTri)
+                 : (lx*lx + ly*ly) <= (P.seamR || P.tubeR) * (P.seamR || P.tubeR);
+  var outward = P._exPrevWorld ? -_exVel.copy(gameMode.ship.position).sub(P._exPrevWorld).dot(_peAxis) : 0;
+  var crossedOut = (P._exPrevSigned != null && P._exPrevSigned > 0 && signed <= 0);
+  if(crossedOut && inBounds && outward > 0.0002){ leaveToCrystalSeamless(); return; }
+  P._exPrevSigned = signed;
+  P._exPrevWorld = (P._exPrevWorld || new THREE.Vector3()).copy(gameMode.ship.position);
+}
+
+function leaveToCrystalSeamless(){
+  var P = gameMode.portal, s = gameMode.surfaceState, ship = gameMode.ship;
+  var wasFlying = gameMode.fly.active;
+  P.inside = false; P.inB = false;
+  // transform ship + camera + velocity back through the portal → you emerge in the crystal hallway
+  // exactly where the seam view showed it.
+  teleportPortal(P.dstAnchor, P.srcAnchor);   // ship+camera+vel+forward+groundNormal folded back through
+  var gf = gameMode.galleryFloor;
+  gameMode.surface.crystal = P.crystal; gameMode.surface.floor = gf;
+  P.crystal.updateMatrixWorld(true); P.crystal.getWorldPosition(gameMode.surface.center);
+  gameMode.lastCrystalRotY = gf ? gf.group.rotation.y : 0;
+  s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.coastFrames = 0;
+  s.isDrifting = false; s.driftDirection = 0; s.driftAngle = 0; s.driftTargetAngle = 0; s.driftTime = 0;
+  s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+  if(wasFlying){
+    // Stay in FLIGHT — you fly back out the way you came. The flight camera is used on both sides so
+    // the framing matches exactly (teleportPortal already folded camera + fly.vel + orientation), so
+    // the cross is seamless with nothing to snap/reset.
+    gameMode.fly.active = true;
+  } else {
+    // Emerge gripped onto the crystal tunnel wall — a NO-OP since the chute is its portal-image, so
+    // the folded groundNormal/position already match. Momentum preserved (s.speed unchanged).
+    var cpc = closestPointOnCrystal(ship.position);
+    if(cpc){
+      s.groundNormal.copy(cpc.normal).normalize();
+      ship.position.copy(cpc.point).addScaledVector(s.groundNormal, s.hoverHeight);
+      s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+      if(s.forward.lengthSq() < 1e-6){ s.forward.copy(P.holeDir).transformDirection(P.crystal.matrixWorld); s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal))); }
+      if(s.forward.lengthSq() > 1e-6) s.forward.normalize();
+    }
+    var vAlong = gameMode.fly.vel.dot(s.forward);
+    if(vAlong > s.speed) s.speed = Math.min(vAlong, gameMode.physics.boostMaxSpeed);
+    gameMode.fly.active = false; gameMode.fly.vel.set(0,0,0);
+  }
+  gameMode.wantJump = false;
+  P.entryCooldown = 110; P.prevEntryAxial = 999;   // grace so the crystal entry trigger doesn't immediately re-fire
+  if(P.p1) P.p1.visible = false; if(P.p2) P.p2.visible = false;
+  P.snapCam = true;   // snap the camera on the first crystal frame so the view doesn't roll/jump after the cross
+}
+
+// The ceiling chute is a triangular prism extruded along dstAnchor +Z (world −Y) from z=0 (the
+// seam) to z=shaftLen. dstAnchor.worldToLocal puts the ship in that frame; local z grows as it
+// descends. shipInChute() = within the chute span.
+var _chuteLp = new THREE.Vector3(), _chuteN = new THREE.Vector3();
+function shipInChute(){
+  var P = gameMode.portal;
+  if(!P.shaft || !P.dstAnchor || P.shaftTriM == null) return false;
+  P.dstAnchor.updateMatrixWorld(true);
+  _chuteLp.copy(gameMode.ship.position); P.dstAnchor.worldToLocal(_chuteLp);
+  return _chuteLp.z >= -0.05 && _chuteLp.z <= P.shaftLen + 0.02;
+}
+// Magnetic grip to the nearest chute WALL (same feel as the crystal hallway): snap the ship to
+// hover just off the closest triangle edge and point groundNormal inward, leaving its axial
+// position (local z) alone so it can drive freely up/down the chute. No grip → instant fall.
+function chuteGrip(){
+  var P = gameMode.portal, s = gameMode.surfaceState, ship = gameMode.ship, tri = P.shaftTriM;
+  if(!tri) return false;
+  P.dstAnchor.updateMatrixWorld(true);
+  _chuteLp.copy(ship.position); P.dstAnchor.worldToLocal(_chuteLp);
+  var px = _chuteLp.x, py = _chuteLp.y, bestD = 1e9, bx = 0, by = 0;
+  for(var i=0;i<3;i++){
+    var a=tri[i], b=tri[(i+1)%3], ex=b[0]-a[0], ey=b[1]-a[1], L2=ex*ex+ey*ey;
+    var tt = L2>1e-9 ? ((px-a[0])*ex+(py-a[1])*ey)/L2 : 0; if(tt<0)tt=0; else if(tt>1)tt=1;
+    var qx=a[0]+ex*tt, qy=a[1]+ey*tt, dx=px-qx, dy=py-qy, d=Math.hypot(dx,dy);
+    if(d<bestD){ bestD=d; bx=qx; by=qy; }
+  }
+  var inx=P.shaftCx-bx, iny=P.shaftCy-by, il=Math.hypot(inx,iny)||1; inx/=il; iny/=il;  // wall → centre
+  _chuteLp.x = bx + inx*s.hoverHeight;
+  _chuteLp.y = by + iny*s.hoverHeight;
+  P.dstAnchor.localToWorld(_chuteLp);
+  ship.position.copy(_chuteLp);
+  _chuteN.set(inx,iny,0).transformDirection(P.dstAnchor.matrixWorld).normalize();
+  s.groundNormal.copy(_chuteN).normalize();   // full snap (only used at emergence — no drift/roll)
+  return true;
+}
+// Soft containment used by FLIGHT mode so you don't sink through the chute walls — push the ship
+// back to hover off the nearest chute-wall triangle if it's penetrating.
+function containInChute(){
+  var P = gameMode.portal;
+  if(!P.chuteTris) return;
+  var hh = gameMode.surfaceState.hoverHeight;
+  var cp = closestPointOnTris(gameMode.ship.position, P.chuteTris);
+  if(cp && cp.dist < hh){
+    gameMode.ship.position.copy(cp.point).addScaledVector(cp.normal, hh);
+  }
+}
+
+// ── Unified dome surface collision ── closest point on ANY drivable dome surface (the flat floor
+// disc, the curved sphere inner wall, and the triangular chute walls), computed analytically so
+// it's cheap every frame. Returns {point, normal, dist} with the normal pointing toward the ship —
+// so the magnetic grip sticks the ship to whichever surface is nearest, letting it drive across
+// the floor, up the curved walls, and through the chute as one continuous surface (Orbicule-style).
+var _domeBest = { point: new THREE.Vector3(), normal: new THREE.Vector3(), dist: 0 };
+var _domeChP = new THREE.Vector3(), _domeChN = new THREE.Vector3(), _domeChLp = new THREE.Vector3();
+function closestPointOnDome(pos){
+  var P = gameMode.portal;
+  var bestDist = Infinity, bx=0, by=0, bz=0, nx=0, ny=0, nz=0, found=false;
+  // Is the probe inside the ceiling HOLE column (the chute opening + the cap just above the seam)?
+  // If so we skip the ceiling grip so the ship can pass straight up/down through the hole instead of
+  // sticking to the dome cap right beside the opening (this is what lets you drive back up and out).
+  var inHole = false;
+  if(P.dstAnchor && P.exitTri){
+    P.dstAnchor.updateMatrixWorld(true);
+    _domeChLp.copy(pos); P.dstAnchor.worldToLocal(_domeChLp);
+    // Only skip the ceiling/wall grip RIGHT AT the opening (so you can fly out the hole) — not down
+    // the whole tunnel, otherwise the inner exit never grabs the wall and you drift to the centre.
+    if(_domeChLp.z >= -0.45 && _domeChLp.z <= 0.15)
+      inHole = pointInSeamTri(_domeChLp.x, _domeChLp.y, P.exitTri);
+  }
+  // floor disc (y = domeFloorY, radius domeR around (DX, domeCz))
+  var fdx = pos.x - P.DX, fdz = pos.z - P.domeCz, fr = Math.hypot(fdx, fdz);
+  if(fr <= P.domeR){
+    var fdist = Math.abs(pos.y - P.domeFloorY);
+    if(fdist < bestDist){ bestDist = fdist; bx = pos.x; by = P.domeFloorY; bz = pos.z; nx=0; ny=1; nz=0; found=true; }
+  }
+  // sphere inner wall (centre (DX, domeCy, domeCz), radius domeR) — only at/above the floor, and NOT
+  // across the ceiling hole (so you can fly/drive out through the opening).
+  var cy = P.domeFloorY + P.domeR;
+  var sdx = pos.x - P.DX, sdy = pos.y - cy, sdz = pos.z - P.domeCz, rlen = Math.hypot(sdx, sdy, sdz);
+  if(rlen > 1e-4 && !inHole){
+    var spy = cy + sdy/rlen*P.domeR;
+    if(spy >= P.domeFloorY - 0.02){
+      var sdist = Math.abs(P.domeR - rlen);
+      if(sdist < bestDist){
+        bestDist = sdist; bx = P.DX + sdx/rlen*P.domeR; by = spy; bz = P.domeCz + sdz/rlen*P.domeR;
+        nx = -sdx/rlen; ny = -sdy/rlen; nz = -sdz/rlen; found = true;
+      }
+    }
+  }
+  // chute walls — the portal-image of the crystal tunnel (baked dome-world tris). Closest-point on
+  // those is EXACTLY the transformed crystal collision, so it matches the crystal side at the seam.
+  // Gated to the chute span (dstAnchor-local z ∈ [0, shaftLen]); past the bottom the ship releases
+  // and free-falls into the open dome instead of sticking to the chute's bottom edge.
+  if(P.chuteTris && P.dstAnchor){
+    P.dstAnchor.updateMatrixWorld(true);
+    _domeChLp.copy(pos); P.dstAnchor.worldToLocal(_domeChLp);
+    if(_domeChLp.z >= -0.06 && _domeChLp.z <= P.shaftLen + 0.03){
+      var cct = closestPointOnTris(pos, P.chuteTris);
+      if(cct && cct.dist < bestDist){
+        bestDist=cct.dist; bx=cct.point.x; by=cct.point.y; bz=cct.point.z;
+        nx=cct.normal.x; ny=cct.normal.y; nz=cct.normal.z; found=true;
+      }
+    }
+  }
+  if(!found) return null;
+  _domeBest.point.set(bx,by,bz); _domeBest.normal.set(nx,ny,nz); _domeBest.dist = bestDist;
+  return _domeBest;
+}
+
+// Dome interior — the SAME land-locked drive the crystal uses (gameMode.surfaceState + the shared
+// physics params), now on a UNIFIED surface: drive across the flat floor, up the curved sphere
+// wall, or through the chute, all via closest-point grip. Drift, thrust, yaw, barrel roll, jump
+// behave identically to the crystal. A glowing pad on the floor is the exit.
 function updatePortalInterior(){
   var P = gameMode.portal, p = gameMode.physics, k = gameMode.keys, t = gameMode.touch, s = gameMode.surfaceState, ship = gameMode.ship;
+  // Free-flight (P) works inside the dome just like outside — hand off to the flight controller,
+  // then keep the ship contained in the chute on the way down.
+  if(gameMode.fly.active){ updateFlightPhysicsAndCamera(); containInChute(); return; }
   var cx = P.DX, cz = P.domeCz, floorY = P.domeFloorY, roomR = P.domeR;
-  s.groundNormal.set(0, 1, 0);   // flat floor, up = +Y
+  var domeGrip = 0.7;   // how far the magnetic grip reaches before the ship free-falls
 
   // input (identical to crystal)
   var fwdAxis = 0, yawAxis = 0;
@@ -13958,7 +14687,7 @@ function updatePortalInterior(){
   if(gameMode.wantJump){
     gameMode.wantJump = false;
     if(!s.airborne){
-      s.airborne = true; s.freeFalling = false; s.vertVel = p.jumpImpulse; s.airTime = 0; s.jumpAxis.set(0,1,0);
+      s.airborne = true; s.freeFalling = false; s.vertVel = p.jumpImpulse; s.airTime = 0; s.jumpAxis.copy(s.groundNormal).normalize();
       s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; s.driftTime = 0;
       var nowJ = (typeof performance!=='undefined'?performance.now():Date.now());
       var aH = k.a || (nowJ-gameMode.lastATime)<gameMode.jumpRollWindow, dH = k.d || (nowJ-gameMode.lastDTime)<gameMode.jumpRollWindow, rd = 0;
@@ -14002,30 +14731,50 @@ function updatePortalInterior(){
   if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
   if(Math.abs(s.speed) > 0.00001) ship.position.addScaledVector(s.forward, s.speed);
 
-  // ── vertical: hop (−Y gravity) or stick to the flat floor ──
+  // ── unified surface grip — drive on ANY dome surface (flat floor, curved sphere wall, or the
+  //    chute) via closest-point-on-surface, the same magnetic feel as the crystal. Airborne hops
+  //    and falls move along the takeoff normal, then re-stick to whatever surface is nearest. ──
   if(s.airborne){
-    s.vertVel -= p.jumpGravity; ship.position.y += s.vertVel; s.airTime += 1;
+    s.vertVel -= p.jumpGravity; ship.position.addScaledVector(s.jumpAxis, s.vertVel); s.airTime += 1;
     if(s.barrelRoll.active){ s.barrelRoll.progress = Math.min(1, s.barrelRoll.progress + 1/s.barrelRoll.duration); var brP = s.barrelRoll.progress; var lat = s.barrelRoll.lateralPeak*(1-brP)*(1-brP); ship.position.addScaledVector(s.barrelRoll.lateralDir, lat); if(brP >= 1){ s.barrelRoll.active = false; s.barrelRoll.progress = 0; } }
-    if((s.vertVel < 0 || s.airTime > p.jumpMaxAirTime) && ship.position.y <= floorY + s.hoverHeight + 0.0005){
-      ship.position.y = floorY + s.hoverHeight; s.airborne = false; s.vertVel = 0; s.airTime = 0; s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+    var cpL = closestPointOnDome(ship.position);
+    if(cpL && cpL.dist <= s.hoverHeight + 0.012 && (s.vertVel < 0 || s.airTime > p.jumpMaxAirTime)){
+      s.groundNormal.lerp(cpL.normal, 0.5).normalize();
+      ship.position.copy(cpL.point).addScaledVector(s.groundNormal, s.hoverHeight);
+      s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+      if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+      s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.barrelRoll.active = false; s.barrelRoll.progress = 0;
     }
   } else {
-    ship.position.y = floorY + s.hoverHeight;
+    var cp = closestPointOnDome(ship.position);
+    if(cp && cp.dist < domeGrip){
+      var nrmSmooth = 0.2 + Math.min(0.2, Math.abs(s.speed) * 30);
+      s.groundNormal.lerp(cp.normal, nrmSmooth).normalize();
+      ship.position.lerp(cp.point.clone().addScaledVector(s.groundNormal, s.hoverHeight), 0.5);
+      s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+      if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+    } else {
+      // nothing within reach (e.g. just dropped out of the chute bottom) → fall toward the floor
+      s.airborne = true; s.freeFalling = false; s.vertVel = -0.004; s.jumpAxis.set(0,1,0); s.airTime = 0;
+    }
   }
-
-  // ── soft radial wall ──
-  var dx = ship.position.x - cx, dz = ship.position.z - cz, rad = Math.hypot(dx, dz), maxRad = roomR - 0.04;
-  if(rad > maxRad && rad > 1e-4){ var scl = maxRad/rad; ship.position.x = cx + dx*scl; ship.position.z = cz + dz*scl; if((s.forward.x*dx + s.forward.z*dz) > 0) s.speed *= 0.6; }
 
   // ── orient + drift visuals + engine glow (same as crystal) ──
   var oM = new THREE.Matrix4(); oM.lookAt(new THREE.Vector3(), s.forward.clone().multiplyScalar(-1), s.groundNormal); ship.quaternion.setFromRotationMatrix(oM);
   if(gameMode.shipVisual){ if(s.barrelRoll.active){ gameMode.shipVisual.rotation.z = -s.barrelRoll.direction*s.barrelRoll.rotations*Math.PI*2*s.barrelRoll.progress; gameMode.shipVisual.rotation.y = 0; } else { gameMode.shipVisual.rotation.y = s.driftAngle; gameMode.shipVisual.rotation.z = -s.driftAngle*0.3; } }
   if(gameMode.engineGlow){ var sf = Math.abs(s.speed)/p.boostMaxSpeed; gameMode.engineGlow.material.opacity = 0.5+sf*0.5; gameMode.engineGlow.scale.setScalar(1+sf*0.7); }
 
-  // ── chase camera (tangent frame, like the crystal) ──
-  var camPos = ship.position.clone().addScaledVector(s.forward, -gameMode.camBackDist).addScaledVector(s.groundNormal, gameMode.camUpDist);
-  camera.position.lerp(camPos, 0.18); camera.up.lerp(s.groundNormal, 0.12); camera.up.normalize();
-  camera.lookAt(ship.position.clone().addScaledVector(s.forward, gameMode.camBackDist*0.5));
+  // ── chase camera — IDENTICAL framing to the crystal (computeChaseCamPose) so the portal-folded
+  //    crystal pose equals the dome pose exactly: the cross is then truly seamless (no aim snap). ──
+  var chase = computeChaseCamPose();
+  if(P.snapCam){
+    // first frame after the portal cross — snap so the view doesn't roll/slide as it re-settles
+    camera.position.copy(chase.pos); camera.up.copy(chase.up).normalize();
+    P.snapCam = false;
+  } else {
+    camera.position.lerp(chase.pos, 0.18); camera.up.lerp(chase.up, 0.12); camera.up.normalize();
+  }
+  camera.lookAt(chase.lookAt);
 
   // ── exit: drive onto the return pad (placed behind the spawn-facing direction) ──
   if(P.exitCooldown > 0){ P.exitCooldown--; }
@@ -14039,7 +14788,7 @@ function updatePortalInterior(){
 // Fully decoupled from the crystal (no spin, no radial gravity) so the portal can be
 // troubleshot in isolation. Toggle with PORTAL_TEST_MODE.
 // ════════════════════════════════════════════════════════════════════════════════════
-var PORTAL_TEST_MODE = true;
+var PORTAL_TEST_MODE = false;   // false = real crystal hallway; true = flat sandbox for troubleshooting
 var TEST_Y = 1000;   // high above the website content so nothing else is ever in frame
 
 // flat-floor walk on one region (same model as the dome interior, minus its exit pad)
@@ -14103,18 +14852,29 @@ function flatDrive(cx, cz, floorY, roomR){
 
 // world-space doorway crossing → seamless transform-teleport, emerge GROUNDED walking on the
 // destination floor with heading + speed preserved (no jolt). Symmetric (works both ways).
+// Trigger on the CAMERA crossing the seam (not the ship): the chase cam trails the ship, so
+// teleporting when the ship crosses would jump the camera while it's still short of the plane —
+// the visible "pop". Waiting for the camera puts the viewpoint exactly on the seam at teleport,
+// so the view stays continuous. The ship (which crossed earlier) keeps showing through the
+// portal via its destination-side clone (updateShipClone) until the camera follows it through.
 function testCross(fromA, toA, dstFloorY){
   var P=gameMode.portal, ship=gameMode.ship, s=gameMode.surfaceState;
   if(P.crossCooldown>0){ P.crossCooldown--; }
   fromA.updateMatrixWorld(true);
   _peSeam.setFromMatrixPosition(fromA.matrixWorld);
   _peAxis.set(0,0,1).applyQuaternion(fromA.getWorldQuaternion(_peQ)).normalize();
-  _peRel.copy(ship.position).sub(_peSeam);
+  _peRel.copy(camera.position).sub(_peSeam);                    // CAMERA vs seam (not the ship)
   var signed=_peRel.dot(_peAxis);
-  var perp=_pePerp.copy(_peRel).addScaledVector(_peAxis,-signed).length();
-  var inward=P._prevWorld?-_peVel.copy(ship.position).sub(P._prevWorld).dot(_peAxis):0;
+  // Crossing point in the doorway's LOCAL 2D frame — checked against the visual seam's actual
+  // half-extents (rectangle for the sandbox, disk for the crystal). Stepping to the side of the
+  // opening (outside the borders) no longer teleports; only passing through the hole does.
+  var lx=_peRel.dot(_peRight.set(1,0,0).applyQuaternion(_peQ));
+  var ly=_peRel.dot(_peUp.set(0,1,0).applyQuaternion(_peQ));
+  var inBounds = P.seamHW ? (Math.abs(lx)<=P.seamHW && Math.abs(ly)<=P.seamHH)
+                          : ((lx*lx+ly*ly) <= (P.seamR||P.tubeR)*(P.seamR||P.tubeR));
+  var inward=P._prevWorld?-_peVel.copy(camera.position).sub(P._prevWorld).dot(_peAxis):0;
   var crossedIn=(P._prevSigned!=null&&P._prevSigned>0&&signed<=0);
-  if(P.crossCooldown<=0&&crossedIn&&perp<P.tubeR*1.3&&inward>0.0003){
+  if(P.crossCooldown<=0&&crossedIn&&inBounds&&inward>0.0002){
     gameMode.fly.vel.copy(s.forward).multiplyScalar(s.speed);   // stash walking velocity for the transform
     teleportPortal(fromA, toA);                                  // position+camera+velocity through the portal
     _peVel.set(gameMode.fly.vel.x, 0, gameMode.fly.vel.z);
@@ -14126,7 +14886,7 @@ function testCross(fromA, toA, dstFloorY){
     P.inB=!P.inB; P.crossCooldown=15; P._prevSigned=null; P._prevWorld=null;
     return;
   }
-  P._prevSigned=signed; P._prevWorld=(P._prevWorld||new THREE.Vector3()).copy(ship.position);
+  P._prevSigned=signed; P._prevWorld=(P._prevWorld||new THREE.Vector3()).copy(camera.position);
 }
 
 function updatePortalTest(){
@@ -14190,6 +14950,7 @@ function buildPortalTestbed(){
   P.p1=new THREE.Mesh(new THREE.PlaneGeometry(DW,DH),portalSeamMat(P.rt1)); P.p1.renderOrder=3; P.p1.visible=false; P.p1.layers.set(0); P.srcAnchor.add(P.p1);
   P.p2=new THREE.Mesh(new THREE.PlaneGeometry(DW,DH),portalSeamMat(P.rt2)); P.p2.renderOrder=3; P.p2.visible=false; P.p2.layers.set(PORTAL_LAYER); P.dstAnchor.add(P.p2);
   P.tubeR=Math.max(DW,DH)*0.6;
+  P.seamHW=DW/2; P.seamHH=DH/2;   // trigger bounds == the visual doorway rectangle
   P.bg=new THREE.Color(0x06070c); P.fog=new THREE.FogExp2(0x06070c,0.06);
   P.seamRenderOn=true; P.built=true; P.testMode=true; P.testBuilt=true;
   P.crossCooldown=0; P._prevSigned=null; P._prevWorld=null; P.inB=false;
@@ -14480,12 +15241,17 @@ function animate(){
   if(gameMode.decelerating) animateGameDecel();
   if(gameMode.entering || gameMode.exiting) animateGameTransition();
   if(gameMode.active){
-    buildPortal();
-    if(gameMode.portal.inside){
-      updatePortalInterior();
+    if(gameMode.portal.testMode){
+      updatePortalTest();                 // TEMP: flat-plane ↔ room sandbox (decoupled from the crystal)
     } else {
-      updateGamePhysicsAndCamera();
-      checkPortalEntry();
+      buildPortal();
+      if(gameMode.portal.inside){
+        updatePortalInterior();
+        checkPortalExit();      // drive/fly back up through the ceiling hole → back to the crystal
+      } else {
+        updateGamePhysicsAndCamera();
+        checkPortalEntry();
+      }
     }
   }
   // Drift particles age every frame (even when not drifting, so existing streaks finish out)
@@ -14496,18 +15262,28 @@ function animate(){
     var vel=ud.velocity;
     var passive=ud.rotationSpeed;
 
-    if(isDragging&&selectedFloor===fl){
-      // HELD STATE — blend velocity toward user input
-      var inputVel=ud.inputVel||0;
-      var absVel=Math.abs(vel);
-      var absInput=Math.abs(inputVel);
+    // Freeze the crystal the player is standing on while the mini-game is active, so the portal
+    // (and the surface) is a stationary target to fly into. The website wheel still spins
+    // normally when you're not playing.
+    if(gameMode.active && fl === gameMode.galleryFloor){ ud.velocity = 0; return; }
 
-      if(absInput>=absVel){
-        // User is pushing faster — match quickly
-        vel+=(inputVel-vel)*0.3;
+    if(isDragging&&selectedFloor===fl){
+      var inputVel=ud.inputVel||0;
+      if(fl===gameMode.galleryFloor){
+        // GALLERY CHARGE WHEEL — LINEAR ACCUMULATION (flywheel). Each frame of active swiping
+        // ADDS momentum proportional to swipe speed, so every swipe contributes the same chunk
+        // regardless of current RPM — momentum builds at a steady linear pace instead of the
+        // old converge model, which capped at the swipe speed (making it harder and harder to
+        // add more). Friction (free state, 0.9998) preserves it between swipes.
+        var GALLERY_ACCEL = 0.05;
+        vel += inputVel * GALLERY_ACCEL;
+        var VMAX = 2.4;                                   // clamp (~rpm 1375) so it can't run away
+        if(vel>VMAX)vel=VMAX; else if(vel<-VMAX)vel=-VMAX;
       } else {
-        // User is slower or holding still — gradually decelerate toward input
-        vel+=(inputVel-vel)*0.05;
+        // PRODUCT WHEELS — converge toward swipe speed (responsive browsing).
+        var absVel=Math.abs(vel), absInput=Math.abs(inputVel);
+        if(absInput>=absVel){ vel+=(inputVel-vel)*0.3; }   // pushing faster — match quickly
+        else { vel+=(inputVel-vel)*0.05; }                 // slower/still — ease toward input
       }
       ud.velocity=vel;
       // No passive spin while held — wheel is under user control
@@ -14520,8 +15296,13 @@ function animate(){
       fl.group.rotation.y+=passive+vel;
     }
 
-    // Sync center star
-    if(ud.centerStar){ud.centerStar.rotation.y=-fl.group.rotation.y;ud.centerStar.rotation.x+=vel*0.5;}
+    // Sync center star. While the mini-game owns the gallery crystal, hold it hole-up (+Y) by
+    // countering the floor's Y spin with the precomputed holeUpQuat — so the hole stays facing
+    // straight up the entire game instead of tumbling to a random frozen orientation.
+    var _gameHoldsCrystal = (gameMode.active || gameMode.entering || gameMode.decelerating) && fl === gameMode.galleryFloor && gameMode.portal.holeUpQuat;
+    if(_gameHoldsCrystal && ud.centerStar){
+      ud.centerStar.quaternion.copy(_holeUpYTmp.setFromAxisAngle(_yAxisTmp.set(0,1,0), -fl.group.rotation.y)).multiply(gameMode.portal.holeUpQuat);
+    } else if(ud.centerStar){ud.centerStar.rotation.y=-fl.group.rotation.y;ud.centerStar.rotation.x+=vel*0.5;}
 
     // Sync rings
     var cs=Math.abs(vel),is=Math.abs(passive);
@@ -14963,16 +15744,12 @@ function animate(){
     }
   }
 
-  // Portal pass: render Region B from the rotation-correct virtual camera into the seam's
-  // render target BEFORE the main pass, so the seam disk shows the continuation this frame.
-  if(gameMode.active && gameMode.portal.built) updatePortalWindow();
-
-  // Render scene (without cart) to post-processing FBO. While inside the portal, swap in
-  // the interior fog/background so the dome/tunnel read right and the crystal world (now
-  // ~300 units away, past the far plane) fully drops out.
+  // Render scene (without cart) to post-processing FBO. While inside the portal (or in the
+  // flat test sandbox), swap in the dark interior fog/background so the room reads right and
+  // the website content (far away) fully drops out.
   renderer.setRenderTarget(postFBO);
   renderer.clear();
-  var _pIn = gameMode.portal.built && gameMode.portal.inside;
+  var _pIn = gameMode.portal.built && (gameMode.portal.inside || gameMode.portal.testMode);
   var _pBg, _pFog;
   if(_pIn){ _pBg = scene.background; _pFog = scene.fog; scene.background = gameMode.portal.bg; scene.fog = gameMode.portal.fog; }
   renderer.render(scene,camera);
