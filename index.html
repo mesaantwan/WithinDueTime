@@ -501,6 +501,37 @@ var gameMode = {
     particles: [],
     material: null            // lazy-initialized MeshBasicMaterial
   },
+  // Dug-trench gouge dug under the scraping inner wing while drifting — ONE continuous ribbon
+  // mesh whose vertices track the live wing↔ground contact point and stitch into a single
+  // connected, fading band (not discrete quads).
+  driftTrench: {
+    mesh: null, geo: null, posAttr: null, alphaAttr: null,
+    points: [],               // {p, n, side, age} — sampled wing-ground contact path
+    maxPoints: 200,
+    lastPos: null,            // last sample (spacing gate)
+    spacing: 0.0022,          // min world distance between samples (small = smooth line)
+    halfWidth: 0.0022,        // gouge half-width (thin scrape line)
+    fade: 0.011               // age increment per frame (~1.5s lifetime)
+  },
+  // Purple rocket beam emitted from the engine while BOOSTING — a tapered TUBE that starts as a
+  // point at the nozzle and swells into a thin cylindrical beam of power behind the ship, plus
+  // emitted spark particles. One persistent tube mesh + one pooled Points system.
+  boostTrail: {
+    // Spine framework (engine positions over time) — the beam's glowing centerline.
+    points: [], maxPoints: 44, lastPos: null, spacing: 0.0026, fade: 0.05,
+    boosting: false, startT: 0, intensity: 0,
+    // Central purple beam: a tapered tube around the spine + a point light it emits.
+    mesh: null, geo: null, posAttr: null, alphaAttr: null, sides: 7, radius: 0.004, ramp: 5,
+    light: null,
+    // Orbiting spark streaks — thin line-trail sparks that swirl around the beam.
+    orb: [], orbLines: null, orbGeo: null, orbPos: null, orbAlpha: null, maxOrb: 200, orbTrail: 6,
+    orbR: 0.011, orbSpin: 0.34,
+    // Ignition shockwave (one-shot expanding ring + bright flash pop).
+    shockRing: null, flash: null, shockT: -1, shockPos: null,
+    // Welding-style sparks fired straight out (ignition burst + ongoing).
+    sparks: [], sparkLines: null, sparkGeo: null, sparkPos: null, sparkAlpha: null,
+    maxSparks: 160, sparkTrail: 5
+  },
   group: null,              // wrapper around ship for visibility toggle
   ship: null,
   shipVisual: null,
@@ -600,6 +631,9 @@ var gameMode = {
     // from boostMaxSpeed.
     coastHoldFrames: 240,
     coastLinearDecel: 0.00005,
+    // When you release boost above the walk cap, speed bleeds down toward the cap at this rate
+    // per frame (running → walking) instead of snapping — ~1.6s from boostMax back to walk.
+    boostFalloff: 0.00009,
     turnSpeed: 0.04,
     // Drift tuning (matches Orbicule's basic gunner drift, scaled for tiny planet)
     driftTurnBase: 0.012,                    // initial drift yaw rate
@@ -2184,6 +2218,12 @@ function createLightRays() {
 // ══════════════════════════════════════════════
 var lensFlare = null;
 var lensFlareElements = []; // track elements for adaptive sizing
+// THREE.Lensflare occlusion-tests at its anchor's screen position; if the anchor sits inside the
+// solid crystal it reads as fully occluded → invisible. So the flare gets its OWN anchor that
+// floats in front of the crystal toward the camera (clear space → not occluded), repositioned
+// each frame in updateLensFlare. Offset is along the view axis so it still projects onto the crystal.
+var lensFlareAnchor = null;
+var _lfCrystalPos = new THREE.Vector3();
 
 function generateFlareTexture(size, coreR, coreG, coreB, falloff) {
   var c = document.createElement('canvas'); c.width = size; c.height = size;
@@ -2279,13 +2319,17 @@ function createLensFlare() {
   lensFlare.addElement(e6);
   lensFlareElements.push({el:e6, baseSize:35, baseColor:new THREE.Color(0.5, 0.45, 0.65)});
 
-  // Attach to the orb floor's center light
+  // Attach to a dedicated anchor in scene space (NOT the crystal-center light, which would make
+  // the flare occlude itself). updateLensFlare floats this anchor in front of the crystal.
+  lensFlareAnchor = new THREE.Object3D();
   for(var i=0;i<floors.length;i++){
-    if(floors[i].isOrbFloor && floors[i].group.userData.centerLight){
-      floors[i].group.userData.centerLight.add(lensFlare);
+    if(floors[i].isOrbFloor){
+      lensFlareAnchor.position.set(0, floors[i].group.position.y, 2.0);
       break;
     }
   }
+  lensFlareAnchor.add(lensFlare);
+  scene.add(lensFlareAnchor);
 }
 
 // Adaptive camera lens flare bound to the MAIN crystal's light. THREE.Lensflare already tracks
@@ -2296,12 +2340,26 @@ function createLensFlare() {
 function updateLensFlare(lightVal, climax) {
   if(!lensFlare || !lensFlareElements.length) return;
   lightVal = lightVal || 0; climax = climax || 0;
-  var intensity = lightVal * 1.15 + climax * climax * 2.6;   // tracks the crystal's light + climax
-  var scaleMult = Math.max(0, intensity) * 1.45;
-  var whiteShift = Math.min(lightVal * 0.7 + climax, 1.0);   // white-hot when the crystal is bright
+  // Float the anchor in front of the crystal, toward the camera, so the occlusion test lands in
+  // clear space (the solid crystal no longer hides the flare). Offset along the view axis keeps it
+  // projecting onto the crystal on screen.
+  if(lensFlareAnchor){
+    _lfCrystalPos.set(0, gameMode.galleryFloor ? gameMode.galleryFloor.group.position.y : 0, 0);
+    var toCam = camera.position.clone().sub(_lfCrystalPos);
+    if(toCam.lengthSq() > 1e-6) toCam.normalize(); else toCam.set(0,0,1);
+    lensFlareAnchor.position.copy(_lfCrystalPos).addScaledVector(toCam, 2.2);
+  }
+  var intensity = lightVal * 1.7 + climax * climax * 3.8;     // stronger overall bloom
+  // Flicker — fast multi-octave shimmer that gets deeper as the flare brightens, so it reads as
+  // an unstable energy burst rather than a steady glow. Per-element phase so they don't pulse in lockstep.
+  var nowF = performance.now() * 0.001;
+  var flickBase = 0.78 + 0.22 * (Math.sin(nowF * 31.0) * 0.6 + Math.sin(nowF * 53.0 + 1.7) * 0.4);
+  var scaleMult = Math.max(0, intensity) * 2.0;
+  var whiteShift = Math.min(lightVal * 0.85 + climax, 1.0);   // white-hot when the crystal is bright
   for(var i=0;i<lensFlareElements.length;i++){
     var le = lensFlareElements[i];
-    le.el.size = le.baseSize * scaleMult;
+    var flick = flickBase + 0.18 * Math.sin(nowF * 47.0 + i * 2.3);
+    le.el.size = le.baseSize * scaleMult * flick;
     var r = le.baseColor.r + whiteShift * (1.0 - le.baseColor.r) * 0.85;
     var g = le.baseColor.g + whiteShift * (1.0 - le.baseColor.g) * 0.85;
     var b = le.baseColor.b + whiteShift * (1.0 - le.baseColor.b) * 0.5;
@@ -3854,16 +3912,19 @@ function onTE(e){
          swipeDy > Math.abs(swipeDx) * 1.2){
         gameMode.wantJump = true;
       }
-      // Quick horizontal swipe-release while airborne = barrel roll. Sustained
-      // horizontal drag is yaw (handled in onTM), so the time + dominance check is
-      // what disambiguates. Only fires while airborne — on the ground horizontal
-      // gestures stay yaw.
+      // Quick swipe-release while airborne = barrel roll. A flat horizontal swipe is a pure
+      // lateral roll; a ~45° swipe corkscrews up (NE/NW) or down (SE/SW). Needs a real
+      // horizontal component (>0.5x the vertical) so a near-vertical flick still reads as
+      // jump (up) / slam (down). Sustained horizontal drag is yaw (onTM); the time check
+      // disambiguates. Only fires while airborne — on the ground horizontal gestures stay yaw.
       else if(swipeDur < 280 &&
-              Math.abs(swipeDx) > window.innerWidth * 0.06 &&
-              Math.abs(swipeDx) > Math.abs(swipeDy) * 1.2 &&
+              Math.abs(swipeDx) > window.innerWidth * 0.05 &&
+              Math.abs(swipeDx) > Math.abs(swipeDy) * 0.5 &&
               gameMode.surfaceState.airborne){
-        // Right swipe = roll right (-1), left swipe = roll left (+1) — matches A/D mapping
-        triggerBarrelRoll(swipeDx > 0 ? -1 : 1);
+        // Right swipe = roll right (-1), left = roll left (+1) — matches A/D mapping. swipeDy
+        // is +up, so the vertical component drives the corkscrew up/down bias.
+        var brVert = Math.max(-1, Math.min(1, swipeDy / Math.max(Math.abs(swipeDx), 1)));
+        triggerBarrelRoll(swipeDx > 0 ? -1 : 1, { vertBias: brVert });
       }
       // Quick downward swipe-release while airborne = slam to the surface.
       // Mirror of the swipe-up-jump trigger (positive swipeDy fires a jump on
@@ -4371,6 +4432,22 @@ function pUp(cx,cy){
   if(wasClick){
     mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
     raycaster.setFromCamera(mouse,camera);
+
+    // ── Double-tap the bottom spinny wheel (gallery floor) to queue the mini-game start. ──
+    if(gameMode.galleryFloor && !gameMode.active && !gameMode.entering && !gameMode.decelerating && !gameMode.exiting){
+      var gwHits = raycaster.intersectObjects(gameMode.galleryFloor.group.children, true);
+      if(gwHits.length > 0){
+        var nowWT = performance.now();
+        if(nowWT - (pUp._lastWheelTap || 0) < 350){
+          pUp._lastWheelTap = 0;
+          enterGameMode();   // kicks off the decelerate → camera-dive entry sequence
+          isDragging=false; selectedFloor=null; if(dm.draggingVW) dm.draggingVW=false;
+          renderer.domElement.parentElement.classList.remove('dragging');
+          return;
+        }
+        pUp._lastWheelTap = nowWT;
+      }
+    }
 
     // In-game glass windows intercept clicks (options/inventory windows + their icons)
     if(gameMode.active && !gameMode.exiting){
@@ -7671,7 +7748,7 @@ function buildOptionsContent(win){
   // to the ship (lower = closer); FOV = camera field of view.
   var rows = [
     {label:'CAMERA ZOOM', val:gameMode.camBackDist.toFixed(2), dec:'opt-zoom-dec', inc:'opt-zoom-inc'},
-    {label:'FOV',         val:Math.round(camera.fov) + '',     dec:'opt-fov-dec',  inc:'opt-fov-inc'}
+    {label:'FOV',         val:Math.round(gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + '', dec:'opt-fov-dec',  inc:'opt-fov-inc'}
   ];
   rows.forEach(function(r){
     var lbl = pdvTextMesh(r.label, {cw:400, ch:64, font:'600 28px Arial', color:'#2a3248', align:'left', w:W*0.40, h:rowH*0.62});
@@ -7742,8 +7819,8 @@ function closeGameWindow(win){ if(win){ win.open = false; win.target = 0; } }
 function handleGameOption(actionId){
   if(actionId === 'opt-zoom-dec')      gameMode.camBackDist = Math.max(0.04, gameMode.camBackDist - 0.02); // closer
   else if(actionId === 'opt-zoom-inc') gameMode.camBackDist = Math.min(0.50, gameMode.camBackDist + 0.02); // farther
-  else if(actionId === 'opt-fov-dec'){ camera.fov = Math.max(40, camera.fov - 5); camera.updateProjectionMatrix(); }
-  else if(actionId === 'opt-fov-inc'){ camera.fov = Math.min(120, camera.fov + 5); camera.updateProjectionMatrix(); }
+  else if(actionId === 'opt-fov-dec'){ gameMode.fovBase = Math.max(40, (gameMode.fovBase != null ? gameMode.fovBase : camera.fov) - 5); }
+  else if(actionId === 'opt-fov-inc'){ gameMode.fovBase = Math.min(120, (gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + 5); }
   else if(actionId === 'opt-joy')      gameMode.joystickEnabled = (gameMode.joystickEnabled === false);
   else if(actionId === 'opt-fly')      toggleFlightMode();
   else if(actionId === 'opt-exit'){ closeGameWindow(gameUI.options); closeGameWindow(gameUI.inventory); exitGameMode(); return; }
@@ -12239,6 +12316,13 @@ function enterGameMode() {
   if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
   if(PORTAL_TEST_MODE){ enterPortalTestMode(); return; }   // TEMP: jump straight into the flat portal sandbox
   if(!gameMode.group) buildGameMode();
+  // Warm up the boost-trail meshes NOW (under the entry animation) so the first boost press
+  // doesn't hitch building geometry + compiling shaders. renderer.compile pre-links the new
+  // shader programs; cached ones are skipped.
+  if(!gameMode.boostTrail.mesh){
+    ensureBoostTrailMesh();
+    if(renderer) renderer.compile(scene, camera);
+  }
   // Two-stage entry: first the wheel rapidly decelerates from its current burst velocity,
   // THEN the camera dives in. Without this pre-decel, the wheel would either snap to a
   // halt (jarring) or continue spinning while the camera zooms in (distracting).
@@ -12256,6 +12340,9 @@ function enterGameMode() {
   // default 0.1 near plane would clip the surface right under the camera.
   gameMode.savedCamNear = camera.near;
   camera.near = 0.001;
+  // Adaptive-FOV baseline — the resting FOV that speed widens from. The options FOV buttons
+  // adjust this base; the per-frame adaptive term adds on top of it.
+  gameMode.fovBase = camera.fov;
   camera.updateProjectionMatrix();
   // Lock surface center to the gallery floor's crystal in world space, and bind the
   // active crystal to it. Free-fall can later re-bind these to any other floor's crystal.
@@ -12890,17 +12977,95 @@ function killGalleryEffects(gf) {
 }
 
 function computeChaseCamPose() {
-  // Returns {pos, lookAt, up} for the chase camera. `up` is the smoothed surface normal
-  // (from the per-frame raycast) so the camera stays upright relative to whatever facet
-  // the ship is sitting on. Position is the ship's actual world position.
+  // Returns {pos, lookAt, up} for the chase camera.
+  //
+  // While drifting we hold two hard requirements: (1) screen-CENTRE points along the ship's
+  // FIRING direction (its model facing, = travel rotated by the drift yaw) so the crosshair /
+  // bullets line up dead-centre, and (2) the ship stays fully on screen. The dependent
+  // variables are camera position + rotation. We satisfy it in that order: first POINT the
+  // camera down the firing line while keeping the body BEHIND the travel direction (the ship
+  // then sits off to the drift side). If that would push the ship past the screen edge, we
+  // can't get both by rotation alone, so we ROTATE THE CAMERA'S "behind" vector toward the
+  // firing line — i.e. move the camera around behind the ship — and pull it a little closer,
+  // clamping the ship to the screen edge. A slight roll into the drift is still applied.
   var s = gameMode.surfaceState;
   var up = s.groundNormal.clone();
-  var shipWorld = gameMode.ship.position.clone();
-  var camPos = shipWorld.clone()
-    .add(s.forward.clone().multiplyScalar(-gameMode.camBackDist))
-    .add(up.clone().multiplyScalar(gameMode.camUpDist));
-  var lookAt = shipWorld.clone().add(up.clone().multiplyScalar(0.015));
-  return { pos: camPos, lookAt: lookAt, up: up };
+  var S = gameMode.ship.position.clone();
+  var d = gameMode.camBackDist, h = gameMode.camUpDist;
+  var F = s.forward;
+  var driftA = s.driftAngle || 0;
+
+  // ── Non-drift (default chase) pose ──
+  var posN = S.clone().addScaledVector(F, -d).addScaledVector(up, h);
+  var lookN = S.clone().addScaledVector(up, 0.015);
+
+  // ── Smoothed drift-cam blend (0 → 1) ── ramps in/out over ~0.4s so ENTERING or leaving a drift
+  // eases the camera between the two poses instead of snapping. (The pose itself flips hard at the
+  // drift threshold; blending the whole pose by this factor is what removes the disorienting jolt.)
+  var target = s.isDrifting ? 1 : 0;
+  var b = gameMode._driftCamBlend || 0;
+  b += (target - b) * 0.09;
+  if(b < 0.0008) b = 0;
+  gameMode._driftCamBlend = b;
+  if(b <= 0.0008){
+    return { pos: posN, lookAt: lookN, up: up };
+  }
+
+  // ── Drift pose ── centre on the firing direction M; the ship is placed at a fixed SCREEN spot
+  // (always visible), pushed to the drift side and capped inside the edge. Camera forward = M, so
+  // for light drifts it sits behind travel and swings behind the ship once the offset hits the edge.
+  var M = F.clone().applyAxisAngle(up, driftA);
+  if(M.lengthSq() > 1e-9) M.normalize();
+  var fovRadCam = camera.fov * Math.PI / 180;
+  var halfV = fovRadCam / 2;
+  var halfH = Math.atan(Math.tan(halfV) * camera.aspect);
+  var sxMax = halfH * 0.5;
+  var sx = Math.max(-sxMax, Math.min(sxMax, driftA));
+  var sy = -Math.min(0.13, halfV * 0.3);
+  var right = new THREE.Vector3().crossVectors(M, up).normalize();
+  var shipDir = M.clone().addScaledVector(right, Math.tan(sx)).addScaledVector(up, Math.tan(sy));
+  if(shipDir.lengthSq() > 1e-9) shipDir.normalize();
+  var posD = S.clone().addScaledVector(shipDir, -d);
+  var lookD = posD.clone().addScaledVector(M, 1.0);
+  var upD = up.clone();
+  var driftFrac = Math.min(1, Math.abs(driftA) / (Math.PI * 0.5));
+  var rollQ = new THREE.Quaternion().setFromAxisAngle(M, -driftFrac * 0.18 * (driftA < 0 ? -1 : 1));
+  upD.applyQuaternion(rollQ);
+
+  // ── Blend the two poses by the smoothed factor ──
+  var pos = posN.lerp(posD, b);
+  var lookAt = lookN.lerp(lookD, b);
+  var outUp = up.lerp(upD, b);
+  if(outUp.lengthSq() > 1e-9) outUp.normalize();
+  return { pos: pos, lookAt: lookAt, up: outUp };
+}
+
+// Live-gameplay chase pose: the Souls-like LOCK-ON framing when a target is locked, else the
+// normal chase/drift pose. (Entry/exit transitions call computeChaseCamPose directly so they're
+// never affected by a lock.)
+function gameCamPose(){
+  if(typeof combat !== 'undefined' && combat.lockTarget && combat.enemies.indexOf(combat.lockTarget) >= 0){
+    return computeLockCamPose(combat.lockTarget);
+  }
+  return computeChaseCamPose();
+}
+// Camera sits behind the ship on the side AWAY from the locked enemy (projected onto the surface)
+// and looks at a point between ship and enemy — so the enemy stays framed in front of the player
+// as they circle/strafe, the classic lock-on camera.
+function computeLockCamPose(target){
+  var s = gameMode.surfaceState;
+  var up = s.groundNormal.clone();
+  var S = gameMode.ship.position.clone();
+  var toEnemy = target.position.clone().sub(S);
+  var flat = toEnemy.clone().addScaledVector(up, -toEnemy.dot(up));   // enemy dir along the surface
+  if(flat.lengthSq() > 1e-8) flat.normalize(); else flat.copy(s.forward);
+  // pull back + up a little more than the default chase so both ship and enemy sit in frame
+  var pos = S.clone()
+    .addScaledVector(flat, -gameMode.camBackDist * 1.5)
+    .addScaledVector(up, gameMode.camUpDist * 1.8);
+  // look at ≈ the midpoint between ship and enemy, lifted slightly off the surface
+  var lookAt = S.clone().addScaledVector(toEnemy, 0.5).addScaledVector(up, 0.02);
+  return { pos: pos, lookAt: lookAt, up: up };
 }
 
 // Arc-lerp a camera position from `fromPos` to `toPos` around `center`. The direction
@@ -13020,6 +13185,11 @@ function animateGameTransition() {
       camera.updateProjectionMatrix();
       // Clean up any drift particles still alive — they'd otherwise hang in mid-air
       clearGameDriftParticles();
+      clearGameDriftTrench();
+      clearGameBoostTrail();
+      clearGameBullets();
+      hideSpeedCounter();
+      updateCrosshair(false);
     }
 
     if(ep >= 1) {
@@ -13086,16 +13256,28 @@ function updateGamePhysicsAndCamera() {
   var ship = gameMode.ship;
 
   // === Read input axes ===
+  // Two speed states: WALKING (W only, capped at ~15 km/h) and RUNNING (Shift/boost — 2× the
+  // W acceleration and the cap lifts toward boostMaxSpeed). Anything above the walk cap counts
+  // as running, the only state where drifting + flips are allowed.
   var fwdAxis = 0, yawAxis = 0;
   if(t.active){
     fwdAxis = t.throttle;
     yawAxis = t.yaw;
     p.isBoosting = t.boost;
   } else {
-    fwdAxis = (k.w ? 1 : 0) + (k.s ? -0.6 : 0);
+    fwdAxis = (k.w ? 1 : 0) + ((k.s && !gameMode.sBrakeLock) ? -0.6 : 0);
     yawAxis = (k.a ? -1 : 0) + (k.d ? 1 : 0);
-    p.isBoosting = k.shift && k.w;
+    p.isBoosting = k.shift;
   }
+  // Boost drives forward on its own (you don't also have to hold W to run).
+  if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
+  // No braking in the air — S mid-air is only a slam, never a brake, so a slam keeps your momentum.
+  if(s.airborne && fwdAxis < 0) fwdAxis = 0;
+  // Running = above the walk cap OR actively boosting. Uses the larger of surface speed and
+  // airborne velocity so a fast ramp-launch stays "running" mid-air (keeps flips enabled).
+  var speedMetric = Math.max(Math.abs(s.speed), fly.vel.length());
+  s.running = p.isBoosting || speedMetric > p.maxSpeed * (10/15);   // running (drift/flip) gate = 10 km/h
+  updateSpeedCounter(speedMetric);
 
   // === Jump trigger → clean vertical HOP (land-locked) ===
   // A normal jump is a predictable hop straight up off the current facet along a
@@ -13149,8 +13331,10 @@ function updateGamePhysicsAndCamera() {
                         || (t.active && t.driftHold && t.driftDir > 0);
     var wantsDrift = wantsDriftLeft || wantsDriftRight;
     var spdAbs = Math.abs(s.speed);
-    var canEnter = spdAbs > p.maxSpeed * p.driftEntrySpeedRatio;
-    var canContinue = spdAbs > p.maxSpeed * p.driftContinueSpeedRatio;
+    // Drifting is a RUNNING-only move — you must be above the walk cap (~15 km/h) to start one,
+    // and it ends if you drop back into walking speed.
+    var canEnter = s.running && spdAbs > p.maxSpeed * p.driftEntrySpeedRatio;
+    var canContinue = s.running && spdAbs > p.maxSpeed * p.driftContinueSpeedRatio;
     var canDriftNow = s.isDrifting ? canContinue : canEnter;
 
     if(wantsDrift && canDriftNow && !s.airborne) {
@@ -13163,6 +13347,7 @@ function updateGamePhysicsAndCamera() {
       s.driftDirection = wantsDriftLeft ? 1 : -1;
       s.driftTargetAngle = s.driftDirection * (Math.PI * 0.5);
       spawnGameDriftParticles();
+      spawnDriftTrench();
     } else {
       s.isDrifting = false;
       s.driftDirection = 0;
@@ -13176,34 +13361,58 @@ function updateGamePhysicsAndCamera() {
     else p.accelerationTime = Math.max(0, p.accelerationTime - 3);
     var thrustRamp = p.accelerationTime / p.maxAccelerationTime;
     var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * thrustRamp;
-    if(p.isBoosting) thrust = p.boostAccelRate;
+    // Boost = double the normal W acceleration (linear), driving you up into the running range.
+    if(p.isBoosting) thrust = thrust * 2;
 
     var driftTight = 0;
     if(t.active && t.driftHold) driftTight = t.driftTight;
     if(k.s) driftTight = Math.max(driftTight, 1);
 
     if(s.isDrifting) {
-      if(s.driftTime > p.driftSustainTime) {
+      if(s.driftTime <= p.driftSustainTime) {
+        // Hold the entry momentum — a fresh drift must NEVER bleed speed, even coming in at
+        // top speed. (Previously entering a drift fast could settle you into a slower glide.)
+        var driftSign = s.speed < 0 ? -1 : 1;
+        if(Math.abs(s.speed) < s.driftEntrySpeed) s.speed = driftSign * s.driftEntrySpeed;
+      } else {
         s.speed -= Math.sign(s.speed || 1) * p.driftDecel;
         s.speed *= 0.998;
+        if(driftTight > 0) s.speed *= (1 - driftTight * 0.015);
       }
-      if(driftTight > 0) s.speed *= (1 - driftTight * 0.015);
-    } else {
+    } else if(p.isBoosting){
+      // RUNNING (boost): double-accel forward with NO max speed — keep building over and over.
+      s.speed += thrust * fwdAxis;                          // no drag, no cap → speed climbs unbounded
+      s.coastFrames = 0;
+      var BOOST_SAFETY = p.maxSpeed * 12;                   // ~180 km/h sanity guard (effectively uncapped)
+      if(s.speed > BOOST_SAFETY) s.speed = BOOST_SAFETY;
+      var maxRb = p.maxSpeed * 0.6;
+      if(s.speed < -maxRb) s.speed = -maxRb;
+    } else if(fwdAxis > 0.01 && s.speed > p.maxSpeed){
+      // Holding W ABOVE the 15 km/h walk cap: W can't accelerate past it, but it HOLDS your
+      // momentum up to the 35 km/h sustain cap. Above 35 it slowly bleeds back down to it.
+      s.coastFrames = 0;
+      var SUSTAIN_CAP = p.maxSpeed * (35/15);               // 35 km/h
+      if(s.speed > SUSTAIN_CAP){
+        s.speed -= 0.00015;                                 // slow momentum loss down to 35
+        if(s.speed < SUSTAIN_CAP) s.speed = SUSTAIN_CAP;
+      }
+      // 15–35 km/h while W is held → maintained steady (no accel, no decay).
+    } else if(hasFwd){
+      // WALKING (within walk range) / reverse — W ramps you up toward the walk cap.
       s.speed += thrust * fwdAxis;
-      if(hasFwd) {
-        s.coastFrames = 0;
-        s.speed *= p.drag;
-        var maxS = p.isBoosting ? p.boostMaxSpeed : p.maxSpeed;
-        if(t.active && t.useJoystick) maxS = Math.max(maxS, 0.03);
-        if(s.speed > maxS) s.speed = maxS;
-        var maxR = (p.isBoosting ? p.boostMaxSpeed : p.maxSpeed) * 0.6;
-        if(s.speed < -maxR) s.speed = -maxR;
-      } else {
-        s.coastFrames += 1;
-        if(s.coastFrames > p.coastHoldFrames) {
-          if(s.speed > 0) s.speed = Math.max(0, s.speed - p.coastLinearDecel);
-          else if(s.speed < 0) s.speed = Math.min(0, s.speed + p.coastLinearDecel);
-        }
+      s.coastFrames = 0;
+      s.speed *= p.drag;
+      var walkCap = p.maxSpeed;
+      if(t.active && t.useJoystick) walkCap = Math.max(walkCap, 0.03);
+      if(s.speed > walkCap) s.speed = walkCap;
+      var maxR = p.maxSpeed * 0.6;
+      if(s.speed < -maxR) s.speed = -maxR;
+    } else {
+      // No throttle — coast: hold momentum, then bleed off linearly.
+      s.coastFrames += 1;
+      if(s.coastFrames > p.coastHoldFrames) {
+        if(s.speed > 0) s.speed = Math.max(0, s.speed - p.coastLinearDecel);
+        else if(s.speed < 0) s.speed = Math.min(0, s.speed + p.coastLinearDecel);
       }
     }
 
@@ -13304,6 +13513,8 @@ function updateGamePhysicsAndCamera() {
       var vN = fly.vel.dot(s.groundNormal);
       if(vN < 0) fly.vel.sub(s.groundNormal.clone().multiplyScalar(vN));
       fly.vel.multiplyScalar(0.85);
+      // Wings ride the facets/ridges (anti-clip). Skipped while drifting so the inner wing scrapes.
+      if(!s.isDrifting) contourWingsToSurface();
     } else {
       // Crystal missing (shouldn't happen) → detach into free-fall (carry walking momentum).
       s.airborne = true; s.freeFalling = true; s.airTime = 0;
@@ -13439,22 +13650,60 @@ function updateGamePhysicsAndCamera() {
     }
   }
 
-  // === Orient ship: local +Z = forward, local +Y = groundNormal ===
-  s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
-  if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
-  var orientM = new THREE.Matrix4();
-  orientM.lookAt(new THREE.Vector3(0,0,0), s.forward.clone().multiplyScalar(-1), s.groundNormal);
-  ship.quaternion.setFromRotationMatrix(orientM);
+  // === Orient ship ===
+  // FREE-FALLING: the ship behaves like a thrown physical object — its nose (local +Z)
+  // swings to point along its velocity. Going off a ramp it leans forward on the way up,
+  // then pitches nose-down as the arc carries it back toward the surface (the "car catching
+  // air" feel) — purely a side effect of aligning to the velocity vector. Grounded / hopping
+  // keeps the clean surface-tangent pose.
+  if(s.freeFalling && fly.vel.lengthSq() > 1e-8){
+    var fvDir = fly.vel.clone().normalize();
+    var fUp = s.groundNormal.clone();
+    if(Math.abs(fUp.dot(fvDir)) > 0.95) fUp.set(0, 1, 0);   // avoid a degenerate look-up
+    var fOrient = new THREE.Matrix4();
+    fOrient.lookAt(new THREE.Vector3(0,0,0), fvDir.clone().multiplyScalar(-1), fUp);
+    var fQuat = new THREE.Quaternion().setFromRotationMatrix(fOrient);
+    ship.quaternion.slerp(fQuat, 0.12);                     // ease into it so it tumbles smoothly
+    s.forward.lerp(fvDir, 0.12);                            // keep the chase cam tracking the dive
+    if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+  } else {
+    s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+    if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+    var orientM = new THREE.Matrix4();
+    orientM.lookAt(new THREE.Vector3(0,0,0), s.forward.clone().multiplyScalar(-1), s.groundNormal);
+    ship.quaternion.setFromRotationMatrix(orientM);
+  }
 
-  // === Visual overlays (drift roll + barrel roll) ===
+  // === Visual overlays (drift roll + barrel roll + ramp pitch + scrape shake) ===
   if(gameMode.shipVisual) {
+    var sv = gameMode.shipVisual;
     if(s.barrelRoll.active){
       var rollEase = s.barrelRoll.progress;
-      gameMode.shipVisual.rotation.z = -s.barrelRoll.direction * s.barrelRoll.rotations * Math.PI * 2 * rollEase;
-      gameMode.shipVisual.rotation.y = 0;
+      sv.rotation.z = -s.barrelRoll.direction * s.barrelRoll.rotations * Math.PI * 2 * rollEase;
+      sv.rotation.y = 0;
+      sv.rotation.x = 0;
+      sv.position.set(0, 0, 0);
     } else {
-      gameMode.shipVisual.rotation.y = s.driftAngle;
-      gameMode.shipVisual.rotation.z = -s.driftAngle * 0.3;
+      sv.rotation.y = s.driftAngle;
+      // The surface-contour bank only applies while grounded-contouring; bleed it off in the
+      // air or during a drift (contourWingsToSurface drives it back up when grounded).
+      if(s.airborne || s.isDrifting) s.surfaceBank = (s.surfaceBank || 0) * 0.85;
+      // Bank harder while drifting so the inner wing dips toward the floor (it's allowed to
+      // scrape); otherwise hold the gentle 0.3 drift bank plus the surface-follow contour bank.
+      sv.rotation.z = -s.driftAngle * (s.isDrifting ? 0.6 : 0.3) + (s.surfaceBank || 0);
+      // Ramp lean: a land-locked hop pitches the nose with vertical velocity (nose up while
+      // rising, down while falling). Free-fall handles its own pitch via the velocity-facing
+      // quaternion above, so this only runs for the controlled hop.
+      var rampPitch = (s.airborne && !s.freeFalling) ? -s.vertVel * 9.0 : 0;
+      sv.rotation.x = Math.max(-0.5, Math.min(0.5, rampPitch));
+      // Scrape vibration — while drifting the ship buzzes as if grinding the surface. Jitters
+      // the VISUAL only (shipVisual is a child of ship); collision uses ship.position untouched.
+      if(s.isDrifting){
+        var jit = 0.05;
+        sv.position.set((Math.random()-0.5)*jit, (Math.random()-0.5)*jit, (Math.random()-0.5)*jit);
+      } else {
+        sv.position.set(0, 0, 0);
+      }
     }
   }
 
@@ -13465,15 +13714,25 @@ function updateGamePhysicsAndCamera() {
     gameMode.engineGlow.scale.setScalar(1 + sf * 0.7);
   }
 
-  // === Chase camera ===
-  var chase = computeChaseCamPose();
+  // Purple rocket trail while boosting (running state).
+  if(p.isBoosting) spawnBoostTrail();
+
+  // === Adaptive FOV — widens linearly with speed for a sense of velocity ===
+  var fovBase = (gameMode.fovBase != null) ? gameMode.fovBase : 60;
+  var fovSpdRatio = Math.min(1, Math.abs(s.speed) / p.boostMaxSpeed);
+  camera.fov = fovBase + fovSpdRatio * 28;   // base → base+28° at boost-max speed
+  camera.updateProjectionMatrix();
+
+  // === Chase camera (lock-on aware) ===
+  var chase = gameCamPose();
   if(gameMode.portal.snapCam){
     // first frame after a portal cross — snap straight to the chase pose so there's no roll/glide
     camera.position.copy(chase.pos); camera.up.copy(chase.up).normalize();
     gameMode.portal.snapCam = false;
   } else {
-    camera.position.lerp(chase.pos, 0.18);
-    camera.up.lerp(chase.up, 0.12); camera.up.normalize();
+    var camLerp = gameMode.surfaceState.isDrifting ? 0.5 : 0.18;   // track the rotating drift cam tightly
+    camera.position.lerp(chase.pos, camLerp);
+    camera.up.lerp(chase.up, gameMode.surfaceState.isDrifting ? 0.3 : 0.12); camera.up.normalize();
   }
   camera.lookAt(chase.lookAt);
 }
@@ -13490,6 +13749,8 @@ function updateFlightPhysicsAndCamera() {
   var t = gameMode.touch;
   var fly = gameMode.fly;
   var ship = gameMode.ship;
+
+  updateSpeedCounter(fly.vel.length());   // keep the km/h readout live in flight mode
 
   // Read input axes — keyboard binary, touch analog
   var fwdAxis, yawAxis;
@@ -13697,27 +13958,1217 @@ function clearGameDriftParticles() {
   arr.length = 0;
 }
 
+// ── 1:1 wing contouring ──────────────────────────────────────────────────────────────
+// Half the ship's wingspan in WORLD units (ship.scale ≈ 0.014, body ~2.4 wide → ~0.017 half).
+var GAME_WING_HALF_SPAN = 0.018;
+var GAME_WING_BANK_GAIN = 0.8;     // how strongly the ship banks to match the lateral slope
+// While GROUNDED and NOT drifting, sample the crystal surface under each wingtip and:
+//   • bank the ship (roll) so its wings follow the local surface slope, and
+//   • raise the ship if the lower wingtip would otherwise dip below the surface,
+// so the wings ride the facets/ridges instead of clipping through them. Skipped while
+// drifting on purpose — there the inner wing is meant to scrape and gouge the ground.
+function contourWingsToSurface(){
+  var s = gameMode.surfaceState;
+  var ship = gameMode.ship;
+  if(s.surfaceBank === undefined) s.surfaceBank = 0;
+  var up = s.groundNormal;
+  var right = new THREE.Vector3(1, 0, 0).applyQuaternion(ship.quaternion);
+  right.sub(up.clone().multiplyScalar(right.dot(up)));   // keep it on the tangent plane
+  if(right.lengthSq() < 1e-6) return;
+  right.normalize();
+  var span = GAME_WING_HALF_SPAN;
+  var pL = ship.position.clone().addScaledVector(right, span);
+  var pR = ship.position.clone().addScaledVector(right, -span);
+  var cpL = closestPointOnCrystal(pL);
+  var cpR = closestPointOnCrystal(pR);
+  if(!cpL || !cpR) return;
+  // Clearance of each wingtip above the surface directly beneath it (measured along ship up).
+  var hL = pL.clone().sub(cpL.point).dot(up);
+  var hR = pR.clone().sub(cpR.point).dot(up);
+  // Bank to match the lateral slope between the wingtips. atan2 of the height difference over
+  // the span is the slope angle; gain + smoothing keep it from jittering on jagged facets.
+  var bankTarget = Math.atan2(hL - hR, span * 2) * GAME_WING_BANK_GAIN;
+  bankTarget = Math.max(-0.6, Math.min(0.6, bankTarget));
+  s.surfaceBank += (bankTarget - s.surfaceBank) * 0.2;
+  // Raise so the LOWER wingtip clears by hoverHeight (never lower — that would sink the ship).
+  var minH = Math.min(hL, hR);
+  if(minH < s.hoverHeight) ship.position.addScaledVector(up, s.hoverHeight - minH);
+}
+
+// ── Dug-trench gouge (continuous ribbon) ─────────────────────────────────────────────
+// While drifting, the inner wing scrapes the ground. We sample the live wing↔ground contact
+// point each frame, push it onto a path, and rebuild ONE triangle-strip ribbon that stitches
+// those points into a single connected band laid on the surface — a real procedural gouge
+// line, not a row of stamped quads. Each sample carries its own age so the tail fades out
+// smoothly behind the ship.
+//
+// The ribbon is one persistent mesh with a fixed-size buffer; only the active span is drawn
+// (setDrawRange) and the vertices are rewritten from the live path every frame.
+function ensureDriftTrenchMesh(){
+  var DT = gameMode.driftTrench;
+  if(DT.mesh) return;
+  var maxP = DT.maxPoints;
+  var positions = new Float32Array(maxP * 2 * 3);
+  var alphas = new Float32Array(maxP * 2);
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+  // Two triangles per segment between consecutive path points (fixed index buffer).
+  var idx = [];
+  for(var i = 0; i < maxP - 1; i++){
+    var a = i*2, b = i*2+1, c = i*2+2, d = i*2+3;
+    idx.push(a, b, c, b, d, c);
+  }
+  geo.setIndex(idx);
+  geo.setDrawRange(0, 0);
+  var mat = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color(0x6b6675) } },
+    vertexShader: [
+      'attribute float alpha;',
+      'varying float vA;',
+      'void main(){ vA = alpha; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 uColor;',
+      'varying float vA;',
+      'void main(){ if(vA <= 0.002) discard; gl_FragColor = vec4(uColor, vA); }'
+    ].join('\n'),
+    transparent: true, depthWrite: false, side: THREE.DoubleSide
+  });
+  var mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;   // verts move every frame; bounding sphere would lag
+  mesh.renderOrder = 3;
+  scene.add(mesh);
+  DT.geo = geo;
+  DT.posAttr = geo.getAttribute('position');
+  DT.alphaAttr = geo.getAttribute('alpha');
+  DT.mesh = mesh;
+}
+
+// Sample the live wing↔ground contact and append it to the path (spacing-gated so the ribbon
+// stays evenly tessellated regardless of speed).
+function spawnDriftTrench(){
+  var s = gameMode.surfaceState;
+  if(!s.isDrifting || gameMode.fly.active) return;
+  var DT = gameMode.driftTrench;
+  ensureDriftTrenchMesh();
+  var ship = gameMode.ship;
+  var right = new THREE.Vector3(1, 0, 0).applyQuaternion(ship.quaternion);
+  right.sub(s.groundNormal.clone().multiplyScalar(right.dot(s.groundNormal)));
+  if(right.lengthSq() < 1e-6) return;
+  right.normalize();
+  // Inner wingtip (drift side) → its nearest point on the surface IS the scrape contact. Inside the
+  // portal the surface is the grey plane/chute, outside it's the crystal.
+  var innerPos = ship.position.clone().addScaledVector(right, -s.driftDirection * GAME_WING_HALF_SPAN);
+  var cp = (gameMode.portal && gameMode.portal.inside) ? closestPointOnDome(innerPos) : closestPointOnCrystal(innerPos);
+  if(!cp) return;
+  if(DT.lastPos && cp.point.distanceToSquared(DT.lastPos) < DT.spacing * DT.spacing) return;
+  DT.lastPos = cp.point.clone();
+  // Travel direction on the facet → the ribbon's cross-direction (side) is perpendicular to it.
+  var fwd = s.forward.clone().sub(cp.normal.clone().multiplyScalar(s.forward.dot(cp.normal)));
+  if(fwd.lengthSq() < 1e-6) fwd.set(1, 0, 0);
+  fwd.normalize();
+  var side = new THREE.Vector3().crossVectors(fwd, cp.normal).normalize();
+  DT.points.push({ p: cp.point.clone(), n: cp.normal.clone(), side: side, age: 0 });
+  if(DT.points.length > DT.maxPoints) DT.points.shift();
+}
+
+// Age the path, drop fully-faded tail samples, and rewrite the ribbon vertices/alpha.
+function updateDriftTrench(){
+  var DT = gameMode.driftTrench;
+  if(!DT.mesh) return;
+  var pts = DT.points;
+  for(var i = 0; i < pts.length; i++) pts[i].age += DT.fade;
+  while(pts.length && pts[0].age >= 1) pts.shift();   // oldest sample is at the front
+  var n = pts.length;
+  if(n < 2){ DT.geo.setDrawRange(0, 0); return; }
+  var pos = DT.posAttr.array, al = DT.alphaAttr.array, hw = DT.halfWidth;
+  for(var j = 0; j < n; j++){
+    var pt = pts[j];
+    var a = Math.max(0, 1 - pt.age);
+    // The freshest few samples widen in (so the leading edge isn't a blunt cut), then hold.
+    var lead = Math.min(1, (n - 1 - j) / 3);             // 0 at the very tip → 1 a few back
+    var w = hw * (0.45 + 0.55 * lead);
+    var ox = pt.side.x * w, oy = pt.side.y * w, oz = pt.side.z * w;
+    var nx = pt.n.x * 0.0012, ny = pt.n.y * 0.0012, nz = pt.n.z * 0.0012; // lift off the surface
+    var b = j * 6;
+    pos[b]   = pt.p.x - ox + nx; pos[b+1] = pt.p.y - oy + ny; pos[b+2] = pt.p.z - oz + nz;
+    pos[b+3] = pt.p.x + ox + nx; pos[b+4] = pt.p.y + oy + ny; pos[b+5] = pt.p.z + oz + nz;
+    al[j*2] = a * 0.55; al[j*2+1] = a * 0.55;   // overall translucency of the scrape
+  }
+  DT.posAttr.needsUpdate = true;
+  DT.alphaAttr.needsUpdate = true;
+  DT.geo.setDrawRange(0, (n - 1) * 6);
+}
+
+function clearGameDriftTrench(){
+  var DT = gameMode.driftTrench;
+  DT.points.length = 0;
+  DT.lastPos = null;
+  if(DT.geo) DT.geo.setDrawRange(0, 0);
+}
+
+// ── On-screen km/h counter (bottom-right) ────────────────────────────────────────────
+// The internal speed is world-units/frame; physics.maxSpeed maps to GAME_WALK_KMH (the W-only
+// cap). Lazily creates a fixed DOM readout that turns purple in the running state.
+var GAME_WALK_KMH = 15;
+var gameSpeedEl = null;
+function updateSpeedCounter(speedUnits){
+  if(!gameSpeedEl){
+    gameSpeedEl = document.createElement('div');
+    gameSpeedEl.id = 'game-speed';
+    gameSpeedEl.style.cssText = 'position:fixed;right:18px;bottom:16px;z-index:50;'
+      + 'font-family:Arial,sans-serif;font-weight:700;font-size:22px;letter-spacing:1px;'
+      + 'color:#cfd4e0;text-shadow:0 1px 5px rgba(0,0,0,0.65);pointer-events:none;display:none;';
+    document.body.appendChild(gameSpeedEl);
+  }
+  var kmph = Math.round(speedUnits / gameMode.physics.maxSpeed * GAME_WALK_KMH);
+  gameSpeedEl.textContent = kmph + ' KM/H';
+  gameSpeedEl.style.color = (kmph > 10) ? '#c9a3ff' : '#cfd4e0'; // purple in the running state (10 km/h+)
+  gameSpeedEl.style.display = 'block';
+}
+function hideSpeedCounter(){ if(gameSpeedEl) gameSpeedEl.style.display = 'none'; }
+
+// ── Crosshair (screen-centre reticle = firing direction) ─────────────────────────────
+var gameCrosshairEl = null;
+function updateCrosshair(show){
+  if(!gameCrosshairEl){
+    gameCrosshairEl = document.createElement('div');
+    gameCrosshairEl.id = 'game-crosshair';
+    gameCrosshairEl.style.cssText = 'position:fixed;left:50%;top:50%;width:28px;height:28px;'
+      + 'margin:-14px 0 0 -14px;z-index:50;pointer-events:none;display:none;';
+    gameCrosshairEl.innerHTML =
+      '<svg width="28" height="28" viewBox="0 0 28 28">' +
+      '<circle cx="14" cy="14" r="9.5" fill="none" stroke="rgba(201,163,255,0.75)" stroke-width="1.5"/>' +
+      '<line x1="14" y1="1" x2="14" y2="7" stroke="rgba(201,163,255,0.9)" stroke-width="1.5"/>' +
+      '<line x1="14" y1="21" x2="14" y2="27" stroke="rgba(201,163,255,0.9)" stroke-width="1.5"/>' +
+      '<line x1="1" y1="14" x2="7" y2="14" stroke="rgba(201,163,255,0.9)" stroke-width="1.5"/>' +
+      '<line x1="21" y1="14" x2="27" y2="14" stroke="rgba(201,163,255,0.9)" stroke-width="1.5"/>' +
+      '<circle cx="14" cy="14" r="1.4" fill="rgba(255,255,255,0.95)"/></svg>';
+    document.body.appendChild(gameCrosshairEl);
+  }
+  gameCrosshairEl.style.display = show ? 'block' : 'none';
+}
+
+// ── Test bullets (fire with Enter, travel down the firing line) ──────────────────────
+var gameBullets = [];
+var gameBulletMat = null;
+var lastFireTime = 0;
+var GAME_AIM_DIST = 0.6;   // convergence distance: where the crosshair's aim point sits ahead of the camera
+// The world-space firing direction = the ship's model facing (travel rotated by the drift yaw),
+// which is exactly what the drift camera centres on.
+function gameFiringDir(){
+  var s = gameMode.surfaceState;
+  var M = s.forward.clone();
+  if(s.driftAngle) M.applyAxisAngle(s.groundNormal, s.driftAngle);
+  if(M.lengthSq() > 1e-9) M.normalize();
+  return M;
+}
+function fireBullet(){
+  if(!gameMode.active || gameMode.exiting) return;
+  var now = performance.now();
+  if(now - lastFireTime < 110) return;   // fire-rate cap (~9/s); lets you hold Enter
+  lastFireTime = now;
+  var M = gameFiringDir();                                       // ship's nose direction → bullet ORIGIN
+  var nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
+  // The crosshair's aim point = a point on the camera's centre ray (where you're looking) at the
+  // convergence distance. The bullet flies from the ship's nose TO that point — so it always lands
+  // where the crosshair is, even though it comes out of the (drift-angled) ship. Not drifting, the
+  // ship and crosshair are aligned so it's a straight shot; drifting, it angles in to converge.
+  var dir;
+  if(typeof combat !== 'undefined' && combat.lockTarget){
+    // Locked on: there's no crosshair — bullets fly straight out the ship's nose.
+    dir = M.clone();
+  } else {
+    // Free-aim: fly from the nose toward the crosshair's convergence point on the camera centre ray.
+    var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+    var aimPoint = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST);
+    dir = aimPoint.sub(nose);
+    if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
+  }
+  // Muzzle velocity along the aim line + the SHIP'S velocity (real-life: a bullet keeps the
+  // platform's momentum). This is what makes it converge on the crosshair instead of drifting next
+  // to you when you're moving fast.
+  var BULLET_SPEED = 0.18;
+  var vel = dir.multiplyScalar(BULLET_SPEED);
+  if(gameMode._shipVel) vel.add(gameMode._shipVel);
+  if(!gameBulletMat) gameBulletMat = new THREE.MeshBasicMaterial({ color: 0xc9a3ff });   // purple core
+  var mesh = new THREE.Mesh(new THREE.SphereGeometry(0.004, 8, 6), gameBulletMat);
+  mesh.position.copy(nose);
+  mesh.frustumCulled = false; mesh.renderOrder = 5;
+  // Soft additive glow halo so the round reads as a glowing purple bolt.
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xb98cff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glow.scale.set(0.022, 0.022, 1);
+  mesh.add(glow);
+  scene.add(mesh);
+  gameBullets.push({ mesh: mesh, vel: vel, life: 0, maxLife: 90, dmg: PLAYER_BULLET_DAMAGE });
+}
+function updateGameBullets(){
+  // The ship only exists while the mini-game is built; before that there's nothing to track or fire.
+  if(!gameMode.ship){ if(gameBullets.length) clearGameBullets(); return; }
+  // Track the ship's per-frame world velocity so fired bullets can inherit it (muzzle + platform
+  // momentum, like real life). Clamped to swallow the occasional landing/grip snap.
+  if(!gameMode._shipVel) gameMode._shipVel = new THREE.Vector3();
+  if(gameMode._shipPrevPos){
+    gameMode._shipVel.copy(gameMode.ship.position).sub(gameMode._shipPrevPos);
+    var svMax = 0.12; if(gameMode._shipVel.lengthSq() > svMax*svMax) gameMode._shipVel.setLength(svMax);
+  } else {
+    gameMode._shipPrevPos = new THREE.Vector3();
+    gameMode._shipVel.set(0, 0, 0);
+  }
+  gameMode._shipPrevPos.copy(gameMode.ship.position);
+
+  if(!gameBullets.length) return;
+  for(var i = gameBullets.length - 1; i >= 0; i--){
+    var b = gameBullets[i];
+    b.life++;
+    b.mesh.position.add(b.vel);
+    if(b.life >= b.maxLife){ scene.remove(b.mesh); b.mesh.geometry.dispose(); gameBullets.splice(i, 1); }
+  }
+}
+function disposeGameBullet(b){
+  scene.remove(b.mesh);
+  if(b.mesh.geometry) b.mesh.geometry.dispose();
+  // dispose the additive glow sprite's material (texture is shared, leave it)
+  for(var c = 0; c < b.mesh.children.length; c++){ if(b.mesh.children[c].material) b.mesh.children[c].material.dispose(); }
+}
+function clearGameBullets(){
+  for(var i = 0; i < gameBullets.length; i++) disposeGameBullet(gameBullets[i]);
+  gameBullets.length = 0;
+}
+
+// ══════════════════════════════════════════════
+// COMBAT — basic port of Orbicule's combat: one purple weapon (above), a single Tank
+// enemy that charges + fires red-orange shells, player/enemy health bars, floating damage
+// numbers and a running damage counter. Everything is sized for the tiny crystal-scale
+// world (ship ≈ 0.04u, crystal orbit radius ≈ 0.95u).
+// ══════════════════════════════════════════════
+var PLAYER_BULLET_DAMAGE = 12;
+var combat = {
+  spawned: false,
+  arena: null,          // 'crystal' | 'dome' — which region the enemies live in right now
+  player: { hp: 100, maxHp: 100, dead: false, deadT: 0 },
+  enemies: [],          // tank groups (userData carries hp/turret/charge state + DOM bar refs)
+  enemyBullets: [],     // { mesh, vel, life, maxLife, dmg }
+  totalDamage: 0,
+  hurtFlash: 0,         // 0..1 red screen flash
+  // lazily-built shared resources + DOM
+  _glowTex: null, _ebGeo: null, _ebMat: null,
+  damageNumbers: [],
+  hpBarEl: null, hpFillEl: null, dmgCounterEl: null, flashEl: null, fireBtnEl: null,
+  mouseFiring: false, touchFiring: false,
+  lockTarget: null, reticleEl: null, lockBtnEl: null   // lock-on camera target + HUD
+};
+var CRIT_CHANCE = 0.05;
+
+function getCombatGlowTex(){
+  if(combat._glowTex) return combat._glowTex;
+  var c = document.createElement('canvas'); c.width = c.height = 64;
+  var ctx = c.getContext('2d');
+  var g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.35, 'rgba(255,255,255,0.65)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 64, 64);
+  combat._glowTex = new THREE.CanvasTexture(c);
+  return combat._glowTex;
+}
+
+// ── Tank model (tiny turret that sits on the crystal surface) ──
+function buildTank(){
+  var g = new THREE.Group();
+  var bodyMat = new THREE.MeshStandardMaterial({ color: 0x7a3b3b, roughness: 0.5, metalness: 0.35, emissive: 0x3a1414, emissiveIntensity: 0.5 });
+  var darkMat = new THREE.MeshStandardMaterial({ color: 0x4a2424, roughness: 0.6, metalness: 0.4 });
+  // Tracked hull — short hexagonal cylinder, local +Y is up (surface normal)
+  var body = new THREE.Mesh(new THREE.CylinderGeometry(0.026, 0.032, 0.014, 6), bodyMat);
+  body.position.y = 0.007;
+  g.add(body);
+  // Bright edge outline so it reads against the reflective crystal
+  var bodyEdge = new THREE.LineSegments(new THREE.EdgesGeometry(body.geometry), new THREE.LineBasicMaterial({ color: 0xcc6a6a, transparent: true, opacity: 0.8 }));
+  bodyEdge.position.copy(body.position); g.add(bodyEdge);
+  // Turret pivot — aims the cannon at the player every frame (local +Z = barrel forward)
+  var turret = new THREE.Group();
+  turret.position.y = 0.016;
+  g.add(turret);
+  var dome = new THREE.Mesh(new THREE.SphereGeometry(0.014, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), bodyMat);
+  turret.add(dome);
+  var cannon = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.005, 0.032, 8), darkMat);
+  cannon.rotation.x = Math.PI / 2;        // align cylinder axis to +Z
+  cannon.position.z = 0.02;
+  turret.add(cannon);
+  // Charge ring at the muzzle — pulses + shrinks while charging a shot
+  var ringMat = new THREE.MeshBasicMaterial({ color: 0xff3311, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending });
+  var chargeRing = new THREE.Mesh(new THREE.RingGeometry(0.012, 0.05, 16), ringMat);
+  chargeRing.position.z = 0.045;
+  turret.add(chargeRing);
+  // Rear engine glow
+  var engine = new THREE.Mesh(new THREE.SphereGeometry(0.006, 6, 6), new THREE.MeshBasicMaterial({ color: 0xff5522, transparent: true, opacity: 0.8 }));
+  engine.position.set(0, 0.008, -0.026);
+  g.add(engine);
+  g.userData.turret = turret;
+  g.userData.cannon = cannon;
+  g.userData.chargeRing = chargeRing;
+  return g;
+}
+
+// Build a tank at a surface point (pos) with the given up-normal, wire its combat state +
+// floating health bar, and register it. Used for both the crystal and the dome.
+function addTank(pos, normal, attackRadius){
+  var tank = buildTank();
+  tank.position.copy(pos).addScaledVector(normal, 0.004);
+  tank.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
+  var maxHp = 250;
+  tank.userData.hp = maxHp;
+  tank.userData.maxHp = maxHp;
+  tank.userData.normal = normal;
+  tank.userData.lastShot = 0;
+  tank.userData.fireRate = 1700;       // ms between shots
+  tank.userData.charging = false;
+  tank.userData.chargeProg = 0;
+  tank.userData.chargeTime = 50;        // frames to charge a shot
+  tank.userData.attackRadius = attackRadius;
+  scene.add(tank);
+  combat.enemies.push(tank);
+  // Floating DOM health bar (projected above the tank, like the damage numbers)
+  var bar = document.createElement('div');
+  bar.style.cssText = 'position:fixed;z-index:55;width:70px;height:7px;margin-left:-35px;'
+    + 'background:rgba(40,12,12,0.85);border:1px solid rgba(0,0,0,0.5);border-radius:3px;'
+    + 'pointer-events:none;display:none;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.6);';
+  var fill = document.createElement('div');
+  fill.style.cssText = 'height:100%;width:100%;background:linear-gradient(90deg,#ff5a4a,#cc3333);border-radius:2px;';
+  bar.appendChild(fill);
+  document.body.appendChild(bar);
+  tank.userData.hpBarEl = bar;
+  tank.userData.hpFillEl = fill;
+  return tank;
+}
+// Crystal world: snap a tank onto the octahedron surface in the given offset direction.
+function spawnTank(offsetDir){
+  var center = gameMode.surface.center;
+  var dir = offsetDir.clone().normalize();
+  var hit = raycastShipToSurface(center.clone().addScaledVector(dir, 1.5));
+  var pos, normal;
+  if(hit){ pos = hit.point.clone(); normal = hit.normal.clone(); }
+  else { pos = center.clone().addScaledVector(dir, 0.92); normal = dir.clone(); }
+  return addTank(pos, normal, 2.6);   // basically the whole crystal — single-enemy demo
+}
+// Dome (Region B): drop a tank on the dome floor near the centre, snapped to the dome surface.
+function spawnDomeTank(){
+  var P = gameMode.portal;
+  var base = new THREE.Vector3(P.DX + 0.5, P.domeFloorY + 0.05, P.domeCz + 0.4);
+  var cp = (typeof closestPointOnDome === 'function') ? closestPointOnDome(base) : null;
+  var pos = cp ? cp.point.clone() : new THREE.Vector3(P.DX + 0.5, P.domeFloorY, P.domeCz + 0.4);
+  var normal = cp ? cp.normal.clone() : new THREE.Vector3(0, 1, 0);
+  return addTank(pos, normal, 3.5);   // dome is small (R≈1.5) — always engaged
+}
+// Spawn one tank in whichever arena is current.
+function spawnTankForArena(arena){
+  if(arena === 'dome') return spawnDomeTank();
+  return spawnTank(new THREE.Vector3((Math.random() - 0.5), 0.5, (Math.random() - 0.5)));
+}
+
+// Manual spawn (T key): drop a tank near the player in the current arena, capped so it can't
+// run away. Combat must already be running.
+function spawnEnemyNearPlayer(){
+  if(!gameMode.active || gameMode.exiting || gameMode.portal.testMode || !combat.spawned) return;
+  if(combat.enemies.length >= 16) return;
+  if(combat.arena === 'dome'){
+    var P = gameMode.portal;
+    var a = Math.random() * Math.PI * 2, r = 0.4 + Math.random() * 0.7;
+    var base = new THREE.Vector3(P.DX + Math.cos(a) * r, P.domeFloorY + 0.05, P.domeCz + Math.sin(a) * r);
+    var cp = (typeof closestPointOnDome === 'function') ? closestPointOnDome(base) : null;
+    addTank(cp ? cp.point.clone() : base, cp ? cp.normal.clone() : new THREE.Vector3(0, 1, 0), 3.5);
+  } else {
+    // A surface point near the player, nudged off by a random tangent so it doesn't land on the ship.
+    var center = gameMode.surface.center;
+    var dir = gameMode.ship.position.clone().sub(center);
+    if(dir.lengthSq() < 1e-6) dir.set(0, 0, 1); else dir.normalize();
+    var t = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5);
+    t.addScaledVector(dir, -t.dot(dir));
+    if(t.lengthSq() > 1e-6) t.normalize();
+    dir.addScaledVector(t, 0.5 + Math.random() * 0.5).normalize();
+    var hit = raycastShipToSurface(center.clone().addScaledVector(dir, 1.5));
+    addTank(hit ? hit.point.clone() : center.clone().addScaledVector(dir, 0.92), hit ? hit.normal.clone() : dir.clone(), 2.6);
+  }
+}
+
+function disposeTank(tank){
+  scene.remove(tank);
+  tank.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); });
+  if(tank.userData.hpBarEl) tank.userData.hpBarEl.remove();
+}
+
+// ── Enemy projectile (heavy red-orange shell, like the Orbicule tank) ──
+function fireEnemyShell(tank){
+  if(!combat._ebGeo){
+    combat._ebGeo = new THREE.SphereGeometry(0.012, 8, 8);
+    combat._ebMat = new THREE.MeshBasicMaterial({ color: 0xff9980 });   // matches Orbicule's heavy bullet
+  }
+  var tip = new THREE.Vector3();
+  tank.userData.cannon.getWorldPosition(tip);          // muzzle centre
+  var dir = gameMode.ship.position.clone().sub(tip);
+  if(dir.lengthSq() < 1e-9) dir.copy(tank.userData.normal); else dir.normalize();
+  tip.addScaledVector(dir, 0.02);                      // nudge out past the barrel toward the player
+  var mesh = new THREE.Mesh(combat._ebGeo, combat._ebMat);
+  mesh.position.copy(tip);
+  mesh.frustumCulled = false; mesh.renderOrder = 5;
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xff7755, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glow.scale.set(0.05, 0.05, 1);
+  mesh.add(glow);
+  scene.add(mesh);
+  combat.enemyBullets.push({ mesh: mesh, vel: dir.multiplyScalar(0.013), life: 0, maxLife: 320, dmg: 16 });
+}
+function disposeEnemyBullet(b){
+  scene.remove(b.mesh);
+  for(var c = 0; c < b.mesh.children.length; c++){ if(b.mesh.children[c].material) b.mesh.children[c].material.dispose(); }
+}
+
+// ── Floating damage numbers (ported from Orbicule) ──
+function spawnDamageNumber(worldPos, amount, isCrit){
+  var el = document.createElement('div');
+  el.textContent = isCrit ? Math.round(amount) + '!' : Math.round(amount);
+  el.style.cssText = 'position:fixed;pointer-events:none;z-index:60;font-family:Arial,sans-serif;'
+    + 'font-weight:bold;white-space:nowrap;'
+    + 'font-size:' + (isCrit ? '22px' : '15px') + ';'
+    + 'color:' + (isCrit ? '#ffe34a' : '#ffffff') + ';'
+    + 'text-shadow:0 0 5px ' + (isCrit ? 'rgba(255,200,0,0.9)' : 'rgba(0,0,0,0.85)') + ',0 1px 2px rgba(0,0,0,0.7);';
+  document.body.appendChild(el);
+  combat.damageNumbers.push({ el: el, worldPos: worldPos.clone(), startTime: performance.now(), offsetY: 0 });
+}
+function updateDamageNumbers(){
+  var now = performance.now(), dur = 1100;
+  for(var i = combat.damageNumbers.length - 1; i >= 0; i--){
+    var dn = combat.damageNumbers[i];
+    var elapsed = now - dn.startTime;
+    if(elapsed > dur){ dn.el.remove(); combat.damageNumbers.splice(i, 1); continue; }
+    var p = dn.worldPos.clone().project(camera);
+    var x = (p.x * 0.5 + 0.5) * window.innerWidth;
+    var y = (-p.y * 0.5 + 0.5) * window.innerHeight;
+    dn.offsetY += 0.7;
+    dn.el.style.left = x + 'px';
+    dn.el.style.top = (y - dn.offsetY) + 'px';
+    dn.el.style.opacity = (p.z > 1) ? 0 : (1 - elapsed / dur);
+  }
+}
+
+function dealDamageToTank(tank, baseDamage){
+  var isCrit = Math.random() < CRIT_CHANCE;
+  var dmg = isCrit ? baseDamage * 2 : baseDamage;
+  tank.userData.hp -= dmg;
+  combat.totalDamage += dmg;
+  var dnPos = tank.position.clone().addScaledVector(tank.userData.normal, 0.04);
+  spawnDamageNumber(dnPos, dmg, isCrit);
+}
+
+// ── HUD: player health bar + running damage counter (top-left) ──
+function ensureCombatHUD(){
+  if(combat.hpBarEl) return;
+  var bar = document.createElement('div');
+  bar.id = 'combat-hp';
+  bar.style.cssText = 'position:fixed;left:18px;top:18px;z-index:55;width:220px;height:20px;'
+    + 'background:rgba(20,10,10,0.7);border:1px solid rgba(255,255,255,0.18);border-radius:5px;'
+    + 'overflow:hidden;pointer-events:none;display:none;box-shadow:0 2px 8px rgba(0,0,0,0.5);';
+  var fill = document.createElement('div');
+  fill.style.cssText = 'height:100%;width:100%;background:linear-gradient(90deg,#48e07a,#2fae5c);transition:width 0.12s;';
+  bar.appendChild(fill);
+  var label = document.createElement('div');
+  label.style.cssText = 'position:absolute;left:8px;top:0;height:20px;line-height:20px;font-family:Arial,sans-serif;'
+    + 'font-size:12px;font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.8);letter-spacing:1px;';
+  label.textContent = 'HP';
+  bar.appendChild(label);
+  document.body.appendChild(bar);
+  combat.hpBarEl = bar; combat.hpFillEl = fill;
+
+  var dc = document.createElement('div');
+  dc.id = 'combat-dmg';
+  dc.style.cssText = 'position:fixed;left:18px;top:44px;z-index:55;font-family:Arial,sans-serif;'
+    + 'font-weight:700;font-size:14px;color:#c9a3ff;text-shadow:0 1px 4px rgba(0,0,0,0.7);'
+    + 'pointer-events:none;display:none;letter-spacing:1px;';
+  document.body.appendChild(dc);
+  combat.dmgCounterEl = dc;
+
+  var fl = document.createElement('div');
+  fl.style.cssText = 'position:fixed;inset:0;z-index:54;background:#ff1a1a;opacity:0;'
+    + 'pointer-events:none;transition:opacity 0.18s;';
+  document.body.appendChild(fl);
+  combat.flashEl = fl;
+
+  // Touch fire button (also works with mouse) — hold to auto-fire at the weapon's cap
+  var fb = document.createElement('div');
+  fb.id = 'combat-fire';
+  fb.style.cssText = 'position:fixed;right:26px;bottom:80px;z-index:56;width:84px;height:84px;'
+    + 'border-radius:50%;background:radial-gradient(circle at 50% 40%,rgba(201,163,255,0.35),rgba(120,80,180,0.18));'
+    + 'border:2px solid rgba(201,163,255,0.6);box-shadow:0 2px 10px rgba(0,0,0,0.45);'
+    + 'display:none;touch-action:none;-webkit-user-select:none;user-select:none;'
+    + 'font-family:Arial,sans-serif;font-weight:700;font-size:13px;letter-spacing:1px;color:#e8dcff;'
+    + 'text-align:center;line-height:84px;text-shadow:0 1px 3px rgba(0,0,0,0.7);cursor:pointer;';
+  fb.textContent = 'FIRE';
+  var press = function(e){ e.preventDefault(); e.stopPropagation(); combat.touchFiring = true; fb.style.transform = 'scale(0.92)'; };
+  var release = function(e){ if(e){ e.preventDefault(); e.stopPropagation(); } combat.touchFiring = false; fb.style.transform = 'scale(1)'; };
+  fb.addEventListener('touchstart', press, { passive: false });
+  fb.addEventListener('touchend', release, { passive: false });
+  fb.addEventListener('touchcancel', release, { passive: false });
+  fb.addEventListener('mousedown', press);
+  fb.addEventListener('mouseup', release);
+  fb.addEventListener('mouseleave', release);
+  document.body.appendChild(fb);
+  combat.fireBtnEl = fb;
+
+  // Lock-on reticle — projected onto the locked enemy (hidden until you lock)
+  var rt = document.createElement('div');
+  rt.id = 'combat-reticle';
+  rt.style.cssText = 'position:fixed;z-index:58;width:54px;height:54px;margin:-27px 0 0 -27px;'
+    + 'pointer-events:none;display:none;';
+  rt.innerHTML = '<svg width="54" height="54" viewBox="0 0 54 54">'
+    + '<circle cx="27" cy="27" r="20" fill="none" stroke="rgba(255,90,74,0.9)" stroke-width="2.5" stroke-dasharray="10 8"/>'
+    + '<path d="M27 3 L31 11 L23 11 Z" fill="rgba(255,90,74,0.95)"/>'
+    + '<path d="M27 51 L31 43 L23 43 Z" fill="rgba(255,90,74,0.95)"/>'
+    + '<path d="M3 27 L11 23 L11 31 Z" fill="rgba(255,90,74,0.95)"/>'
+    + '<path d="M51 27 L43 23 L43 31 Z" fill="rgba(255,90,74,0.95)"/></svg>';
+  document.body.appendChild(rt);
+  combat.reticleEl = rt;
+
+  // Touch LOCK button (left of FIRE) — toggles the lock-on camera
+  var lb = document.createElement('div');
+  lb.id = 'combat-lock';
+  lb.style.cssText = 'position:fixed;right:122px;bottom:92px;z-index:56;width:60px;height:60px;'
+    + 'border-radius:50%;background:radial-gradient(circle at 50% 40%,rgba(255,120,100,0.3),rgba(150,50,40,0.16));'
+    + 'border:2px solid rgba(255,120,100,0.55);box-shadow:0 2px 8px rgba(0,0,0,0.45);'
+    + 'display:none;touch-action:none;-webkit-user-select:none;user-select:none;'
+    + 'font-family:Arial,sans-serif;font-weight:700;font-size:11px;letter-spacing:1px;color:#ffe0d8;'
+    + 'text-align:center;line-height:60px;text-shadow:0 1px 3px rgba(0,0,0,0.7);cursor:pointer;';
+  lb.textContent = 'LOCK';
+  var lockTap = function(e){ e.preventDefault(); e.stopPropagation(); toggleLockOn(); };
+  lb.addEventListener('touchstart', lockTap, { passive: false });
+  lb.addEventListener('mousedown', lockTap);
+  document.body.appendChild(lb);
+  combat.lockBtnEl = lb;
+}
+function showCombatHUD(show){
+  ensureCombatHUD();
+  var d = show ? 'block' : 'none';
+  combat.hpBarEl.style.display = d;
+  combat.dmgCounterEl.style.display = d;
+  if(combat.fireBtnEl) combat.fireBtnEl.style.display = d;
+  if(combat.lockBtnEl) combat.lockBtnEl.style.display = d;
+  if(!show && combat.reticleEl) combat.reticleEl.style.display = 'none';
+}
+
+// Toggle the lock-on camera: lock the nearest enemy, or release if already locked.
+function toggleLockOn(){
+  if(!gameMode.active || gameMode.exiting){ combat.lockTarget = null; return; }
+  if(combat.lockTarget){ combat.lockTarget = null; return; }
+  var best = null, bd = Infinity, sp = gameMode.ship.position;
+  for(var i = 0; i < combat.enemies.length; i++){
+    var dd = combat.enemies[i].position.distanceTo(sp);
+    if(dd < bd){ bd = dd; best = combat.enemies[i]; }
+  }
+  combat.lockTarget = best;
+}
+
+function hurtPlayer(amount){
+  if(combat.player.dead) return;
+  combat.player.hp -= amount;
+  combat.hurtFlash = 1;
+  if(combat.player.hp <= 0){
+    combat.player.hp = 0;
+    combat.player.dead = true;
+    combat.player.deadT = performance.now();
+  }
+}
+
+// ── Spawn / teardown ──
+function initCombat(arena){
+  ensureCombatHUD();
+  combat.player.hp = combat.player.maxHp;
+  combat.player.dead = false;
+  combat.totalDamage = 0;
+  combat.arena = arena;
+  spawnTankForArena(arena);
+  combat.spawned = true;
+}
+// Player moved between regions (crystal ↔ dome): clear the old arena's enemies + bullets and
+// spawn a fresh tank in the new one. Player HP + damage counter persist across the move.
+function switchArena(arena){
+  for(var i = 0; i < combat.enemies.length; i++) disposeTank(combat.enemies[i]);
+  combat.enemies.length = 0;
+  for(var j = 0; j < combat.enemyBullets.length; j++) disposeEnemyBullet(combat.enemyBullets[j]);
+  combat.enemyBullets.length = 0;
+  clearGameBullets();   // stray player bullets belong to the region we just left
+  combat.arena = arena;
+  spawnTankForArena(arena);
+}
+function clearCombat(){
+  for(var i = 0; i < combat.enemies.length; i++) disposeTank(combat.enemies[i]);
+  combat.enemies.length = 0;
+  for(var j = 0; j < combat.enemyBullets.length; j++) disposeEnemyBullet(combat.enemyBullets[j]);
+  combat.enemyBullets.length = 0;
+  for(var k = combat.damageNumbers.length - 1; k >= 0; k--) combat.damageNumbers[k].el.remove();
+  combat.damageNumbers.length = 0;
+  combat.hurtFlash = 0;
+  if(combat.flashEl) combat.flashEl.style.opacity = 0;
+  combat.mouseFiring = false; combat.touchFiring = false;
+  showCombatHUD(false);
+  combat.spawned = false;
+  combat.arena = null;
+}
+
+// ── Per-frame combat tick ──
+function updateCombat(dt){
+  // Runs while playing in EITHER region — on the crystal or inside the dome. (The flat debug
+  // sandbox stays combat-free.)
+  var playing = gameMode.active && !gameMode.exiting && !gameMode.portal.testMode;
+  if(!playing){
+    if(combat.spawned) clearCombat();
+    return;
+  }
+  var arena = gameMode.portal.inside ? 'dome' : 'crystal';
+  if(!combat.spawned) initCombat(arena);
+  else if(combat.arena !== arena) switchArena(arena);
+
+  // Drop the lock if its target is gone (killed / cleared on an arena switch)
+  if(combat.lockTarget && combat.enemies.indexOf(combat.lockTarget) < 0) combat.lockTarget = null;
+
+  // Held-fire from mouse / touch button (Enter is handled in gameKeyDown)
+  if(combat.mouseFiring || combat.touchFiring) fireBullet();
+
+  var now = performance.now();
+  var shipPos = gameMode.ship.position;
+  var _q = new THREE.Quaternion();
+
+  // Player bullets → tank collision
+  for(var bi = gameBullets.length - 1; bi >= 0; bi--){
+    var b = gameBullets[bi];
+    var hitTank = null;
+    for(var ei = 0; ei < combat.enemies.length; ei++){
+      var en = combat.enemies[ei];
+      if(b.mesh.position.distanceTo(en.position) < 0.05){ hitTank = en; break; }
+    }
+    if(hitTank){
+      dealDamageToTank(hitTank, b.dmg || PLAYER_BULLET_DAMAGE);
+      disposeGameBullet(b); gameBullets.splice(bi, 1);
+      if(hitTank.userData.hp <= 0){
+        var idx = combat.enemies.indexOf(hitTank);
+        if(idx >= 0) combat.enemies.splice(idx, 1);
+        disposeTank(hitTank);
+        // Respawn a fresh tank shortly (in whatever arena we're in now) so the demo keeps going
+        setTimeout(function(){ if(combat.spawned && combat.enemies.length === 0) spawnTankForArena(combat.arena); }, 1400);
+      }
+    }
+  }
+
+  // Tank AI: aim turret at player, charge + fire
+  for(var ti = 0; ti < combat.enemies.length; ti++){
+    var tank = combat.enemies[ti];
+    var d = tank.userData;
+    var dist = tank.position.distanceTo(shipPos);
+    // Aim the turret's +Z at the player (in tank-local space)
+    var aimWorld = shipPos.clone().sub(tank.position);
+    if(aimWorld.lengthSq() > 1e-9){
+      aimWorld.normalize();
+      var localAim = aimWorld.clone().applyQuaternion(tank.getWorldQuaternion(_q).invert());
+      if(localAim.lengthSq() > 1e-9) d.turret.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), localAim.normalize());
+    }
+    var ring = d.chargeRing;
+    if(dist < d.attackRadius && now - d.lastShot > d.fireRate){
+      if(!d.charging){ d.charging = true; d.chargeProg = 0; }
+      d.chargeProg++;
+      var cp = d.chargeProg / d.chargeTime;
+      ring.scale.setScalar(1.0 - cp * 0.7);
+      ring.material.opacity = 0.5 + 0.5 * Math.abs(Math.sin(d.chargeProg * 0.5));
+      if(d.chargeProg >= d.chargeTime){
+        fireEnemyShell(tank);
+        d.charging = false; d.chargeProg = 0; d.lastShot = now;
+        ring.material.opacity = 0; ring.scale.setScalar(1);
+      }
+    } else if(d.charging){
+      d.charging = false; d.chargeProg = 0; ring.material.opacity = 0; ring.scale.setScalar(1);
+    }
+    // Project the floating health bar above the tank
+    if(d.hpBarEl){
+      var bp = tank.position.clone().addScaledVector(d.normal, 0.055).project(camera);
+      if(bp.z > 1){ d.hpBarEl.style.display = 'none'; }
+      else {
+        d.hpBarEl.style.display = 'block';
+        d.hpBarEl.style.left = ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
+        d.hpBarEl.style.top = ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
+        d.hpFillEl.style.width = Math.max(0, d.hp / d.maxHp * 100) + '%';
+      }
+    }
+  }
+
+  // Enemy bullets: travel, stretch along velocity, hit the player
+  for(var pj = combat.enemyBullets.length - 1; pj >= 0; pj--){
+    var p = combat.enemyBullets[pj];
+    p.life++;
+    p.mesh.position.add(p.vel);
+    var sp = p.vel.length();
+    if(sp > 1e-6){
+      p.mesh.lookAt(p.mesh.position.clone().add(p.vel));
+      var stretch = 1 + Math.min(p.life * 0.2, 1) * 1.4;
+      p.mesh.scale.set(1, 1, stretch);
+    }
+    if(p.mesh.position.distanceTo(shipPos) < 0.03){
+      hurtPlayer(p.dmg);
+      disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1);
+      continue;
+    }
+    if(p.life >= p.maxLife){ disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1); }
+  }
+
+  // Player death → brief downtime then revive at full HP (basic, non-punishing)
+  if(combat.player.dead && now - combat.player.deadT > 1400){
+    combat.player.dead = false;
+    combat.player.hp = combat.player.maxHp;
+    for(var eb = 0; eb < combat.enemyBullets.length; eb++) disposeEnemyBullet(combat.enemyBullets[eb]);
+    combat.enemyBullets.length = 0;
+  }
+
+  // HUD
+  showCombatHUD(true);
+  combat.hpFillEl.style.width = Math.max(0, combat.player.hp / combat.player.maxHp * 100) + '%';
+  combat.hpFillEl.style.background = combat.player.hp / combat.player.maxHp > 0.3
+    ? 'linear-gradient(90deg,#48e07a,#2fae5c)' : 'linear-gradient(90deg,#ff6a4a,#cc3333)';
+  combat.dmgCounterEl.textContent = 'DAMAGE  ' + Math.round(combat.totalDamage);
+
+  // Red hurt-flash fade
+  if(combat.hurtFlash > 0){
+    combat.hurtFlash = Math.max(0, combat.hurtFlash - 0.06);
+    if(combat.flashEl) combat.flashEl.style.opacity = combat.hurtFlash * 0.4;
+  }
+
+  // Lock-on reticle: project onto the locked enemy
+  if(combat.reticleEl){
+    if(combat.lockTarget){
+      var rp = combat.lockTarget.position.clone().addScaledVector(combat.lockTarget.userData.normal || new THREE.Vector3(0,1,0), 0.02).project(camera);
+      if(rp.z > 1){ combat.reticleEl.style.display = 'none'; }
+      else {
+        combat.reticleEl.style.display = 'block';
+        combat.reticleEl.style.left = ((rp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
+        combat.reticleEl.style.top = ((-rp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
+      }
+    } else {
+      combat.reticleEl.style.display = 'none';
+    }
+  }
+
+  updateDamageNumbers();
+}
+
+// ── Purple rocket boost trail (continuous camera-facing ribbon) ──────────────────────
+// Same one-ribbon approach as the drift gouge, but billboarded toward the camera, purple, and
+// additive-blended so it reads as a glowing rocket plume. Sampled from the engine point while
+// boosting; the tail keeps fading after boost ends.
+// Build one line-trail particle system (geometry + additive purple→white material + a pool of
+// trail particles). Shared by the orbiting spark streaks and the fired-out welding sparks.
+function buildBoostLineSystem(maxN, T){
+  var totalV = maxN * (T - 1) * 2;
+  var pos = new Float32Array(totalV * 3);
+  var al = new Float32Array(totalV);
+  for(var i = 0; i < totalV; i++) pos[i*3+1] = -99999;
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('alpha', new THREE.BufferAttribute(al, 1));
+  var mat = new THREE.ShaderMaterial({
+    vertexShader: ['attribute float alpha; varying float vA;',
+      'void main(){ vA = alpha; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }'].join('\n'),
+    fragmentShader: ['varying float vA;',
+      'void main(){ if(vA <= 0.01) discard;',
+      '  gl_FragColor = vec4(mix(vec3(0.62, 0.32, 1.0), vec3(1.0, 0.96, 1.0), vA), vA); }'].join('\n'),
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+  });
+  var lines = new THREE.LineSegments(geo, mat);
+  lines.frustumCulled = false; lines.renderOrder = 4;
+  scene.add(lines);
+  var pool = [];
+  for(var p = 0; p < maxN; p++){
+    var tr = [];
+    for(var ti = 0; ti < T; ti++) tr.push({ x: 0, y: -99999, z: 0 });
+    pool.push({ alive: false, trail: tr, head: 0, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, angVel: 0, life: 0, maxLife: 1 });
+  }
+  return { geo: geo, pos: pos, alpha: al, lines: lines, pool: pool };
+}
+
+function ensureBoostTrailMesh(){
+  var DT = gameMode.boostTrail;
+  if(DT.mesh) return;
+  // ── Central purple beam: a tapered tube around the spine (point at the nozzle → cylinder). ──
+  var maxP = DT.maxPoints, K = DT.sides;
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(maxP * K * 3), 3));
+  geo.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(maxP * K), 1));
+  var idx = [];
+  for(var s2 = 0; s2 < maxP - 1; s2++){
+    for(var ki = 0; ki < K; ki++){
+      var a = s2*K + ki, b = s2*K + (ki+1)%K, c = (s2+1)*K + ki, d = (s2+1)*K + (ki+1)%K;
+      idx.push(a, c, b, b, c, d);
+    }
+  }
+  geo.setIndex(idx); geo.setDrawRange(0, 0);
+  var mat = new THREE.ShaderMaterial({
+    vertexShader: ['attribute float alpha; varying float vA;',
+      'void main(){ vA = alpha; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }'].join('\n'),
+    fragmentShader: ['varying float vA;',
+      'void main(){ if(vA <= 0.002) discard;',
+      '  vec3 core = vec3(0.94, 0.86, 1.0);',
+      '  vec3 edge = vec3(0.45, 0.14, 0.88);',
+      '  gl_FragColor = vec4(mix(edge, core, vA), vA); }'].join('\n'),
+    transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending
+  });
+  var mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false; mesh.renderOrder = 4;
+  scene.add(mesh);
+  DT.geo = geo; DT.posAttr = geo.getAttribute('position'); DT.alphaAttr = geo.getAttribute('alpha'); DT.mesh = mesh;
+
+  // ── Beam light: a purple point light the beam emits onto the ship + nearby surface. ──
+  var light = new THREE.PointLight(0x9a5cff, 0, 1.4, 2.0);
+  light.visible = false;
+  scene.add(light);
+  DT.light = light;
+
+  // ── Ignition shockwave: a one-shot bright flash + an expanding ring. ──
+  var flash = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xe0ccff, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
+  flash.frustumCulled = false; flash.renderOrder = 5; flash.visible = false;
+  scene.add(flash); DT.flash = flash;
+  var ring = new THREE.Mesh(new THREE.RingGeometry(0.78, 1.0, 40),
+    new THREE.MeshBasicMaterial({ color: 0x9a5cff, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  ring.frustumCulled = false; ring.renderOrder = 5; ring.visible = false;
+  scene.add(ring); DT.shockRing = ring;
+
+  // ── Orbiting spark streaks + fired-out welding sparks (two line-trail systems). ──
+  var orb = buildBoostLineSystem(DT.maxOrb, DT.orbTrail);
+  DT.orb = orb.pool; DT.orbGeo = orb.geo; DT.orbPos = orb.pos; DT.orbAlpha = orb.alpha; DT.orbLines = orb.lines;
+  var spk = buildBoostLineSystem(DT.maxSparks, DT.sparkTrail);
+  DT.sparks = spk.pool; DT.sparkGeo = spk.geo; DT.sparkPos = spk.pos; DT.sparkAlpha = spk.alpha; DT.sparkLines = spk.lines;
+}
+
+// Fire `count` welding sparks out the back of the engine — fast streaks with a wide cone spread.
+function spawnBoostSparks(count, origin, back){
+  var DT = gameMode.boostTrail;
+  for(var c = 0; c < count; c++){
+    for(var i = 0; i < DT.maxSparks; i++){
+      var sk = DT.sparks[i];
+      if(sk.alive) continue;
+      sk.alive = true; sk.life = 0; sk.maxLife = 8 + Math.random() * 11;
+      var spd = 0.013 + Math.random() * 0.032;                 // fast → reads as a streak
+      sk.vx = -back.x * spd + (Math.random() - 0.5) * spd * 1.3;
+      sk.vy = -back.y * spd + (Math.random() - 0.5) * spd * 1.3;
+      sk.vz = -back.z * spd + (Math.random() - 0.5) * spd * 1.3;
+      for(var ti = 0; ti < DT.sparkTrail; ti++){ sk.trail[ti].x = origin.x; sk.trail[ti].y = origin.y; sk.trail[ti].z = origin.z; }
+      sk.head = 0;
+      break;
+    }
+  }
+}
+
+// Spawn `count` orbiting spark streaks: each starts on a ring around the beam axis at the nozzle
+// with a per-particle angular velocity, so it swirls around the central beam as it streaks + fades.
+function spawnBoostOrbiter(count, origin, back, explosion){
+  var DT = gameMode.boostTrail;
+  var up = Math.abs(back.y) > 0.9 ? new THREE.Vector3(1,0,0) : new THREE.Vector3(0,1,0);
+  var sideA = new THREE.Vector3().crossVectors(back, up).normalize();
+  var sideB = new THREE.Vector3().crossVectors(back, sideA).normalize();
+  for(var c = 0; c < count; c++){
+    var ob = null;
+    for(var i = 0; i < DT.orb.length; i++){ if(!DT.orb[i].alive){ ob = DT.orb[i]; break; } }
+    if(!ob) break;
+    var ang = Math.random() * Math.PI * 2;
+    // Ignition orbiters fling out to a WIDE radius then spring IN to the steady orbit, so the
+    // explosion visibly collapses into the running trail. Normal ones spawn near the orbit radius.
+    var r = explosion ? DT.orbR * (3.0 + Math.random() * 3.5) : DT.orbR * (0.5 + Math.random() * 0.8);
+    var px = origin.x + (Math.cos(ang)*sideA.x + Math.sin(ang)*sideB.x) * r;
+    var py = origin.y + (Math.cos(ang)*sideA.y + Math.sin(ang)*sideB.y) * r;
+    var pz = origin.z + (Math.cos(ang)*sideA.z + Math.sin(ang)*sideB.z) * r;
+    ob.alive = true; ob.life = 0;
+    ob.maxLife = explosion ? (32 + Math.random() * 26) : (16 + Math.random() * 22);
+    ob.x = px; ob.y = py; ob.z = pz;
+    ob.targetR = DT.orbR * (0.6 + Math.random() * 0.8);
+    ob.pull = explosion ? 0.11 : 0.06;     // how fast the orbit radius springs toward targetR
+    ob.angVel = DT.orbSpin * (Math.random() < 0.5 ? -1 : 1) * (explosion ? (1.1 + Math.random()*0.9) : (0.7 + Math.random()*0.6));
+    for(var ti = 0; ti < DT.orbTrail; ti++){ ob.trail[ti].x = px; ob.trail[ti].y = py; ob.trail[ti].z = pz; }
+    ob.head = 0;
+  }
+}
+
+// Called every frame WHILE boosting (from the physics step): drives the ignition envelope, feeds
+// the fluid plume + welding sparks, and appends a spine sample (the framework the fluid follows).
+function spawnBoostTrail(){
+  var s = gameMode.surfaceState;
+  var DT = gameMode.boostTrail;
+  ensureBoostTrailMesh();
+  var ship = gameMode.ship;
+  var back = s.forward.clone();
+  if(back.lengthSq() < 1e-6) back.set(0, 0, 1);
+  back.normalize();
+  var enginePos = ship.position.clone().addScaledVector(back, -0.012);
+
+  // Ignition edge: big startup burst the instant boost begins — spark storm + a ring of orbiters
+  // flung wide that spiral back in to form the trail + a shockwave (flash + expanding ring).
+  if(!DT.boosting){
+    DT.boosting = true;
+    DT.startT = 0;
+    spawnBoostSparks(82, enginePos, back);
+    spawnBoostOrbiter(64, enginePos, back, true);
+    if(!DT.shockPos) DT.shockPos = new THREE.Vector3();
+    DT.shockPos.copy(enginePos);
+    DT.shockT = 0;
+    if(DT.flash) DT.flash.visible = true;
+    if(DT.shockRing) DT.shockRing.visible = true;
+  } else {
+    DT.startT++;
+  }
+
+  // Envelope: quick attack to 1 over ~6 frames, then decay to a held base (~0.3) while boosting.
+  var ATTACK = 6, TAU = 18, BASE = 0.3;
+  var I;
+  if(DT.startT < ATTACK) I = DT.startT / ATTACK;
+  else I = BASE + (1 - BASE) * Math.exp(-(DT.startT - ATTACK) / TAU);
+  DT.intensity = I;
+
+  // Per-frame emission scales with intensity (storm at startup → steady stream while held).
+  spawnBoostSparks(Math.round(1 + I * I * 10), enginePos, back);
+  spawnBoostOrbiter(Math.round(2 + I * I * 14), enginePos, back);
+
+  // Spine sample (spacing-gated) — the beam centerline. Each point snapshots its radius from the
+  // current intensity (fat at ignition → base while held), and the beam fades by alpha as it trails.
+  if(DT.lastPos && enginePos.distanceToSquared(DT.lastPos) < DT.spacing * DT.spacing) return;
+  DT.lastPos = enginePos.clone();
+  DT.points.push({ p: enginePos.clone(), age: 0, r: DT.radius * (0.55 + I * 1.7) });
+  if(DT.points.length > DT.maxPoints) DT.points.shift();
+}
+
+// Every frame: ramp the envelope down when not boosting, age the spine framework, run the fluid
+// particle plume, and advance the welding sparks (all keep living/fading after boost ends).
+function updateBoostTrail(){
+  var DT = gameMode.boostTrail;
+  if(!DT.mesh) return;
+  var ship = gameMode.ship, s = gameMode.surfaceState;
+
+  var boostingNow = gameMode.active && !gameMode.fly.active && gameMode.physics.isBoosting;
+  if(!boostingNow){
+    DT.boosting = false;
+    DT.intensity *= 0.86;                       // effect ramps down on release
+    if(DT.intensity < 0.001) DT.intensity = 0;
+  }
+
+  // ── Age the spine framework (the beam centerline). ──
+  var pts = DT.points;
+  for(var i2 = 0; i2 < pts.length; i2++) pts[i2].age += DT.fade;
+  while(pts.length && pts[0].age >= 1) pts.shift();
+  var np = pts.length;
+
+  // ── Central beam tube: a ring per spine point, radius from each point's snapshot ramped to a
+  // point at the nozzle, fading by alpha down the tail. ──
+  if(np < 2){
+    DT.geo.setDrawRange(0, 0);
+  } else {
+    var bpos = DT.posAttr.array, bal = DT.alphaAttr.array, K = DT.sides;
+    var _t = new THREE.Vector3(), _ref = new THREE.Vector3(), _sx = new THREE.Vector3(), _sy = new THREE.Vector3();
+    for(var j = 0; j < np; j++){
+      var ptt = pts[j];
+      var pv = pts[Math.max(0, j - 1)].p, nv = pts[Math.min(np - 1, j + 1)].p;
+      _t.subVectors(nv, pv);
+      if(_t.lengthSq() < 1e-9) _t.set(0, 1, 0);
+      _t.normalize();
+      if(Math.abs(_t.y) > 0.9) _ref.set(1, 0, 0); else _ref.set(0, 1, 0);
+      _sx.crossVectors(_t, _ref).normalize();
+      _sy.crossVectors(_t, _sx).normalize();
+      var fromHead = (np - 1) - j;
+      var rr = (ptt.r || DT.radius) * Math.min(1, fromHead / DT.ramp);
+      var ba = Math.max(0, 1 - ptt.age);
+      for(var ki = 0; ki < K; ki++){
+        var ang = (ki / K) * Math.PI * 2, ca = Math.cos(ang), sa = Math.sin(ang);
+        var vi = (j * K + ki) * 3;
+        bpos[vi]   = ptt.p.x + (_sx.x * ca + _sy.x * sa) * rr;
+        bpos[vi+1] = ptt.p.y + (_sx.y * ca + _sy.y * sa) * rr;
+        bpos[vi+2] = ptt.p.z + (_sx.z * ca + _sy.z * sa) * rr;
+        bal[j * K + ki] = ba;
+      }
+    }
+    DT.posAttr.needsUpdate = true; DT.alphaAttr.needsUpdate = true;
+    DT.geo.setDrawRange(0, (np - 1) * K * 6);
+  }
+
+  // ── Beam light (sits at the nozzle, brightness from the envelope). ──
+  if(DT.light){
+    if(DT.intensity > 0.02 && np > 0){
+      DT.light.visible = true;
+      DT.light.position.copy(pts[np - 1].p);
+      DT.light.intensity = 0.4 + DT.intensity * 2.4;
+      DT.light.distance = 0.6 + DT.intensity * 1.1;
+    } else DT.light.visible = false;
+  }
+
+  // ── Ignition shockwave: a quick bright flash pop + an expanding fading ring. ──
+  if(DT.shockT >= 0 && DT.flash && DT.shockRing){
+    DT.shockT++;
+    var SHOCK_DUR = 18;
+    var sp3 = DT.shockT / SHOCK_DUR;
+    if(sp3 >= 1){
+      DT.flash.visible = false; DT.shockRing.visible = false; DT.shockT = -1;
+    } else {
+      var fpop = sp3 < 0.25 ? sp3 / 0.25 : 1 - (sp3 - 0.25) / 0.75;   // fast pop, slower fall
+      DT.flash.position.copy(DT.shockPos);
+      DT.flash.scale.setScalar(0.008 + fpop * 0.03);
+      DT.flash.material.opacity = Math.max(0, fpop) * 0.9;
+      DT.shockRing.position.copy(DT.shockPos);
+      DT.shockRing.lookAt(camera.position);                          // billboard the ring at the camera
+      DT.shockRing.scale.setScalar(0.006 + sp3 * 0.075);             // expand outward
+      DT.shockRing.material.opacity = (1 - sp3) * 0.8;               // fade as it grows
+    }
+  }
+
+  // ── Orbiting spark streaks: each swirls around the nearest beam point (kinematic rotation of
+  // its perpendicular offset around the local beam tangent), spiraling slowly inward and streaking
+  // via its trail. Carried back along the beam as the spine trails the ship. ──
+  var oPos = DT.orbPos, oAl = DT.orbAlpha, OT = DT.orbTrail;
+  for(var oi = 0; oi < DT.orb.length; oi++){
+    var ob = DT.orb[oi];
+    var oBase = oi * (OT - 1) * 2;
+    if(!ob.alive){ for(var z = 0; z < (OT - 1) * 2; z++){ oPos[(oBase + z) * 3 + 1] = -99999; oAl[oBase + z] = 0; } continue; }
+    ob.life++;
+    if(ob.life >= ob.maxLife){ ob.alive = false; for(var z2 = 0; z2 < (OT - 1) * 2; z2++){ oPos[(oBase + z2) * 3 + 1] = -99999; oAl[oBase + z2] = 0; } continue; }
+    if(np > 0){
+      var bk = 0, bd2 = Infinity;
+      for(var k2 = 0; k2 < np; k2++){
+        var sp2 = pts[k2].p; var ddx = sp2.x - ob.x, ddy = sp2.y - ob.y, ddz = sp2.z - ob.z;
+        var dd2 = ddx*ddx + ddy*ddy + ddz*ddz;
+        if(dd2 < bd2){ bd2 = dd2; bk = k2; }
+      }
+      var P = pts[bk].p;
+      var pnb = pts[Math.min(np - 1, bk + 1)].p, ppb = pts[Math.max(0, bk - 1)].p;
+      var tx = pnb.x - ppb.x, ty = pnb.y - ppb.y, tz = pnb.z - ppb.z;
+      var tl = Math.sqrt(tx*tx + ty*ty + tz*tz) || 1e-6; tx /= tl; ty /= tl; tz /= tl;
+      var ofx = ob.x - P.x, ofy = ob.y - P.y, ofz = ob.z - P.z;
+      var axial = ofx*tx + ofy*ty + ofz*tz;
+      var prx = ofx - tx*axial, pry = ofy - ty*axial, prz = ofz - tz*axial;
+      var cA = Math.cos(ob.angVel), sA = Math.sin(ob.angVel);
+      var crx = ty*prz - tz*pry, cry = tz*prx - tx*prz, crz = tx*pry - ty*prx; // t × perp
+      var nrx = prx*cA + crx*sA, nry = pry*cA + cry*sA, nrz = prz*cA + crz*sA;
+      // Spring the orbit radius toward this particle's target radius — ignition orbiters start
+      // wide and converge to the steady orbit (forming the trail); normal ones just hold it.
+      var plen = Math.sqrt(nrx*nrx + nry*nry + nrz*nrz) || 1e-6;
+      var sc = (plen + ((ob.targetR || DT.orbR) - plen) * (ob.pull || 0.06)) / plen;
+      nrx *= sc; nry *= sc; nrz *= sc;
+      ob.x = P.x + tx*axial + nrx; ob.y = P.y + ty*axial + nry; ob.z = P.z + tz*axial + nrz;
+    }
+    var oh = ob.head;
+    ob.trail[oh].x = ob.x; ob.trail[oh].y = ob.y; ob.trail[oh].z = ob.z;
+    ob.head = (oh + 1) % OT;
+    var oMaster = 1 - (ob.life / ob.maxLife);
+    var oCur = ob.head;
+    for(var os = 0; os < OT - 1; os++){
+      var oi0 = (oCur - 1 - os + OT * 2) % OT, oi1 = (oCur - 2 - os + OT * 2) % OT;
+      var oOff = oBase + os * 2;
+      oPos[oOff*3]     = ob.trail[oi0].x; oPos[oOff*3+1]     = ob.trail[oi0].y; oPos[oOff*3+2]     = ob.trail[oi0].z;
+      oPos[(oOff+1)*3] = ob.trail[oi1].x; oPos[(oOff+1)*3+1] = ob.trail[oi1].y; oPos[(oOff+1)*3+2] = ob.trail[oi1].z;
+      var oFade = 1 - (os / (OT - 1)); oFade *= oFade;
+      oAl[oOff] = oMaster * oFade; oAl[oOff+1] = oMaster * oFade * 0.7;
+    }
+  }
+  DT.orbGeo.attributes.position.needsUpdate = true;
+  DT.orbGeo.attributes.alpha.needsUpdate = true;
+
+  // ── Welding sparks (line-trail streaks with gravity toward the surface) ──
+  var gx = s.groundNormal.x, gy = s.groundNormal.y, gz = s.groundNormal.z;
+  var sPos = DT.sparkPos, sAl = DT.sparkAlpha, T = DT.sparkTrail;
+  for(var si = 0; si < DT.maxSparks; si++){
+    var sk = DT.sparks[si];
+    var segBase = si * (T - 1) * 2;
+    if(!sk.alive){
+      for(var z = 0; z < (T - 1) * 2; z++){ sPos[(segBase + z) * 3 + 1] = -99999; sAl[segBase + z] = 0; }
+      continue;
+    }
+    sk.life++;
+    if(sk.life >= sk.maxLife){
+      sk.alive = false;
+      for(var z2 = 0; z2 < (T - 1) * 2; z2++){ sPos[(segBase + z2) * 3 + 1] = -99999; sAl[segBase + z2] = 0; }
+      continue;
+    }
+    var h = sk.head, prevH = (h - 1 + T) % T;
+    sk.trail[h].x = sk.trail[prevH].x + sk.vx;
+    sk.trail[h].y = sk.trail[prevH].y + sk.vy;
+    sk.trail[h].z = sk.trail[prevH].z + sk.vz;
+    sk.head = (h + 1) % T;
+    sk.vx = sk.vx * 0.9 - gx * 0.0008;   // drag + gentle pull toward the ground
+    sk.vy = sk.vy * 0.9 - gy * 0.0008;
+    sk.vz = sk.vz * 0.9 - gz * 0.0008;
+    var master = 1 - (sk.life / sk.maxLife);
+    var curHead = sk.head;
+    for(var s3 = 0; s3 < T - 1; s3++){
+      var i0 = (curHead - 1 - s3 + T * 2) % T, i1 = (curHead - 2 - s3 + T * 2) % T;
+      var vOff = segBase + s3 * 2;
+      sPos[vOff*3]     = sk.trail[i0].x; sPos[vOff*3+1]     = sk.trail[i0].y; sPos[vOff*3+2]     = sk.trail[i0].z;
+      sPos[(vOff+1)*3] = sk.trail[i1].x; sPos[(vOff+1)*3+1] = sk.trail[i1].y; sPos[(vOff+1)*3+2] = sk.trail[i1].z;
+      var segFade = 1 - (s3 / (T - 1)); segFade *= segFade;
+      sAl[vOff] = master * segFade; sAl[vOff+1] = master * segFade * 0.7;
+    }
+  }
+  DT.sparkGeo.attributes.position.needsUpdate = true;
+  DT.sparkGeo.attributes.alpha.needsUpdate = true;
+}
+
+function clearGameBoostTrail(){
+  var DT = gameMode.boostTrail;
+  DT.points.length = 0;
+  DT.lastPos = null;
+  DT.boosting = false;
+  DT.startT = 0;
+  DT.intensity = 0;
+  if(DT.geo) DT.geo.setDrawRange(0, 0);
+  if(DT.light) DT.light.visible = false;
+  if(DT.flash) DT.flash.visible = false;
+  if(DT.shockRing) DT.shockRing.visible = false;
+  DT.shockT = -1;
+  for(var oi = 0; oi < DT.orb.length; oi++){ DT.orb[oi].alive = false; }
+  if(DT.orbPos){ for(var ov = 0; ov < DT.orbPos.length; ov += 3) DT.orbPos[ov+1] = -99999; }
+  if(DT.orbAlpha){ for(var oa = 0; oa < DT.orbAlpha.length; oa++) DT.orbAlpha[oa] = 0; }
+  if(DT.orbGeo){ DT.orbGeo.attributes.position.needsUpdate = true; DT.orbGeo.attributes.alpha.needsUpdate = true; }
+  for(var i = 0; i < DT.sparks.length; i++){ DT.sparks[i].alive = false; }
+  if(DT.sparkPos){ for(var v = 0; v < DT.sparkPos.length; v += 3) DT.sparkPos[v+1] = -99999; }
+  if(DT.sparkAlpha){ for(var a = 0; a < DT.sparkAlpha.length; a++) DT.sparkAlpha[a] = 0; }
+  if(DT.sparkGeo){ DT.sparkGeo.attributes.position.needsUpdate = true; DT.sparkGeo.attributes.alpha.needsUpdate = true; }
+}
+
 // Kick off a mid-air barrel roll in the given direction (-1 left, +1 right). Captures
 // the ship's current world-right at trigger time so the lateral dash stays on a fixed
 // axis even as the visual roll spins shipVisual around. No-op if grounded or already
 // rolling — a second press during the same hop is ignored on purpose.
-function triggerBarrelRoll(direction){
+function triggerBarrelRoll(direction, opts){
   if(!gameMode.active || gameMode.fly.active) return;
   var s = gameMode.surfaceState;
   if(!s.airborne || s.barrelRoll.active) return;
+  // Flips are RUNNING-only. While walking (≤ walk cap), a flip input just yaws (turns) the ship
+  // in the air instead of rolling — and drifting is disabled too (gated in the physics).
+  if(!s.running){
+    var airTurn = direction * 0.6;   // direction -1 = right → negative angle = turn right
+    s.forward.applyAxisAngle(s.groundNormal, airTurn);
+    s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+    if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+    return;
+  }
+  opts = opts || {};
+  var vertBias = Math.max(-1, Math.min(1, opts.vertBias || 0)); // +1 = up-diagonal, -1 = down-diagonal
   s.barrelRoll.active = true;
   s.barrelRoll.direction = direction;
   s.barrelRoll.progress = 0;
-  // World-space "right" relative to the ship's current orientation
+  // A FLAT (horizontal) swipe is a pure, punchy lateral roll — much more sideways travel and
+  // more spins. A DIAGONAL swipe trades some of that sideways dash for vertical travel, so the
+  // ship corkscrews up (NE/NW) or down (SE/SW) as it rolls.
+  var horizFrac = 1 - Math.abs(vertBias);
+  s.barrelRoll.lateralPeak = 0.025 * (1 + horizFrac * 1.6);   // up to ~2.6x sideways for a flat roll
+  s.barrelRoll.rotations = 2 + horizFrac;                     // 2 spins (diagonal) → 3 spins (flat)
+  // World-space "right" on the surface tangent plane.
   var right = new THREE.Vector3(1, 0, 0).applyQuaternion(gameMode.ship.quaternion);
-  // Project onto the tangent plane of groundNormal so the dash stays
-  // horizontal and doesn't fight gravity. (Old code used s.jumpAxis which
-  // the new physics no longer maintains; groundNormal is the latest valid
-  // "up" relative to the surface we took off from.)
   right.sub(s.groundNormal.clone().multiplyScalar(right.dot(s.groundNormal)));
   if(right.lengthSq() < 0.0001) right.set(1, 0, 0);
-  right.normalize().multiplyScalar(direction);
-  s.barrelRoll.lateralDir.copy(right);
+  right.normalize();
+  // Dash direction = sideways (scaled by horizFrac) + vertical (surface normal up/down).
+  var dir = right.multiplyScalar(direction * horizFrac)
+    .add(s.groundNormal.clone().multiplyScalar(vertBias));
+  if(dir.lengthSq() < 1e-6) dir.copy(right).multiplyScalar(direction);
+  s.barrelRoll.lateralDir.copy(dir.normalize());
 }
 
 // Slam toward the surface from mid-air. Sets a strong negative vertVel along
@@ -13759,7 +15210,7 @@ function gameKeyDown(e) {
     gameMode.keys.s = true;
     // Airborne (hop or free-fall): S slams the ship down — same as the touch swipe-down.
     // On the ground S stays reverse throttle (triggerSlam no-ops when not airborne).
-    if(!e.repeat && gameMode.active && !gameMode.fly.active && gameMode.surfaceState.airborne) triggerSlam();
+    if(!e.repeat && gameMode.active && !gameMode.fly.active && gameMode.surfaceState.airborne){ triggerSlam(); gameMode.sBrakeLock = true; }
   }
   else if(k === 'd' || k === 'arrowright') {
     gameMode.keys.d = true;
@@ -13779,6 +15230,9 @@ function gameKeyDown(e) {
     }
   }
   else if(k === 'control') gameMode.keys.ctrl = true;
+  else if(k === 'enter') { if(gameMode.active) { fireBullet(); e.preventDefault(); } }   // test fire
+  else if(k === 'l' && !e.repeat) { if(gameMode.active) { toggleLockOn(); e.preventDefault(); } }   // lock-on camera toggle
+  else if(k === 't' && !e.repeat) { if(gameMode.active) { spawnEnemyNearPlayer(); e.preventDefault(); } }   // spawn an enemy
   else if(k === 'p' && !e.repeat) { if(gameMode.active) toggleFlightMode(); }
   else if(k === 'escape') {
     if(gameMode.active && !gameMode.exiting) {
@@ -13794,7 +15248,7 @@ function gameKeyUp(e) {
   var k = e.key ? e.key.toLowerCase() : '';
   if(k === 'w' || k === 'arrowup') gameMode.keys.w = false;
   else if(k === 'a' || k === 'arrowleft') gameMode.keys.a = false;
-  else if(k === 's' || k === 'arrowdown') gameMode.keys.s = false;
+  else if(k === 's' || k === 'arrowdown') { gameMode.keys.s = false; gameMode.sBrakeLock = false; }
   else if(k === 'd' || k === 'arrowright') gameMode.keys.d = false;
   else if(k === 'shift') gameMode.keys.shift = false;
   else if(k === 'q') gameMode.keys.q = false;
@@ -14101,17 +15555,21 @@ function buildPortal(){
   P.matB = matB;   // crystal material reused for the continuation chute (built after dstAnchor)
   P.domeFloorY = gy - P.domeDrop;
   var domeCy = P.domeFloorY + P.domeR;
-  var dome = new THREE.Mesh(new THREE.SphereGeometry(P.domeR, 48, 32), matDome);
-  dome.position.set(P.DX, domeCy, P.domeCz);
-  gB.add(dome);
-  var floor = new THREE.Mesh(new THREE.CircleGeometry(P.domeR * 0.985, 64), matFloor);
+  // Massive flat plane the hallway opens onto (replaces the dome sphere). A NON-reflective matte
+  // ground + a grey grid so it reads as open floor; the dark fog fades the far edges.
+  var planeSize = 40;
+  P.planeHalf = planeSize * 0.5;
+  var floor = new THREE.Mesh(new THREE.PlaneGeometry(planeSize, planeSize),
+    new THREE.MeshBasicMaterial({ color: 0x24242b, side: THREE.DoubleSide }));   // flat, unlit, non-reflective
   floor.rotation.x = -Math.PI/2;
   floor.position.set(P.DX, P.domeFloorY, P.domeCz);
   gB.add(floor);
-  // interior lights (layer 2) so the crystal reads with shading — one up at the ceiling chute,
-  // one filling the dome.
-  var l1 = new THREE.PointLight(0xbcd0ff, 1.4, 60); l1.position.set(P.DX, domeCy + P.domeR*0.6, P.domeCz); gB.add(l1);
-  var l2 = new THREE.PointLight(0x88aaff, 1.6, 80); l2.position.set(P.DX, domeCy, P.domeCz); gB.add(l2);
+  var grid = new THREE.GridHelper(planeSize, 200, 0x8a8a93, 0x55555c);           // grey grid (0.2-unit cells)
+  grid.position.set(P.DX, P.domeFloorY + 0.001, P.domeCz);                       // just above to avoid z-fight
+  gB.add(grid);
+  // Fill lights — the hallway/chute still uses the crystal material, which needs lighting.
+  var l1 = new THREE.PointLight(0xbcd0ff, 1.4, 90); l1.position.set(P.DX, domeCy + P.domeR*0.6, P.domeCz); gB.add(l1);
+  var l2 = new THREE.PointLight(0x88aaff, 1.1, 150); l2.position.set(P.DX, P.domeFloorY + 16, P.domeCz - 18); gB.add(l2);
   if(PORTAL_DEBUG_WIRE) applyDebugWire(gB, 0x224a3a, 0x66ff99);   // Region B dome/tunnel: green faces / green wire
   gB.traverse(function(o){ o.layers.set(PORTAL_LAYER); });
   scene.add(gB); P.regionB = gB;
@@ -14626,25 +16084,12 @@ function closestPointOnDome(pos){
     if(_domeChLp.z >= -0.45 && _domeChLp.z <= 0.15)
       inHole = pointInSeamTri(_domeChLp.x, _domeChLp.y, P.exitTri);
   }
-  // floor disc (y = domeFloorY, radius domeR around (DX, domeCz))
+  // Flat plane floor (y = domeFloorY) — the massive ground the hallway opens onto. Huge extent so
+  // you never reach an edge; no curved sphere walls anymore.
   var fdx = pos.x - P.DX, fdz = pos.z - P.domeCz, fr = Math.hypot(fdx, fdz);
-  if(fr <= P.domeR){
+  if(fr <= (P.planeHalf || 40)){
     var fdist = Math.abs(pos.y - P.domeFloorY);
     if(fdist < bestDist){ bestDist = fdist; bx = pos.x; by = P.domeFloorY; bz = pos.z; nx=0; ny=1; nz=0; found=true; }
-  }
-  // sphere inner wall (centre (DX, domeCy, domeCz), radius domeR) — only at/above the floor, and NOT
-  // across the ceiling hole (so you can fly/drive out through the opening).
-  var cy = P.domeFloorY + P.domeR;
-  var sdx = pos.x - P.DX, sdy = pos.y - cy, sdz = pos.z - P.domeCz, rlen = Math.hypot(sdx, sdy, sdz);
-  if(rlen > 1e-4 && !inHole){
-    var spy = cy + sdy/rlen*P.domeR;
-    if(spy >= P.domeFloorY - 0.02){
-      var sdist = Math.abs(P.domeR - rlen);
-      if(sdist < bestDist){
-        bestDist = sdist; bx = P.DX + sdx/rlen*P.domeR; by = spy; bz = P.domeCz + sdz/rlen*P.domeR;
-        nx = -sdx/rlen; ny = -sdy/rlen; nz = -sdz/rlen; found = true;
-      }
-    }
   }
   // chute walls — the portal-image of the crystal tunnel (baked dome-world tris). Closest-point on
   // those is EXACTLY the transformed crystal collision, so it matches the crystal side at the seam.
@@ -14678,10 +16123,16 @@ function updatePortalInterior(){
   var cx = P.DX, cz = P.domeCz, floorY = P.domeFloorY, roomR = P.domeR;
   var domeGrip = 0.7;   // how far the magnetic grip reaches before the ship free-falls
 
-  // input (identical to crystal)
+  // input — matches the overworld: boost = Shift (drives forward on its own); "running" is any
+  // speed above the walk cap (gates drift + flips). Same km/h counter, too.
   var fwdAxis = 0, yawAxis = 0;
   if(t.active){ fwdAxis = t.throttle; yawAxis = t.yaw; p.isBoosting = t.boost; }
-  else { fwdAxis = (k.w?1:0)+(k.s?-0.6:0); yawAxis = (k.a?-1:0)+(k.d?1:0); p.isBoosting = k.shift && k.w; }
+  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); yawAxis = (k.a?-1:0)+(k.d?1:0); p.isBoosting = k.shift; }
+  if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
+  if(s.airborne && fwdAxis < 0) fwdAxis = 0;   // no braking in the air (S mid-air is slam-only)
+  var speedMetric = Math.max(Math.abs(s.speed), gameMode.fly.vel.length());
+  s.running = p.isBoosting || speedMetric > p.maxSpeed * (10/15);   // running (drift/flip) gate = 10 km/h
+  updateSpeedCounter(speedMetric);
 
   // jump → hop (+ jump barrel-roll combo, same as crystal)
   if(gameMode.wantJump){
@@ -14701,28 +16152,39 @@ function updatePortalInterior(){
   var wantsDriftRight = (k.d && !k.w) || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15) || (t.active && t.driftHold && t.driftDir > 0);
   var wantsDrift = wantsDriftLeft || wantsDriftRight;
   var spdAbs = Math.abs(s.speed);
-  var canDriftNow = s.isDrifting ? (spdAbs > p.maxSpeed*p.driftContinueSpeedRatio) : (spdAbs > p.maxSpeed*p.driftEntrySpeedRatio);
+  var canDriftNow = s.running && (s.isDrifting ? (spdAbs > p.maxSpeed*p.driftContinueSpeedRatio) : (spdAbs > p.maxSpeed*p.driftEntrySpeedRatio));
   if(wantsDrift && canDriftNow && !s.airborne){
     if(!s.isDrifting){ s.driftTime = 0; s.driftEntrySpeed = spdAbs; }
     s.isDrifting = true; s.driftTime += 1; s.driftDirection = wantsDriftLeft ? 1 : -1; s.driftTargetAngle = s.driftDirection*(Math.PI*0.5);
-    spawnGameDriftParticles();
+    spawnGameDriftParticles(); spawnDriftTrench();
   } else { s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; }
   s.driftAngle += (s.driftTargetAngle - s.driftAngle) * 0.12;
 
-  // ── thrust + speed (copied) ──
+  // ── thrust + speed (matches the overworld: boost = 2× accel, walk cap holds momentum) ──
   var hasFwd = Math.abs(fwdAxis) > 0.01;
   if(hasFwd && !s.isDrifting) p.accelerationTime = Math.min(p.maxAccelerationTime, p.accelerationTime + 1); else p.accelerationTime = Math.max(0, p.accelerationTime - 3);
   var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * (p.accelerationTime / p.maxAccelerationTime);
-  if(p.isBoosting) thrust = p.boostAccelRate;
+  if(p.isBoosting) thrust = thrust * 2;
   var driftTight = 0; if(t.active && t.driftHold) driftTight = t.driftTight; if(k.s) driftTight = Math.max(driftTight, 1);
   if(s.isDrifting){
-    if(s.driftTime > p.driftSustainTime){ s.speed -= Math.sign(s.speed || 1) * p.driftDecel; s.speed *= 0.998; }
-    if(driftTight > 0) s.speed *= (1 - driftTight * 0.015);
+    if(s.driftTime <= p.driftSustainTime){ var ds = s.speed < 0 ? -1 : 1; if(Math.abs(s.speed) < s.driftEntrySpeed) s.speed = ds * s.driftEntrySpeed; }
+    else { s.speed -= Math.sign(s.speed || 1) * p.driftDecel; s.speed *= 0.998; if(driftTight > 0) s.speed *= (1 - driftTight * 0.015); }
+  } else if(p.isBoosting){
+    s.speed += thrust * fwdAxis; s.coastFrames = 0;                 // no drag, no cap → unbounded boost
+    var BOOST_SAFETY = p.maxSpeed * 12; if(s.speed > BOOST_SAFETY) s.speed = BOOST_SAFETY;
+    var maxRb = p.maxSpeed*0.6; if(s.speed < -maxRb) s.speed = -maxRb;
+  } else if(fwdAxis > 0.01 && s.speed > p.maxSpeed){
+    s.coastFrames = 0;
+    var SUSTAIN_CAP = p.maxSpeed * (35/15);                         // hold up to 35 km/h; above, bleed down
+    if(s.speed > SUSTAIN_CAP){ s.speed -= 0.00015; if(s.speed < SUSTAIN_CAP) s.speed = SUSTAIN_CAP; }
+  } else if(hasFwd){
+    s.speed += thrust * fwdAxis; s.coastFrames = 0; s.speed *= p.drag;
+    var walkCap = p.maxSpeed; if(t.active && t.useJoystick) walkCap = Math.max(walkCap, 0.03); if(s.speed > walkCap) s.speed = walkCap;
+    var maxR = p.maxSpeed*0.6; if(s.speed < -maxR) s.speed = -maxR;
   } else {
-    s.speed += thrust * fwdAxis;
-    if(hasFwd){ s.coastFrames = 0; s.speed *= p.drag; var maxS = p.isBoosting?p.boostMaxSpeed:p.maxSpeed; if(t.active && t.useJoystick) maxS = Math.max(maxS, 0.03); if(s.speed > maxS) s.speed = maxS; var maxRv = (p.isBoosting?p.boostMaxSpeed:p.maxSpeed)*0.6; if(s.speed < -maxRv) s.speed = -maxRv; }
-    else { s.coastFrames += 1; if(s.coastFrames > p.coastHoldFrames){ if(s.speed > 0) s.speed = Math.max(0, s.speed - p.coastLinearDecel); else if(s.speed < 0) s.speed = Math.min(0, s.speed + p.coastLinearDecel); } }
+    s.coastFrames += 1; if(s.coastFrames > p.coastHoldFrames){ if(s.speed > 0) s.speed = Math.max(0, s.speed - p.coastLinearDecel); else if(s.speed < 0) s.speed = Math.min(0, s.speed + p.coastLinearDecel); }
   }
+  if(p.isBoosting) spawnBoostTrail();
 
   // ── yaw + tangential move (copied) ──
   if(s.isDrifting){ var ramp = Math.min(1, s.driftTime/p.driftRampTime); var dY = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase)*ramp; dY *= (1 + driftTight*0.7); s.forward.applyAxisAngle(s.groundNormal, dY * s.driftDirection); }
@@ -14738,12 +16200,18 @@ function updatePortalInterior(){
     s.vertVel -= p.jumpGravity; ship.position.addScaledVector(s.jumpAxis, s.vertVel); s.airTime += 1;
     if(s.barrelRoll.active){ s.barrelRoll.progress = Math.min(1, s.barrelRoll.progress + 1/s.barrelRoll.duration); var brP = s.barrelRoll.progress; var lat = s.barrelRoll.lateralPeak*(1-brP)*(1-brP); ship.position.addScaledVector(s.barrelRoll.lateralDir, lat); if(brP >= 1){ s.barrelRoll.active = false; s.barrelRoll.progress = 0; } }
     var cpL = closestPointOnDome(ship.position);
-    if(cpL && cpL.dist <= s.hoverHeight + 0.012 && (s.vertVel < 0 || s.airTime > p.jumpMaxAirTime)){
-      s.groundNormal.lerp(cpL.normal, 0.5).normalize();
-      ship.position.copy(cpL.point).addScaledVector(s.groundNormal, s.hoverHeight);
-      s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
-      if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
-      s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+    if(cpL){
+      // SIGNED height above the surface (negative = punched through it). Using the signed value
+      // means a fast descent that overshoots below the plane in one frame still lands instead of
+      // tunnelling through (the old unsigned check missed it).
+      var sdL = ship.position.clone().sub(cpL.point).dot(cpL.normal);
+      if(sdL <= s.hoverHeight + 0.02 && (s.vertVel < 0 || s.airTime > p.jumpMaxAirTime)){
+        s.groundNormal.lerp(cpL.normal, 0.5).normalize();
+        ship.position.copy(cpL.point).addScaledVector(s.groundNormal, s.hoverHeight);
+        s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
+        if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+        s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+      }
     }
   } else {
     var cp = closestPointOnDome(ship.position);
@@ -14759,20 +16227,37 @@ function updatePortalInterior(){
     }
   }
 
+  // Hard-floor safety: even if the analytic grip misses a frame, NEVER let the ship pass below the
+  // grey plane when it's over it (and below the chute). Clamp it up and treat it as a landing — this
+  // is what stops the "falling through the grid" on fast slams/landings.
+  if(Math.hypot(ship.position.x - P.DX, ship.position.z - P.domeCz) <= P.planeHalf){
+    var floorMinY = P.domeFloorY + s.hoverHeight;
+    if(ship.position.y < floorMinY){
+      ship.position.y = floorMinY;
+      s.groundNormal.set(0, 1, 0);
+      if(s.airborne){
+        s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0;
+        s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+        s.forward.y = 0; if(s.forward.lengthSq() > 1e-6) s.forward.normalize();
+      }
+    }
+  }
+
   // ── orient + drift visuals + engine glow (same as crystal) ──
   var oM = new THREE.Matrix4(); oM.lookAt(new THREE.Vector3(), s.forward.clone().multiplyScalar(-1), s.groundNormal); ship.quaternion.setFromRotationMatrix(oM);
   if(gameMode.shipVisual){ if(s.barrelRoll.active){ gameMode.shipVisual.rotation.z = -s.barrelRoll.direction*s.barrelRoll.rotations*Math.PI*2*s.barrelRoll.progress; gameMode.shipVisual.rotation.y = 0; } else { gameMode.shipVisual.rotation.y = s.driftAngle; gameMode.shipVisual.rotation.z = -s.driftAngle*0.3; } }
   if(gameMode.engineGlow){ var sf = Math.abs(s.speed)/p.boostMaxSpeed; gameMode.engineGlow.material.opacity = 0.5+sf*0.5; gameMode.engineGlow.scale.setScalar(1+sf*0.7); }
 
   // ── chase camera — IDENTICAL framing to the crystal (computeChaseCamPose) so the portal-folded
-  //    crystal pose equals the dome pose exactly: the cross is then truly seamless (no aim snap). ──
-  var chase = computeChaseCamPose();
+  //    crystal pose equals the dome pose exactly: the cross is then truly seamless (no aim snap).
+  //    Lock-on aware so the dome tank can be locked too. ──
+  var chase = gameCamPose();
   if(P.snapCam){
     // first frame after the portal cross — snap so the view doesn't roll/slide as it re-settles
     camera.position.copy(chase.pos); camera.up.copy(chase.up).normalize();
     P.snapCam = false;
   } else {
-    camera.position.lerp(chase.pos, 0.18); camera.up.lerp(chase.up, 0.12); camera.up.normalize();
+    var camLerpP = gameMode.surfaceState.isDrifting ? 0.5 : 0.18; camera.position.lerp(chase.pos, camLerpP); camera.up.lerp(chase.up, gameMode.surfaceState.isDrifting ? 0.3 : 0.12); camera.up.normalize();
   }
   camera.lookAt(chase.lookAt);
 
@@ -15052,6 +16537,16 @@ function init(){
   });
   renderer.domElement.addEventListener('mousedown',onMD);renderer.domElement.addEventListener('mousemove',onMM);
   renderer.domElement.addEventListener('mouseup',onMU);renderer.domElement.addEventListener('mouseleave',onMU);
+  // Combat: hold left mouse to fire the weapon while playing (ignored over in-game glass windows/icons)
+  renderer.domElement.addEventListener('mousedown',function(e){
+    if(gameMode.active && !gameMode.exiting && !gameUITouchHitTest(e.clientX,e.clientY)){
+      if(e.button===0) combat.mouseFiring=true;
+      else if(e.button===2){ toggleLockOn(); e.preventDefault(); }   // right-click toggles lock-on
+    }
+  });
+  window.addEventListener('mouseup',function(e){ if(e.button===0) combat.mouseFiring=false; });
+  // Suppress the browser context menu over the canvas while playing (so right-click can lock on)
+  renderer.domElement.addEventListener('contextmenu',function(e){ if(gameMode.active && !gameMode.exiting) e.preventDefault(); });
   renderer.domElement.addEventListener('touchstart',onTS,{passive:false});renderer.domElement.addEventListener('touchmove',onTM,{passive:false});renderer.domElement.addEventListener('touchend',onTE);
   renderer.domElement.addEventListener('wheel',function(e){
     // Lightbox: wheel zooms the image instead of scrolling the page/camera. Also bumps
@@ -15256,6 +16751,12 @@ function animate(){
   }
   // Drift particles age every frame (even when not drifting, so existing streaks finish out)
   updateGameDriftParticles();
+  updateDriftTrench();
+  updateBoostTrail();
+  updateGameBullets();
+  updateCombat(dt);
+  updateCrosshair(gameMode.active && !gameMode.exiting && !combat.lockTarget);
+  if(!gameMode.active) hideSpeedCounter();
 
   floors.forEach(function(fl){
     var ud=fl.group.userData;
