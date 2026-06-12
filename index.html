@@ -631,6 +631,17 @@ var gameMode = {
     // from boostMaxSpeed.
     coastHoldFrames: 240,
     coastLinearDecel: 0.00005,
+    // S-brake tuning. Braking (S held while still moving forward) uses a RAMPED decel that eases
+    // in: barely slows for the first moments, then firms up the longer S is held — so a tap is
+    // gentle and a long hold brings you to a controlled stop instead of snapping. Per-frame decel
+    // ramps brakeMin → brakeMax over brakeRampFrames (quadratic ease-in). Once stopped it falls
+    // through to normal reverse thrust.
+    brakeMin: 0.00003,
+    brakeMax: 0.00044,
+    brakeRampFrames: 100,
+    // Drift-exit "fling out of orbit": on release, keep applying the drift's yaw rate but decay it
+    // each frame, so the heading keeps arcing then straightens instead of snapping straight.
+    driftExitDecay: 0.92,
     // When you release boost above the walk cap, speed bleeds down toward the cap at this rate
     // per frame (running → walking) instead of snapping — ~1.6s from boostMax back to walk.
     boostFalloff: 0.00009,
@@ -7732,7 +7743,7 @@ function makeGameWindow(kind, title, W, H){
 }
 
 function ensureGameWindows(){
-  if(!gameUI.options)   gameUI.options   = makeGameWindow('options', 'OPTIONS', 4.4, 4.2);
+  if(!gameUI.options)   gameUI.options   = makeGameWindow('options', 'OPTIONS', 4.4, 5.4);
   if(!gameUI.inventory) gameUI.inventory = makeGameWindow('inventory', 'INVENTORY', 4.2, 3.8);
 }
 
@@ -7741,14 +7752,16 @@ function buildOptionsContent(win){
   win.content = new THREE.Group();
   win.group.add(win.content);
   var W = win.W, H = win.H;
-  var rowH = 0.5, gap = 0.14;
-  var y = H/2 - 1.0;
+  var rowH = 0.46, gap = 0.12;
+  var y = H/2 - 0.85;
 
-  // Stepper rows: −/+ around a value. CAMERA ZOOM = how close the chase cam sits
-  // to the ship (lower = closer); FOV = camera field of view.
+  // Stepper rows: −/+ around a value. CAMERA ZOOM = how close the chase cam sits to the ship
+  // (lower = closer); FOV = camera field of view; MUSIC / SFX = master volume dials (0–100%).
   var rows = [
     {label:'CAMERA ZOOM', val:gameMode.camBackDist.toFixed(2), dec:'opt-zoom-dec', inc:'opt-zoom-inc'},
-    {label:'FOV',         val:Math.round(gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + '', dec:'opt-fov-dec',  inc:'opt-fov-inc'}
+    {label:'FOV',         val:Math.round(gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + '', dec:'opt-fov-dec',  inc:'opt-fov-inc'},
+    {label:'MUSIC',       val:Math.round(sfx.musicVol * 100) + '%', dec:'opt-music-dec', inc:'opt-music-inc'},
+    {label:'SFX',         val:Math.round(sfx.sfxVol   * 100) + '%', dec:'opt-sfx-dec',   inc:'opt-sfx-inc'}
   ];
   rows.forEach(function(r){
     var lbl = pdvTextMesh(r.label, {cw:400, ch:64, font:'600 28px Arial', color:'#2a3248', align:'left', w:W*0.40, h:rowH*0.62});
@@ -7821,6 +7834,10 @@ function handleGameOption(actionId){
   else if(actionId === 'opt-zoom-inc') gameMode.camBackDist = Math.min(0.50, gameMode.camBackDist + 0.02); // farther
   else if(actionId === 'opt-fov-dec'){ gameMode.fovBase = Math.max(40, (gameMode.fovBase != null ? gameMode.fovBase : camera.fov) - 5); }
   else if(actionId === 'opt-fov-inc'){ gameMode.fovBase = Math.min(120, (gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + 5); }
+  else if(actionId === 'opt-music-dec') sfx.musicVol = Math.max(0, Math.round((sfx.musicVol - 0.1) * 10) / 10);
+  else if(actionId === 'opt-music-inc') sfx.musicVol = Math.min(1, Math.round((sfx.musicVol + 0.1) * 10) / 10);
+  else if(actionId === 'opt-sfx-dec')   sfx.sfxVol   = Math.max(0, Math.round((sfx.sfxVol   - 0.1) * 10) / 10);
+  else if(actionId === 'opt-sfx-inc')   sfx.sfxVol   = Math.min(1, Math.round((sfx.sfxVol   + 0.1) * 10) / 10);
   else if(actionId === 'opt-joy')      gameMode.joystickEnabled = (gameMode.joystickEnabled === false);
   else if(actionId === 'opt-fly')      toggleFlightMode();
   else if(actionId === 'opt-exit'){ closeGameWindow(gameUI.options); closeGameWindow(gameUI.inventory); exitGameMode(); return; }
@@ -13025,7 +13042,13 @@ function computeChaseCamPose() {
   var right = new THREE.Vector3().crossVectors(M, up).normalize();
   var shipDir = M.clone().addScaledVector(right, Math.tan(sx)).addScaledVector(up, Math.tan(sy));
   if(shipDir.lengthSq() > 1e-9) shipDir.normalize();
-  var posD = S.clone().addScaledVector(shipDir, -d);
+  // Camera-to-ship distance. The non-drift pose sits back d AND up h, so its radius is √(d²+h²).
+  // The drift pose is pulled a little FURTHER out (DRIFT_CAM_ZOOM) so the drift framing reads a
+  // touch wider — tweak this if you want more/less zoom-out on drift.
+  var DRIFT_CAM_ZOOM = 1.12;
+  var camRadiusBase = Math.sqrt(d * d + h * h);
+  var camRadius = camRadiusBase * DRIFT_CAM_ZOOM;
+  var posD = S.clone().addScaledVector(shipDir, -camRadius);
   var lookD = posD.clone().addScaledVector(M, 1.0);
   var upD = up.clone();
   var driftFrac = Math.min(1, Math.abs(driftA) / (Math.PI * 0.5));
@@ -13033,7 +13056,16 @@ function computeChaseCamPose() {
   upD.applyQuaternion(rollQ);
 
   // ── Blend the two poses by the smoothed factor ──
-  var pos = posN.lerp(posD, b);
+  // Position is blended on a SPHERE around the ship (slerp the camera DIRECTION, lerp the RADIUS),
+  // not a straight lerp of the two points. A straight lerp cuts a chord through the inside of the
+  // arc, which dips the camera closer to the ship mid-transition (up to ~30% on a hard drift) and
+  // reads as a zoom-in-then-out. Slerping the direction + lerping the radius keeps the distance
+  // monotonic (camRadiusBase → camRadius), so there's no dip — just a clean swing + slight zoom-out.
+  var dirN = posN.clone().sub(S); dirN.normalize();
+  var dirD = posD.clone().sub(S); dirD.normalize();
+  var qB = new THREE.Quaternion().slerp(new THREE.Quaternion().setFromUnitVectors(dirN, dirD), b);
+  var blendRadius = camRadiusBase + (camRadius - camRadiusBase) * b;
+  var pos = S.clone().addScaledVector(dirN.applyQuaternion(qB), blendRadius);
   var lookAt = lookN.lerp(lookD, b);
   var outUp = up.lerp(upD, b);
   if(outUp.lengthSq() > 1e-9) outUp.normalize();
@@ -13263,11 +13295,11 @@ function updateGamePhysicsAndCamera() {
   if(t.active){
     fwdAxis = t.throttle;
     yawAxis = t.yaw;
-    p.isBoosting = t.boost;
+    p.isBoosting = t.boost && boostAllowed();
   } else {
     fwdAxis = (k.w ? 1 : 0) + ((k.s && !gameMode.sBrakeLock) ? -0.6 : 0);
     yawAxis = (k.a ? -1 : 0) + (k.d ? 1 : 0);
-    p.isBoosting = k.shift;
+    p.isBoosting = k.shift && boostAllowed();
   }
   // Boost drives forward on its own (you don't also have to hold W to run).
   if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
@@ -13368,6 +13400,9 @@ function updateGamePhysicsAndCamera() {
     if(t.active && t.driftHold) driftTight = t.driftTight;
     if(k.s) driftTight = Math.max(driftTight, 1);
 
+    // Reset the brake ramp whenever we're not actively braking (S held while still moving forward).
+    if(!(fwdAxis < -0.01 && s.speed > 0.0005)) s.brakeTime = 0;
+
     if(s.isDrifting) {
       if(s.driftTime <= p.driftSustainTime) {
         // Hold the entry momentum — a fresh drift must NEVER bleed speed, even coming in at
@@ -13379,6 +13414,13 @@ function updateGamePhysicsAndCamera() {
         s.speed *= 0.998;
         if(driftTight > 0) s.speed *= (1 - driftTight * 0.015);
       }
+    } else if(fwdAxis < -0.01 && s.speed > 0.0005){
+      // BRAKING (S held while still moving forward): ramped decel — eases in so it barely slows at
+      // first, then firms up the longer you hold. Once stopped it falls through to reverse thrust.
+      s.brakeTime = (s.brakeTime || 0) + 1;
+      var bramp = Math.min(s.brakeTime / p.brakeRampFrames, 1); bramp *= bramp;
+      s.speed = Math.max(0, s.speed - (p.brakeMin + (p.brakeMax - p.brakeMin) * bramp));
+      s.coastFrames = 0;
     } else if(p.isBoosting){
       // RUNNING (boost): double-accel forward with NO max speed — keep building over and over.
       s.speed += thrust * fwdAxis;                          // no drag, no cap → speed climbs unbounded
@@ -13424,9 +13466,19 @@ function updateGamePhysicsAndCamera() {
       var ramp = Math.min(1, s.driftTime / p.driftRampTime);
       var driftYaw = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase) * ramp;
       driftYaw *= (1 + driftTight * 0.7);
-      s.forward.applyAxisAngle(s.groundNormal, driftYaw * s.driftDirection);
-    } else if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01) {
-      s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis);
+      var dy = driftYaw * s.driftDirection;
+      s.forward.applyAxisAngle(s.groundNormal, dy);
+      s.driftExitYaw = dy;   // remember the orbital yaw to fling out of on release
+    } else {
+      // Fling out of orbit: keep arcing at the (decaying) drift yaw, then layer steering on top.
+      if(Math.abs(s.driftExitYaw || 0) > 1e-5){
+        s.forward.applyAxisAngle(s.groundNormal, s.driftExitYaw);
+        s.driftExitYaw *= p.driftExitDecay;
+        if(Math.abs(s.driftExitYaw) < 1e-5) s.driftExitYaw = 0;
+      }
+      if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01) {
+        s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis);
+      }
     }
     s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
     if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
@@ -13763,7 +13815,8 @@ function updateFlightPhysicsAndCamera() {
   }
   var pitchAxis = (k.q ? 1 : 0) + (k.e ? -1 : 0);    // Q = nose up, E = nose down
   var vertAxis  = (k.space ? 1 : 0) + (k.ctrl ? -1 : 0);
-  var isBoosting = k.shift || (t.active && t.boost);
+  var isBoosting = (k.shift || (t.active && t.boost)) && boostAllowed();
+  gameMode.physics.isBoosting = isBoosting;   // so the boost-fuel bar drains in flight too
 
   // Thrust ramp
   if(Math.abs(fwdAxis) > 0.01) fly.accelTime = Math.min(300, fly.accelTime + 1);
@@ -14129,6 +14182,50 @@ function updateSpeedCounter(speedUnits){
 }
 function hideSpeedCounter(){ if(gameSpeedEl) gameSpeedEl.style.display = 'none'; }
 
+// ── Boost fuel + bar ─────────────────────────────────────────────────────────────────
+// Boosting drains the bar over `duration` s; once empty it LOCKS OUT and must recharge fully
+// over `recharge` s before you can boost again. The bar is only on screen while boosting (or
+// while locked out recharging from empty, so you can see the wait).
+var boostBar = { fuel: 1, lockout: false, duration: 1.5, recharge: 2.5, barEl: null, fillEl: null };
+function boostAllowed(){ return boostBar.fuel > 0 && !boostBar.lockout; }
+function ensureBoostBar(){
+  if(boostBar.barEl) return;
+  var bar = document.createElement('div');
+  bar.id = 'game-boost';
+  bar.style.cssText = 'position:fixed;right:18px;bottom:52px;z-index:50;width:160px;height:9px;'
+    + 'background:rgba(20,16,30,0.65);border:1px solid rgba(255,255,255,0.2);border-radius:5px;'
+    + 'overflow:hidden;pointer-events:none;opacity:0;transition:opacity 0.25s;box-shadow:0 1px 5px rgba(0,0,0,0.5);';
+  var fill = document.createElement('div');
+  fill.style.cssText = 'height:100%;width:100%;background:linear-gradient(90deg,#c9a3ff,#8f6fff);'
+    + 'border-radius:4px;transition:width 0.05s linear;';
+  bar.appendChild(fill);
+  document.body.appendChild(bar);
+  boostBar.barEl = bar; boostBar.fillEl = fill;
+}
+function updateBoostFuel(dt){
+  ensureBoostBar();
+  var B = boostBar;
+  if(!gameMode.active || gameMode.exiting){
+    // Out of game — keep it full + ready, hidden.
+    B.fuel = 1; B.lockout = false; B.barEl.style.opacity = '0';
+    return;
+  }
+  var boosting = !!gameMode.physics.isBoosting;
+  if(boosting){
+    B.fuel -= dt / B.duration;
+    if(B.fuel <= 0){ B.fuel = 0; B.lockout = true; }     // ran out → must fully recharge
+  } else {
+    B.fuel += dt / B.recharge;
+    if(B.fuel >= 1){ B.fuel = 1; B.lockout = false; }
+  }
+  B.fillEl.style.width = (B.fuel * 100) + '%';
+  // purple while usable, red-orange while locked out (empty + recharging)
+  B.fillEl.style.background = B.lockout ? 'linear-gradient(90deg,#ff7a4a,#cc3a3a)'
+                                        : 'linear-gradient(90deg,#c9a3ff,#8f6fff)';
+  // Visible only while boosting (or while locked out, so the recharge is visible)
+  B.barEl.style.opacity = (boosting || B.lockout) ? '1' : '0';
+}
+
 // ── Crosshair (screen-centre reticle = firing direction) ─────────────────────────────
 var gameCrosshairEl = null;
 function updateCrosshair(show){
@@ -14148,6 +14245,115 @@ function updateCrosshair(show){
     document.body.appendChild(gameCrosshairEl);
   }
   gameCrosshairEl.style.display = show ? 'block' : 'none';
+}
+
+// ══════════════════════════════════════════════
+// GAME AUDIO — ported from Orbicule (reuses the same CDN sound files). One-shot pools so rapid
+// events don't cut themselves off; looping ship/boost/drift + music gated to game mode.
+// ══════════════════════════════════════════════
+var SFX_BASE = 'https://cdn.jsdelivr.net/gh/mesaantwan/Spacergamer@main/';
+function sfxUrl(f){ return SFX_BASE + f; }
+var sfx = {
+  _loaded:false, _unlocked:false, _all:[],
+  sfxVol:1.0, musicVol:0.6,   // master dials (0..1), set from the in-game OPTIONS window
+  boost:null, boostFadeout:null, drift:null, driftFadeout:null, hover:null, bgMusic:null,
+  _shootPool:[], _shootIdx:0, _shootN:16,
+  _pdmgPool:[], _pdmgIdx:0, _pdmgN:8,
+  _ehitPool:[], _ehitN:8,
+  _ecritPool:[], _ecritIdx:0, _ecritN:4,
+  _ediesPool:[], _ediesIdx:0, _ediesN:4,
+  _bouncePool:[], _bounceIdx:0, _bounceN:6
+};
+function _mkAudio(file, vol, loop){
+  var a = new Audio(sfxUrl(file));
+  a._baseVol = vol; a.volume = vol; if(loop) a.loop = true;
+  sfx._all.push(a);
+  return a;
+}
+function initAudio(){
+  if(sfx._loaded) return; sfx._loaded = true;
+  sfx.boost = _mkAudio('ship_boost.wav', 0.5, true);          // boost noise at 50%
+  sfx.boostFadeout = _mkAudio('boost_fadeout_better.wav', 0.5, false);
+  sfx.drift = _mkAudio('drift_new.wav', 0.4, true);
+  sfx.driftFadeout = _mkAudio('drift_fadeout.wav', 0.4, false);
+  sfx.hover = _mkAudio('ship_hover.wav', 0.12, true);
+  sfx.bgMusic = _mkAudio('PR_FinalMix_320.mp3', 0.33, true); sfx.bgMusic.preload = 'none';   // music +50% (0.22→0.33)
+  var i;
+  for(i=0;i<sfx._shootN;i++) sfx._shootPool.push(_mkAudio('single_shot_fade.wav', 0.32, false));
+  for(i=0;i<sfx._pdmgN;i++) sfx._pdmgPool.push(_mkAudio('take_damage.wav', 0.5, false));
+  var ehit = ['enemy_is_hit_1.wav','enemy_is_hit_2.wav','enemy_is_hit_3.wav','enemy_is_hit_4.wav'];
+  for(i=0;i<sfx._ehitN;i++) sfx._ehitPool.push(_mkAudio(ehit[i%4], 0.5, false));
+  for(i=0;i<sfx._ecritN;i++) sfx._ecritPool.push(_mkAudio('enemyishit_crit.wav', 0.6, false));
+  for(i=0;i<sfx._ediesN;i++) sfx._ediesPool.push(_mkAudio('enemy_dies.wav', 0.55, false));
+  for(i=0;i<sfx._bounceN;i++) sfx._bouncePool.push(_mkAudio('bounce_new.wav', 0.45, false));
+}
+// First user gesture: create the elements + "bless" them (muted play/pause) so they can be fired
+// later outside a gesture. (Skips the big music file so it isn't fetched until the game plays it.)
+function unlockAudio(){
+  if(sfx._unlocked) return; sfx._unlocked = true;
+  initAudio();
+  for(var i=0;i<sfx._all.length;i++){ (function(a){
+    if(a === sfx.bgMusic) return;
+    var v=a.volume, lp=a.loop; a.muted=true; a.loop=false;
+    var p=a.play();
+    if(p && p.then) p.then(function(){ a.pause(); a.currentTime=0; a.muted=false; a.loop=lp; a.volume=v; }).catch(function(){ a.muted=false; a.loop=lp; });
+    else a.muted=false;
+  })(sfx._all[i]); }
+}
+document.addEventListener('pointerdown', unlockAudio);
+document.addEventListener('keydown', unlockAudio);
+document.addEventListener('touchstart', unlockAudio);
+
+// Chrysolin-scale positional volume (tiny world: ship ≈ 0.04u).
+function sfxPosVol(pos, base){
+  if(!pos || !gameMode.ship) return base;
+  var d = gameMode.ship.position.distanceTo(pos), minD = 0.25, maxD = 4.0;
+  if(d <= minD) return base; if(d >= maxD) return 0;
+  return base * (1 - (d - minD) / (maxD - minD));
+}
+function _shotFrom(pool, idxField){
+  var s = sfx[pool][sfx[idxField]]; sfx[idxField] = (sfx[idxField] + 1) % sfx[pool].length;
+  s.pause(); s.currentTime = 0; return s;
+}
+function sfxShoot(){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=_shotFrom('_shootPool','_shootIdx'); s.volume = s._baseVol * sfx.sfxVol; s.play().catch(function(){}); }
+function sfxPlayerDamage(){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=_shotFrom('_pdmgPool','_pdmgIdx'); s.volume = s._baseVol * sfx.sfxVol; s.play().catch(function(){}); }
+function sfxEnemyDamage(pos){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=sfx._ehitPool[Math.floor(Math.random()*sfx._ehitN)]; var v=sfxPosVol(pos,s._baseVol)*sfx.sfxVol; if(v<0.01) return; s.volume=v; s.pause(); s.currentTime=0; s.play().catch(function(){}); }
+function sfxEnemyCrit(pos){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=_shotFrom('_ecritPool','_ecritIdx'); var v=sfxPosVol(pos,s._baseVol)*sfx.sfxVol; if(v<0.01) return; s.volume=v; s.play().catch(function(){}); }
+function sfxEnemyDies(pos){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=_shotFrom('_ediesPool','_ediesIdx'); var v=sfxPosVol(pos,s._baseVol)*sfx.sfxVol; if(v<0.01) return; s.volume=v; s.play().catch(function(){}); }
+var _lastBounce = 0;
+function sfxBounce(pos){ if(!sfx._loaded || sfx.sfxVol<=0) return; var t=performance.now(); if(t-_lastBounce<140) return; _lastBounce=t; var s=_shotFrom('_bouncePool','_bounceIdx'); var v=sfxPosVol(pos,s._baseVol)*sfx.sfxVol; if(v<0.01) return; s.volume=v; s.play().catch(function(){}); }
+
+// Drives the looping sounds (hover/boost/drift/music) from game state. Loops retry play() each
+// frame until a gesture lets them start (then they stick).
+var sfxState = { wasBoosting:false, wasDrifting:false, hoverOn:false, musicOn:false };
+function updateGameAudio(){
+  if(!sfx._loaded) return;
+  var inGame = gameMode.active && !gameMode.exiting;
+  if(!inGame){
+    if(sfxState.hoverOn){ sfx.hover.pause(); sfxState.hoverOn = false; }
+    if(sfxState.musicOn){ sfx.bgMusic.pause(); sfxState.musicOn = false; }
+    if(sfxState.wasBoosting){ sfx.boost.pause(); sfxState.wasBoosting = false; }
+    if(sfxState.wasDrifting){ sfx.drift.pause(); sfxState.wasDrifting = false; }
+    return;
+  }
+  // Keep loop volumes in sync with the master dials every frame (so slider changes apply live).
+  if(sfx.bgMusic) sfx.bgMusic.volume = sfx.bgMusic._baseVol * sfx.musicVol;
+  if(sfx.boost) sfx.boost.volume = sfx.boost._baseVol * sfx.sfxVol;
+  if(sfx.drift) sfx.drift.volume = sfx.drift._baseVol * sfx.sfxVol;
+  if(sfx.hover){
+    if(!sfxState.hoverOn && sfx.sfxVol > 0) sfx.hover.play().then(function(){ sfxState.hoverOn = true; }).catch(function(){});
+    var spd = Math.abs(gameMode.surfaceState.speed || 0);
+    sfx.hover.volume = (0.05 + Math.min(spd / gameMode.physics.maxSpeed, 1) * 0.12) * sfx.sfxVol;
+  }
+  if(sfx.bgMusic && !sfxState.musicOn && sfx.musicVol > 0) sfx.bgMusic.play().then(function(){ sfxState.musicOn = true; }).catch(function(){});
+  var boosting = !!gameMode.physics.isBoosting;
+  if(boosting && !sfxState.wasBoosting){ sfx.boost.currentTime = 0; sfx.boost.play().catch(function(){}); }
+  else if(!boosting && sfxState.wasBoosting){ sfx.boost.pause(); if(sfx.boostFadeout && sfx.sfxVol > 0){ sfx.boostFadeout.volume = sfx.boostFadeout._baseVol * sfx.sfxVol; sfx.boostFadeout.currentTime = 0; sfx.boostFadeout.play().catch(function(){}); } }
+  sfxState.wasBoosting = boosting;
+  var drifting = !!gameMode.surfaceState.isDrifting;
+  if(drifting && !sfxState.wasDrifting){ sfx.drift.currentTime = 0; sfx.drift.play().catch(function(){}); }
+  else if(!drifting && sfxState.wasDrifting){ sfx.drift.pause(); if(sfx.driftFadeout && sfx.sfxVol > 0){ sfx.driftFadeout.volume = sfx.driftFadeout._baseVol * sfx.sfxVol; sfx.driftFadeout.currentTime = 0; sfx.driftFadeout.play().catch(function(){}); } }
+  sfxState.wasDrifting = drifting;
 }
 
 // ── Test bullets (fire with Enter, travel down the firing line) ──────────────────────
@@ -14202,6 +14408,7 @@ function fireBullet(){
   mesh.add(glow);
   scene.add(mesh);
   gameBullets.push({ mesh: mesh, vel: vel, life: 0, maxLife: 90, dmg: PLAYER_BULLET_DAMAGE });
+  sfxShoot();
 }
 function updateGameBullets(){
   // The ship only exists while the mini-game is built; before that there's nothing to track or fire.
@@ -14256,8 +14463,10 @@ var combat = {
   _glowTex: null, _ebGeo: null, _ebMat: null,
   damageNumbers: [],
   hpBarEl: null, hpFillEl: null, dmgCounterEl: null, flashEl: null, fireBtnEl: null,
-  mouseFiring: false, touchFiring: false,
-  lockTarget: null, reticleEl: null, lockBtnEl: null   // lock-on camera target + HUD
+  mouseFiring: false, touchFiring: false, enterFiring: false,
+  lockTarget: null, reticleEl: null, lockBtnEl: null,   // lock-on camera target + HUD
+  // Dome wave arena: touch the floor → 5 tanks, clear them → 10 → 20 → 40 → … ; die → back to spawn.
+  arenaActive: false, wave: 0, waveSize: 0, domeSpawn: null, waveEl: null
 };
 var CRIT_CHANCE = 0.05;
 
@@ -14274,40 +14483,54 @@ function getCombatGlowTex(){
   return combat._glowTex;
 }
 
-// ── Tank model (tiny turret that sits on the crystal surface) ──
+// Tank scale — 3× the original tiny build (TANK_SCALE applied to the whole group).
+var TANK_SCALE = 3.0;
+var TANK_BASE_R = 0.032;   // pre-scale hull radius (used to derive collision radius)
+
+// ── Tank model: a hull with FOUR cannons, one pointing down each horizontal axis (+X,+Z,-X,-Z).
+// Each cannon is its own pivot; per-frame the cannon nearest the player's direction swivels to
+// track + fire while the other three rest at their axis. Built at base size, then scaled ×3. ──
 function buildTank(){
   var g = new THREE.Group();
   var bodyMat = new THREE.MeshStandardMaterial({ color: 0x7a3b3b, roughness: 0.5, metalness: 0.35, emissive: 0x3a1414, emissiveIntensity: 0.5 });
   var darkMat = new THREE.MeshStandardMaterial({ color: 0x4a2424, roughness: 0.6, metalness: 0.4 });
   // Tracked hull — short hexagonal cylinder, local +Y is up (surface normal)
-  var body = new THREE.Mesh(new THREE.CylinderGeometry(0.026, 0.032, 0.014, 6), bodyMat);
+  var body = new THREE.Mesh(new THREE.CylinderGeometry(0.026, TANK_BASE_R, 0.014, 6), bodyMat);
   body.position.y = 0.007;
   g.add(body);
-  // Bright edge outline so it reads against the reflective crystal
   var bodyEdge = new THREE.LineSegments(new THREE.EdgesGeometry(body.geometry), new THREE.LineBasicMaterial({ color: 0xcc6a6a, transparent: true, opacity: 0.8 }));
   bodyEdge.position.copy(body.position); g.add(bodyEdge);
-  // Turret pivot — aims the cannon at the player every frame (local +Z = barrel forward)
+  // Turret dome the four cannons mount on
   var turret = new THREE.Group();
   turret.position.y = 0.016;
   g.add(turret);
-  var dome = new THREE.Mesh(new THREE.SphereGeometry(0.014, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), bodyMat);
+  var dome = new THREE.Mesh(new THREE.SphereGeometry(0.016, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), bodyMat);
   turret.add(dome);
-  var cannon = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.005, 0.032, 8), darkMat);
-  cannon.rotation.x = Math.PI / 2;        // align cylinder axis to +Z
-  cannon.position.z = 0.02;
-  turret.add(cannon);
-  // Charge ring at the muzzle — pulses + shrinks while charging a shot
-  var ringMat = new THREE.MeshBasicMaterial({ color: 0xff3311, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending });
-  var chargeRing = new THREE.Mesh(new THREE.RingGeometry(0.012, 0.05, 16), ringMat);
-  chargeRing.position.z = 0.045;
-  turret.add(chargeRing);
+  // Four cannons, one per axis direction. Each is a pivot whose local +Z is the barrel; the
+  // pivot's rest yaw points it along its axis. The active (nearest) one re-orients to the player.
+  var cannons = [];
+  for(var i = 0; i < 4; i++){
+    var baseAngle = i * Math.PI / 2;        // 0, 90, 180, 270 around Y → +Z, +X, -Z, -X
+    var pivot = new THREE.Group();
+    pivot.rotation.y = baseAngle;
+    turret.add(pivot);
+    var barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.005, 0.032, 8), darkMat);
+    barrel.rotation.x = Math.PI / 2;        // cylinder axis → +Z (barrel forward)
+    barrel.position.z = 0.02;
+    pivot.add(barrel);
+    var ringMat = new THREE.MeshBasicMaterial({ color: 0xff3311, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending });
+    var ring = new THREE.Mesh(new THREE.RingGeometry(0.012, 0.05, 16), ringMat);
+    ring.position.z = 0.045;
+    pivot.add(ring);
+    cannons.push({ pivot: pivot, barrel: barrel, ring: ring, baseAngle: baseAngle });
+  }
   // Rear engine glow
   var engine = new THREE.Mesh(new THREE.SphereGeometry(0.006, 6, 6), new THREE.MeshBasicMaterial({ color: 0xff5522, transparent: true, opacity: 0.8 }));
   engine.position.set(0, 0.008, -0.026);
   g.add(engine);
   g.userData.turret = turret;
-  g.userData.cannon = cannon;
-  g.userData.chargeRing = chargeRing;
+  g.userData.cannons = cannons;
+  g.scale.setScalar(TANK_SCALE);
   return g;
 }
 
@@ -14315,7 +14538,8 @@ function buildTank(){
 // floating health bar, and register it. Used for both the crystal and the dome.
 function addTank(pos, normal, attackRadius){
   var tank = buildTank();
-  tank.position.copy(pos).addScaledVector(normal, 0.004);
+  // Lift the (scaled) hull so it rests ON the surface rather than half-buried.
+  tank.position.copy(pos).addScaledVector(normal, 0.004 * TANK_SCALE);
   tank.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
   var maxHp = 250;
   tank.userData.hp = maxHp;
@@ -14327,6 +14551,11 @@ function addTank(pos, normal, attackRadius){
   tank.userData.chargeProg = 0;
   tank.userData.chargeTime = 50;        // frames to charge a shot
   tank.userData.attackRadius = attackRadius;
+  tank.userData.activeCannon = tank.userData.cannons[0];   // nearest-to-player cannon (updated each frame)
+  tank.userData.collideR = TANK_BASE_R * TANK_SCALE + 0.018; // hull + ship half-extent → ship can't drive through
+  tank.userData.topOffset = 0.055 * TANK_SCALE;             // where the HP bar / reticle float above it
+  tank.userData.proximityTime = 0;                          // builds while you linger → spiral barrage
+  tank.userData.spiralPhase = 'none'; tank.userData.spiralT = 0; tank.userData.spiralAngle = 0; tank.userData.spiralSpin = 0;
   scene.add(tank);
   combat.enemies.push(tank);
   // Floating DOM health bar (projected above the tank, like the damage numbers)
@@ -14342,54 +14571,78 @@ function addTank(pos, normal, attackRadius){
   tank.userData.hpFillEl = fill;
   return tank;
 }
-// Crystal world: snap a tank onto the octahedron surface in the given offset direction.
-function spawnTank(offsetDir){
-  var center = gameMode.surface.center;
-  var dir = offsetDir.clone().normalize();
-  var hit = raycastShipToSurface(center.clone().addScaledVector(dir, 1.5));
-  var pos, normal;
-  if(hit){ pos = hit.point.clone(); normal = hit.normal.clone(); }
-  else { pos = center.clone().addScaledVector(dir, 0.92); normal = dir.clone(); }
-  return addTank(pos, normal, 2.6);   // basically the whole crystal — single-enemy demo
-}
-// Dome (Region B): drop a tank on the dome floor near the centre, snapped to the dome surface.
-function spawnDomeTank(){
-  var P = gameMode.portal;
-  var base = new THREE.Vector3(P.DX + 0.5, P.domeFloorY + 0.05, P.domeCz + 0.4);
-  var cp = (typeof closestPointOnDome === 'function') ? closestPointOnDome(base) : null;
-  var pos = cp ? cp.point.clone() : new THREE.Vector3(P.DX + 0.5, P.domeFloorY, P.domeCz + 0.4);
-  var normal = cp ? cp.normal.clone() : new THREE.Vector3(0, 1, 0);
-  return addTank(pos, normal, 3.5);   // dome is small (R≈1.5) — always engaged
-}
-// Spawn one tank in whichever arena is current.
-function spawnTankForArena(arena){
-  if(arena === 'dome') return spawnDomeTank();
-  return spawnTank(new THREE.Vector3((Math.random() - 0.5), 0.5, (Math.random() - 0.5)));
+// Which region the fight is in — used ONLY to detect a region change (so enemies re-arm on a
+// portal cross). It does NOT branch any spawn/behaviour logic; combat is identical everywhere.
+function combatArena(){
+  if(gameMode.portal.testMode) return gameMode.portal.inB ? 'testB' : 'testA';
+  if(gameMode.portal.inside) return 'dome';
+  return 'crystal';
 }
 
-// Manual spawn (T key): drop a tank near the player in the current arena, capped so it can't
-// run away. Combat must already be running.
+// The ship's current surface frame — works on ANY surface the player can stand on (crystal facet,
+// dome floor/wall, flat sandbox plane). Returns a point offset `ahead`/`side` from the ship along
+// its surface tangents, dropped to the ship's own surface height, plus that surface's up-normal.
+// This is the single source of truth for "place something near the player on the ground" — there
+// is deliberately no per-region code.
+function surfaceFrameNearShip(ahead, side){
+  var s = gameMode.surfaceState;
+  var n = s.groundNormal.clone(); if(n.lengthSq() < 1e-6) n.set(0, 1, 0); n.normalize();
+  var f = s.forward.clone().addScaledVector(n, -s.forward.dot(n));
+  if(f.lengthSq() < 1e-6){ f.set(1, 0, 0).addScaledVector(n, -n.x); }
+  f.normalize();
+  var r = new THREE.Vector3().crossVectors(f, n).normalize();
+  var pos = gameMode.ship.position.clone()
+    .addScaledVector(n, -(s.hoverHeight || 0.008))   // surface point directly under the ship
+    .addScaledVector(f, ahead)
+    .addScaledVector(r, side);
+  return { pos: pos, normal: n };
+}
+
+// Spawn a tank near the player on whatever surface they're standing on — IDENTICAL in every
+// region. Used for the initial spawn, the T key, and respawns.
 function spawnEnemyNearPlayer(){
-  if(!gameMode.active || gameMode.exiting || gameMode.portal.testMode || !combat.spawned) return;
+  if(!gameMode.active || gameMode.exiting || !combat.spawned) return;
   if(combat.enemies.length >= 16) return;
-  if(combat.arena === 'dome'){
-    var P = gameMode.portal;
-    var a = Math.random() * Math.PI * 2, r = 0.4 + Math.random() * 0.7;
+  var fr = surfaceFrameNearShip(0.35 + Math.random() * 0.25, (Math.random() - 0.5) * 0.6);
+  return addTank(fr.pos, fr.normal, 4.0);
+}
+
+// ── Dome wave arena ──
+// Spawn `n` tanks scattered across the dome floor (snapped to the dome surface).
+function spawnWaveDome(n){
+  var P = gameMode.portal;
+  for(var i = 0; i < n; i++){
+    var a = Math.random() * Math.PI * 2;
+    var r = 0.25 + Math.random() * (P.domeR * 0.72);
     var base = new THREE.Vector3(P.DX + Math.cos(a) * r, P.domeFloorY + 0.05, P.domeCz + Math.sin(a) * r);
     var cp = (typeof closestPointOnDome === 'function') ? closestPointOnDome(base) : null;
-    addTank(cp ? cp.point.clone() : base, cp ? cp.normal.clone() : new THREE.Vector3(0, 1, 0), 3.5);
-  } else {
-    // A surface point near the player, nudged off by a random tangent so it doesn't land on the ship.
-    var center = gameMode.surface.center;
-    var dir = gameMode.ship.position.clone().sub(center);
-    if(dir.lengthSq() < 1e-6) dir.set(0, 0, 1); else dir.normalize();
-    var t = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5);
-    t.addScaledVector(dir, -t.dot(dir));
-    if(t.lengthSq() > 1e-6) t.normalize();
-    dir.addScaledVector(t, 0.5 + Math.random() * 0.5).normalize();
-    var hit = raycastShipToSurface(center.clone().addScaledVector(dir, 1.5));
-    addTank(hit ? hit.point.clone() : center.clone().addScaledVector(dir, 0.92), hit ? hit.normal.clone() : dir.clone(), 2.6);
+    addTank(cp ? cp.point.clone() : base, cp ? cp.normal.clone() : new THREE.Vector3(0, 1, 0), 6.0);
   }
+}
+// Run the dome arena: first floor-touch starts wave 1 (1 tank); clearing a wave adds one more
+// (1→2→3→4→5→…). Death is handled in updateCombat (back to spawn + restart at wave 1).
+function updateDomeArena(){
+  var P = gameMode.portal, s = gameMode.surfaceState, ship = gameMode.ship;
+  if(combat.player.dead) return;   // mid-death; the respawn logic in updateCombat handles reset
+  var grounded = !s.airborne && !s.freeFalling;
+  var nearFloor = ship.position.y < P.domeFloorY + 0.5;   // actually down on the dome floor, not the chute
+  if(!combat.arenaActive){
+    if(grounded && nearFloor){
+      combat.arenaActive = true;
+      combat.wave = 1; combat.waveSize = 1;
+      combat.domeSpawn = ship.position.clone();   // where to send the player back to on death
+      spawnWaveDome(combat.waveSize);
+    }
+  } else if(combat.enemies.length === 0){
+    // Wave cleared → next wave, one more tank than last (1→2→3→4→5→…).
+    combat.wave++; combat.waveSize = combat.wave;
+    spawnWaveDome(combat.waveSize);
+  }
+}
+function resetDomeArena(){
+  for(var i = 0; i < combat.enemies.length; i++) disposeTank(combat.enemies[i]);
+  combat.enemies.length = 0;
+  combat.arenaActive = false; combat.wave = 0; combat.waveSize = 0;
 }
 
 function disposeTank(tank){
@@ -14398,17 +14651,58 @@ function disposeTank(tank){
   if(tank.userData.hpBarEl) tank.userData.hpBarEl.remove();
 }
 
+// Ship ↔ tank collision: push the ship out of any tank's hull sphere and cancel the bit of motion
+// heading into it, so you can't drive through. Region-agnostic (works in surface, dome, and fly).
+function resolveTankCollisions(){
+  if(!combat.enemies.length || !gameMode.ship) return;
+  var ship = gameMode.ship, s = gameMode.surfaceState;
+  for(var i = 0; i < combat.enemies.length; i++){
+    var t = combat.enemies[i];
+    var R = t.userData.collideR || 0.1;
+    var diff = ship.position.clone().sub(t.position);
+    var dd = diff.length();
+    if(dd < R){
+      // push direction away from the hull; if dead-centre, pop out along the surface normal
+      var nrm = (dd > 1e-6) ? diff.multiplyScalar(1 / dd)
+                            : (s && s.groundNormal ? s.groundNormal.clone() : new THREE.Vector3(0, 1, 0));
+      ship.position.addScaledVector(nrm, R - dd);
+      if(gameMode.fly.active){
+        var vn = gameMode.fly.vel.dot(nrm);
+        if(vn < 0) gameMode.fly.vel.addScaledVector(nrm, -vn);
+      } else if(s){
+        // kill the part of the surface drive heading into the tank → you stop against it
+        var fdotn = s.forward.dot(nrm);
+        if(s.speed * fdotn < 0){ s.speed *= 0.2; sfxBounce(t.position); }
+      }
+    }
+  }
+}
+
 // ── Enemy projectile (heavy red-orange shell, like the Orbicule tank) ──
-function fireEnemyShell(tank){
+var ENEMY_BULLET_SPEED = 0.03;   // ~4× the player's surface speed → hard to outrun, still dodgeable
+// Intercept aim: where to fire from `fromPos` so the shell MEETS the moving player. Iterates
+// time-to-hit using the player's tracked per-frame velocity (gameMode._shipVel). Returns a unit
+// world direction, or null if degenerate.
+function enemyLeadDir(fromPos){
+  var target = gameMode.ship.position;
+  var vel = gameMode._shipVel || new THREE.Vector3();
+  var aim = target.clone();
+  for(var k = 0; k < 4; k++){
+    var t = aim.distanceTo(fromPos) / ENEMY_BULLET_SPEED;   // frames for the shell to arrive
+    aim.copy(target).addScaledVector(vel, t);               // predict the player there
+  }
+  var d = aim.sub(fromPos);
+  return d.lengthSq() > 1e-12 ? d.normalize() : null;
+}
+// Spawns one shell flying out of `barrel` along `dir` (unit).
+function spawnEnemyShell(barrel, dir){
   if(!combat._ebGeo){
     combat._ebGeo = new THREE.SphereGeometry(0.012, 8, 8);
     combat._ebMat = new THREE.MeshBasicMaterial({ color: 0xff9980 });   // matches Orbicule's heavy bullet
   }
   var tip = new THREE.Vector3();
-  tank.userData.cannon.getWorldPosition(tip);          // muzzle centre
-  var dir = gameMode.ship.position.clone().sub(tip);
-  if(dir.lengthSq() < 1e-9) dir.copy(tank.userData.normal); else dir.normalize();
-  tip.addScaledVector(dir, 0.02);                      // nudge out past the barrel toward the player
+  barrel.getWorldPosition(tip);
+  tip.addScaledVector(dir, 0.04);                      // nudge out past the (now larger) barrel
   var mesh = new THREE.Mesh(combat._ebGeo, combat._ebMat);
   mesh.position.copy(tip);
   mesh.frustumCulled = false; mesh.renderOrder = 5;
@@ -14416,11 +14710,93 @@ function fireEnemyShell(tank){
   glow.scale.set(0.05, 0.05, 1);
   mesh.add(glow);
   scene.add(mesh);
-  combat.enemyBullets.push({ mesh: mesh, vel: dir.multiplyScalar(0.013), life: 0, maxLife: 320, dmg: 16 });
+  combat.enemyBullets.push({ mesh: mesh, vel: dir.clone().multiplyScalar(ENEMY_BULLET_SPEED), life: 0, maxLife: 320, dmg: 16 });
+}
+// A tank firing = ALL FOUR cannons unload at once. The tracking (active) cannon LEADS the player
+// (intercept aim) so it actually connects; the other three spray out along their axes.
+function fireEnemyShell(tank){
+  var _wq = new THREE.Quaternion();
+  var cannons = tank.userData.cannons, active = tank.userData.activeCannon;
+  for(var c = 0; c < cannons.length; c++){
+    var cn = cannons[c];
+    var dir = null;
+    if(cn === active){
+      var tip = new THREE.Vector3(); cn.barrel.getWorldPosition(tip);
+      dir = enemyLeadDir(tip);                            // fire where the player WILL be
+    }
+    if(!dir){
+      dir = new THREE.Vector3(0, 0, 1).applyQuaternion(cn.pivot.getWorldQuaternion(_wq));
+      if(dir.lengthSq() < 1e-9) dir.copy(tank.userData.normal); else dir.normalize();
+    }
+    spawnEnemyShell(cn.barrel, dir);
+  }
 }
 function disposeEnemyBullet(b){
   scene.remove(b.mesh);
   for(var c = 0; c < b.mesh.children.length; c++){ if(b.mesh.children[c].material) b.mesh.children[c].material.dispose(); }
+}
+
+// ── Spiral barrage ── each second you're in a tank's vicinity it has a small chance to wind up
+// and fling a slow, fat spiral of shells outward (4 spiral arms).
+var SPIRAL_CHANCE = 0.05;            // 5% chance per second in range
+var SPIRAL_ROLL_FRAMES = 60;         // roll once per second
+var SPIRAL_CHARGE_FRAMES = 90;       // ~1.5s wind-up (barrels spin up, rings bloom)
+var SPIRAL_FIRE_FRAMES = 84;         // ~1.4s of spinning + emitting (shorter → fewer shells)
+var SPIRAL_SPIN_RATE = 0.16;         // barrel/turret spin (rad/frame)
+var SPIRAL_EMIT_INTERVAL = 7;        // frames between emissions (each = 4 shells) → ~12×4 ≈ 48 total
+var SPIRAL_BULLET_SPEED = 0.008;     // slow — you can weave through the spiral
+// Big slow spiral shell.
+function spawnSpiralShell(pos, dir){
+  if(!combat._sbGeo){
+    combat._sbGeo = new THREE.SphereGeometry(0.022, 12, 12);
+    combat._sbMat = new THREE.MeshBasicMaterial({ color: 0xff6633 });   // deeper/fatter than normal shells
+  }
+  var mesh = new THREE.Mesh(combat._sbGeo, combat._sbMat);
+  mesh.position.copy(pos);
+  mesh.frustumCulled = false; mesh.renderOrder = 5;
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xff7744, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glow.scale.set(0.09, 0.09, 1);
+  mesh.add(glow);
+  scene.add(mesh);
+  combat.enemyBullets.push({ mesh: mesh, vel: dir.clone().multiplyScalar(SPIRAL_BULLET_SPEED), life: 0, maxLife: 600, dmg: 12, noStretch: true, hitR: 0.042 });
+}
+// Drives the wind-up → spin-and-emit barrage. Spins the whole turret (all 4 barrels at base angle)
+// so successive emissions trace 4 spiral arms.
+function updateSpiralAttack(tank, d){
+  var turret = d.turret, cannons = d.cannons;
+  // Lock cannons to their axes; the TURRET spin makes the pinwheel.
+  for(var i = 0; i < cannons.length; i++) cannons[i].pivot.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), cannons[i].baseAngle);
+  if(d.spiralPhase === 'charge'){
+    d.spiralT++;
+    var cp = d.spiralT / SPIRAL_CHARGE_FRAMES;
+    d.spiralSpin = SPIRAL_SPIN_RATE * cp * cp;          // spin builds up
+    d.spiralAngle += d.spiralSpin;
+    turret.rotation.y = d.spiralAngle;
+    for(var r = 0; r < cannons.length; r++){
+      cannons[r].ring.material.opacity = 0.6 + 0.4 * Math.sin(d.spiralT * 0.6);
+      cannons[r].ring.scale.setScalar(1 + cp * 1.6);    // rings bloom big during wind-up
+    }
+    if(d.spiralT >= SPIRAL_CHARGE_FRAMES){ d.spiralPhase = 'fire'; d.spiralT = 0; }
+  } else if(d.spiralPhase === 'fire'){
+    d.spiralT++;
+    d.spiralAngle += SPIRAL_SPIN_RATE;
+    turret.rotation.y = d.spiralAngle;
+    for(var r2 = 0; r2 < cannons.length; r2++){ cannons[r2].ring.scale.setScalar(2.2); cannons[r2].ring.material.opacity = 0.85; }
+    if(d.spiralT % SPIRAL_EMIT_INTERVAL === 0){
+      var _wq = new THREE.Quaternion(), tip = new THREE.Vector3();
+      for(var c = 0; c < cannons.length; c++){
+        cannons[c].barrel.getWorldPosition(tip);
+        var dir = new THREE.Vector3(0, 0, 1).applyQuaternion(cannons[c].pivot.getWorldQuaternion(_wq));
+        if(dir.lengthSq() < 1e-9) dir.copy(d.normal); else dir.normalize();
+        spawnSpiralShell(tip.clone().addScaledVector(dir, 0.05), dir);
+      }
+    }
+    if(d.spiralT >= SPIRAL_FIRE_FRAMES){
+      d.spiralPhase = 'none'; d.spiralT = 0; turret.rotation.y = 0;
+      for(var r3 = 0; r3 < cannons.length; r3++){ cannons[r3].ring.material.opacity = 0; cannons[r3].ring.scale.setScalar(1); }
+      d.lastShot = performance.now();   // small beat before normal shots resume
+    }
+  }
 }
 
 // ── Floating damage numbers (ported from Orbicule) ──
@@ -14458,6 +14834,7 @@ function dealDamageToTank(tank, baseDamage){
   combat.totalDamage += dmg;
   var dnPos = tank.position.clone().addScaledVector(tank.userData.normal, 0.04);
   spawnDamageNumber(dnPos, dmg, isCrit);
+  if(isCrit) sfxEnemyCrit(tank.position); else sfxEnemyDamage(tank.position);
 }
 
 // ── HUD: player health bar + running damage counter (top-left) ──
@@ -14543,6 +14920,15 @@ function ensureCombatHUD(){
   lb.addEventListener('mousedown', lockTap);
   document.body.appendChild(lb);
   combat.lockBtnEl = lb;
+
+  // Wave banner (top-center) — only shown during the dome wave arena
+  var wv = document.createElement('div');
+  wv.id = 'combat-wave';
+  wv.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:55;'
+    + 'font-family:Arial,sans-serif;font-weight:800;font-size:18px;letter-spacing:2px;color:#ffd2c2;'
+    + 'text-shadow:0 1px 6px rgba(0,0,0,0.75);pointer-events:none;display:none;white-space:nowrap;';
+  document.body.appendChild(wv);
+  combat.waveEl = wv;
 }
 function showCombatHUD(show){
   ensureCombatHUD();
@@ -14552,12 +14938,11 @@ function showCombatHUD(show){
   if(combat.fireBtnEl) combat.fireBtnEl.style.display = d;
   if(combat.lockBtnEl) combat.lockBtnEl.style.display = d;
   if(!show && combat.reticleEl) combat.reticleEl.style.display = 'none';
+  if(!show && combat.waveEl) combat.waveEl.style.display = 'none';
 }
 
-// Toggle the lock-on camera: lock the nearest enemy, or release if already locked.
-function toggleLockOn(){
-  if(!gameMode.active || gameMode.exiting){ combat.lockTarget = null; return; }
-  if(combat.lockTarget){ combat.lockTarget = null; return; }
+// Lock onto the nearest enemy to the ship (or null if none).
+function lockNearestEnemy(){
   var best = null, bd = Infinity, sp = gameMode.ship.position;
   for(var i = 0; i < combat.enemies.length; i++){
     var dd = combat.enemies[i].position.distanceTo(sp);
@@ -14565,11 +14950,18 @@ function toggleLockOn(){
   }
   combat.lockTarget = best;
 }
+// Toggle the lock-on camera: lock the nearest enemy, or release if already locked.
+function toggleLockOn(){
+  if(!gameMode.active || gameMode.exiting){ combat.lockTarget = null; return; }
+  if(combat.lockTarget){ combat.lockTarget = null; return; }
+  lockNearestEnemy();
+}
 
 function hurtPlayer(amount){
   if(combat.player.dead) return;
   combat.player.hp -= amount;
   combat.hurtFlash = 1;
+  sfxPlayerDamage();
   if(combat.player.hp <= 0){
     combat.player.hp = 0;
     combat.player.dead = true;
@@ -14584,8 +14976,8 @@ function initCombat(arena){
   combat.player.dead = false;
   combat.totalDamage = 0;
   combat.arena = arena;
-  spawnTankForArena(arena);
   combat.spawned = true;
+  // No auto-spawn — the player spawns every tank manually with T.
 }
 // Player moved between regions (crystal ↔ dome): clear the old arena's enemies + bullets and
 // spawn a fresh tank in the new one. Player HP + damage counter persist across the move.
@@ -14596,7 +14988,9 @@ function switchArena(arena){
   combat.enemyBullets.length = 0;
   clearGameBullets();   // stray player bullets belong to the region we just left
   combat.arena = arena;
-  spawnTankForArena(arena);
+  // Reset the dome wave arena on any region change; it re-arms when you touch the dome floor again.
+  combat.arenaActive = false; combat.wave = 0; combat.waveSize = 0;
+  // No auto-spawn on a region cross either — re-spawn tanks manually with T.
 }
 function clearCombat(){
   for(var i = 0; i < combat.enemies.length; i++) disposeTank(combat.enemies[i]);
@@ -14607,7 +15001,8 @@ function clearCombat(){
   combat.damageNumbers.length = 0;
   combat.hurtFlash = 0;
   if(combat.flashEl) combat.flashEl.style.opacity = 0;
-  combat.mouseFiring = false; combat.touchFiring = false;
+  combat.mouseFiring = false; combat.touchFiring = false; combat.enterFiring = false;
+  combat.arenaActive = false; combat.wave = 0; combat.waveSize = 0;
   showCombatHUD(false);
   combat.spawned = false;
   combat.arena = null;
@@ -14615,34 +15010,39 @@ function clearCombat(){
 
 // ── Per-frame combat tick ──
 function updateCombat(dt){
-  // Runs while playing in EITHER region — on the crystal or inside the dome. (The flat debug
-  // sandbox stays combat-free.)
-  var playing = gameMode.active && !gameMode.exiting && !gameMode.portal.testMode;
+  // Runs while playing in ANY region — crystal, dome, OR the flat sandbox. No region is special.
+  var playing = gameMode.active && !gameMode.exiting;
   if(!playing){
     if(combat.spawned) clearCombat();
     return;
   }
-  var arena = gameMode.portal.inside ? 'dome' : 'crystal';
+  var arena = combatArena();
   if(!combat.spawned) initCombat(arena);
   else if(combat.arena !== arena) switchArena(arena);
 
-  // Drop the lock if its target is gone (killed / cleared on an arena switch)
-  if(combat.lockTarget && combat.enemies.indexOf(combat.lockTarget) < 0) combat.lockTarget = null;
+  // Dome wave arena (touch floor → 5 → 10 → 20 → 40 → …)
+  if(arena === 'dome') updateDomeArena();
+
+  // If the locked target vanished (e.g. arena switch), re-lock the nearest remaining enemy (null if none).
+  if(combat.lockTarget && combat.enemies.indexOf(combat.lockTarget) < 0) lockNearestEnemy();
 
   // Held-fire from mouse / touch button (Enter is handled in gameKeyDown)
-  if(combat.mouseFiring || combat.touchFiring) fireBullet();
+  if(combat.mouseFiring || combat.touchFiring || combat.enterFiring) fireBullet();
 
   var now = performance.now();
   var shipPos = gameMode.ship.position;
   var _q = new THREE.Quaternion();
 
-  // Player bullets → tank collision
+  // Ship can't drive through tanks
+  resolveTankCollisions();
+
+  // Player bullets → tank collision (hit radius scales with the bigger hull)
   for(var bi = gameBullets.length - 1; bi >= 0; bi--){
     var b = gameBullets[bi];
     var hitTank = null;
     for(var ei = 0; ei < combat.enemies.length; ei++){
       var en = combat.enemies[ei];
-      if(b.mesh.position.distanceTo(en.position) < 0.05){ hitTank = en; break; }
+      if(b.mesh.position.distanceTo(en.position) < (en.userData.collideR || 0.1)){ hitTank = en; break; }
     }
     if(hitTank){
       dealDamageToTank(hitTank, b.dmg || PLAYER_BULLET_DAMAGE);
@@ -14650,26 +15050,89 @@ function updateCombat(dt){
       if(hitTank.userData.hp <= 0){
         var idx = combat.enemies.indexOf(hitTank);
         if(idx >= 0) combat.enemies.splice(idx, 1);
+        // Killed the locked target → jump the lock to the next-nearest enemy (null if none left).
+        if(combat.lockTarget === hitTank) lockNearestEnemy();
+        sfxEnemyDies(hitTank.position);
         disposeTank(hitTank);
-        // Respawn a fresh tank shortly (in whatever arena we're in now) so the demo keeps going
-        setTimeout(function(){ if(combat.spawned && combat.enemies.length === 0) spawnTankForArena(combat.arena); }, 1400);
+        // NO auto-respawn — every tank is one the player spawned with T.
       }
     }
   }
 
-  // Tank AI: aim turret at player, charge + fire
+  // Tank AI: nearest cannon tracks + fires at the player, the other three rest at their axis
   for(var ti = 0; ti < combat.enemies.length; ti++){
     var tank = combat.enemies[ti];
     var d = tank.userData;
     var dist = tank.position.distanceTo(shipPos);
-    // Aim the turret's +Z at the player (in tank-local space)
+
+    // ── Spiral barrage trigger ── linger in a tank's attack range too long and it winds up a big
+    // charge, spins its 4 barrels, and unloads a slow, fat spiral of shells. Otherwise it does its
+    // normal lead-and-fire. Leaving the range bleeds the proximity timer back down.
+    var inSpiral = !!(d.spiralPhase && d.spiralPhase !== 'none');
+    if(inSpiral){
+      updateSpiralAttack(tank, d);
+    } else {
+      // Each second within range, a small (SPIRAL_CHANCE) roll to kick off the barrage.
+      if(dist < d.attackRadius){
+        d.proximityTime = (d.proximityTime || 0) + 1;
+        if(d.proximityTime >= SPIRAL_ROLL_FRAMES){
+          d.proximityTime = 0;
+          if(Math.random() < SPIRAL_CHANCE){
+            d.spiralPhase = 'charge'; d.spiralT = 0; d.spiralAngle = 0; d.spiralSpin = 0;
+            d.charging = false; d.chargeProg = 0;
+            inSpiral = true;
+          }
+        }
+      } else {
+        d.proximityTime = 0;
+      }
+    }
+
+    // Normal lead-and-fire AI (skipped while the spiral barrage runs)
+    if(!inSpiral){
+    // Player direction in the tank's LOCAL frame (cannon pivots live in this frame)
+    var localAim = null;
     var aimWorld = shipPos.clone().sub(tank.position);
     if(aimWorld.lengthSq() > 1e-9){
-      aimWorld.normalize();
-      var localAim = aimWorld.clone().applyQuaternion(tank.getWorldQuaternion(_q).invert());
-      if(localAim.lengthSq() > 1e-9) d.turret.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), localAim.normalize());
+      localAim = aimWorld.normalize().applyQuaternion(tank.getWorldQuaternion(_q).invert());
+      if(localAim.lengthSq() > 1e-9) localAim.normalize(); else localAim = null;
     }
-    var ring = d.chargeRing;
+    // Pick the cannon whose axis (its rest +Z) best faces the player, by the yaw-plane direction
+    var cannons = d.cannons, active = cannons[0];
+    if(localAim){
+      var flat = new THREE.Vector3(localAim.x, 0, localAim.z);
+      if(flat.lengthSq() > 1e-9){
+        flat.normalize();
+        var bestDot = -Infinity;
+        for(var ci = 0; ci < cannons.length; ci++){
+          var ba = cannons[ci].baseAngle;
+          var dot = Math.sin(ba) * flat.x + Math.cos(ba) * flat.z;   // pivot +Z at rest · player dir
+          if(dot > bestDot){ bestDot = dot; active = cannons[ci]; }
+        }
+      }
+    }
+    // Hand the in-progress load-up to the new tracking cannon (DON'T restart it) when the nearest
+    // cannon changes — its glowing charge ring just moves to whichever cannon now faces the player.
+    d.activeCannon = active;
+    // Orient cannons: active one tracks the player in 3D, the others ease back to their axis.
+    for(var ci2 = 0; ci2 < cannons.length; ci2++){
+      var cn = cannons[ci2];
+      if(cn === active && localAim){
+        // Aim the tracking cannon at the LEAD point (intercept), converted into tank-local space,
+        // so the barrel visually points where the shell will actually go.
+        var aimL = localAim, leadW = enemyLeadDir(tank.position);
+        if(leadW){
+          var lw = leadW.applyQuaternion(tank.getWorldQuaternion(new THREE.Quaternion()).invert());
+          if(lw.lengthSq() > 1e-9) aimL = lw.normalize();
+        }
+        cn.pivot.quaternion.slerp(_q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), aimL), 0.3);
+      } else {
+        cn.pivot.quaternion.slerp(_q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), cn.baseAngle), 0.2);
+      }
+      if(cn !== active){ cn.ring.material.opacity = 0; cn.ring.scale.setScalar(1); }   // only active ring glows
+    }
+
+    var ring = active.ring;
     if(dist < d.attackRadius && now - d.lastShot > d.fireRate){
       if(!d.charging){ d.charging = true; d.chargeProg = 0; }
       d.chargeProg++;
@@ -14684,9 +15147,10 @@ function updateCombat(dt){
     } else if(d.charging){
       d.charging = false; d.chargeProg = 0; ring.material.opacity = 0; ring.scale.setScalar(1);
     }
-    // Project the floating health bar above the tank
+    }   // end normal lead-and-fire AI
+    // Project the floating health bar above the (taller) tank
     if(d.hpBarEl){
-      var bp = tank.position.clone().addScaledVector(d.normal, 0.055).project(camera);
+      var bp = tank.position.clone().addScaledVector(d.normal, d.topOffset || 0.16).project(camera);
       if(bp.z > 1){ d.hpBarEl.style.display = 'none'; }
       else {
         d.hpBarEl.style.display = 'block';
@@ -14703,12 +15167,12 @@ function updateCombat(dt){
     p.life++;
     p.mesh.position.add(p.vel);
     var sp = p.vel.length();
-    if(sp > 1e-6){
+    if(sp > 1e-6 && !p.noStretch){
       p.mesh.lookAt(p.mesh.position.clone().add(p.vel));
       var stretch = 1 + Math.min(p.life * 0.2, 1) * 1.4;
       p.mesh.scale.set(1, 1, stretch);
     }
-    if(p.mesh.position.distanceTo(shipPos) < 0.03){
+    if(p.mesh.position.distanceTo(shipPos) < (p.hitR || 0.03)){
       hurtPlayer(p.dmg);
       disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1);
       continue;
@@ -14716,12 +15180,23 @@ function updateCombat(dt){
     if(p.life >= p.maxLife){ disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1); }
   }
 
-  // Player death → brief downtime then revive at full HP (basic, non-punishing)
+  // Player death → brief downtime then revive at full HP
   if(combat.player.dead && now - combat.player.deadT > 1400){
     combat.player.dead = false;
     combat.player.hp = combat.player.maxHp;
     for(var eb = 0; eb < combat.enemyBullets.length; eb++) disposeEnemyBullet(combat.enemyBullets[eb]);
     combat.enemyBullets.length = 0;
+    // Dome wave arena: dying sends you BACK TO SPAWN and restarts from wave 1.
+    if(combat.arenaActive){
+      resetDomeArena();   // clears enemies + re-arms (wave restarts on next floor touch)
+      if(combat.domeSpawn){
+        gameMode.ship.position.copy(combat.domeSpawn);
+        gameMode.surfaceState.speed = 0;
+        gameMode.surfaceState.airborne = false;
+        gameMode.surfaceState.freeFalling = false;
+        gameMode.fly.vel.set(0, 0, 0);
+      }
+    }
   }
 
   // HUD
@@ -14730,6 +15205,14 @@ function updateCombat(dt){
   combat.hpFillEl.style.background = combat.player.hp / combat.player.maxHp > 0.3
     ? 'linear-gradient(90deg,#48e07a,#2fae5c)' : 'linear-gradient(90deg,#ff6a4a,#cc3333)';
   combat.dmgCounterEl.textContent = 'DAMAGE  ' + Math.round(combat.totalDamage);
+  if(combat.waveEl){
+    if(combat.arenaActive){
+      combat.waveEl.style.display = 'block';
+      combat.waveEl.textContent = 'WAVE ' + combat.wave + '  ·  ' + combat.enemies.length + ' LEFT';
+    } else {
+      combat.waveEl.style.display = 'none';
+    }
+  }
 
   // Red hurt-flash fade
   if(combat.hurtFlash > 0){
@@ -14740,7 +15223,7 @@ function updateCombat(dt){
   // Lock-on reticle: project onto the locked enemy
   if(combat.reticleEl){
     if(combat.lockTarget){
-      var rp = combat.lockTarget.position.clone().addScaledVector(combat.lockTarget.userData.normal || new THREE.Vector3(0,1,0), 0.02).project(camera);
+      var rp = combat.lockTarget.position.clone().addScaledVector(combat.lockTarget.userData.normal || new THREE.Vector3(0,1,0), combat.lockTarget.userData.topOffset || 0.16).project(camera);
       if(rp.z > 1){ combat.reticleEl.style.display = 'none'; }
       else {
         combat.reticleEl.style.display = 'block';
@@ -15230,9 +15713,9 @@ function gameKeyDown(e) {
     }
   }
   else if(k === 'control') gameMode.keys.ctrl = true;
-  else if(k === 'enter') { if(gameMode.active) { fireBullet(); e.preventDefault(); } }   // test fire
+  else if(k === 'enter') { if(gameMode.active) { combat.enterFiring = true; fireBullet(); e.preventDefault(); } }   // hold Enter to fire
   else if(k === 'l' && !e.repeat) { if(gameMode.active) { toggleLockOn(); e.preventDefault(); } }   // lock-on camera toggle
-  else if(k === 't' && !e.repeat) { if(gameMode.active) { spawnEnemyNearPlayer(); e.preventDefault(); } }   // spawn an enemy
+  else if(k === 't' && !e.repeat) { if(gameMode.active) { spawnEnemyNearPlayer(); e.preventDefault(); } }   // spawn an enemy near the player
   else if(k === 'p' && !e.repeat) { if(gameMode.active) toggleFlightMode(); }
   else if(k === 'escape') {
     if(gameMode.active && !gameMode.exiting) {
@@ -15255,6 +15738,7 @@ function gameKeyUp(e) {
   else if(k === 'e') gameMode.keys.e = false;
   else if(k === ' ') gameMode.keys.space = false;
   else if(k === 'control') gameMode.keys.ctrl = false;
+  else if(k === 'enter') combat.enterFiring = false;   // stop hold-to-fire
 }
 
 // ── Toggle flight mode (Orbicule.html:27117 pattern) ──
@@ -15957,6 +16441,9 @@ var _exRel = new THREE.Vector3(), _exVel = new THREE.Vector3();
 function checkPortalExit(){
   var P = gameMode.portal;
   if(!P.built || !P.inside || !P.inB || !P.dstAnchor){ P._exPrevSigned = null; P._exPrevWorld = null; return; }
+  // Lock the exit during the dome wave arena — you're committed to the fight, so getting bumped up
+  // the dome wall by tanks/collisions can't accidentally teleport you back out to the crystal.
+  if(typeof combat !== 'undefined' && combat.arenaActive){ P._exPrevSigned = null; P._exPrevWorld = null; return; }
   if(P.exitCooldown > 0){ P.exitCooldown--; P._exPrevSigned = null; P._exPrevWorld = null; return; }  // grace right after entering
   P.dstAnchor.updateMatrixWorld(true);
   _peSeam.setFromMatrixPosition(P.dstAnchor.matrixWorld);
@@ -16126,8 +16613,8 @@ function updatePortalInterior(){
   // input — matches the overworld: boost = Shift (drives forward on its own); "running" is any
   // speed above the walk cap (gates drift + flips). Same km/h counter, too.
   var fwdAxis = 0, yawAxis = 0;
-  if(t.active){ fwdAxis = t.throttle; yawAxis = t.yaw; p.isBoosting = t.boost; }
-  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); yawAxis = (k.a?-1:0)+(k.d?1:0); p.isBoosting = k.shift; }
+  if(t.active){ fwdAxis = t.throttle; yawAxis = t.yaw; p.isBoosting = t.boost && boostAllowed(); }
+  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); yawAxis = (k.a?-1:0)+(k.d?1:0); p.isBoosting = k.shift && boostAllowed(); }
   if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
   if(s.airborne && fwdAxis < 0) fwdAxis = 0;   // no braking in the air (S mid-air is slam-only)
   var speedMetric = Math.max(Math.abs(s.speed), gameMode.fly.vel.length());
@@ -16166,9 +16653,15 @@ function updatePortalInterior(){
   var thrust = p.thrustBase + (p.thrustMax - p.thrustBase) * (p.accelerationTime / p.maxAccelerationTime);
   if(p.isBoosting) thrust = thrust * 2;
   var driftTight = 0; if(t.active && t.driftHold) driftTight = t.driftTight; if(k.s) driftTight = Math.max(driftTight, 1);
+  if(!(fwdAxis < -0.01 && s.speed > 0.0005)) s.brakeTime = 0;       // reset brake ramp when not braking
   if(s.isDrifting){
     if(s.driftTime <= p.driftSustainTime){ var ds = s.speed < 0 ? -1 : 1; if(Math.abs(s.speed) < s.driftEntrySpeed) s.speed = ds * s.driftEntrySpeed; }
     else { s.speed -= Math.sign(s.speed || 1) * p.driftDecel; s.speed *= 0.998; if(driftTight > 0) s.speed *= (1 - driftTight * 0.015); }
+  } else if(fwdAxis < -0.01 && s.speed > 0.0005){
+    // BRAKING — ramped decel (gentle → firm); falls through to reverse once stopped.
+    s.brakeTime = (s.brakeTime || 0) + 1;
+    var bramp = Math.min(s.brakeTime / p.brakeRampFrames, 1); bramp *= bramp;
+    s.speed = Math.max(0, s.speed - (p.brakeMin + (p.brakeMax - p.brakeMin) * bramp)); s.coastFrames = 0;
   } else if(p.isBoosting){
     s.speed += thrust * fwdAxis; s.coastFrames = 0;                 // no drag, no cap → unbounded boost
     var BOOST_SAFETY = p.maxSpeed * 12; if(s.speed > BOOST_SAFETY) s.speed = BOOST_SAFETY;
@@ -16187,8 +16680,8 @@ function updatePortalInterior(){
   if(p.isBoosting) spawnBoostTrail();
 
   // ── yaw + tangential move (copied) ──
-  if(s.isDrifting){ var ramp = Math.min(1, s.driftTime/p.driftRampTime); var dY = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase)*ramp; dY *= (1 + driftTight*0.7); s.forward.applyAxisAngle(s.groundNormal, dY * s.driftDirection); }
-  else if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01){ s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis); }
+  if(s.isDrifting){ var ramp = Math.min(1, s.driftTime/p.driftRampTime); var dY = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase)*ramp; dY *= (1 + driftTight*0.7); dY *= s.driftDirection; s.forward.applyAxisAngle(s.groundNormal, dY); s.driftExitYaw = dY; }
+  else { if(Math.abs(s.driftExitYaw||0) > 1e-5){ s.forward.applyAxisAngle(s.groundNormal, s.driftExitYaw); s.driftExitYaw *= p.driftExitDecay; if(Math.abs(s.driftExitYaw) < 1e-5) s.driftExitYaw = 0; } if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01){ s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis); } }
   s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
   if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
   if(Math.abs(s.speed) > 0.00001) ship.position.addScaledVector(s.forward, s.speed);
@@ -16262,8 +16755,10 @@ function updatePortalInterior(){
   camera.lookAt(chase.lookAt);
 
   // ── exit: drive onto the return pad (placed behind the spawn-facing direction) ──
+  // Disabled during the wave arena so fighting around the floor can't trip the pad and teleport out.
   if(P.exitCooldown > 0){ P.exitCooldown--; }
-  else if(Math.hypot(ship.position.x - cx, ship.position.z - (cz - roomR*0.6)) < 0.22){ leaveToCrystal(); }
+  else if(!(typeof combat !== 'undefined' && combat.arenaActive)
+          && Math.hypot(ship.position.x - cx, ship.position.z - (cz - roomR*0.6)) < 0.22){ leaveToCrystal(); }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════
@@ -16281,8 +16776,8 @@ function flatDrive(cx, cz, floorY, roomR){
   var p = gameMode.physics, k = gameMode.keys, t = gameMode.touch, s = gameMode.surfaceState, ship = gameMode.ship;
   s.groundNormal.set(0,1,0);
   var fwdAxis=0, yawAxis=0;
-  if(t.active){ fwdAxis=t.throttle; yawAxis=t.yaw; p.isBoosting=t.boost; }
-  else { fwdAxis=(k.w?1:0)+(k.s?-0.6:0); yawAxis=(k.a?-1:0)+(k.d?1:0); p.isBoosting=k.shift&&k.w; }
+  if(t.active){ fwdAxis=t.throttle; yawAxis=t.yaw; p.isBoosting=t.boost && boostAllowed(); }
+  else { fwdAxis=(k.w?1:0)+(k.s?-0.6:0); yawAxis=(k.a?-1:0)+(k.d?1:0); p.isBoosting=k.shift&&k.w&&boostAllowed(); }
   if(gameMode.wantJump){
     gameMode.wantJump=false;
     if(!s.airborne){ s.airborne=true; s.freeFalling=false; s.vertVel=p.jumpImpulse; s.airTime=0; s.jumpAxis.set(0,1,0);
@@ -16308,16 +16803,21 @@ function flatDrive(cx, cz, floorY, roomR){
   var thrust=p.thrustBase+(p.thrustMax-p.thrustBase)*(p.accelerationTime/p.maxAccelerationTime);
   if(p.isBoosting) thrust=p.boostAccelRate;
   var driftTight=0; if(t.active&&t.driftHold) driftTight=t.driftTight; if(k.s) driftTight=Math.max(driftTight,1);
+  if(!(fwdAxis < -0.01 && s.speed > 0.0005)) s.brakeTime = 0;       // reset brake ramp when not braking
   if(s.isDrifting){
     if(s.driftTime>p.driftSustainTime){ s.speed-=Math.sign(s.speed||1)*p.driftDecel; s.speed*=0.998; }
     if(driftTight>0) s.speed*=(1-driftTight*0.015);
+  } else if(fwdAxis < -0.01 && s.speed > 0.0005){
+    // BRAKING — ramped decel (gentle → firm); falls through to reverse once stopped.
+    s.brakeTime = (s.brakeTime||0)+1; var bramp=Math.min(s.brakeTime/p.brakeRampFrames,1); bramp*=bramp;
+    s.speed=Math.max(0, s.speed-(p.brakeMin+(p.brakeMax-p.brakeMin)*bramp)); s.coastFrames=0;
   } else {
     s.speed+=thrust*fwdAxis;
     if(hasFwd){ s.coastFrames=0; s.speed*=p.drag; var maxS=p.isBoosting?p.boostMaxSpeed:p.maxSpeed; if(t.active&&t.useJoystick) maxS=Math.max(maxS,0.03); if(s.speed>maxS) s.speed=maxS; var maxRv=(p.isBoosting?p.boostMaxSpeed:p.maxSpeed)*0.6; if(s.speed<-maxRv) s.speed=-maxRv; }
     else { s.coastFrames+=1; if(s.coastFrames>p.coastHoldFrames){ if(s.speed>0) s.speed=Math.max(0,s.speed-p.coastLinearDecel); else if(s.speed<0) s.speed=Math.min(0,s.speed+p.coastLinearDecel); } }
   }
-  if(s.isDrifting){ var ramp=Math.min(1,s.driftTime/p.driftRampTime); var dY=p.driftTurnBase+(p.driftTurnMax-p.driftTurnBase)*ramp; dY*=(1+driftTight*0.7); s.forward.applyAxisAngle(s.groundNormal,dY*s.driftDirection); }
-  else if(!s.barrelRoll.active&&Math.abs(yawAxis)>0.01){ s.forward.applyAxisAngle(s.groundNormal,-p.turnSpeed*yawAxis); }
+  if(s.isDrifting){ var ramp=Math.min(1,s.driftTime/p.driftRampTime); var dY=p.driftTurnBase+(p.driftTurnMax-p.driftTurnBase)*ramp; dY*=(1+driftTight*0.7); dY*=s.driftDirection; s.forward.applyAxisAngle(s.groundNormal,dY); s.driftExitYaw=dY; }
+  else { if(Math.abs(s.driftExitYaw||0)>1e-5){ s.forward.applyAxisAngle(s.groundNormal,s.driftExitYaw); s.driftExitYaw*=p.driftExitDecay; if(Math.abs(s.driftExitYaw)<1e-5) s.driftExitYaw=0; } if(!s.barrelRoll.active&&Math.abs(yawAxis)>0.01){ s.forward.applyAxisAngle(s.groundNormal,-p.turnSpeed*yawAxis); } }
   s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
   if(s.forward.lengthSq()>0.0001) s.forward.normalize();
   if(Math.abs(s.speed)>0.00001) ship.position.addScaledVector(s.forward,s.speed);
@@ -16755,6 +17255,8 @@ function animate(){
   updateBoostTrail();
   updateGameBullets();
   updateCombat(dt);
+  updateBoostFuel(dt);
+  updateGameAudio();
   updateCrosshair(gameMode.active && !gameMode.exiting && !combat.lockTarget);
   if(!gameMode.active) hideSpeedCounter();
 
