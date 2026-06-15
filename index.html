@@ -14459,11 +14459,7 @@ function updateGameBullets(){
   }
 }
 function disposeGameBullet(b){
-  scene.remove(b.mesh);
-  if(b.mesh.geometry) b.mesh.geometry.dispose();
-  if(b.mesh.material) b.mesh.material.dispose();   // per-bullet material (Big/Velocity/Split colours)
-  // dispose the additive glow sprite's material (texture is shared, leave it)
-  for(var c = 0; c < b.mesh.children.length; c++){ if(b.mesh.children[c].material) b.mesh.children[c].material.dispose(); }
+  scene.remove(b.mesh);   // geometry + materials are SHARED (sharedBullet*) — only detach, never dispose.
 }
 function clearGameBullets(){
   for(var i = 0; i < gameBullets.length; i++) disposeGameBullet(gameBullets[i]);
@@ -14838,7 +14834,7 @@ function updateBalls(){
       if(b.building === 0){ b.mesh.scale.setScalar(1); if(b.mesh.material){ b.mesh.material.opacity = 1; b.mesh.material.transparent = false; } }
       continue;   // inactive while materializing
     }
-    var toP = mpNearestPlayer(b.mesh.position).pos.clone().sub(b.mesh.position);   // co-op: chase the nearer player
+    var toP = _ballV3.copy(mpNearestPlayer(b.mesh.position).pos).sub(b.mesh.position);   // co-op: chase the nearer player
     var flat = toP.addScaledVector(b.normal, -toP.dot(b.normal));
     if(flat.lengthSq() > 1e-9){ flat.normalize(); b.vel.addScaledVector(flat, BALL_ACCEL); }
     if(b.vel.length() > BALL_SPEED) b.vel.setLength(BALL_SPEED);
@@ -14849,10 +14845,10 @@ function updateBalls(){
     for(var c2 = a + 1; c2 < balls.length; c2++){
       var ba = balls[a], bb = balls[c2];
       if(ba.building > 0 || bb.building > 0) continue;   // materializing balls don't collide yet
-      var dvec = ba.mesh.position.clone().sub(bb.mesh.position);
-      var dd2 = dvec.length(), minD = ba.r + bb.r;
-      if(dd2 < minD && dd2 > 1e-6){
-        var cn = dvec.multiplyScalar(1 / dd2);
+      var minD = ba.r + bb.r, dsq = ba.mesh.position.distanceToSquared(bb.mesh.position);
+      if(dsq < minD * minD && dsq > 1e-12){              // squared early-out → no alloc/sqrt for non-overlapping pairs
+        var dd2 = Math.sqrt(dsq);
+        var cn = _ballV3.copy(ba.mesh.position).sub(bb.mesh.position).multiplyScalar(1 / dd2);
         var push = (minD - dd2) * 0.5;
         ba.mesh.position.addScaledVector(cn, push);
         bb.mesh.position.addScaledVector(cn, -push);
@@ -14877,12 +14873,12 @@ function updateBalls(){
     }
     var sp = bk.vel.length();
     if(sp > 1e-6){
-      var rollAxis = new THREE.Vector3().crossVectors(bk.normal, bk.vel);
+      var rollAxis = _ballV3.crossVectors(bk.normal, bk.vel);
       if(rollAxis.lengthSq() > 1e-9){ rollAxis.normalize(); bk.mesh.rotateOnWorldAxis(rollAxis, sp / bk.r); }
     }
     var knp = mpNearestPlayer(bk.mesh.position);   // co-op: ram whichever player is closer
-    var d = bk.mesh.position.distanceTo(knp.pos);
-    if(d < bk.r + 0.02){
+    var ramR = bk.r + 0.02;
+    if(bk.mesh.position.distanceToSquared(knp.pos) < ramR * ramR){   // squared → no sqrt
       if(now - bk.lastHit > BALL_HIT_COOLDOWN){ bk.lastHit = now; if(knp.isGuest) mpHurtGuest(BALL_DMG); else hurtPlayer(BALL_DMG, bk.mesh.position); sfxBounce(bk.mesh.position); }
       // Battering Ram: the HOST player ramming a ball at speed damages it (guest battering-ram is deferred).
       if(!knp.isGuest && skillFx.ram > 0){
@@ -14901,7 +14897,7 @@ function updateBalls(){
     }
     // Floating HP bar above the ball
     if(bk.hpBarEl){
-      var bp = bk.mesh.position.clone().addScaledVector(bk.normal, bk.r + 0.03).project(camera);
+      var bp = _barV3.copy(bk.mesh.position).addScaledVector(bk.normal, bk.r + 0.03).project(camera);
       if(bp.z > 1){ bk.hpBarEl.style.display = 'none'; }
       else {
         bk.hpBarEl.style.display = 'block';
@@ -14926,10 +14922,21 @@ var XP_STRETCH = 2.6;   // how much an orb elongates toward the player at full m
 var TANK_XP_ORBS = 30, BALL_XP_ORBS = 8, DEATH_FRAMES = 22;
 function xpRequired(){ return Math.floor(xpState.base * Math.pow(xpState.mult, xpState.level - 1)); }  // Orbicule curve: 4, ~4, 5, 6, 8…
 function addXP(amount){
+  // Co-op: ONE shared XP pool. The guest forwards its collected XP to the host (the pool owner);
+  // the host accumulates, levels up, and tells BOTH players to pick a skill at the same moment.
+  if(typeof mpIsGuest === 'function' && mpIsGuest()){
+    mpSend({ type: 'xpcollect', a: amount });
+    return;
+  }
   var before = xpState.level;
   xpState.current += amount;
   while(xpState.current >= xpRequired()){ xpState.current -= xpRequired(); xpState.level++; }  // overflow → multi-level
-  if(xpState.level > before) gameSkills.pending += (xpState.level - before);   // each level → one skill package (opened in animate)
+  if(xpState.level > before){
+    var gained = xpState.level - before;
+    gameSkills.pending += gained;                                  // each level → one skill package (opened in animate)
+    if(MP.connected && MP.isHost) mpSend({ type: 'levelup', n: gained });   // partner gets a pick at the same time
+  }
+  if(MP.connected && MP.isHost) mpSend({ type: 'xppool', cur: xpState.current, lvl: xpState.level });   // sync the shared bar
   updateXPHud();
 }
 function updateXPHud(){
@@ -15074,6 +15081,7 @@ function resolveTankCollisions(){
     var t = combat.enemies[i];
     if(t.userData.building > 0) continue;   // can drive through a materializing tank
     var R = t.userData.collideR || 0.1;
+    if(ship.position.distanceToSquared(t.position) >= R * R) continue;   // squared early-out — skip the clone+sqrt when not colliding
     var diff = ship.position.clone().sub(t.position);
     var dd = diff.length();
     if(dd < R){
@@ -15132,7 +15140,7 @@ function spawnEnemyShell(barrel, dir){
   var mesh = new THREE.Mesh(combat._ebGeo, combat._ebMat);
   mesh.position.copy(tip);
   mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xff7755, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
+  var glow = new THREE.Sprite(sharedBulletGlow(0xff7755, 0.9));
   glow.scale.set(0.05, 0.05, 1);
   mesh.add(glow);
   scene.add(mesh);
@@ -15159,8 +15167,7 @@ function fireEnemyShell(tank){
   }
 }
 function disposeEnemyBullet(b){
-  scene.remove(b.mesh);
-  for(var c = 0; c < b.mesh.children.length; c++){ if(b.mesh.children[c].material) b.mesh.children[c].material.dispose(); }
+  scene.remove(b.mesh);   // shared geometry + glow material — only detach, never dispose.
 }
 
 // ── Spiral barrage ── each second you're in a tank's vicinity it has a small chance to wind up
@@ -15187,7 +15194,7 @@ function spawnSpiralShell(pos, dir, gravAxis, floorH){
   var mesh = new THREE.Mesh(combat._sbGeo, combat._sbMat);
   mesh.position.copy(pos);
   mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xff7744, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false }));
+  var glow = new THREE.Sprite(sharedBulletGlow(0xff7744, 0.95));
   glow.scale.set(0.09, 0.09, 1);
   mesh.add(glow);
   scene.add(mesh);
@@ -15237,24 +15244,38 @@ function updateSpiralAttack(tank, d){
 }
 
 // ── Floating damage numbers (ported from Orbicule) ──
+// Pooled floating damage numbers: reuse hidden DOM divs instead of create/remove per hit
+// (hits scale with bullets × enemies, so the old churn was a layout-thrash source). Visuals
+// are identical — the same text/colour/size is just re-applied to a recycled element.
+var _dmgPool = [], _dmgV3 = new THREE.Vector3(), _barV3 = new THREE.Vector3(), _ballV3 = new THREE.Vector3();
 function spawnDamageNumber(worldPos, amount, isCrit){
-  var el = document.createElement('div');
-  el.textContent = isCrit ? Math.round(amount) + '!' : Math.round(amount);
-  el.style.cssText = 'position:fixed;pointer-events:none;z-index:60;font-family:Arial,sans-serif;'
-    + 'font-weight:bold;white-space:nowrap;'
-    + 'font-size:' + (isCrit ? '22px' : '15px') + ';'
-    + 'color:' + (isCrit ? '#ffe34a' : '#ffffff') + ';'
-    + 'text-shadow:0 0 5px ' + (isCrit ? 'rgba(255,200,0,0.9)' : 'rgba(0,0,0,0.85)') + ',0 1px 2px rgba(0,0,0,0.7);';
-  document.body.appendChild(el);
-  combat.damageNumbers.push({ el: el, worldPos: worldPos.clone(), startTime: performance.now(), offsetY: 0 });
+  var rec = null;
+  for(var i = 0; i < _dmgPool.length; i++){ if(!_dmgPool[i]._active){ rec = _dmgPool[i]; break; } }
+  if(!rec){
+    var el = document.createElement('div');
+    el.style.cssText = 'position:fixed;pointer-events:none;z-index:60;font-family:Arial,sans-serif;font-weight:bold;white-space:nowrap;';
+    document.body.appendChild(el);
+    rec = { el: el, _active: false, worldPos: new THREE.Vector3(), startTime: 0, offsetY: 0 };
+    _dmgPool.push(rec);
+  }
+  rec._active = true;
+  rec.el.textContent = isCrit ? Math.round(amount) + '!' : Math.round(amount);
+  rec.el.style.fontSize = isCrit ? '22px' : '15px';
+  rec.el.style.color = isCrit ? '#ffe34a' : '#ffffff';
+  rec.el.style.textShadow = (isCrit ? '0 0 5px rgba(255,200,0,0.9)' : '0 0 5px rgba(0,0,0,0.85)') + ',0 1px 2px rgba(0,0,0,0.7)';
+  rec.el.style.display = 'block';
+  rec.worldPos.copy(worldPos);
+  rec.startTime = performance.now();
+  rec.offsetY = 0;
+  combat.damageNumbers.push(rec);
 }
 function updateDamageNumbers(){
   var now = performance.now(), dur = 1100;
   for(var i = combat.damageNumbers.length - 1; i >= 0; i--){
     var dn = combat.damageNumbers[i];
     var elapsed = now - dn.startTime;
-    if(elapsed > dur){ dn.el.remove(); combat.damageNumbers.splice(i, 1); continue; }
-    var p = dn.worldPos.clone().project(camera);
+    if(elapsed > dur){ dn.el.style.display = 'none'; dn._active = false; combat.damageNumbers.splice(i, 1); continue; }
+    var p = _dmgV3.copy(dn.worldPos).project(camera);
     var x = (p.x * 0.5 + 0.5) * window.innerWidth;
     var y = (-p.y * 0.5 + 0.5) * window.innerHeight;
     dn.offsetY += 0.7;
@@ -15396,21 +15417,36 @@ function showCombatHUD(show){
   if(!show && combat.waveEl) combat.waveEl.style.display = 'none';
 }
 
-// Is the current lock target still a live enemy or ball?
-function lockTargetValid(){
-  return !!combat.lockTarget &&
-         (combat.enemies.indexOf(combat.lockTarget) >= 0 || combat.balls.indexOf(combat.lockTarget) >= 0);
+// Lockable targets: the GUEST locks onto the host's MIRROR enemies (its own combat.enemies/balls
+// are empty in co-op); the host/single-player use the real arrays.
+function lockCandidates(){
+  if(typeof mpIsGuest === 'function' && mpIsGuest()){
+    var arr = [];
+    for(var id in MP.mirror.e) arr.push(MP.mirror.e[id]);
+    for(var id2 in MP.mirror.b) arr.push(MP.mirror.b[id2]);
+    return arr;
+  }
+  return combat.enemies.concat(combat.balls);
 }
-// Lock onto the nearest TARGET (tank OR rolling ball) to the ship (or null if none).
+// Is the current lock target still a live enemy/ball (or live mirror, on the guest)?
+function lockTargetValid(){
+  if(!combat.lockTarget) return false;
+  if(typeof mpIsGuest === 'function' && mpIsGuest()){
+    var t = combat.lockTarget;
+    for(var id in MP.mirror.e){ if(MP.mirror.e[id] === t) return true; }
+    for(var id2 in MP.mirror.b){ if(MP.mirror.b[id2] === t) return true; }
+    return false;
+  }
+  return combat.enemies.indexOf(combat.lockTarget) >= 0 || combat.balls.indexOf(combat.lockTarget) >= 0;
+}
+// Lock onto the nearest TARGET (tank OR rolling ball / mirror) to the ship (or null if none).
 function lockNearestEnemy(){
   var best = null, bd = Infinity, sp = gameMode.ship.position;
-  for(var i = 0; i < combat.enemies.length; i++){
-    var dd = combat.enemies[i].position.distanceTo(sp);
-    if(dd < bd){ bd = dd; best = combat.enemies[i]; }
-  }
-  for(var j = 0; j < combat.balls.length; j++){
-    var bdst = combat.balls[j].position.distanceTo(sp);
-    if(bdst < bd){ bd = bdst; best = combat.balls[j]; }
+  var cands = lockCandidates();
+  for(var i = 0; i < cands.length; i++){
+    var pos = cands[i].position; if(!pos) continue;
+    var dd = pos.distanceToSquared(sp);
+    if(dd < bd){ bd = dd; best = cands[i]; }
   }
   combat.lockTarget = best;
 }
@@ -15424,6 +15460,22 @@ function toggleLockOn(){
   combat.lockMode = !combat.lockMode;
   if(combat.lockMode) lockNearestEnemy();
   else combat.lockTarget = null;
+}
+// Project the lock-on reticle onto the current target. Shared by host (updateCombat) + guest (mpGuestCombat).
+function updateLockReticle(){
+  if(!combat.reticleEl) return;
+  var t = combat.lockTarget;
+  if(t && t.position){
+    var rp = t.position.clone().addScaledVector(t.userData.normal || new THREE.Vector3(0, 1, 0), t.userData.topOffset || 0.16).project(camera);
+    if(rp.z > 1){ combat.reticleEl.style.display = 'none'; }
+    else {
+      combat.reticleEl.style.display = 'block';
+      combat.reticleEl.style.left = ((rp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
+      combat.reticleEl.style.top = ((-rp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
+    }
+  } else {
+    combat.reticleEl.style.display = 'none';
+  }
 }
 
 function hurtPlayer(amount, srcPos){
@@ -15479,7 +15531,7 @@ function clearCombat(){
   clearDying(); clearXPOrbs();
   for(var j = 0; j < combat.enemyBullets.length; j++) disposeEnemyBullet(combat.enemyBullets[j]);
   combat.enemyBullets.length = 0;
-  for(var k = combat.damageNumbers.length - 1; k >= 0; k--) combat.damageNumbers[k].el.remove();
+  for(var k = combat.damageNumbers.length - 1; k >= 0; k--){ combat.damageNumbers[k].el.style.display = 'none'; combat.damageNumbers[k]._active = false; }   // release back to the pool (don't remove from DOM)
   combat.damageNumbers.length = 0;
   combat.hurtFlash = 0;
   if(combat.flashEl) combat.flashEl.style.opacity = 0;
@@ -15529,11 +15581,12 @@ function updateCombat(dt){
   // Player bullets → tank collision (hit radius scales with the bigger hull)
   for(var bi = gameBullets.length - 1; bi >= 0; bi--){
     var b = gameBullets[bi];
-    var hitTank = null;
+    var hitTank = null, bpos = b.mesh.position;
     for(var ei = 0; ei < combat.enemies.length; ei++){
       var en = combat.enemies[ei];
       if(en.userData.building > 0) continue;   // can't shoot a materializing tank
-      if(b.mesh.position.distanceTo(en.position) < (en.userData.collideR || 0.1)){ hitTank = en; break; }
+      var er = en.userData.collideR || 0.1;
+      if(bpos.distanceToSquared(en.position) < er * er){ hitTank = en; break; }   // squared → no sqrt
     }
     if(hitTank){
       dealDamageToTank(hitTank, b.dmg || PLAYER_BULLET_DAMAGE);
@@ -15551,7 +15604,8 @@ function updateCombat(dt){
     for(var bki = 0; bki < combat.balls.length; bki++){
       var bk = combat.balls[bki];
       if(bk.building > 0) continue;   // can't shoot a materializing ball
-      if(b.mesh.position.distanceTo(bk.mesh.position) < bk.r + 0.008){
+      var bkr = bk.r + 0.008;
+      if(bpos.distanceToSquared(bk.mesh.position) < bkr * bkr){   // squared → no sqrt
         var bdmg = b.dmg || PLAYER_BULLET_DAMAGE;
         bk.hp -= bdmg; combat.totalDamage += bdmg;
         spawnDamageNumber(bk.mesh.position.clone().addScaledVector(bk.normal, 0.04), bdmg, false);
@@ -15673,7 +15727,7 @@ function updateCombat(dt){
     }   // end normal lead-and-fire AI
     // Project the floating health bar above the (taller) tank
     if(d.hpBarEl){
-      var bp = tank.position.clone().addScaledVector(d.normal, d.topOffset || 0.16).project(camera);
+      var bp = _barV3.copy(tank.position).addScaledVector(d.normal, d.topOffset || 0.16).project(camera);
       if(bp.z > 1){ d.hpBarEl.style.display = 'none'; }
       else {
         d.hpBarEl.style.display = 'block';
@@ -15704,17 +15758,18 @@ function updateCombat(dt){
     }
     var sp = p.vel.length();
     if(sp > 1e-6 && !p.noStretch){
-      p.mesh.lookAt(p.mesh.position.clone().add(p.vel));
+      p.mesh.lookAt(_dmgV3.copy(p.mesh.position).add(p.vel));
       var stretch = 1 + Math.min(p.life * 0.2, 1) * 1.4;
       p.mesh.scale.set(1, 1, stretch);
     }
-    if(p.mesh.position.distanceTo(shipPos) < (p.hitR || 0.03)){
+    var hr2 = (p.hitR || 0.03) * (p.hitR || 0.03);
+    if(p.mesh.position.distanceToSquared(shipPos) < hr2){   // squared → no sqrt
       hurtPlayer(p.dmg, p.mesh.position);
       disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1);
       continue;
     }
     // co-op: the same authoritative shell also hits the guest (its ship is MP.remote.ship on the host)
-    if(MP.isHost && MP.connected && MP.remote.ship && MP.remote.ship.visible && p.mesh.position.distanceTo(MP.remote.ship.position) < (p.hitR || 0.03)){
+    if(MP.isHost && MP.connected && MP.remote.ship && MP.remote.ship.visible && p.mesh.position.distanceToSquared(MP.remote.ship.position) < hr2){
       mpHurtGuest(p.dmg);
       disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1);
       continue;
@@ -15767,20 +15822,7 @@ function updateCombat(dt){
     if(combat.flashEl) combat.flashEl.style.opacity = combat.hurtFlash * 0.4;
   }
 
-  // Lock-on reticle: project onto the locked enemy
-  if(combat.reticleEl){
-    if(combat.lockTarget){
-      var rp = combat.lockTarget.position.clone().addScaledVector(combat.lockTarget.userData.normal || new THREE.Vector3(0,1,0), combat.lockTarget.userData.topOffset || 0.16).project(camera);
-      if(rp.z > 1){ combat.reticleEl.style.display = 'none'; }
-      else {
-        combat.reticleEl.style.display = 'block';
-        combat.reticleEl.style.left = ((rp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
-        combat.reticleEl.style.top = ((-rp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
-      }
-    } else {
-      combat.reticleEl.style.display = 'none';
-    }
-  }
+  updateLockReticle();   // project the lock-on reticle onto the locked target
 
   updateDamageNumbers();
 }
@@ -16588,22 +16630,39 @@ function updateBoostChargeHud(){
 // ══════════════════════════════════════════════
 
 // Nearest active tank/ball to a point. Returns {pos, kind, ref} or null.
+var _nge = { pos: null, kind: '', ref: null }, _skV3 = new THREE.Vector3();
 function nearestGameEnemy(pos, maxDist){
-  var best = null, bd = (maxDist !== undefined) ? maxDist * maxDist : Infinity;
+  // Reuses one result object (callers consume it immediately) — under Tracking Eye every bullet
+  // calls this each frame, so the old per-call {pos,kind,ref} allocation was real GC pressure.
+  var ref = null, kind = '', bp = null, bd = (maxDist !== undefined) ? maxDist * maxDist : Infinity;
   for(var i = 0; i < combat.enemies.length; i++){
     var en = combat.enemies[i]; if(en.userData.building > 0) continue;
     var d = en.position.distanceToSquared(pos);
-    if(d < bd){ bd = d; best = { pos: en.position, kind: 'tank', ref: en }; }
+    if(d < bd){ bd = d; ref = en; kind = 'tank'; bp = en.position; }
   }
   for(var j = 0; j < combat.balls.length; j++){
     var bk = combat.balls[j]; if(bk.building > 0) continue;
     var d2 = bk.mesh.position.distanceToSquared(pos);
-    if(d2 < bd){ bd = d2; best = { pos: bk.mesh.position, kind: 'ball', ref: bk }; }
+    if(d2 < bd){ bd = d2; ref = bk; kind = 'ball'; bp = bk.mesh.position; }
   }
-  return best;
+  if(!ref) return null;
+  _nge.pos = bp; _nge.kind = kind; _nge.ref = ref;
+  return _nge;
 }
 
 // ── Player firing pattern (Front Bullet / Diagonal / Big / Velocity / Split / Orbiting / Tracking) ──
+// ── Shared bullet resources ──────────────────────────────────────────────────────────
+// Identical-looking bullets reuse ONE geometry + material instead of allocating a fresh
+// SphereGeometry + MeshBasicMaterial + SpriteMaterial per shot. At high fire-rates that
+// per-bullet allocation (+ GPU upload + the matching dispose) was the lag; the cached
+// resources are byte-identical (same size/segments/colour/opacity), so visuals are
+// unchanged. They're shared + never disposed → disposeGameBullet/disposeEnemyBullet must
+// only detach from the scene, never call .dispose() on the geometry/material.
+var _bulletGeoCache = {}, _bulletMatCache = {}, _bulletGlowCache = {};
+function sharedBulletGeo(sz, ws, hs){ ws = ws || 8; hs = hs || 6; var k = sz + '_' + ws + '_' + hs; return _bulletGeoCache[k] || (_bulletGeoCache[k] = new THREE.SphereGeometry(sz, ws, hs)); }
+function sharedBulletMat(col){ return _bulletMatCache[col] || (_bulletMatCache[col] = new THREE.MeshBasicMaterial({ color: col })); }
+function sharedBulletGlow(col, op){ var k = col + '_' + op; return _bulletGlowCache[k] || (_bulletGlowCache[k] = new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: col, transparent: true, opacity: op, blending: THREE.AdditiveBlending, depthWrite: false })); }
+
 function spawnSkillBullet(origin, dir, lateral){
   var s = gameMode.surfaceState, p = gameMode.physics;
   dir = dir.clone(); if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.set(0, 0, 1);
@@ -16624,11 +16683,11 @@ function spawnSkillBullet(origin, dir, lateral){
   }
   var sz = skillFx.bigBullet ? 0.008 : 0.004;
   var col = skillFx.bigBullet ? 0xff7adf : 0xc9a3ff;
-  var mesh = new THREE.Mesh(new THREE.SphereGeometry(sz, 8, 6), new THREE.MeshBasicMaterial({ color: col }));
+  var mesh = new THREE.Mesh(sharedBulletGeo(sz), sharedBulletMat(col));
   mesh.position.copy(origin);
   mesh.frustumCulled = false; mesh.renderOrder = 5;
   var glowC = skillFx.bigBullet ? 0xff8ae0 : (skillFx.velocity ? 0xe0a0ff : 0xb98cff);
-  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: glowC, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+  var glow = new THREE.Sprite(sharedBulletGlow(glowC, 0.85));
   var gs = skillFx.bigBullet ? 0.05 : 0.022;
   glow.scale.set(gs, gs, 1);
   mesh.add(glow);
@@ -16682,9 +16741,9 @@ function spawnSplitChildren(b, hitPos){
   var speed = 0.16;
   for(var sgn = -1; sgn <= 1; sgn += 2){
     var sdir = fwd.clone().multiplyScalar(0.4).addScaledVector(side, sgn).normalize();
-    var mesh = new THREE.Mesh(new THREE.SphereGeometry(b.big ? 0.006 : 0.0035, 8, 6), new THREE.MeshBasicMaterial({ color: 0xc9a3ff }));
+    var mesh = new THREE.Mesh(sharedBulletGeo(b.big ? 0.006 : 0.0035), sharedBulletMat(0xc9a3ff));
     mesh.position.copy(hitPos); mesh.frustumCulled = false; mesh.renderOrder = 5;
-    var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xb98cff, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false }));
+    var glow = new THREE.Sprite(sharedBulletGlow(0xb98cff, 0.8));
     glow.scale.set(0.018, 0.018, 1); mesh.add(glow); scene.add(mesh);
     gameBullets.push({ mesh: mesh, vel: sdir.multiplyScalar(speed), life: 0, maxLife: 70, dmg: b.dmg * 0.6, big: b.big, homing: b.homing, split: b.split - 1, orbit: null });
   }
@@ -16726,7 +16785,7 @@ function updateSkillBullets(){
     if(b.homing && (!b.orbit || b.orbit.phase !== 'orbit')){
       var ht = nearestGameEnemy(b.mesh.position, 0.6);
       if(ht){
-        var want = ht.pos.clone().sub(b.mesh.position); if(want.lengthSq() > 1e-9){ want.normalize();
+        var want = _skV3.copy(ht.pos).sub(b.mesh.position); if(want.lengthSq() > 1e-9){ want.normalize();
           var sp = b.vel.length() || 0.16; b.vel.lerp(want.multiplyScalar(sp), 0.18); if(b.vel.lengthSq() > 1e-9) b.vel.setLength(sp); }
       }
     }
@@ -16763,9 +16822,9 @@ function clearCompanions(){
 }
 function fireDroneShot(from, target){
   var dir = target.clone().sub(from); if(dir.lengthSq() < 1e-9) return; dir.normalize();
-  var mesh = new THREE.Mesh(new THREE.SphereGeometry(0.0035, 6, 5), new THREE.MeshBasicMaterial({ color: 0x55ffcc }));
+  var mesh = new THREE.Mesh(sharedBulletGeo(0.0035, 6, 5), sharedBulletMat(0x55ffcc));
   mesh.position.copy(from); mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0x88ffe0, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false }));
+  var glow = new THREE.Sprite(sharedBulletGlow(0x88ffe0, 0.8));
   glow.scale.set(0.016, 0.016, 1); mesh.add(glow); scene.add(mesh);
   gameBullets.push({ mesh: mesh, vel: dir.multiplyScalar(0.14), life: 0, maxLife: 80, dmg: 8, big: false, homing: false, split: 0, orbit: null });
 }
@@ -17132,7 +17191,10 @@ function mpOnData(data){
   else if(data.type === 'world'){ if(mpIsGuest()) mpApplyWorld(data); }       // guest: mirror the host's world
   else if(data.type === 'fire'){ if(MP.isHost) mpHostSpawnGuestVolley(data); } // host: spawn the guest's authoritative bullets
   else if(data.type === 'respawn'){ if(mpIsGuest()) mpApplyRespawn(data); }   // host told the guest to respawn
-  else if(data.type === 'xp'){ if(mpIsGuest()) spawnXPBurst(new THREE.Vector3(data.p[0], data.p[1], data.p[2]), new THREE.Vector3(data.n[0], data.n[1], data.n[2]), data.c); } // shared kill → guest's own XP
+  else if(data.type === 'xp'){ if(mpIsGuest()) spawnXPBurst(new THREE.Vector3(data.p[0], data.p[1], data.p[2]), new THREE.Vector3(data.n[0], data.n[1], data.n[2]), data.c); } // shared kill → guest's own (client-side) orbs
+  else if(data.type === 'xpcollect'){ if(MP.isHost) addXP(data.a); }                                  // guest collected an orb → into the shared pool
+  else if(data.type === 'xppool'){ if(mpIsGuest()){ xpState.current = data.cur; xpState.level = data.lvl; updateXPHud(); } }   // sync the shared XP bar
+  else if(data.type === 'levelup'){ if(mpIsGuest()) gameSkills.pending += data.n; }                    // shared pool leveled → guest picks at the same time
 }
 function mpApplyRespawn(d){
   var ship = gameMode.ship; if(!ship) return;
@@ -17434,9 +17496,9 @@ function mpMirrorEbulletMesh(spiral){
 function mpMirrorPbulletMesh(big, owner){
   var sz = big ? 0.008 : 0.004;
   var col = owner === 1 ? 0x66e0ff : (big ? 0xff7adf : 0xc9a3ff);   // guest = teal, host = purple
-  var mesh = new THREE.Mesh(new THREE.SphereGeometry(sz, 8, 6), new THREE.MeshBasicMaterial({ color: col }));
+  var mesh = new THREE.Mesh(sharedBulletGeo(sz), sharedBulletMat(col));
   mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: owner === 1 ? 0x9af0ff : 0xb98cff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+  var glow = new THREE.Sprite(sharedBulletGlow(owner === 1 ? 0x9af0ff : 0xb98cff, 0.85));
   glow.scale.set(big ? 0.05 : 0.022, big ? 0.05 : 0.022, 1); mesh.add(glow); scene.add(mesh); return mesh;
 }
 // ── Guest: reconcile mirrors from a snapshot (create / update-target / remove) ──
@@ -17446,10 +17508,10 @@ function mpApplyWorld(w){
   // tanks
   for(i = 0; i < w.e.length; i++){ row = w.e[i]; id = row[0]; seenE[id] = 1;
     m = MP.mirror.e[id];
-    if(!m){ m = buildTank(); scene.add(m); m.userData.hpBarEl = mpMakeBar(); m.userData.hpFillEl = m.userData.hpBarEl.firstChild; MP.mirror.e[id] = m; }
+    if(!m){ m = buildTank(); scene.add(m); m.userData.hpBarEl = mpMakeBar(); m.userData.hpFillEl = m.userData.hpBarEl.firstChild; m.userData.topOffset = 0.055 * TANK_SCALE; MP.mirror.e[id] = m; }
     m.userData._tp = new THREE.Vector3(row[1], row[2], row[3]);
     m.userData._tq = new THREE.Quaternion(row[4], row[5], row[6], row[7]);
-    m.userData.hp = row[8]; m.userData.maxHp = row[9];
+    m.userData.hp = row[8]; m.userData.maxHp = row[9]; m.userData.building = row[10];   // building → lock/reticle aware
     m.userData.normal = new THREE.Vector3(row[11], row[12], row[13]);
     m.scale.setScalar(TANK_SCALE * (row[10] > 0 ? 0.4 : 1));   // shrunk while building
   }
@@ -17457,9 +17519,10 @@ function mpApplyWorld(w){
   // balls
   for(i = 0; i < w.b.length; i++){ row = w.b[i]; id = row[0]; seenB[id] = 1;
     m = MP.mirror.b[id];
-    if(!m){ m = buildBall(); MP.mirror.b[id] = m; }
+    if(!m){ m = buildBall(); m.userData.topOffset = BALL_RADIUS + 0.03; MP.mirror.b[id] = m; }
     m.userData._tp = new THREE.Vector3(row[1], row[2], row[3]);
     m.userData._tq = new THREE.Quaternion(row[4], row[5], row[6], row[7]);
+    m.userData.normal = new THREE.Vector3(row[9], row[10], row[11]);   // lock reticle floats along this
     m.scale.setScalar(row[12] > 0 ? 0.3 : 1);
   }
   for(id in MP.mirror.b){ if(!seenB[id]){ scene.remove(MP.mirror.b[id]); delete MP.mirror.b[id]; } }
@@ -17515,7 +17578,7 @@ function mpUpdateMirrorBars(){
   for(var id in MP.mirror.e){
     var t = MP.mirror.e[id], u = t.userData; if(!u.hpBarEl) continue;
     var n = u.normal || new THREE.Vector3(0, 1, 0);
-    var bp = t.position.clone().addScaledVector(n, 0.16).project(camera);
+    var bp = _barV3.copy(t.position).addScaledVector(n, 0.16).project(camera);
     if(bp.z > 1){ u.hpBarEl.style.display = 'none'; continue; }
     u.hpBarEl.style.display = 'block';
     u.hpBarEl.style.left = ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
@@ -17529,7 +17592,9 @@ function mpGuestCombat(dt){
   showCombatHUD(true);
   mpInterpolateWorld();
   mpUpdateMirrorBars();   // enemy HP bars over the mirrored tanks
-  updateXPOrbs();         // the guest's own XP orbs (spawned from shared-kill events) magnet + collect
+  relock();               // lock-on: re-acquire the nearest mirror if the locked one died
+  updateLockReticle();    // project the reticle onto the locked mirror
+  updateXPOrbs();         // the guest's own (client-side) XP orbs magnet + collect → forwarded to the shared pool
   updateDamageNumbers();
   // reflect HP bar + damage counter + wave banner from the latest snapshot
   if(combat.hpFillEl){ combat.hpFillEl.style.width = Math.max(0, combat.player.hp / combat.player.maxHp * 100) + '%';
@@ -17574,9 +17639,9 @@ function mpHostSpawnGuestVolley(d){
     var vel = dr.clone().multiplyScalar(0.18).add(sv);
     var dmg = PLAYER_BULLET_DAMAGE * (sk.big ? 3.5 : 1) * (1 + 0.5 * (sk.vel || 0));
     var szb = sk.big ? 0.008 : 0.004;
-    var mesh = new THREE.Mesh(new THREE.SphereGeometry(szb, 8, 6), new THREE.MeshBasicMaterial({ color: 0x66e0ff }));
+    var mesh = new THREE.Mesh(sharedBulletGeo(szb), sharedBulletMat(0x66e0ff));
     mesh.position.copy(orig); mesh.frustumCulled = false; mesh.renderOrder = 5;
-    var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0x9af0ff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+    var glow = new THREE.Sprite(sharedBulletGlow(0x9af0ff, 0.85));
     glow.scale.set(sk.big ? 0.05 : 0.022, sk.big ? 0.05 : 0.022, 1); mesh.add(glow); scene.add(mesh);
     gameBullets.push({ mesh: mesh, vel: vel, life: 0, maxLife: sk.orbit ? 240 : 90, dmg: dmg, big: !!sk.big, homing: !!sk.track, split: sk.split || 0,
       orbit: (sk.orbit > 0) ? { stacks: sk.orbit, phase: 'seek', target: null, angle: 0, ttl: 0 } : null, owner: 1 });
