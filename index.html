@@ -30,6 +30,7 @@ body { font-family: Arial, sans-serif; background:#0a0a0a; overflow-x: hidden; h
 <script defer src="https://sdks.shopifycdn.com/buy-button/latest/buy-button-storefront.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/objects/Lensflare.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 // ══════════════════════════════════════════════
 // PRODUCT DATA
@@ -703,7 +704,7 @@ var gameMode = {
     camBackDist: 0.45,
     camUpDist: 0.15
   },
-  keys: {w:false, a:false, s:false, d:false, shift:false, q:false, e:false, space:false, ctrl:false},
+  keys: {w:false, a:false, s:false, d:false, shift:false, q:false, e:false, space:false, ctrl:false, charge:false},
   // Camera state (saved on entry, restored on exit)
   savedCamPos: new THREE.Vector3(),
   savedCamQuat: new THREE.Quaternion(),
@@ -714,6 +715,11 @@ var gameMode = {
   // Chase camera offsets — in tangent frame, scaled for planet
   camBackDist: 0.12,
   camUpDist: 0.05,
+  // Camera zoom (scroll wheel / two-finger pinch). 1 = default chase; larger pulls the camera
+  // back, and past CAM_ZOOM_TOPDOWN_START it tilts toward a straight-overhead survey view.
+  // Reset to 1 on game entry.
+  camZoom: 1,
+  camPinch: { active: false, startDist: 0, startZoom: 1 },
   // Touch joystick — single-finger drag from touch origin.
   // Vertical drag = throttle (up = faster forward), horizontal drag = yaw (left/right turn).
   // Full upward swipe past 50% of screen height engages boost.
@@ -3607,6 +3613,16 @@ function onMU(e){pUp(e.clientX,e.clientY);}
 var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null, startX:0, startY:0, startTime:0, scrollMomentum:0 }; // locked: null,'scroll','wheel','vwheel'
 function onTS(e){
   e.preventDefault();
+  // Mini-game: two fingers → pinch-zoom the chase camera (spread = in, pinch = out → top-down).
+  if(gameMode.active && !gameMode.exiting && e.touches.length === 2){
+    var pdx = e.touches[1].clientX - e.touches[0].clientX, pdy = e.touches[1].clientY - e.touches[0].clientY;
+    gameMode.camPinch.active = true;
+    gameMode.camPinch.startDist = Math.sqrt(pdx*pdx + pdy*pdy) || 1;
+    gameMode.camPinch.startZoom = gameMode.camZoom;
+    // release the joystick so the ship coasts while zooming
+    gameMode.touch.active = false; gameMode.touch.throttle = 0; gameMode.touch.yaw = 0; gameMode.touch.boost = false;
+    return;
+  }
   // Mini-game touch joystick — first finger becomes the joystick origin
   if(gameMode.active && !gameMode.exiting && e.touches.length === 1){
     // Tapping a game UI element (menu/cart icon or an open window) routes to the
@@ -3705,6 +3721,14 @@ function onTS(e){
 }
 function onTM(e){
   e.preventDefault();
+  // Mini-game: two-finger pinch drives the chase-camera zoom.
+  if(gameMode.active && gameMode.camPinch.active && e.touches.length === 2){
+    var pdx = e.touches[1].clientX - e.touches[0].clientX, pdy = e.touches[1].clientY - e.touches[0].clientY;
+    var pdist = Math.sqrt(pdx*pdx + pdy*pdy) || 1;
+    // spread fingers (dist↑) → zoom in (camZoom↓); pinch together (dist↓) → zoom out → top-down
+    gameMode.camZoom = Math.max(CAM_ZOOM_MIN, Math.min(CAM_ZOOM_MAX, gameMode.camPinch.startZoom * (gameMode.camPinch.startDist / pdist)));
+    return;
+  }
   // In-game UI touch (window drag / button) — route to pointer move
   if(gameMode.active && gameMode.touch.uiTouch){
     if(e.touches.length === 1) pMove(e.touches[0].clientX, e.touches[0].clientY);
@@ -3897,6 +3921,8 @@ function onTM(e){
   }
 }
 function onTE(e){
+  // Mini-game: end the pinch-zoom once a finger lifts (under two fingers).
+  if(gameMode.camPinch && gameMode.camPinch.active && e.touches.length < 2){ gameMode.camPinch.active = false; }
   // In-game UI touch release — route to pointer up (handles taps + window drag end)
   if(gameMode.active && gameMode.touch.uiTouch){
     gameMode.touch.uiTouch = false;
@@ -7788,6 +7814,9 @@ function buildOptionsContent(win){
   var flyBtn = gameUIButton(W*0.72, rowH, 'FLIGHT MODE: ' + (gameMode.fly.active ? 'ON' : 'OFF'), 'opt-fly', 0.46);
   flyBtn.position.set(0, y, 0.02); win.content.add(flyBtn); y -= rowH + gap;
 
+  var mpBtn = gameUIButton(W*0.72, rowH, (MP.connected ? 'CO-OP: ' + (MP.isHost ? 'HOSTING' : 'CONNECTED') : 'CO-OP MULTIPLAYER'), 'opt-mp', 0.46);
+  mpBtn.position.set(0, y, 0.02); win.content.add(mpBtn); y -= rowH + gap;
+
   var exitBtn = gameUIButton(W*0.72, rowH, 'EXIT GAME', 'opt-exit', 0.5);
   exitBtn.position.set(0, y, 0.02); win.content.add(exitBtn);
 
@@ -7840,6 +7869,7 @@ function handleGameOption(actionId){
   else if(actionId === 'opt-sfx-inc')   sfx.sfxVol   = Math.min(1, Math.round((sfx.sfxVol   + 0.1) * 10) / 10);
   else if(actionId === 'opt-joy')      gameMode.joystickEnabled = (gameMode.joystickEnabled === false);
   else if(actionId === 'opt-fly')      toggleFlightMode();
+  else if(actionId === 'opt-mp'){ closeGameWindow(gameUI.options); mpOpenLobby(); return; }   // co-op lobby (DOM overlay)
   else if(actionId === 'opt-exit'){ closeGameWindow(gameUI.options); closeGameWindow(gameUI.inventory); exitGameMode(); return; }
   if(gameUI.options && gameUI.options.open) buildOptionsContent(gameUI.options);
 }
@@ -7901,7 +7931,7 @@ function handleGameUIClick(){
   }
   // Icons toggle their window
   if(navMenu.glassMesh && raycaster.intersectObject(navMenu.glassMesh).length > 0){ toggleGameWindow('options'); return true; }
-  if(cart.glassMesh && raycaster.intersectObject(cart.glassMesh).length > 0){ toggleGameWindow('inventory'); return true; }
+  if(cart.glassMesh && raycaster.intersectObject(cart.glassMesh).length > 0){ openSkillManager(); return true; }   // inventory icon → loadout/skill editor
   return false;
 }
 
@@ -12333,6 +12363,13 @@ function enterGameMode() {
   if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
   if(PORTAL_TEST_MODE){ enterPortalTestMode(); return; }   // TEMP: jump straight into the flat portal sandbox
   if(!gameMode.group) buildGameMode();
+  // Skills: grant the starter (Boost Charge) on first entry, then (re)build companion meshes +
+  // monster-truck wheels for whatever the player already has, and show the equipped-skill HUD.
+  if(!gameSkills._init){ gameSkills._init = true; gameSkills.equipped.push('boostCharge'); }
+  applyGameUpgrades();
+  showSkillHud(true);
+  updateGodModeHud();   // re-show the IMMORTAL badge if it was left on
+  gameMode.camZoom = 1; gameMode.camPinch.active = false;   // start at the default chase zoom
   // Warm up the boost-trail meshes NOW (under the entry animation) so the first boost press
   // doesn't hitch building geometry + compiling shaders. renderer.compile pre-links the new
   // shader programs; cached ones are skipped.
@@ -12895,6 +12932,14 @@ function exitGameMode() {
   }
   gameMode.exiting = true;
   gameMode.exitProg = 0;
+  // Skills: tear down transient meshes (companions, drift fire, stomp rings) + hide the HUD.
+  // Equipped skills persist for the session and rebuild on re-entry via applyGameUpgrades.
+  clearSkillSystems();
+  if(skillMenu && skillMenu.open){ skillMenu.open = false; if(skillMenu.el) skillMenu.el.style.display = 'none'; }
+  closeSkillManager();
+  showSkillHud(false);
+  updateGodModeHud();   // hide the IMMORTAL badge while out of the game
+  mpHideRemote(); mpClearFx(); mpClearWorld(); mpUpdateBadge();   // hide the partner ship + FX + mirrored world + badge
   // Clear key state so nothing sticks after exit
   var k = gameMode.keys;
   k.w = k.a = k.s = k.d = k.shift = k.q = k.e = k.space = k.ctrl = false;
@@ -12993,6 +13038,9 @@ function killGalleryEffects(gf) {
   }
 }
 
+// Camera-zoom tuning (scroll wheel / pinch). Zoom out past TOPDOWN_START eases to overhead at END.
+var CAM_ZOOM_MIN = 0.6, CAM_ZOOM_MAX = 7.0;
+var CAM_ZOOM_TOPDOWN_START = 2.4, CAM_ZOOM_TOPDOWN_END = 4.0;   // full top-down at 4×; 4×→7× keeps rising higher
 function computeChaseCamPose() {
   // Returns {pos, lookAt, up} for the chase camera.
   //
@@ -13008,9 +13056,23 @@ function computeChaseCamPose() {
   var s = gameMode.surfaceState;
   var up = s.groundNormal.clone();
   var S = gameMode.ship.position.clone();
-  var d = gameMode.camBackDist, h = gameMode.camUpDist;
+  var z = gameMode.camZoom || 1;                       // scroll/pinch zoom — pulls the camera back
+  var d = gameMode.camBackDist * z, h = gameMode.camUpDist * z;
   var F = s.forward;
   var driftA = s.driftAngle || 0;
+  // Top-down survey blend: as zoom passes CAM_ZOOM_TOPDOWN_START, ease the pose from the chase
+  // angle to straight-overhead (camera above the ship, looking down, ship-forward = screen-up).
+  function topDownBlend(pose){
+    var zt = (z - CAM_ZOOM_TOPDOWN_START) / (CAM_ZOOM_TOPDOWN_END - CAM_ZOOM_TOPDOWN_START);
+    zt = Math.max(0, Math.min(1, zt));
+    if(zt <= 0) return pose;
+    zt = zt * zt * (3 - 2 * zt);                        // smoothstep
+    var Htop = gameMode.camBackDist * z * 1.8;          // overhead height grows with zoom (keeps rising past 4×)
+    pose.pos.lerp(S.clone().addScaledVector(up, Htop), zt);
+    pose.lookAt.lerp(S.clone(), zt);
+    pose.up.lerp(F.clone(), zt); if(pose.up.lengthSq() > 1e-9) pose.up.normalize();
+    return pose;
+  }
 
   // ── Non-drift (default chase) pose ──
   var posN = S.clone().addScaledVector(F, -d).addScaledVector(up, h);
@@ -13025,7 +13087,7 @@ function computeChaseCamPose() {
   if(b < 0.0008) b = 0;
   gameMode._driftCamBlend = b;
   if(b <= 0.0008){
-    return { pos: posN, lookAt: lookN, up: up };
+    return topDownBlend({ pos: posN, lookAt: lookN, up: up });
   }
 
   // ── Drift pose ── centre on the firing direction M; the ship is placed at a fixed SCREEN spot
@@ -13069,14 +13131,14 @@ function computeChaseCamPose() {
   var lookAt = lookN.lerp(lookD, b);
   var outUp = up.lerp(upD, b);
   if(outUp.lengthSq() > 1e-9) outUp.normalize();
-  return { pos: pos, lookAt: lookAt, up: outUp };
+  return topDownBlend({ pos: pos, lookAt: lookAt, up: outUp });
 }
 
 // Live-gameplay chase pose: the Souls-like LOCK-ON framing when a target is locked, else the
 // normal chase/drift pose. (Entry/exit transitions call computeChaseCamPose directly so they're
 // never affected by a lock.)
 function gameCamPose(){
-  if(typeof combat !== 'undefined' && combat.lockTarget && combat.enemies.indexOf(combat.lockTarget) >= 0){
+  if(typeof combat !== 'undefined' && typeof lockTargetValid === 'function' && lockTargetValid()){
     return computeLockCamPose(combat.lockTarget);
   }
   return computeChaseCamPose();
@@ -13092,9 +13154,10 @@ function computeLockCamPose(target){
   var flat = toEnemy.clone().addScaledVector(up, -toEnemy.dot(up));   // enemy dir along the surface
   if(flat.lengthSq() > 1e-8) flat.normalize(); else flat.copy(s.forward);
   // pull back + up a little more than the default chase so both ship and enemy sit in frame
+  var z = gameMode.camZoom || 1;
   var pos = S.clone()
-    .addScaledVector(flat, -gameMode.camBackDist * 1.5)
-    .addScaledVector(up, gameMode.camUpDist * 1.8);
+    .addScaledVector(flat, -gameMode.camBackDist * 1.5 * z)
+    .addScaledVector(up, gameMode.camUpDist * 1.8 * z);
   // look at ≈ the midpoint between ship and enemy, lifted slightly off the surface
   var lookAt = S.clone().addScaledVector(toEnemy, 0.5).addScaledVector(up, 0.02);
   return { pos: pos, lookAt: lookAt, up: up };
@@ -13278,6 +13341,7 @@ function animateGameTransition() {
 // ══════════════════════════════════════════════
 function updateGamePhysicsAndCamera() {
   if(!gameMode.active) return;
+  if(skillMenuOpen()) return;   // level-up skill picker pauses the game
   if(gameMode.fly.active) { updateFlightPhysicsAndCamera(); return; }
 
   var p = gameMode.physics;
@@ -13310,42 +13374,10 @@ function updateGamePhysicsAndCamera() {
   var speedMetric = Math.max(Math.abs(s.speed), fly.vel.length());
   s.running = p.isBoosting || speedMetric > p.maxSpeed * (10/15);   // running (drift/flip) gate = 10 km/h
   updateSpeedCounter(speedMetric);
+  updateBoostCharge();   // Boost Charge: hold CTRL (still) to charge, release to blast forward
 
-  // === Jump trigger → clean vertical HOP (land-locked) ===
-  // A normal jump is a predictable hop straight up off the current facet along a
-  // takeoff axis locked to the surface normal — NOT a launch into gravity-well
-  // free-fall. The hop branch below integrates it and magnetically re-sticks on the
-  // way down. This restores the original good movement the gravity rewrite had
-  // overwritten. (You still reach free-fall by launching fast off a ramp/edge or
-  // toggling P-flight — see the detachment logic in the grounded + airborne blocks.)
-  if(gameMode.wantJump){
-    gameMode.wantJump = false;
-    if(!s.airborne){
-      s.airborne = true;
-      s.freeFalling = false;
-      s.vertVel = p.jumpImpulse;
-      s.airTime = 0;
-      s.jumpAxis.copy(s.groundNormal).normalize();
-      // Cancel drift so the hop doesn't carry a sideways roll
-      s.isDrifting = false;
-      s.driftDirection = 0;
-      s.driftTargetAngle = 0;
-      s.driftTime = 0;
-      // ── Jump barrel-roll combo ──
-      // If a turn key is held — or was tapped within jumpRollWindow ms before this jump —
-      // immediately barrel roll in that direction (A = +1 / left, D = -1 / right). Both
-      // hot → whichever was pressed most recently wins. Now that we're airborne the roll
-      // fires instantly off the hop, so the ship jumps and spins in one motion.
-      var nowJ = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-      var aHot = gameMode.keys.a || (nowJ - gameMode.lastATime) < gameMode.jumpRollWindow;
-      var dHot = gameMode.keys.d || (nowJ - gameMode.lastDTime) < gameMode.jumpRollWindow;
-      var rollDir = 0;
-      if(aHot && dHot) rollDir = (gameMode.lastATime >= gameMode.lastDTime) ? 1 : -1;
-      else if(aHot) rollDir = 1;
-      else if(dHot) rollDir = -1;
-      if(rollDir !== 0) triggerBarrelRoll(rollDir);
-    }
-  }
+  // === Jump trigger → clean vertical HOP, or a +1 Jump air re-jump (handled in tryGameJump) ===
+  if(gameMode.wantJump){ gameMode.wantJump = false; tryGameJump(); }
 
   // ═══════════════════════════════════════════════
   // LAND-LOCKED — grounded OR mid-hop. Runs the full surface-movement path
@@ -13377,7 +13409,8 @@ function updateGamePhysicsAndCamera() {
       s.isDrifting = true;
       s.driftTime += 1;
       s.driftDirection = wantsDriftLeft ? 1 : -1;
-      s.driftTargetAngle = s.driftDirection * (Math.PI * 0.5);
+      // Gauge Drift: ramp the angle up with hold (tap = small, hold = full 90°) instead of snapping.
+      s.driftTargetAngle = s.driftDirection * (p.hasGaugeDrift ? Math.min(s.driftTime * GAUGE_DRIFT_RATE, Math.PI * 0.5) : (Math.PI * 0.5));
       spawnGameDriftParticles();
       spawnDriftTrench();
     } else {
@@ -13404,7 +13437,8 @@ function updateGamePhysicsAndCamera() {
     if(!(fwdAxis < -0.01 && s.speed > 0.0005)) s.brakeTime = 0;
 
     if(s.isDrifting) {
-      if(s.driftTime <= p.driftSustainTime) {
+      // Zero Friction Drift: always hold the entry momentum (never decay) → drift forever.
+      if(p.hasZeroFriction || s.driftTime <= p.driftSustainTime) {
         // Hold the entry momentum — a fresh drift must NEVER bleed speed, even coming in at
         // top speed. (Previously entering a drift fast could settle you into a slower glide.)
         var driftSign = s.speed < 0 ? -1 : 1;
@@ -13494,7 +13528,7 @@ function updateGamePhysicsAndCamera() {
       // ── HOP (clean, predictable): rise/fall along the locked takeoff axis with a
       //    gentle constant gravity, so you fall slowly enough to line up a landing,
       //    a barrel roll, or a downward slam. No gravity wells in a normal jump. ──
-      s.vertVel -= p.jumpGravity;
+      s.vertVel -= gameJumpGravity();   // Hover near-zeroes gravity while holding SPACE airborne
       ship.position.addScaledVector(s.jumpAxis, s.vertVel);
       s.airTime += 1;
       if(s.barrelRoll.active){
@@ -13797,6 +13831,7 @@ function updateGamePhysicsAndCamera() {
 // hands control back to surface mode (gravity returns), and the ship
 // keeps its current position — no teleport.
 function updateFlightPhysicsAndCamera() {
+  if(skillMenuOpen()) return;   // level-up skill picker pauses the game
   var k = gameMode.keys;
   var t = gameMode.touch;
   var fly = gameMode.fly;
@@ -13886,10 +13921,13 @@ function updateFlightPhysicsAndCamera() {
 //   - PIXEL  (~45%): tiny additive-blended cube — the visible "sparks"
 //   - STREAK (~40%): short-to-medium tapered cylinder pointing along velocity
 //   - STRING (~15%): rare long streak that trails far behind for visual punch
-function spawnGameDriftParticles() {
+function spawnGameDriftParticles(ctx) {
   var s = gameMode.surfaceState;
-  if(!s.isDrifting || gameMode.fly.active) return;
   var ship = gameMode.ship;
+  // Optional ship-context (the multiplayer partner) reuses the exact same drift sparks.
+  var drifting = s.isDrifting, dSpeed = s.speed, dDir = s.driftDirection, flyGuard = gameMode.fly.active;
+  if(ctx){ ship = ctx.ship; drifting = true; dSpeed = (ctx.speed != null ? ctx.speed : gameMode.physics.maxSpeed); dDir = (ctx.dir != null ? ctx.dir : 1); flyGuard = false; }
+  if(!drifting || flyGuard) return;
   if(!gameMode.driftFx.material) {
     // Additive blending so particles read as glowing sparks, not solid orange dots.
     gameMode.driftFx.material = new THREE.MeshBasicMaterial({
@@ -13903,7 +13941,7 @@ function spawnGameDriftParticles() {
   var shipRight = new THREE.Vector3(1, 0, 0).applyQuaternion(ship.quaternion);
   var shipBack  = new THREE.Vector3(0, 0, -1).applyQuaternion(ship.quaternion);
   // Spawn count scales with drift speed — pixels fly off faster drifts
-  var spdRatio = Math.min(1, Math.abs(s.speed) / gameMode.physics.maxSpeed);
+  var spdRatio = Math.min(1, Math.abs(dSpeed) / gameMode.physics.maxSpeed);
   var count = 4 + Math.floor(Math.random() * 5 * spdRatio);
 
   for(var i = 0; i < count; i++) {
@@ -13933,14 +13971,14 @@ function spawnGameDriftParticles() {
     }
 
     // Spawn at rear inner wing — side based on drift direction
-    var wingOff = -s.driftDirection * (0.005 + Math.random() * 0.003);
+    var wingOff = -dDir * (0.005 + Math.random() * 0.003);
     particle.position.copy(ship.position)
       .add(shipBack.clone().multiplyScalar(0.006 + Math.random() * 0.005))
       .add(shipRight.clone().multiplyScalar(wingOff));
 
     // Spray mostly backward in ship space, with slight up + sideways bias
     var sprayDir = new THREE.Vector3(
-      (Math.random() - 0.5) * 0.5 + (-s.driftDirection * 0.25),
+      (Math.random() - 0.5) * 0.5 + (-dDir * 0.25),
       0.1 + Math.random() * 0.3,
       -0.7 - Math.random() * 0.4
     );
@@ -14370,45 +14408,30 @@ function gameFiringDir(){
   if(M.lengthSq() > 1e-9) M.normalize();
   return M;
 }
+// True once the chase camera has started tilting toward the top-down survey view.
+function gameInTopDown(){ return (gameMode.camZoom || 1) > CAM_ZOOM_TOPDOWN_START; }
+// Crosshair convergence aiming (bullets fly toward the camera-centre ray) is only kept WHILE
+// DRIFTING in the normal chase view — there it lines bullets up dead-centre. Everywhere else
+// (normal driving, locked-on, or top-down) it would angle bullets into the ground, so we fire
+// straight out of the ship instead. This flag also controls whether the crosshair is drawn.
+function crosshairActive(){
+  if(!gameMode.active || gameMode.exiting) return false;
+  if(typeof combat !== 'undefined' && typeof lockTargetValid === 'function' && lockTargetValid()) return false;
+  if(gameInTopDown()) return false;
+  return !!gameMode.surfaceState.isDrifting;
+}
 function fireBullet(){
   if(!gameMode.active || gameMode.exiting) return;
   var now = performance.now();
-  if(now - lastFireTime < 110) return;   // fire-rate cap (~9/s); lets you hold Enter
+  var cap = skillFx.bigBullet ? 330 : 110;   // Big Bullet = 3× slower fire; otherwise ~9/s (hold Enter)
+  if(now - lastFireTime < cap) return;
   lastFireTime = now;
-  var M = gameFiringDir();                                       // ship's nose direction → bullet ORIGIN
-  var nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
-  // The crosshair's aim point = a point on the camera's centre ray (where you're looking) at the
-  // convergence distance. The bullet flies from the ship's nose TO that point — so it always lands
-  // where the crosshair is, even though it comes out of the (drift-angled) ship. Not drifting, the
-  // ship and crosshair are aligned so it's a straight shot; drifting, it angles in to converge.
-  var dir;
-  if(typeof combat !== 'undefined' && combat.lockTarget){
-    // Locked on: there's no crosshair — bullets fly straight out the ship's nose.
-    dir = M.clone();
-  } else {
-    // Free-aim: fly from the nose toward the crosshair's convergence point on the camera centre ray.
-    var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-    var aimPoint = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST);
-    dir = aimPoint.sub(nose);
-    if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
-  }
-  // Muzzle velocity along the aim line + the SHIP'S velocity (real-life: a bullet keeps the
-  // platform's momentum). This is what makes it converge on the crosshair instead of drifting next
-  // to you when you're moving fast.
-  var BULLET_SPEED = 0.18;
-  var vel = dir.multiplyScalar(BULLET_SPEED);
-  if(gameMode._shipVel) vel.add(gameMode._shipVel);
-  if(!gameBulletMat) gameBulletMat = new THREE.MeshBasicMaterial({ color: 0xc9a3ff });   // purple core
-  var mesh = new THREE.Mesh(new THREE.SphereGeometry(0.004, 8, 6), gameBulletMat);
-  mesh.position.copy(nose);
-  mesh.frustumCulled = false; mesh.renderOrder = 5;
-  // Soft additive glow halo so the round reads as a glowing purple bolt.
-  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xb98cff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
-  glow.scale.set(0.022, 0.022, 1);
-  mesh.add(glow);
-  scene.add(mesh);
-  gameBullets.push({ mesh: mesh, vel: vel, life: 0, maxLife: 90, dmg: PLAYER_BULLET_DAMAGE });
-  sfxShoot();
+  fireOneVolley();   // the full bullet fan (Front Bullet + Diagonal + Big/Velocity/Split/Orbit/Tracking)
+  // Multi Shot: queue extra full volleys a few frames apart so they read as a rapid burst.
+  for(var m = 0; m < skillFx.multiShot; m++) skillFx.volleys.push(6 * (m + 1));
+  // Co-op guest: also tell the host to spawn these bullets authoritatively (so they damage the
+  // shared enemies). The locally-fired ones above are a prediction for instant feel.
+  if(mpIsGuest()) mpSendFireIntent();
 }
 function updateGameBullets(){
   // The ship only exists while the mini-game is built; before that there's nothing to track or fire.
@@ -14425,17 +14448,20 @@ function updateGameBullets(){
   }
   gameMode._shipPrevPos.copy(gameMode.ship.position);
 
+  if(skillMenuOpen()) return;   // skill picker pauses the game
+  updateSkillBullets();   // Multi Shot volley queue + Tracking Eye homing + Orbiting Shot orbits
   if(!gameBullets.length) return;
   for(var i = gameBullets.length - 1; i >= 0; i--){
     var b = gameBullets[i];
     b.life++;
-    b.mesh.position.add(b.vel);
-    if(b.life >= b.maxLife){ scene.remove(b.mesh); b.mesh.geometry.dispose(); gameBullets.splice(i, 1); }
+    if(!(b.orbit && b.orbit.phase === 'orbit')) b.mesh.position.add(b.vel);   // orbiting bullets are positioned by updateSkillBullets
+    if(b.life >= b.maxLife){ disposeGameBullet(b); gameBullets.splice(i, 1); }
   }
 }
 function disposeGameBullet(b){
   scene.remove(b.mesh);
   if(b.mesh.geometry) b.mesh.geometry.dispose();
+  if(b.mesh.material) b.mesh.material.dispose();   // per-bullet material (Big/Velocity/Split colours)
   // dispose the additive glow sprite's material (texture is shared, leave it)
   for(var c = 0; c < b.mesh.children.length; c++){ if(b.mesh.children[c].material) b.mesh.children[c].material.dispose(); }
 }
@@ -14464,9 +14490,12 @@ var combat = {
   damageNumbers: [],
   hpBarEl: null, hpFillEl: null, dmgCounterEl: null, flashEl: null, fireBtnEl: null,
   mouseFiring: false, touchFiring: false, enterFiring: false,
-  lockTarget: null, reticleEl: null, lockBtnEl: null,   // lock-on camera target + HUD
+  lockTarget: null, lockMode: false, reticleEl: null, lockBtnEl: null,   // lock-on camera target + mode + HUD
   // Dome wave arena: touch the floor → 5 tanks, clear them → 10 → 20 → 40 → … ; die → back to spawn.
-  arenaActive: false, wave: 0, waveSize: 0, domeSpawn: null, waveEl: null
+  arenaActive: false, wave: 0, waveSize: 0, domeSpawn: null, waveEl: null,
+  balls: [],            // rolling chaser balls — 3 spawned per tank, ram the player
+  spawnQueue: [], spawnTimer: 0,  // between-wave downtime: telegraph circles → build-up spawn
+  dying: [], xpOrbs: []  // death animations (shatter into XP) + the loose XP pickups
 };
 var CRIT_CHANCE = 0.05;
 
@@ -14536,7 +14565,8 @@ function buildTank(){
 
 // Build a tank at a surface point (pos) with the given up-normal, wire its combat state +
 // floating health bar, and register it. Used for both the crystal and the dome.
-function addTank(pos, normal, attackRadius){
+// `build` (dome waves) makes it rise/materialize from the ground before it activates.
+function addTank(pos, normal, attackRadius, build){
   var tank = buildTank();
   // Lift the (scaled) hull so it rests ON the surface rather than half-buried.
   tank.position.copy(pos).addScaledVector(normal, 0.004 * TANK_SCALE);
@@ -14569,6 +14599,15 @@ function addTank(pos, normal, attackRadius){
   document.body.appendChild(bar);
   tank.userData.hpBarEl = bar;
   tank.userData.hpFillEl = fill;
+  // Build-up materialize (dome waves): start flat on the ground + transparent, rise + fade in over
+  // TANK_BUILD_FRAMES, inactive (no firing / collision / can't be shot) until it activates.
+  if(build){
+    tank.userData.building = TANK_BUILD_FRAMES;
+    tank.userData.buildMax = TANK_BUILD_FRAMES;
+    tank.scale.set(TANK_SCALE, TANK_SCALE * 0.001, TANK_SCALE);
+    tank.traverse(function(c){ if(c.isMesh && c.material){ c.material.transparent = true; c.material.opacity = 0; } });
+  }
+  spawnBallsForTank(tank, build);   // every tank brings BALLS_PER_TANK rolling chasers
   return tank;
 }
 // Which region the fight is in — used ONLY to detect a region change (so enemies re-arm on a
@@ -14607,23 +14646,86 @@ function spawnEnemyNearPlayer(){
   return addTank(fr.pos, fr.normal, 4.0);
 }
 
-// ── Dome wave arena ──
-// Spawn `n` tanks scattered across the dome floor (snapped to the dome surface).
-function spawnWaveDome(n){
+// ── Dome wave arena ── waves don't pop in instantly: a glowing red circle telegraphs each spawn
+// point on the floor, there's a downtime (5s between rounds), then the tanks RISE/build up from
+// the ground and activate.
+var WAVE_DOWNTIME = 300;       // ~5s between a cleared wave and the next one spawning
+var WAVE1_DELAY = 90;          // shorter lead-in for the very first wave (~1.5s)
+var TANK_BUILD_FRAMES = 54;    // rise/materialize time (~0.9s)
+var BALL_BUILD_FRAMES = 42;
+// A glowing red circle on the ground (filled glow disc + bright ring outline) marking an incoming
+// spawn. Stays clearly lit the whole countdown and intensifies as the spawn approaches.
+function makeSpawnRing(pos, normal){
+  var grp = new THREE.Group();
+  var disc = new THREE.Mesh(new THREE.CircleGeometry(0.26, 40),
+    new THREE.MeshBasicMaterial({ color: 0xff2222, transparent: true, opacity: 0.5, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  var ring = new THREE.Mesh(new THREE.RingGeometry(0.235, 0.275, 40),
+    new THREE.MeshBasicMaterial({ color: 0xff6666, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  ring.position.z = 0.0005;
+  grp.add(disc); grp.add(ring);
+  grp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize());
+  grp.position.copy(pos).addScaledVector(normal, 0.004);
+  grp.renderOrder = 4;
+  grp.userData = { disc: disc, ring: ring };
+  scene.add(grp);
+  return grp;
+}
+function disposeRing(ring){
+  if(!ring) return;
+  scene.remove(ring);
+  ring.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); });
+}
+// Pick `n` dome-floor spawn points, drop a telegraph circle at each, and arm the spawn timer.
+function beginWaveSpawn(n, delay){
   var P = gameMode.portal;
   for(var i = 0; i < n; i++){
-    var a = Math.random() * Math.PI * 2;
-    var r = 0.25 + Math.random() * (P.domeR * 0.72);
+    var a = Math.random() * Math.PI * 2, r = 0.25 + Math.random() * (P.domeR * 0.72);
     var base = new THREE.Vector3(P.DX + Math.cos(a) * r, P.domeFloorY + 0.05, P.domeCz + Math.sin(a) * r);
     var cp = (typeof closestPointOnDome === 'function') ? closestPointOnDome(base) : null;
-    addTank(cp ? cp.point.clone() : base, cp ? cp.normal.clone() : new THREE.Vector3(0, 1, 0), 6.0);
+    var pos = cp ? cp.point.clone() : base, nrm = cp ? cp.normal.clone() : new THREE.Vector3(0, 1, 0);
+    combat.spawnQueue.push({ pos: pos, normal: nrm, ring: makeSpawnRing(pos, nrm) });
+  }
+  combat.spawnTimer = delay;
+}
+function updateSpawnTelegraph(){
+  var t = performance.now() * 0.001;
+  var speed = combat.spawnTimer < 45 ? 16 : 7;                 // pulse faster as the spawn nears
+  var pulse = 0.5 + 0.5 * Math.sin(t * speed);
+  var urgency = combat.spawnTimer < 60 ? (1 - combat.spawnTimer / 60) : 0;   // ramps up over the last second
+  for(var i = 0; i < combat.spawnQueue.length; i++){
+    var ring = combat.spawnQueue[i].ring; if(!ring || !ring.userData) continue;
+    ring.userData.disc.material.opacity = 0.4 + 0.25 * pulse + urgency * 0.3;
+    ring.userData.ring.material.opacity = 0.6 + 0.3 * pulse + urgency * 0.4;
+    ring.scale.setScalar(0.92 + 0.08 * pulse + urgency * 0.18);
   }
 }
+// Timer elapsed → remove the telegraph circles and spawn the tanks with their build-up animation.
+function commitWaveSpawn(){
+  for(var i = 0; i < combat.spawnQueue.length; i++){
+    var q = combat.spawnQueue[i];
+    disposeRing(q.ring);
+    addTank(q.pos, q.normal, 6.0, true);   // build=true → rises from the ground
+  }
+  combat.spawnQueue.length = 0;
+}
+function clearSpawnQueue(){
+  for(var i = 0; i < combat.spawnQueue.length; i++){
+    disposeRing(combat.spawnQueue[i].ring);
+  }
+  combat.spawnQueue.length = 0; combat.spawnTimer = 0;
+}
 // Run the dome arena: first floor-touch starts wave 1 (1 tank); clearing a wave adds one more
-// (1→2→3→4→5→…). Death is handled in updateCombat (back to spawn + restart at wave 1).
+// (1→2→3→4→5→…), after a downtime. Death is handled in updateCombat (back to spawn + restart).
 function updateDomeArena(){
   var P = gameMode.portal, s = gameMode.surfaceState, ship = gameMode.ship;
   if(combat.player.dead) return;   // mid-death; the respawn logic in updateCombat handles reset
+  // Downtime + telegraph → spawn the queued wave when the timer runs out.
+  if(combat.spawnTimer > 0){
+    combat.spawnTimer--;
+    updateSpawnTelegraph();
+    if(combat.spawnTimer <= 0) commitWaveSpawn();
+    return;
+  }
   var grounded = !s.airborne && !s.freeFalling;
   var nearFloor = ship.position.y < P.domeFloorY + 0.5;   // actually down on the dome floor, not the chute
   if(!combat.arenaActive){
@@ -14631,17 +14733,20 @@ function updateDomeArena(){
       combat.arenaActive = true;
       combat.wave = 1; combat.waveSize = 1;
       combat.domeSpawn = ship.position.clone();   // where to send the player back to on death
-      spawnWaveDome(combat.waveSize);
+      beginWaveSpawn(combat.waveSize, WAVE1_DELAY);
     }
-  } else if(combat.enemies.length === 0){
-    // Wave cleared → next wave, one more tank than last (1→2→3→4→5→…).
+  } else if(combat.enemies.length === 0 && combat.spawnQueue.length === 0){
+    // Wave cleared → wait out the downtime, then telegraph + build the next (one bigger) wave.
     combat.wave++; combat.waveSize = combat.wave;
-    spawnWaveDome(combat.waveSize);
+    beginWaveSpawn(combat.waveSize, WAVE_DOWNTIME);
   }
 }
 function resetDomeArena(){
   for(var i = 0; i < combat.enemies.length; i++) disposeTank(combat.enemies[i]);
   combat.enemies.length = 0;
+  clearBalls();
+  clearSpawnQueue();
+  clearDying(); clearXPOrbs();   // wipe in-flight death FX + loose orbs (XP/level itself persists)
   combat.arenaActive = false; combat.wave = 0; combat.waveSize = 0;
 }
 
@@ -14649,6 +14754,315 @@ function disposeTank(tank){
   scene.remove(tank);
   tank.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); });
   if(tank.userData.hpBarEl) tank.userData.hpBarEl.remove();
+  // Kill this tank's rolling balls too.
+  for(var bi = combat.balls.length - 1; bi >= 0; bi--){
+    if(combat.balls[bi].tank === tank){ disposeBall(combat.balls[bi]); combat.balls.splice(bi, 1); }
+  }
+}
+
+// ── Rolling chaser balls ── a bigger-than-the-ship ball that rolls along the surface toward the
+// player and rams them (Orbicule's orbwalker, lightened for the tiny scale). 3 per tank.
+var BALL_RADIUS = 0.06;          // bigger than the ship (~0.04)
+var BALL_SPEED = 0.0048;         // roll speed — slower than the ship so you can outrun/juke it
+var BALL_ACCEL = 0.00045;        // how fast it builds toward the player
+var BALL_HP = 70;
+var BALL_DMG = 10;
+var BALL_HIT_COOLDOWN = 650;     // ms between contact-damage ticks
+var BALLS_PER_TANK = 3;
+function buildBall(){
+  if(!combat._ballGeo){
+    combat._ballGeo = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
+    combat._ballEdgeGeo = new THREE.EdgesGeometry(combat._ballGeo);
+  }
+  var mesh = new THREE.Mesh(combat._ballGeo, new THREE.MeshStandardMaterial({ color: 0x8a2f2f, roughness: 0.35, metalness: 0.55, emissive: 0x4a1010, emissiveIntensity: 0.6 }));
+  var edge = new THREE.LineSegments(combat._ballEdgeGeo, new THREE.LineBasicMaterial({ color: 0xff7a66, transparent: true, opacity: 0.6 }));
+  mesh.add(edge);
+  scene.add(mesh);
+  return mesh;
+}
+function spawnBallsForTank(tank, build){
+  var n = tank.userData.normal.clone(); if(n.lengthSq() < 1e-6) n.set(0, 1, 0); n.normalize();
+  var t1 = new THREE.Vector3(1, 0, 0); if(Math.abs(n.dot(t1)) > 0.9) t1.set(0, 0, 1);
+  var right = new THREE.Vector3().crossVectors(n, t1).normalize();
+  var fwd = new THREE.Vector3().crossVectors(right, n).normalize();
+  for(var i = 0; i < BALLS_PER_TANK; i++){
+    var ang = (i / BALLS_PER_TANK) * Math.PI * 2 + Math.random() * 0.5;
+    var off = 0.16 + Math.random() * 0.1;
+    var mesh = buildBall();
+    mesh.position.copy(tank.position)
+      .addScaledVector(right, Math.cos(ang) * off)
+      .addScaledVector(fwd, Math.sin(ang) * off)
+      .addScaledVector(n, BALL_RADIUS);
+    if(build){ mesh.scale.setScalar(0.001); mesh.material.transparent = true; mesh.material.opacity = 0; }
+    // Floating health bar (same as tanks)
+    var bar = document.createElement('div');
+    bar.style.cssText = 'position:fixed;z-index:55;width:54px;height:6px;margin-left:-27px;'
+      + 'background:rgba(40,12,12,0.85);border:1px solid rgba(0,0,0,0.5);border-radius:3px;'
+      + 'pointer-events:none;display:none;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.6);';
+    var fill = document.createElement('div');
+    fill.style.cssText = 'height:100%;width:100%;background:linear-gradient(90deg,#ff8a4a,#cc4422);border-radius:2px;';
+    bar.appendChild(fill); document.body.appendChild(bar);
+    var nrm = n.clone();
+    combat.balls.push({
+      mesh: mesh, vel: new THREE.Vector3(), normal: nrm, hp: BALL_HP, maxHp: BALL_HP, lastHit: 0, tank: tank, r: BALL_RADIUS,
+      position: mesh.position,                                  // alias → lock cam + reticle treat it like a tank
+      userData: { normal: nrm, topOffset: BALL_RADIUS + 0.03 }, // shares nrm so it tracks the live surface normal
+      hpBarEl: bar, hpFillEl: fill,
+      building: build ? BALL_BUILD_FRAMES : 0, buildMax: BALL_BUILD_FRAMES
+    });
+  }
+}
+function disposeBall(b){
+  scene.remove(b.mesh);
+  if(b.mesh.geometry !== combat._ballGeo && b.mesh.geometry) b.mesh.geometry.dispose();
+  if(b.mesh.material) b.mesh.material.dispose();
+  for(var c = 0; c < b.mesh.children.length; c++){ if(b.mesh.children[c].material) b.mesh.children[c].material.dispose(); }
+  if(b.hpBarEl) b.hpBarEl.remove();
+}
+// Roll every ball toward the player, separate balls that overlap, ram the player on contact, spin
+// to match motion, and project each ball's floating health bar. Three passes so the ball↔ball
+// push-apart sees every ball's post-move position before re-gripping them to the surface.
+function updateBalls(){
+  if(!combat.balls.length || !gameMode.ship) return;
+  var ship = gameMode.ship, now = performance.now(), balls = combat.balls;
+  var inDome = gameMode.portal && gameMode.portal.inside;
+  // ── Pass 1: build-up materialize OR steer toward the player + integrate ──
+  for(var i = 0; i < balls.length; i++){
+    var b = balls[i];
+    if(b.building > 0){
+      b.building--;
+      var bbe = 1 - b.building / b.buildMax; bbe = bbe * bbe * (3 - 2 * bbe);
+      b.mesh.scale.setScalar(Math.max(0.001, bbe));
+      if(b.mesh.material){ b.mesh.material.opacity = bbe; }
+      if(b.hpBarEl) b.hpBarEl.style.display = 'none';
+      if(b.building === 0){ b.mesh.scale.setScalar(1); if(b.mesh.material){ b.mesh.material.opacity = 1; b.mesh.material.transparent = false; } }
+      continue;   // inactive while materializing
+    }
+    var toP = mpNearestPlayer(b.mesh.position).pos.clone().sub(b.mesh.position);   // co-op: chase the nearer player
+    var flat = toP.addScaledVector(b.normal, -toP.dot(b.normal));
+    if(flat.lengthSq() > 1e-9){ flat.normalize(); b.vel.addScaledVector(flat, BALL_ACCEL); }
+    if(b.vel.length() > BALL_SPEED) b.vel.setLength(BALL_SPEED);
+    b.mesh.position.addScaledVector(b.vel, skillFx.timeScale);   // Drift Focus slows chaser balls while drifting
+  }
+  // ── Pass 2: ball↔ball collision — push overlapping pairs apart + trade their closing velocity ──
+  for(var a = 0; a < balls.length; a++){
+    for(var c2 = a + 1; c2 < balls.length; c2++){
+      var ba = balls[a], bb = balls[c2];
+      if(ba.building > 0 || bb.building > 0) continue;   // materializing balls don't collide yet
+      var dvec = ba.mesh.position.clone().sub(bb.mesh.position);
+      var dd2 = dvec.length(), minD = ba.r + bb.r;
+      if(dd2 < minD && dd2 > 1e-6){
+        var cn = dvec.multiplyScalar(1 / dd2);
+        var push = (minD - dd2) * 0.5;
+        ba.mesh.position.addScaledVector(cn, push);
+        bb.mesh.position.addScaledVector(cn, -push);
+        var va = ba.vel.dot(cn), vb = bb.vel.dot(cn);
+        if(va - vb < 0){                                   // closing → swap the normal components (damped)
+          var avg = (va + vb) * 0.5;
+          ba.vel.addScaledVector(cn, (avg - va) * 0.8);
+          bb.vel.addScaledVector(cn, (avg - vb) * 0.8);
+        }
+      }
+    }
+  }
+  // ── Pass 3: grip to surface, spin, ram the player, project the health bar ──
+  for(var k = 0; k < balls.length; k++){
+    var bk = balls[k];
+    if(bk.building > 0) continue;   // still materializing
+    var cp = inDome ? closestPointOnDome(bk.mesh.position) : closestPointOnCrystal(bk.mesh.position);
+    if(cp){
+      bk.normal.copy(cp.normal).normalize();
+      bk.mesh.position.copy(cp.point).addScaledVector(bk.normal, bk.r);
+      bk.vel.addScaledVector(bk.normal, -bk.vel.dot(bk.normal));   // keep velocity in the tangent plane
+    }
+    var sp = bk.vel.length();
+    if(sp > 1e-6){
+      var rollAxis = new THREE.Vector3().crossVectors(bk.normal, bk.vel);
+      if(rollAxis.lengthSq() > 1e-9){ rollAxis.normalize(); bk.mesh.rotateOnWorldAxis(rollAxis, sp / bk.r); }
+    }
+    var knp = mpNearestPlayer(bk.mesh.position);   // co-op: ram whichever player is closer
+    var d = bk.mesh.position.distanceTo(knp.pos);
+    if(d < bk.r + 0.02){
+      if(now - bk.lastHit > BALL_HIT_COOLDOWN){ bk.lastHit = now; if(knp.isGuest) mpHurtGuest(BALL_DMG); else hurtPlayer(BALL_DMG, bk.mesh.position); sfxBounce(bk.mesh.position); }
+      // Battering Ram: the HOST player ramming a ball at speed damages it (guest battering-ram is deferred).
+      if(!knp.isGuest && skillFx.ram > 0){
+        var rs = Math.max(Math.abs(gameMode.surfaceState.speed), gameMode.fly.vel.length());
+        if(rs > gameMode.physics.maxSpeed * 0.5 && now - (bk._ramCd || 0) > 250){
+          bk._ramCd = now;
+          var rd = 30 * skillFx.ram * (rs / gameMode.physics.maxSpeed);
+          bk.hp -= rd; combat.totalDamage += rd;
+          spawnDamageNumber(bk.mesh.position.clone().addScaledVector(bk.normal, 0.04), rd, false);
+          if(bk.hp <= 0){ killBall(bk); relock(); continue; }
+        }
+      }
+      var away = bk.mesh.position.clone().sub(knp.pos);
+      away.addScaledVector(bk.normal, -away.dot(bk.normal));
+      if(away.lengthSq() > 1e-9){ away.normalize(); bk.vel.addScaledVector(away, BALL_SPEED * 0.6); }
+    }
+    // Floating HP bar above the ball
+    if(bk.hpBarEl){
+      var bp = bk.mesh.position.clone().addScaledVector(bk.normal, bk.r + 0.03).project(camera);
+      if(bp.z > 1){ bk.hpBarEl.style.display = 'none'; }
+      else {
+        bk.hpBarEl.style.display = 'block';
+        bk.hpBarEl.style.left = ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
+        bk.hpBarEl.style.top = ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
+        bk.hpFillEl.style.width = Math.max(0, bk.hp / bk.maxHp * 100) + '%';
+      }
+    }
+  }
+}
+function clearBalls(){
+  for(var i = 0; i < combat.balls.length; i++) disposeBall(combat.balls[i]);
+  combat.balls.length = 0;
+}
+
+// ══ XP + death burst ══ (ported from Orbicule's XP system). Enemies don't just vanish — they
+// shake, glow bright yellow, then EXPLODE into XP orbs (their "shattered parts") that scatter,
+// fall to the floor, and magnet to the player. Collecting XP fills a bar + levels you up.
+var xpState = { current: 0, level: 1, base: 4, mult: 1.2, barEl: null, fillEl: null, lvlEl: null };
+var XP_ORB_R = 0.007, XP_ORB_VALUE = 0.1, XP_GRAV = 0.0006, XP_PICKUP = 0.05, XP_MAGNET = 0.32, XP_MAGNET_SPEED = 0.024, XP_MAX = 700;
+var XP_STRETCH = 2.6;   // how much an orb elongates toward the player at full magnet pull
+var TANK_XP_ORBS = 30, BALL_XP_ORBS = 8, DEATH_FRAMES = 22;
+function xpRequired(){ return Math.floor(xpState.base * Math.pow(xpState.mult, xpState.level - 1)); }  // Orbicule curve: 4, ~4, 5, 6, 8…
+function addXP(amount){
+  var before = xpState.level;
+  xpState.current += amount;
+  while(xpState.current >= xpRequired()){ xpState.current -= xpRequired(); xpState.level++; }  // overflow → multi-level
+  if(xpState.level > before) gameSkills.pending += (xpState.level - before);   // each level → one skill package (opened in animate)
+  updateXPHud();
+}
+function updateXPHud(){
+  if(!xpState.barEl) return;
+  xpState.fillEl.style.width = Math.max(0, Math.min(100, xpState.current / xpRequired() * 100)) + '%';
+  xpState.lvlEl.textContent = 'LV ' + xpState.level;
+}
+// Burst `count` XP orbs out of `pos` along the surface (gravAxis = `normal`), exploding up + out.
+// Each orb = a bright core sphere + a translucent additive glow sphere (shared geo/mats), so it
+// reads as a glowing dot at rest AND can be STRETCHED into a streak when it flows to the player.
+function spawnXPBurst(pos, normal, count){
+  // Co-op: the HOST broadcasts the burst so the guest spawns its OWN XP from the shared kill
+  // (both players progress independently). Guests don't re-broadcast (only the host owns deaths).
+  if(MP.isHost && MP.connected) mpSend({ type: 'xp', p: [pos.x, pos.y, pos.z], n: [normal.x, normal.y, normal.z], c: count });
+  if(!combat._xpGeo){
+    combat._xpGeo = new THREE.SphereGeometry(XP_ORB_R, 7, 6);
+    combat._xpGlowGeo = new THREE.SphereGeometry(XP_ORB_R * 2.0, 7, 6);
+    combat._xpMat = new THREE.MeshBasicMaterial({ color: 0xfff070 });
+    combat._xpGlowMat = new THREE.MeshBasicMaterial({ color: 0xffd844, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false });
+  }
+  var n = normal.clone(); if(n.lengthSq() < 1e-6) n.set(0, 1, 0); n.normalize();
+  var t1 = new THREE.Vector3(1, 0, 0); if(Math.abs(n.dot(t1)) > 0.9) t1.set(0, 0, 1);
+  var right = new THREE.Vector3().crossVectors(n, t1).normalize();
+  var fwd = new THREE.Vector3().crossVectors(right, n).normalize();
+  for(var i = 0; i < count; i++){
+    if(combat.xpOrbs.length >= XP_MAX) break;
+    var mesh = new THREE.Mesh(combat._xpGeo, combat._xpMat);
+    mesh.position.copy(pos);
+    var glow = new THREE.Mesh(combat._xpGlowGeo, combat._xpGlowMat);
+    mesh.add(glow);
+    mesh.frustumCulled = false; mesh.renderOrder = 5;
+    scene.add(mesh);
+    var ang = Math.random() * Math.PI * 2, spd = 0.005 + Math.random() * 0.016;
+    var vel = right.clone().multiplyScalar(Math.cos(ang) * spd).addScaledVector(fwd, Math.sin(ang) * spd).addScaledVector(n, 0.008 + Math.random() * 0.016);
+    combat.xpOrbs.push({ mesh: mesh, vel: vel, normal: n.clone(), grounded: false, life: 0, maxLife: 1400, value: XP_ORB_VALUE });
+  }
+}
+function disposeXPOrb(o){ scene.remove(o.mesh); }   // all geo/mats are shared — nothing per-orb to free
+var _xpLook = new THREE.Vector3();
+// Fly out → fall to the floor → settle (bob) → magnet to the player (stretching toward them) → collect.
+function updateXPOrbs(){
+  if(!combat.xpOrbs.length || !gameMode.ship) return;
+  var ship = gameMode.ship, inDome = gameMode.portal && gameMode.portal.inside;
+  for(var i = combat.xpOrbs.length - 1; i >= 0; i--){
+    var o = combat.xpOrbs[i];
+    o.life++;
+    if(o.life > o.maxLife){ disposeXPOrb(o); combat.xpOrbs.splice(i, 1); continue; }
+    var d = o.mesh.position.distanceTo(ship.position);
+    if(d < XP_PICKUP){ addXP(o.value); disposeXPOrb(o); combat.xpOrbs.splice(i, 1); continue; }
+    var magnet = XP_MAGNET * (1 + skillFx.xpRange);          // XP Magnet: +1× pickup range per stack
+    if(d < magnet){
+      // Smoothly suck toward the player + STRETCH along the direction of travel (Orbicule comet look):
+      // orient the orb at the player and scale it long on Z, squished on X/Y, so it reads as a streak.
+      var dir = ship.position.clone().sub(o.mesh.position); if(dir.lengthSq() > 1e-9) dir.normalize();
+      var str = 1 - d / magnet;                          // 0 at the edge → 1 at the player
+      o.mesh.position.addScaledVector(dir, XP_MAGNET_SPEED * (0.4 + str));
+      o.grounded = false;
+      var stretch = 1 + str * XP_STRETCH, squish = 1 / Math.sqrt(stretch);
+      o.mesh.lookAt(_xpLook.copy(o.mesh.position).add(dir));   // local +Z points at the player
+      o.mesh.scale.set(squish, squish, stretch);
+    } else {
+      if(o.mesh.scale.x !== 1){ o.mesh.scale.set(1, 1, 1); o.mesh.quaternion.identity(); }   // un-stretch when free
+      if(!o.grounded){
+        o.vel.addScaledVector(o.normal, -XP_GRAV);
+        o.mesh.position.add(o.vel);
+        var cp = inDome ? closestPointOnDome(o.mesh.position) : closestPointOnCrystal(o.mesh.position);
+        if(cp){
+          var h = o.mesh.position.clone().sub(cp.point).dot(cp.normal);
+          if(h <= XP_ORB_R + 0.003){ o.normal.copy(cp.normal).normalize(); o.mesh.position.copy(cp.point).addScaledVector(o.normal, XP_ORB_R); o.vel.set(0, 0, 0); o.grounded = true; }
+        }
+      } else {
+        o.mesh.position.addScaledVector(o.normal, Math.sin(o.life * 0.15) * 0.0005);   // gentle bob on the ground
+      }
+    }
+  }
+}
+function clearXPOrbs(){ for(var i = 0; i < combat.xpOrbs.length; i++) disposeXPOrb(combat.xpOrbs[i]); combat.xpOrbs.length = 0; }
+
+// Death animation: shake + glow bright yellow + swell, then shatter into XP.
+var _xpYellow = new THREE.Color(0xffee33);
+function disposeDeadMesh(mesh, isBall){
+  scene.remove(mesh);
+  mesh.traverse(function(c){
+    if(c.material) c.material.dispose();
+    if(c.geometry){
+      if(isBall && (c.geometry === combat._ballGeo || c.geometry === combat._ballEdgeGeo)) return;  // shared
+      c.geometry.dispose();
+    }
+  });
+}
+function startDeath(mesh, normal, xpCount, isBall, hpBarEl){
+  if(hpBarEl) hpBarEl.remove();
+  combat.dying.push({ mesh: mesh, normal: normal.clone(), t: 0, max: DEATH_FRAMES, xp: xpCount, isBall: isBall,
+    basePos: mesh.position.clone(), baseScale: mesh.scale.clone() });
+}
+function updateDying(){
+  for(var i = combat.dying.length - 1; i >= 0; i--){
+    var dn = combat.dying[i];
+    dn.t++;
+    var f = dn.t / dn.max;
+    var amp = (dn.isBall ? 0.05 : 0.06) * f;                            // shake grows toward the burst
+    dn.mesh.position.copy(dn.basePos);
+    dn.mesh.position.x += (Math.random() - 0.5) * amp;
+    dn.mesh.position.y += (Math.random() - 0.5) * amp;
+    dn.mesh.position.z += (Math.random() - 0.5) * amp;
+    dn.mesh.traverse(function(c){                                        // glow bright yellow
+      if(c.material){
+        if(c.material.emissive){ c.material.emissive.copy(_xpYellow); c.material.emissiveIntensity = 0.5 + f * 5; }
+        if(c.material.color){ c.material.color.lerp(_xpYellow, 0.25); }
+      }
+    });
+    dn.mesh.scale.copy(dn.baseScale).multiplyScalar(1 + f * 0.5);        // swell
+    if(dn.t >= dn.max){                                                  // EXPLODE → XP shards
+      spawnXPBurst(dn.basePos, dn.normal, dn.xp);
+      disposeDeadMesh(dn.mesh, dn.isBall);
+      combat.dying.splice(i, 1);
+    }
+  }
+}
+function clearDying(){ for(var i = 0; i < combat.dying.length; i++) disposeDeadMesh(combat.dying[i].mesh, combat.dying[i].isBall); combat.dying.length = 0; }
+
+// Kill a tank/ball → remove from its array (+ a tank's balls), play the death animation. Used for
+// player-bullet kills; the instant disposeTank/disposeBall path (region clears) skips the animation.
+function killTank(tank){
+  var idx = combat.enemies.indexOf(tank); if(idx >= 0) combat.enemies.splice(idx, 1);
+  for(var bi = combat.balls.length - 1; bi >= 0; bi--){ if(combat.balls[bi].tank === tank) killBall(combat.balls[bi]); }
+  sfxEnemyDies(tank.position);
+  startDeath(tank, tank.userData.normal, TANK_XP_ORBS, false, tank.userData.hpBarEl);
+}
+function killBall(ball){
+  var bi = combat.balls.indexOf(ball); if(bi >= 0) combat.balls.splice(bi, 1);
+  sfxEnemyDies(ball.mesh.position);
+  startDeath(ball.mesh, ball.normal, BALL_XP_ORBS, true, ball.hpBarEl);
 }
 
 // Ship ↔ tank collision: push the ship out of any tank's hull sphere and cancel the bit of motion
@@ -14658,6 +15072,7 @@ function resolveTankCollisions(){
   var ship = gameMode.ship, s = gameMode.surfaceState;
   for(var i = 0; i < combat.enemies.length; i++){
     var t = combat.enemies[i];
+    if(t.userData.building > 0) continue;   // can drive through a materializing tank
     var R = t.userData.collideR || 0.1;
     var diff = ship.position.clone().sub(t.position);
     var dd = diff.length();
@@ -14674,6 +15089,17 @@ function resolveTankCollisions(){
         var fdotn = s.forward.dot(nrm);
         if(s.speed * fdotn < 0){ s.speed *= 0.2; sfxBounce(t.position); }
       }
+      // Battering Ram: a fast collision damages the tank by speed × stacks (short per-tank cooldown).
+      if(skillFx.ram > 0){
+        var ramSpeed = Math.max(Math.abs(s.speed), gameMode.fly.vel.length());
+        var nowR = performance.now();
+        if(ramSpeed > gameMode.physics.maxSpeed * 0.5 && nowR - (t.userData._ramCd || 0) > 250){
+          t.userData._ramCd = nowR;
+          var ramDmg = 30 * skillFx.ram * (ramSpeed / gameMode.physics.maxSpeed);
+          dealDamageToTank(t, ramDmg);
+          if(t.userData.hp <= 0){ killTank(t); relock(); }
+        }
+      }
     }
   }
 }
@@ -14683,9 +15109,9 @@ var ENEMY_BULLET_SPEED = 0.03;   // ~4× the player's surface speed → hard to 
 // Intercept aim: where to fire from `fromPos` so the shell MEETS the moving player. Iterates
 // time-to-hit using the player's tracked per-frame velocity (gameMode._shipVel). Returns a unit
 // world direction, or null if degenerate.
-function enemyLeadDir(fromPos){
-  var target = gameMode.ship.position;
-  var vel = gameMode._shipVel || new THREE.Vector3();
+function enemyLeadDir(fromPos, player){
+  var target = player ? player.pos : gameMode.ship.position;
+  var vel = player ? player.vel : (gameMode._shipVel || new THREE.Vector3());
   var aim = target.clone();
   for(var k = 0; k < 4; k++){
     var t = aim.distanceTo(fromPos) / ENEMY_BULLET_SPEED;   // frames for the shell to arrive
@@ -14716,13 +15142,14 @@ function spawnEnemyShell(barrel, dir){
 // (intercept aim) so it actually connects; the other three spray out along their axes.
 function fireEnemyShell(tank){
   var _wq = new THREE.Quaternion();
+  var np = mpNearestPlayer(tank.position);               // co-op: lead the closer of the two players
   var cannons = tank.userData.cannons, active = tank.userData.activeCannon;
   for(var c = 0; c < cannons.length; c++){
     var cn = cannons[c];
     var dir = null;
     if(cn === active){
       var tip = new THREE.Vector3(); cn.barrel.getWorldPosition(tip);
-      dir = enemyLeadDir(tip);                            // fire where the player WILL be
+      dir = enemyLeadDir(tip, np);                        // fire where the (nearest) player WILL be
     }
     if(!dir){
       dir = new THREE.Vector3(0, 0, 1).applyQuaternion(cn.pivot.getWorldQuaternion(_wq));
@@ -14737,16 +15164,22 @@ function disposeEnemyBullet(b){
 }
 
 // ── Spiral barrage ── each second you're in a tank's vicinity it has a small chance to wind up
-// and fling a slow, fat spiral of shells outward (4 spiral arms).
+// and lay down a slow spiral of shells (4 spiral arms) that falls to the floor.
 var SPIRAL_CHANCE = 0.05;            // 5% chance per second in range
 var SPIRAL_ROLL_FRAMES = 60;         // roll once per second
 var SPIRAL_CHARGE_FRAMES = 90;       // ~1.5s wind-up (barrels spin up, rings bloom)
-var SPIRAL_FIRE_FRAMES = 84;         // ~1.4s of spinning + emitting (shorter → fewer shells)
-var SPIRAL_SPIN_RATE = 0.16;         // barrel/turret spin (rad/frame)
-var SPIRAL_EMIT_INTERVAL = 7;        // frames between emissions (each = 4 shells) → ~12×4 ≈ 48 total
-var SPIRAL_BULLET_SPEED = 0.008;     // slow — you can weave through the spiral
-// Big slow spiral shell.
-function spawnSpiralShell(pos, dir){
+var SPIRAL_FIRE_FRAMES = 56;         // spin + emit window
+// Continuous STRING that curls into a spiral (Orbicule's 4-gun spiral enemy): a SLOW turret spin +
+// FREQUENT emission means each barrel lays down an unbroken line of shells, and the spin bends that
+// line into a spiral arm. The shells are slow + fall to the ground so they sweep the floor at the
+// player's height instead of flying overhead.
+var SPIRAL_SPIN_RATE = 0.05;         // slow turret spin (rad/frame) → readable spiral arc, not scattered
+var SPIRAL_EMIT_INTERVAL = 2;        // emit every 2 frames → consecutive shells overlap into a string
+var SPIRAL_BULLET_SPEED = 0.007;     // slow, so the string stays tight
+var SPIRAL_BULLET_GRAV = 0.00006;    // per-frame pull toward the surface → the string falls to the floor
+// Big slow spiral shell that falls toward the surface (gravAxis = surface normal it descends along).
+// `floorH` = world height along gravAxis where it lands (rests just above the floor and skims along it).
+function spawnSpiralShell(pos, dir, gravAxis, floorH){
   if(!combat._sbGeo){
     combat._sbGeo = new THREE.SphereGeometry(0.022, 12, 12);
     combat._sbMat = new THREE.MeshBasicMaterial({ color: 0xff6633 });   // deeper/fatter than normal shells
@@ -14758,7 +15191,8 @@ function spawnSpiralShell(pos, dir){
   glow.scale.set(0.09, 0.09, 1);
   mesh.add(glow);
   scene.add(mesh);
-  combat.enemyBullets.push({ mesh: mesh, vel: dir.clone().multiplyScalar(SPIRAL_BULLET_SPEED), life: 0, maxLife: 600, dmg: 12, noStretch: true, hitR: 0.042 });
+  combat.enemyBullets.push({ mesh: mesh, vel: dir.clone().multiplyScalar(SPIRAL_BULLET_SPEED), life: 0, maxLife: 600, dmg: 12, noStretch: true, hitR: 0.042,
+    grav: SPIRAL_BULLET_GRAV, gravAxis: (gravAxis ? gravAxis.clone() : new THREE.Vector3(0, 1, 0)), floorH: floorH });
 }
 // Drives the wind-up → spin-and-emit barrage. Spins the whole turret (all 4 barrels at base angle)
 // so successive emissions trace 4 spiral arms.
@@ -14784,11 +15218,14 @@ function updateSpiralAttack(tank, d){
     for(var r2 = 0; r2 < cannons.length; r2++){ cannons[r2].ring.scale.setScalar(2.2); cannons[r2].ring.material.opacity = 0.85; }
     if(d.spiralT % SPIRAL_EMIT_INTERVAL === 0){
       var _wq = new THREE.Quaternion(), tip = new THREE.Vector3();
+      // Floor level along the surface normal: the tank group sits 0.004*scale above the surface,
+      // so subtract that, then rest the shells ~0.018 above the floor (sitting on it, at ship height).
+      var floorH = tank.position.dot(d.normal) - 0.004 * TANK_SCALE + 0.018;
       for(var c = 0; c < cannons.length; c++){
         cannons[c].barrel.getWorldPosition(tip);
         var dir = new THREE.Vector3(0, 0, 1).applyQuaternion(cannons[c].pivot.getWorldQuaternion(_wq));
         if(dir.lengthSq() < 1e-9) dir.copy(d.normal); else dir.normalize();
-        spawnSpiralShell(tip.clone().addScaledVector(dir, 0.05), dir);
+        spawnSpiralShell(tip.clone().addScaledVector(dir, 0.05), dir, d.normal, floorH);
       }
     }
     if(d.spiralT >= SPIRAL_FIRE_FRAMES){
@@ -14864,6 +15301,23 @@ function ensureCombatHUD(){
   document.body.appendChild(dc);
   combat.dmgCounterEl = dc;
 
+  // XP bar + level (top-left, under the damage counter)
+  var xb = document.createElement('div');
+  xb.style.cssText = 'position:fixed;left:18px;top:66px;z-index:55;width:220px;height:12px;'
+    + 'background:rgba(28,24,8,0.75);border:1px solid rgba(255,255,255,0.18);border-radius:4px;'
+    + 'overflow:hidden;pointer-events:none;display:none;box-shadow:0 2px 6px rgba(0,0,0,0.5);';
+  var xfill = document.createElement('div');
+  xfill.style.cssText = 'height:100%;width:0%;background:linear-gradient(90deg,#ffe34a,#ffaa22);transition:width 0.15s;';
+  xb.appendChild(xfill); document.body.appendChild(xb);
+  var xlvl = document.createElement('div');
+  xlvl.id = 'combat-lvl';
+  xlvl.style.cssText = 'position:fixed;left:244px;top:64px;z-index:55;font-family:Arial,sans-serif;'
+    + 'font-weight:800;font-size:14px;color:#ffe34a;text-shadow:0 1px 4px rgba(0,0,0,0.7);'
+    + 'pointer-events:none;display:none;letter-spacing:1px;';
+  xlvl.textContent = 'LV 1';
+  document.body.appendChild(xlvl);
+  xpState.barEl = xb; xpState.fillEl = xfill; xpState.lvlEl = xlvl;
+
   var fl = document.createElement('div');
   fl.style.cssText = 'position:fixed;inset:0;z-index:54;background:#ff1a1a;opacity:0;'
     + 'pointer-events:none;transition:opacity 0.18s;';
@@ -14935,30 +15389,52 @@ function showCombatHUD(show){
   var d = show ? 'block' : 'none';
   combat.hpBarEl.style.display = d;
   combat.dmgCounterEl.style.display = d;
+  if(xpState.barEl){ xpState.barEl.style.display = d; xpState.lvlEl.style.display = d; if(show) updateXPHud(); }
   if(combat.fireBtnEl) combat.fireBtnEl.style.display = d;
   if(combat.lockBtnEl) combat.lockBtnEl.style.display = d;
   if(!show && combat.reticleEl) combat.reticleEl.style.display = 'none';
   if(!show && combat.waveEl) combat.waveEl.style.display = 'none';
 }
 
-// Lock onto the nearest enemy to the ship (or null if none).
+// Is the current lock target still a live enemy or ball?
+function lockTargetValid(){
+  return !!combat.lockTarget &&
+         (combat.enemies.indexOf(combat.lockTarget) >= 0 || combat.balls.indexOf(combat.lockTarget) >= 0);
+}
+// Lock onto the nearest TARGET (tank OR rolling ball) to the ship (or null if none).
 function lockNearestEnemy(){
   var best = null, bd = Infinity, sp = gameMode.ship.position;
   for(var i = 0; i < combat.enemies.length; i++){
     var dd = combat.enemies[i].position.distanceTo(sp);
     if(dd < bd){ bd = dd; best = combat.enemies[i]; }
   }
+  for(var j = 0; j < combat.balls.length; j++){
+    var bdst = combat.balls[j].position.distanceTo(sp);
+    if(bdst < bd){ bd = bdst; best = combat.balls[j]; }
+  }
   combat.lockTarget = best;
 }
-// Toggle the lock-on camera: lock the nearest enemy, or release if already locked.
+// Re-lock the next-nearest target after a kill — but ONLY while lock-on MODE is on. (Without the
+// mode gate this fired on every kill, auto-locking even when the player never locked on.)
+function relock(){ if(combat.lockMode && !lockTargetValid()) lockNearestEnemy(); }
+// Toggle lock-on MODE: on → lock the nearest target (and auto-relock the next on a kill); off →
+// release + stop auto-locking.
 function toggleLockOn(){
-  if(!gameMode.active || gameMode.exiting){ combat.lockTarget = null; return; }
-  if(combat.lockTarget){ combat.lockTarget = null; return; }
-  lockNearestEnemy();
+  if(!gameMode.active || gameMode.exiting){ combat.lockMode = false; combat.lockTarget = null; return; }
+  combat.lockMode = !combat.lockMode;
+  if(combat.lockMode) lockNearestEnemy();
+  else combat.lockTarget = null;
 }
 
-function hurtPlayer(amount){
+function hurtPlayer(amount, srcPos){
   if(combat.player.dead) return;
+  if(combat.godMode) return;   // Immortality toggle (I key)
+  // Melee Shield: reduce close-range damage by 25% per stack (capped 90%). In this tiny world
+  // shells land at the ship and rams are point-blank, so a missing srcPos counts as close.
+  if(skillFx.meleeShield > 0){
+    var close = !srcPos || srcPos.distanceTo(gameMode.ship.position) < 0.2;
+    if(close) amount *= (1 - Math.min(0.9, 0.25 * skillFx.meleeShield));
+  }
   combat.player.hp -= amount;
   combat.hurtFlash = 1;
   sfxPlayerDamage();
@@ -14984,6 +15460,9 @@ function initCombat(arena){
 function switchArena(arena){
   for(var i = 0; i < combat.enemies.length; i++) disposeTank(combat.enemies[i]);
   combat.enemies.length = 0;
+  clearBalls();
+  clearSpawnQueue();
+  clearDying(); clearXPOrbs();
   for(var j = 0; j < combat.enemyBullets.length; j++) disposeEnemyBullet(combat.enemyBullets[j]);
   combat.enemyBullets.length = 0;
   clearGameBullets();   // stray player bullets belong to the region we just left
@@ -14995,6 +15474,9 @@ function switchArena(arena){
 function clearCombat(){
   for(var i = 0; i < combat.enemies.length; i++) disposeTank(combat.enemies[i]);
   combat.enemies.length = 0;
+  clearBalls();
+  clearSpawnQueue();
+  clearDying(); clearXPOrbs();
   for(var j = 0; j < combat.enemyBullets.length; j++) disposeEnemyBullet(combat.enemyBullets[j]);
   combat.enemyBullets.length = 0;
   for(var k = combat.damageNumbers.length - 1; k >= 0; k--) combat.damageNumbers[k].el.remove();
@@ -15003,6 +15485,7 @@ function clearCombat(){
   if(combat.flashEl) combat.flashEl.style.opacity = 0;
   combat.mouseFiring = false; combat.touchFiring = false; combat.enterFiring = false;
   combat.arenaActive = false; combat.wave = 0; combat.waveSize = 0;
+  combat.lockTarget = null; combat.lockMode = false;   // drop lock-on when the game ends
   showCombatHUD(false);
   combat.spawned = false;
   combat.arena = null;
@@ -15016,6 +15499,8 @@ function updateCombat(dt){
     if(combat.spawned) clearCombat();
     return;
   }
+  if(skillMenuOpen()) return;   // the level-up skill picker pauses the game
+  if(mpIsGuest()){ mpGuestCombat(dt); return; }   // guest: no local sim — mirror the host's world
   var arena = combatArena();
   if(!combat.spawned) initCombat(arena);
   else if(combat.arena !== arena) switchArena(arena);
@@ -15023,8 +15508,8 @@ function updateCombat(dt){
   // Dome wave arena (touch floor → 5 → 10 → 20 → 40 → …)
   if(arena === 'dome') updateDomeArena();
 
-  // If the locked target vanished (e.g. arena switch), re-lock the nearest remaining enemy (null if none).
-  if(combat.lockTarget && combat.enemies.indexOf(combat.lockTarget) < 0) lockNearestEnemy();
+  // If the locked target vanished (killed / arena switch), re-lock the nearest remaining target.
+  relock();   // in lock-on mode, re-acquire the nearest target if the locked one died/vanished
 
   // Held-fire from mouse / touch button (Enter is handled in gameKeyDown)
   if(combat.mouseFiring || combat.touchFiring || combat.enterFiring) fireBullet();
@@ -15035,6 +15520,11 @@ function updateCombat(dt){
 
   // Ship can't drive through tanks
   resolveTankCollisions();
+  // Rolling chaser balls steer at the player + ram them
+  updateBalls();
+  updateDying();    // enemies shaking/glowing → shattering into XP
+  updateXPOrbs();   // loose XP scatter, settle, magnet to the player
+  updateSkillSystems();   // drift-focus slow-mo, companions, drift fire, crazy daisy, stomp rings
 
   // Player bullets → tank collision (hit radius scales with the bigger hull)
   for(var bi = gameBullets.length - 1; bi >= 0; bi--){
@@ -15042,19 +15532,34 @@ function updateCombat(dt){
     var hitTank = null;
     for(var ei = 0; ei < combat.enemies.length; ei++){
       var en = combat.enemies[ei];
+      if(en.userData.building > 0) continue;   // can't shoot a materializing tank
       if(b.mesh.position.distanceTo(en.position) < (en.userData.collideR || 0.1)){ hitTank = en; break; }
     }
     if(hitTank){
       dealDamageToTank(hitTank, b.dmg || PLAYER_BULLET_DAMAGE);
+      spawnSplitChildren(b, hitTank.position.clone());   // Split Shot: spawn child bullets on hit
       disposeGameBullet(b); gameBullets.splice(bi, 1);
       if(hitTank.userData.hp <= 0){
-        var idx = combat.enemies.indexOf(hitTank);
-        if(idx >= 0) combat.enemies.splice(idx, 1);
-        // Killed the locked target → jump the lock to the next-nearest enemy (null if none left).
-        if(combat.lockTarget === hitTank) lockNearestEnemy();
-        sfxEnemyDies(hitTank.position);
-        disposeTank(hitTank);
-        // NO auto-respawn — every tank is one the player spawned with T.
+        killTank(hitTank);   // shake → glow yellow → shatter into XP (also kills its balls the same way)
+        // Killed the locked target (the tank OR one of its balls) → jump to the next-nearest target
+        // (null if none left). Done AFTER killTank so the lock can't land on a just-removed ball.
+        relock();
+      }
+      continue;
+    }
+    // …else check the rolling balls (also destroyable by the player's weapon)
+    for(var bki = 0; bki < combat.balls.length; bki++){
+      var bk = combat.balls[bki];
+      if(bk.building > 0) continue;   // can't shoot a materializing ball
+      if(b.mesh.position.distanceTo(bk.mesh.position) < bk.r + 0.008){
+        var bdmg = b.dmg || PLAYER_BULLET_DAMAGE;
+        bk.hp -= bdmg; combat.totalDamage += bdmg;
+        spawnDamageNumber(bk.mesh.position.clone().addScaledVector(bk.normal, 0.04), bdmg, false);
+        sfxEnemyDamage(bk.mesh.position);
+        spawnSplitChildren(b, bk.mesh.position.clone());   // Split Shot: spawn child bullets on hit
+        disposeGameBullet(b); gameBullets.splice(bi, 1);
+        if(bk.hp <= 0){ killBall(bk); relock(); }
+        break;
       }
     }
   }
@@ -15063,7 +15568,25 @@ function updateCombat(dt){
   for(var ti = 0; ti < combat.enemies.length; ti++){
     var tank = combat.enemies[ti];
     var d = tank.userData;
-    var dist = tank.position.distanceTo(shipPos);
+
+    // ── Build-up materialize ── rise from the ground (scale.y 0→1) + fade the solid in (edges stay
+    // visible → wireframe-first look), inactive until it finishes, then ACTIVATE.
+    if(d.building > 0){
+      d.building--;
+      var bfe = 1 - d.building / d.buildMax; bfe = bfe * bfe * (3 - 2 * bfe);
+      tank.scale.set(TANK_SCALE, TANK_SCALE * Math.max(0.001, bfe), TANK_SCALE);
+      tank.traverse(function(c){ if(c.isMesh && c.material){ c.material.opacity = bfe; } });
+      if(d.building === 0){
+        tank.scale.setScalar(TANK_SCALE);
+        tank.traverse(function(c){ if(c.isMesh && c.material){ c.material.opacity = 1; c.material.transparent = false; } });
+        d.lastShot = performance.now();   // brief beat before it opens fire
+      }
+      if(d.hpBarEl) d.hpBarEl.style.display = 'none';
+      continue;   // no AI / firing while materializing
+    }
+
+    var tnp = mpNearestPlayer(tank.position);   // co-op: track/aim the closer of the two players
+    var dist = tank.position.distanceTo(tnp.pos);
 
     // ── Spiral barrage trigger ── linger in a tank's attack range too long and it winds up a big
     // charge, spins its 4 barrels, and unloads a slow, fat spiral of shells. Otherwise it does its
@@ -15092,7 +15615,7 @@ function updateCombat(dt){
     if(!inSpiral){
     // Player direction in the tank's LOCAL frame (cannon pivots live in this frame)
     var localAim = null;
-    var aimWorld = shipPos.clone().sub(tank.position);
+    var aimWorld = tnp.pos.clone().sub(tank.position);
     if(aimWorld.lengthSq() > 1e-9){
       localAim = aimWorld.normalize().applyQuaternion(tank.getWorldQuaternion(_q).invert());
       if(localAim.lengthSq() > 1e-9) localAim.normalize(); else localAim = null;
@@ -15120,7 +15643,7 @@ function updateCombat(dt){
       if(cn === active && localAim){
         // Aim the tracking cannon at the LEAD point (intercept), converted into tank-local space,
         // so the barrel visually points where the shell will actually go.
-        var aimL = localAim, leadW = enemyLeadDir(tank.position);
+        var aimL = localAim, leadW = enemyLeadDir(tank.position, tnp);
         if(leadW){
           var lw = leadW.applyQuaternion(tank.getWorldQuaternion(new THREE.Quaternion()).invert());
           if(lw.lengthSq() > 1e-9) aimL = lw.normalize();
@@ -15165,7 +15688,20 @@ function updateCombat(dt){
   for(var pj = combat.enemyBullets.length - 1; pj >= 0; pj--){
     var p = combat.enemyBullets[pj];
     p.life++;
-    p.mesh.position.add(p.vel);
+    if(p.grav) p.vel.addScaledVector(p.gravAxis, -p.grav);   // spiral shells arc down to the floor
+    p.mesh.position.addScaledVector(p.vel, skillFx.timeScale);   // Drift Focus slows enemy shells while drifting
+    // Floor collision for the falling spiral shells: once a shell drops to floor level, clamp it
+    // there and kill the into-floor velocity so it RESTS on the floor and skims outward along it
+    // (the spiral lays onto the ground) instead of sinking through.
+    if(p.floorH !== undefined){
+      var fh = p.mesh.position.dot(p.gravAxis);
+      if(fh <= p.floorH){
+        p.mesh.position.addScaledVector(p.gravAxis, p.floorH - fh);
+        var fvn = p.vel.dot(p.gravAxis);
+        if(fvn < 0) p.vel.addScaledVector(p.gravAxis, -fvn);   // cancel the downward component → slide on the floor
+        p.grav = 0;                                            // landed → stop pulling it down
+      }
+    }
     var sp = p.vel.length();
     if(sp > 1e-6 && !p.noStretch){
       p.mesh.lookAt(p.mesh.position.clone().add(p.vel));
@@ -15173,7 +15709,13 @@ function updateCombat(dt){
       p.mesh.scale.set(1, 1, stretch);
     }
     if(p.mesh.position.distanceTo(shipPos) < (p.hitR || 0.03)){
-      hurtPlayer(p.dmg);
+      hurtPlayer(p.dmg, p.mesh.position);
+      disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1);
+      continue;
+    }
+    // co-op: the same authoritative shell also hits the guest (its ship is MP.remote.ship on the host)
+    if(MP.isHost && MP.connected && MP.remote.ship && MP.remote.ship.visible && p.mesh.position.distanceTo(MP.remote.ship.position) < (p.hitR || 0.03)){
+      mpHurtGuest(p.dmg);
       disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1);
       continue;
     }
@@ -15198,6 +15740,7 @@ function updateCombat(dt){
       }
     }
   }
+  mpHostGuestDeathCheck(now);   // co-op: revive the guest after a brief downtime (+ teleport in the arena)
 
   // HUD
   showCombatHUD(true);
@@ -15208,7 +15751,11 @@ function updateCombat(dt){
   if(combat.waveEl){
     if(combat.arenaActive){
       combat.waveEl.style.display = 'block';
-      combat.waveEl.textContent = 'WAVE ' + combat.wave + '  ·  ' + combat.enemies.length + ' LEFT';
+      if(combat.spawnTimer > 0){
+        combat.waveEl.textContent = 'WAVE ' + combat.wave + '  ·  INCOMING ' + Math.ceil(combat.spawnTimer / 60);
+      } else {
+        combat.waveEl.textContent = 'WAVE ' + combat.wave + '  ·  ' + combat.enemies.length + ' LEFT';
+      }
     } else {
       combat.waveEl.style.display = 'none';
     }
@@ -15614,6 +16161,1462 @@ function clearGameBoostTrail(){
   if(DT.sparkGeo){ DT.sparkGeo.attributes.position.needsUpdate = true; DT.sparkGeo.attributes.alpha.needsUpdate = true; }
 }
 
+// ══════════════════════════════════════════════
+// SKILL UPGRADE SYSTEM  (ported from Orbicule's roguelite upgrades, re-engineered for the
+// tiny crystal-scale Chrysolin mini-game). Level up (the existing XP system) → a card picker
+// offers 3 rarity-rolled skills; pick one to equip. Skills stack and persist for the session.
+// 25 skills across movement/drift, firing, orbiting companions, defense/collision and utility.
+// ══════════════════════════════════════════════
+var GAME_RARITY = {
+  common:    { name:'Common',    color:'#9aa4be', border:'#6a7392', glow:'rgba(120,130,160,0.35)', weight:50 },
+  rare:      { name:'Rare',      color:'#a585e0', border:'#7a55b0', glow:'rgba(130,90,210,0.45)',  weight:35 },
+  legendary: { name:'Legendary', color:'#d86bff', border:'#c850ff', glow:'rgba(200,90,255,0.6)',   weight:15 }
+};
+var gameUpgradeDefs = {
+  // ── Movement / drift ──
+  boostCharge:  { name:'Boost Charge',   rarity:'legendary', stackable:false, maxStack:1, icon:'💥', starter:true,
+    desc:'Hold C (still) to charge, release to blast forward.' },
+  extraJump:    { name:'+1 Jump',        rarity:'common', stackable:true, maxStack:5, icon:'⬆',
+    desc:'An extra mid-air jump. Stacks up to 5.' },
+  hover:        { name:'+1s Hover',      rarity:'common', stackable:true, maxStack:5, icon:'◇',
+    desc:'Hold SPACE while airborne to hover / slow-descend. Stacks.' },
+  stomp:        { name:'Ground Stomp',   rarity:'rare', stackable:false, maxStack:1, icon:'⬇',
+    desc:'Slam down (S in air) explodes on landing — damage scales with air time.' },
+  driftFocus:   { name:'Drift Focus',    rarity:'common', stackable:true, maxStack:5, icon:'⏱',
+    desc:'Slows enemies/bullets while drifting. Each stack slows them further.' },
+  zeroFriction: { name:'Zero Friction Drift', rarity:'legendary', stackable:false, maxStack:1, icon:'∞',
+    desc:'Drift never loses momentum — drift forever.' },
+  gaugeDrift:   { name:'Gauge Drift',    rarity:'common', stackable:false, maxStack:1, icon:'🎚',
+    desc:'Drift angle builds gradually — tap for small, hold for full 90°.' },
+  // ── Bullets / firing ──
+  frontBullet:  { name:'Front Bullet',   rarity:'rare', stackable:true, maxStack:5, icon:'▲',
+    desc:'+1 bullet straight ahead. Stacks.' },
+  multiShot:    { name:'Multi Shot',     rarity:'legendary', stackable:true, maxStack:3, icon:'»',
+    desc:'Fires the volley again right after each shot. Stacks ×3.' },
+  diagonalShot: { name:'Diagonal Shot',  rarity:'rare', stackable:true, maxStack:5, icon:'⟨⟩',
+    desc:'Adds angled side shots, denser per stack.' },
+  bigBullet:    { name:'Big Bullet',     rarity:'common', stackable:false, maxStack:1, icon:'🔴',
+    desc:'3× slower fire, 3.5× damage, 2× size.' },
+  splitShot:    { name:'Split Shot',     rarity:'common', stackable:true, maxStack:5, icon:'✸',
+    desc:'Bullets split into 2 on hit. More generations per stack.' },
+  orbitingShot: { name:'Orbiting Shot',  rarity:'common', stackable:true, maxStack:5, icon:'🌀',
+    desc:'Bullets orbit an enemy before striking. Wider + faster per stack.' },
+  velocityRounds:{name:'Velocity Rounds',rarity:'rare', stackable:true, maxStack:5, icon:'⚡',
+    desc:'+50% damage at max speed per stack.' },
+  trackingEye:  { name:'Tracking Eye',   rarity:'legendary', stackable:false, maxStack:1, icon:'👁',
+    desc:'All bullets home onto nearby enemies.' },
+  // ── Orbiting companions ──
+  orbitDrone:   { name:'Orbit Drone',    rarity:'common', stackable:true, maxStack:10, icon:'◉',
+    desc:'3 orb drones follow you and auto-fire. Stacks.' },
+  droneSpeed:   { name:'Drone Overdrive',rarity:'rare', stackable:true, maxStack:5, icon:'➤', requires:['orbitDrone'],
+    desc:'Drones orbit + fire faster.' },
+  spinOrb:      { name:'Spinning Orb',   rarity:'common', stackable:true, maxStack:10, icon:'🔮',
+    desc:'3 orbs orbit opposite + contract, ramming enemies. Stacks.' },
+  orbSpeed:     { name:'Orb Overdrive',  rarity:'rare', stackable:true, maxStack:5, icon:'💫', requires:['spinOrb'],
+    desc:'Spinning orbs rotate faster.' },
+  electricNet:  { name:'Electric Net',   rarity:'rare', stackable:false, maxStack:1, icon:'🕸', requiresAny:['orbitDrone','spinOrb'],
+    desc:'Electricity links orbs/drones, chaining to enemies.' },
+  // ── Defense / collision ──
+  meleeShield:  { name:'Melee Shield',   rarity:'common', stackable:true, maxStack:5, icon:'🛡',
+    desc:'-25% close-range damage per level (max 90%).' },
+  ram:          { name:'Battering Ram',  rarity:'rare', stackable:true, maxStack:5, icon:'🐏',
+    desc:'Ramming deals damage by speed × weight. Stacks.' },
+  crazyDaisy:   { name:'Crazy Daisy',    rarity:'legendary', stackable:false, maxStack:1, icon:'🚗',
+    desc:'Monster-truck wheels — run enemies over for explosions.' },
+  // ── Utility / special ──
+  xpMagnet:     { name:'XP Magnet',      rarity:'common', stackable:true, maxStack:5, icon:'🧲',
+    desc:'Doubles XP pickup range. Stacks.' },
+  driftFire:    { name:'Drift Fire',     rarity:'rare', stackable:false, maxStack:1, icon:'🔥',
+    desc:'Leaves a fire trail while drifting that burns enemies for 7s.' }
+};
+var SKILL_SYNERGY = { drone:['orbitDrone','droneSpeed','electricNet'], orb:['spinOrb','orbSpeed','electricNet'] };
+
+// Live applied skill state. Movement flags live on gameMode.physics (the movement loops read it);
+// everything else lives here. applyGameUpgrades() recomputes both from gameSkills.equipped.
+var skillFx = {
+  frontBullet:0, multiShot:0, diagonal:0, bigBullet:false, splitShot:0, orbitingShot:0, velocity:0, tracking:false,
+  drone:0, droneSpeed:0, orb:0, orbSpeed:0, electricNet:false,
+  meleeShield:0, ram:0, crazyDaisy:false,
+  xpRange:0, driftFire:false, driftFocus:0,
+  timeScale:1, volleys:[]   // live: enemy slow-mo factor + queued multishot volley countdowns
+};
+var GAUGE_DRIFT_RATE = (Math.PI * 0.5) / 45;   // gauge drift ramps to full 90° over ~0.75s of hold
+
+var gameSkills = {
+  equipped: [], pending: 0,
+  getCount: function(id){ var c = 0; for(var i = 0; i < this.equipped.length; i++) if(this.equipped[i] === id) c++; return c; },
+  meets: function(def){
+    if(def.requires){ for(var i = 0; i < def.requires.length; i++) if(this.getCount(def.requires[i]) === 0) return false; }
+    if(def.requiresAny){ var any = false; for(var j = 0; j < def.requiresAny.length; j++) if(this.getCount(def.requiresAny[j]) > 0){ any = true; break; } if(!any) return false; }
+    return true;
+  },
+  canOffer: function(id){
+    var def = gameUpgradeDefs[id]; if(!def) return false;
+    if(!this.meets(def)) return false;
+    return def.stackable ? this.getCount(id) < def.maxStack : this.getCount(id) === 0;
+  },
+  equip: function(id){
+    var def = gameUpgradeDefs[id]; if(!def) return false;
+    if(def.stackable && this.getCount(id) >= def.maxStack) return false;
+    if(!def.stackable && this.getCount(id) > 0) return false;
+    this.equipped.push(id);
+    applyGameUpgrades();
+    updateSkillHud();
+    return true;
+  }
+};
+
+// Recompute every live skill value from gameSkills.equipped, then sync companion meshes + the
+// monster-truck wheels to the new counts. Safe to call any time (guards mesh ops on gameMode.ship).
+function applyGameUpgrades(){
+  var p = gameMode.physics, g = gameSkills;
+  // movement / drift (on physics so the movement loops can read it)
+  p.maxJumps       = 1 + g.getCount('extraJump');
+  p.maxHoverFrames = 60 * g.getCount('hover');     // 1s (60 frames) per stack
+  p.hasStomp       = g.getCount('stomp') > 0;
+  p.driftFocusStacks = g.getCount('driftFocus');
+  p.hasZeroFriction  = g.getCount('zeroFriction') > 0;
+  p.hasGaugeDrift    = g.getCount('gaugeDrift') > 0;
+  p.hasBoostCharge   = g.getCount('boostCharge') > 0;
+  // firing
+  skillFx.frontBullet  = g.getCount('frontBullet');
+  skillFx.multiShot    = g.getCount('multiShot');
+  skillFx.diagonal     = g.getCount('diagonalShot');
+  skillFx.bigBullet    = g.getCount('bigBullet') > 0;
+  skillFx.splitShot    = g.getCount('splitShot');
+  skillFx.orbitingShot = g.getCount('orbitingShot');
+  skillFx.velocity     = g.getCount('velocityRounds');
+  skillFx.tracking     = g.getCount('trackingEye') > 0;
+  // companions
+  skillFx.drone        = g.getCount('orbitDrone');
+  skillFx.droneSpeed   = g.getCount('droneSpeed');
+  skillFx.orb          = g.getCount('spinOrb');
+  skillFx.orbSpeed     = g.getCount('orbSpeed');
+  skillFx.electricNet  = g.getCount('electricNet') > 0;
+  // defense / utility
+  skillFx.meleeShield  = g.getCount('meleeShield');
+  skillFx.ram          = g.getCount('ram');
+  skillFx.crazyDaisy   = g.getCount('crazyDaisy') > 0;
+  skillFx.xpRange      = g.getCount('xpMagnet');
+  skillFx.driftFire    = g.getCount('driftFire') > 0;
+  skillFx.driftFocus   = p.driftFocusStacks;
+  // sync meshes (no-ops until the ship is built)
+  if(typeof syncCompanions === 'function') syncCompanions();
+  if(typeof syncDaisyWheels === 'function') syncDaisyWheels();
+}
+
+// ── Movement-skill helpers ───────────────────────────────────────────────────────────
+// Jump barrel-roll combo (factored out of the old inline jump trigger).
+function gameJumpRollCombo(){
+  var nowJ = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  var aHot = gameMode.keys.a || (nowJ - gameMode.lastATime) < gameMode.jumpRollWindow;
+  var dHot = gameMode.keys.d || (nowJ - gameMode.lastDTime) < gameMode.jumpRollWindow;
+  var rollDir = 0;
+  if(aHot && dHot) rollDir = (gameMode.lastATime >= gameMode.lastDTime) ? 1 : -1;
+  else if(aHot) rollDir = 1;
+  else if(dHot) rollDir = -1;
+  if(rollDir !== 0) triggerBarrelRoll(rollDir);
+}
+// Unified jump: ground hop, OR an air re-jump when +1 Jump budget remains. Used by both the
+// crystal and dome movement loops (replaces their inline wantJump blocks).
+function tryGameJump(){
+  var s = gameMode.surfaceState, p = gameMode.physics;
+  if(!s.airborne){
+    s.airborne = true; s.freeFalling = false; s.vertVel = p.jumpImpulse; s.airTime = 0;
+    s.jumpAxis.copy(s.groundNormal).normalize();
+    s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; s.driftTime = 0;
+    s.jumpsUsed = 1; s.hoverUsed = 0; s.slamming = false;
+    gameJumpRollCombo();
+  } else if(!s.freeFalling && (s.jumpsUsed || 1) < (p.maxJumps || 1)){
+    // Air re-jump (+1 Jump): fresh upward impulse along the current takeoff axis.
+    s.jumpAxis.copy(s.groundNormal).normalize();
+    s.vertVel = p.jumpImpulse; s.airTime = 0;
+    s.jumpsUsed = (s.jumpsUsed || 1) + 1; s.hoverUsed = 0; s.slamming = false;
+    s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+    gameJumpRollCombo();
+  }
+}
+// Effective per-frame jump gravity — Hover near-zeroes it while holding SPACE airborne with budget.
+function gameJumpGravity(){
+  var s = gameMode.surfaceState, p = gameMode.physics, k = gameMode.keys;
+  if((p.maxHoverFrames || 0) > 0 && s.airborne && !s.freeFalling && !s.slamming && (s.hoverUsed || 0) < p.maxHoverFrames){
+    var holding = k.space || (gameMode.touch.active && gameMode.touch.hoverHold);
+    if(holding){
+      s.hoverUsed = (s.hoverUsed || 0) + 1;
+      if(s.vertVel < 0) s.vertVel *= 0.55;   // arrest the fall → float gently
+      return p.jumpGravity * 0.05;
+    }
+  }
+  return p.jumpGravity;
+}
+// Boost Charge: hold CTRL (still) to charge a meter, release to blast forward. Called each frame
+// in both movement loops. Independent of the existing Shift boost so the tuned boost is untouched.
+function updateBoostCharge(){
+  var s = gameMode.surfaceState, p = gameMode.physics, k = gameMode.keys;
+  if(!p.hasBoostCharge){ s.boostCharge = 0; s.boostCharging = false; return; }
+  if(k.charge && !s.airborne && !gameMode.fly.active){
+    s.boostCharging = true;
+    s.boostCharge = Math.min(1, (s.boostCharge || 0) + 0.02);   // ~0.8s to full
+  } else if(s.boostCharging){
+    var amt = s.boostCharge || 0;
+    if(amt > 0.08){
+      var blast = p.boostMaxSpeed * (0.8 + amt * 2.6);          // forward impulse along heading
+      if(s.speed < blast) s.speed = blast;
+    }
+    s.boostCharge = 0; s.boostCharging = false;
+  }
+  updateBoostChargeHud();
+}
+// Global airborne→grounded transition: reset jump/hover budgets + fire the stomp explosion. Runs
+// once per frame in animate() so it catches landings from ANY of the (several) landing code-paths.
+function checkGameLanded(){
+  var s = gameMode.surfaceState;
+  var air = !!s.airborne;
+  if(gameMode._wasAir === undefined){ gameMode._wasAir = air; return; }
+  if(gameMode._wasAir && !air){
+    s.jumpsUsed = 0; s.hoverUsed = 0;
+    if(gameMode.physics.hasStomp && s.slamming){
+      gameStompExplosion(gameMode.ship.position.clone(), s.groundNormal.clone(), s.slamAirTime || 0);
+    }
+    s.slamming = false;
+  }
+  gameMode._wasAir = air;
+}
+// Ground Stomp shockwave — AoE damage to tanks + balls, scaled by air time, plus an expanding ring.
+var gameStompRings = [];
+function gameStompExplosion(pos, normal, airTime){
+  var t = Math.min(airTime / 120, 1);
+  var radius = 0.16 + t * 0.34;
+  var dmg = 28 + t * 130;
+  for(var i = combat.enemies.length - 1; i >= 0; i--){
+    var en = combat.enemies[i];
+    if(en.userData.building > 0) continue;
+    if(en.position.distanceTo(pos) < radius + (en.userData.collideR || 0.1)){
+      dealDamageToTank(en, dmg);
+      if(en.userData.hp <= 0){ killTank(en); relock(); }
+    }
+  }
+  for(var b = combat.balls.length - 1; b >= 0; b--){
+    var bk = combat.balls[b];
+    if(bk.building > 0) continue;
+    if(bk.mesh.position.distanceTo(pos) < radius + bk.r){
+      bk.hp -= dmg; combat.totalDamage += dmg;
+      spawnDamageNumber(bk.mesh.position.clone().addScaledVector(bk.normal, 0.04), dmg, true);
+      if(bk.hp <= 0){ killBall(bk); relock(); }
+    }
+  }
+  // expanding additive ring billboarded to the surface normal
+  var ring = new THREE.Mesh(new THREE.RingGeometry(0.7, 1.0, 28),
+    new THREE.MeshBasicMaterial({ color: 0xffd27a, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  ring.position.copy(pos).addScaledVector(normal, 0.01);
+  ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
+  ring.frustumCulled = false; ring.renderOrder = 6;
+  scene.add(ring);
+  gameStompRings.push({ mesh: ring, t: 0, max: 22, radius: radius });
+  if(combat.flashEl){ combat.hurtFlash = Math.min(0.5, combat.hurtFlash + 0.0); }   // no hurt flash; placeholder
+  sfxEnemyDies(pos);
+}
+function updateStompRings(){
+  for(var i = gameStompRings.length - 1; i >= 0; i--){
+    var r = gameStompRings[i]; r.t++;
+    var f = r.t / r.max;
+    r.mesh.scale.setScalar(r.radius * (0.3 + f * 1.5) / 1.0);
+    r.mesh.material.opacity = (1 - f) * 0.9;
+    if(r.t >= r.max){ scene.remove(r.mesh); r.mesh.geometry.dispose(); r.mesh.material.dispose(); gameStompRings.splice(i, 1); }
+  }
+}
+function clearStompRings(){ for(var i = 0; i < gameStompRings.length; i++){ scene.remove(gameStompRings[i].mesh); gameStompRings[i].mesh.geometry.dispose(); gameStompRings[i].mesh.material.dispose(); } gameStompRings.length = 0; }
+
+// ── Level-up skill picker (card UI) + pause ──────────────────────────────────────────
+var skillMenu = { open: false, choices: [], el: null, _built: false };
+// True while the level-up picker, the loadout editor, OR the multiplayer lobby is open — they pause the game.
+function skillMenuOpen(){ return !!((skillMenu && skillMenu.open) || (typeof skillManager !== 'undefined' && skillManager && skillManager.open) || (typeof mpLobby !== 'undefined' && mpLobby && mpLobby.open)); }
+function rollSkillRarity(){
+  var r = Math.random() * 100;
+  if(r < GAME_RARITY.legendary.weight) return 'legendary';
+  if(r < GAME_RARITY.legendary.weight + GAME_RARITY.rare.weight) return 'rare';
+  return 'common';
+}
+// Pick `count` offerable skills of `rarity` (falling back to an adjacent tier if too few), with a
+// 3× weight on synergy skills the player already has the base for.
+function rollSkillChoices(count, rarity){
+  var ids = Object.keys(gameUpgradeDefs);
+  var avail = ids.filter(function(id){ return gameUpgradeDefs[id].rarity === rarity && gameSkills.canOffer(id); });
+  if(avail.length < count){
+    var fb = rarity === 'legendary' ? 'rare' : (rarity === 'rare' ? 'common' : 'rare');
+    ids.forEach(function(id){ if(gameUpgradeDefs[id].rarity === fb && avail.indexOf(id) < 0 && gameSkills.canOffer(id)) avail.push(id); });
+  }
+  if(avail.length < count){   // last resort: any offerable skill
+    ids.forEach(function(id){ if(avail.indexOf(id) < 0 && gameSkills.canOffer(id)) avail.push(id); });
+  }
+  var hasDrone = gameSkills.getCount('orbitDrone') > 0, hasOrb = gameSkills.getCount('spinOrb') > 0;
+  var pool = avail.slice(), out = [];
+  for(var pick = 0; pick < Math.min(count, pool.length); pick++){
+    var weights = [], total = 0;
+    for(var i = 0; i < pool.length; i++){
+      var w = 1, id = pool[i];
+      if(hasDrone && SKILL_SYNERGY.drone.indexOf(id) >= 0) w = 3;
+      if(hasOrb && SKILL_SYNERGY.orb.indexOf(id) >= 0) w = 3;
+      weights.push(w); total += w;
+    }
+    var roll = Math.random() * total, ci = 0;
+    for(var j = 0; j < weights.length; j++){ roll -= weights[j]; if(roll <= 0){ ci = j; break; } }
+    out.push(pool[ci]); pool.splice(ci, 1);
+  }
+  return out;
+}
+function buildSkillMenuDom(){
+  if(skillMenu._built) return;
+  var el = document.createElement('div');
+  el.id = 'skill-menu';
+  el.style.cssText = 'position:fixed;inset:0;z-index:120;display:none;flex-direction:column;align-items:center;justify-content:center;'
+    + 'background:rgba(8,8,16,0.78);backdrop-filter:blur(3px);font-family:Arial,sans-serif;';
+  var title = document.createElement('div'); title.id = 'skill-menu-title';
+  title.style.cssText = 'font-size:24px;font-weight:800;letter-spacing:3px;margin-bottom:6px;';
+  el.appendChild(title);
+  var sub = document.createElement('div'); sub.id = 'skill-menu-sub';
+  sub.style.cssText = 'font-size:12px;color:rgba(255,255,255,0.5);margin-bottom:22px;letter-spacing:1px;';
+  sub.textContent = 'CHOOSE A SKILL  —  press 1 / 2 / 3 or click';
+  el.appendChild(sub);
+  var cards = document.createElement('div'); cards.id = 'skill-menu-cards';
+  cards.style.cssText = 'display:flex;gap:18px;flex-wrap:wrap;justify-content:center;';
+  el.appendChild(cards);
+  document.body.appendChild(el);
+  skillMenu.el = el; skillMenu.cardsEl = cards; skillMenu.titleEl = title; skillMenu._built = true;
+}
+function openSkillPicker(){
+  if(skillMenu.open) return;
+  buildSkillMenuDom();
+  var rarity = rollSkillRarity();
+  skillMenu.choices = rollSkillChoices(3, rarity);
+  if(skillMenu.choices.length === 0){ gameSkills.pending = 0; return; }   // nothing left to offer
+  skillMenu.open = true;
+  var ri = GAME_RARITY[rarity];
+  skillMenu.titleEl.textContent = ri.name.toUpperCase() + ' SKILL';
+  skillMenu.titleEl.style.color = ri.color;
+  skillMenu.titleEl.style.textShadow = '0 0 18px ' + ri.glow;
+  skillMenu.cardsEl.innerHTML = '';
+  skillMenu.choices.forEach(function(id, idx){
+    var def = gameUpgradeDefs[id], r = GAME_RARITY[def.rarity], cnt = gameSkills.getCount(id);
+    var bw = def.rarity === 'legendary' ? 4 : (def.rarity === 'rare' ? 3 : 2);
+    var card = document.createElement('div');
+    card.style.cssText = 'width:200px;padding:22px 18px;text-align:center;cursor:pointer;border-radius:14px;'
+      + 'background:rgba(20,18,32,0.95);border:' + bw + 'px solid ' + r.border + ';box-shadow:0 0 16px ' + r.glow + ';transition:transform 0.15s,box-shadow 0.15s;';
+    card.onmouseenter = function(){ card.style.transform = 'scale(1.07)'; card.style.boxShadow = '0 0 32px ' + r.glow; };
+    card.onmouseleave = function(){ card.style.transform = 'scale(1)'; card.style.boxShadow = '0 0 16px ' + r.glow; };
+    card.innerHTML = '<div style="font-size:38px;margin-bottom:12px;">' + def.icon + '</div>'
+      + '<div style="color:' + r.color + ';font-size:18px;font-weight:800;margin-bottom:9px;">' + def.name + '</div>'
+      + '<div style="color:rgba(255,255,255,0.72);font-size:12px;line-height:1.45;">' + def.desc + '</div>'
+      + (def.stackable ? '<div style="color:rgba(255,255,255,0.45);font-size:11px;margin-top:10px;">(' + cnt + '/' + def.maxStack + ')</div>' : '')
+      + '<div style="color:rgba(255,255,255,0.3);font-size:10px;margin-top:8px;letter-spacing:1px;">' + (idx + 1) + '</div>';
+    card.onclick = function(){ chooseSkill(idx); };
+    skillMenu.cardsEl.appendChild(card);
+  });
+  skillMenu.el.style.display = 'flex';
+}
+function chooseSkill(idx){
+  if(!skillMenu.open) return;
+  var id = skillMenu.choices[idx]; if(!id) return;
+  gameSkills.equip(id);
+  skillMenu.open = false;
+  skillMenu.el.style.display = 'none';
+  gameSkills.pending = Math.max(0, gameSkills.pending - 1);
+  if(gameSkills.pending > 0){ setTimeout(openSkillPicker, 120); }   // chain the next package
+}
+function handleSkillMenuKey(e){
+  var k = e.key;
+  if(typeof mpLobby !== 'undefined' && mpLobby.open){
+    if(k === 'Escape'){ mpCloseLobby(); e.preventDefault(); }
+    return;   // let letters/digits reach the room-code input
+  }
+  if(skillManager && skillManager.open){
+    if(k === 'Escape' || k === 'b' || k === 'B'){ closeSkillManager(); e.preventDefault(); }
+    return;
+  }
+  if(k === '1' || k === '2' || k === '3'){ chooseSkill(parseInt(k, 10) - 1); e.preventDefault(); }
+}
+
+// ── Skills HUD (always-visible equipped-skill strip, top-right under the cart/inventory) ──
+var skillHudEl = null;
+function ensureSkillHud(){
+  if(skillHudEl) return;
+  var el = document.createElement('div');
+  el.id = 'skill-hud';
+  el.style.cssText = 'position:fixed;left:16px;top:88px;z-index:55;display:none;max-width:230px;'
+    + 'flex-wrap:wrap;gap:5px;justify-content:flex-start;pointer-events:none;font-family:Arial,sans-serif;';
+  document.body.appendChild(el);
+  skillHudEl = el;
+}
+function updateSkillHud(){
+  ensureSkillHud();
+  var counts = {};
+  gameSkills.equipped.forEach(function(id){ counts[id] = (counts[id] || 0) + 1; });
+  var html = '';
+  Object.keys(counts).forEach(function(id){
+    var def = gameUpgradeDefs[id]; if(!def) return;
+    var r = GAME_RARITY[def.rarity];
+    html += '<div style="width:30px;height:30px;border-radius:7px;background:rgba(18,16,28,0.85);border:1.5px solid ' + r.border + ';'
+      + 'box-shadow:0 0 6px ' + r.glow + ';display:flex;align-items:center;justify-content:center;font-size:16px;position:relative;">' + def.icon
+      + (counts[id] > 1 ? '<span style="position:absolute;right:-4px;bottom:-4px;font-size:9px;font-weight:800;color:#fff;background:' + r.border + ';border-radius:5px;padding:0 3px;">' + counts[id] + '</span>' : '')
+      + '</div>';
+  });
+  skillHudEl.innerHTML = html;
+}
+function showSkillHud(show){ ensureSkillHud(); skillHudEl.style.display = show ? 'flex' : 'none'; if(show) updateSkillHud(); }
+
+// Boost-charge meter (DOM, bottom-center, only while charging)
+var boostChargeEl = null, boostChargeFillEl = null;
+function updateBoostChargeHud(){
+  var s = gameMode.surfaceState;
+  if(!boostChargeEl){
+    var bar = document.createElement('div');
+    bar.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:55;width:130px;height:8px;'
+      + 'background:rgba(20,16,30,0.7);border:1px solid rgba(255,255,255,0.25);border-radius:5px;overflow:hidden;pointer-events:none;opacity:0;transition:opacity 0.18s;';
+    var fill = document.createElement('div');
+    fill.style.cssText = 'height:100%;width:0%;background:linear-gradient(90deg,#7be0ff,#44ffd0);border-radius:4px;';
+    bar.appendChild(fill); document.body.appendChild(bar);
+    boostChargeEl = bar; boostChargeFillEl = fill;
+  }
+  var amt = s.boostCharge || 0;
+  boostChargeFillEl.style.width = (amt * 100) + '%';
+  boostChargeEl.style.opacity = (s.boostCharging && amt > 0.01) ? '1' : '0';
+}
+
+// ══════════════════════════════════════════════
+// SKILL SYSTEMS — firing pattern, companions, drift fire, crazy daisy (region-agnostic; driven
+// from updateCombat so they pause + work on the crystal, in the dome and in the sandbox alike).
+// ══════════════════════════════════════════════
+
+// Nearest active tank/ball to a point. Returns {pos, kind, ref} or null.
+function nearestGameEnemy(pos, maxDist){
+  var best = null, bd = (maxDist !== undefined) ? maxDist * maxDist : Infinity;
+  for(var i = 0; i < combat.enemies.length; i++){
+    var en = combat.enemies[i]; if(en.userData.building > 0) continue;
+    var d = en.position.distanceToSquared(pos);
+    if(d < bd){ bd = d; best = { pos: en.position, kind: 'tank', ref: en }; }
+  }
+  for(var j = 0; j < combat.balls.length; j++){
+    var bk = combat.balls[j]; if(bk.building > 0) continue;
+    var d2 = bk.mesh.position.distanceToSquared(pos);
+    if(d2 < bd){ bd = d2; best = { pos: bk.mesh.position, kind: 'ball', ref: bk }; }
+  }
+  return best;
+}
+
+// ── Player firing pattern (Front Bullet / Diagonal / Big / Velocity / Split / Orbiting / Tracking) ──
+function spawnSkillBullet(origin, dir, lateral){
+  var s = gameMode.surfaceState, p = gameMode.physics;
+  dir = dir.clone(); if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.set(0, 0, 1);
+  var up = s.groundNormal;
+  var pos = origin.clone();
+  if(lateral){
+    var right = new THREE.Vector3().crossVectors(dir, up);
+    if(right.lengthSq() > 1e-9){ right.normalize(); pos.addScaledVector(right, lateral); }
+  }
+  var BULLET_SPEED = 0.18;
+  var vel = dir.clone().multiplyScalar(BULLET_SPEED);
+  if(gameMode._shipVel) vel.add(gameMode._shipVel);
+  var dmg = PLAYER_BULLET_DAMAGE;
+  if(skillFx.bigBullet) dmg *= 3.5;
+  if(skillFx.velocity){
+    var spdFrac = Math.min(1, Math.max(Math.abs(s.speed), gameMode.fly.vel.length()) / p.boostMaxSpeed);
+    dmg *= 1 + 0.5 * skillFx.velocity * spdFrac;
+  }
+  var sz = skillFx.bigBullet ? 0.008 : 0.004;
+  var col = skillFx.bigBullet ? 0xff7adf : 0xc9a3ff;
+  var mesh = new THREE.Mesh(new THREE.SphereGeometry(sz, 8, 6), new THREE.MeshBasicMaterial({ color: col }));
+  mesh.position.copy(origin);
+  mesh.frustumCulled = false; mesh.renderOrder = 5;
+  var glowC = skillFx.bigBullet ? 0xff8ae0 : (skillFx.velocity ? 0xe0a0ff : 0xb98cff);
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: glowC, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+  var gs = skillFx.bigBullet ? 0.05 : 0.022;
+  glow.scale.set(gs, gs, 1);
+  mesh.add(glow);
+  scene.add(mesh);
+  gameBullets.push({
+    mesh: mesh, vel: vel, life: 0, maxLife: skillFx.orbitingShot ? 240 : 90, dmg: dmg,
+    big: skillFx.bigBullet, homing: skillFx.tracking, split: skillFx.splitShot,
+    orbit: skillFx.orbitingShot > 0 ? { stacks: skillFx.orbitingShot, phase: 'seek', target: null, angle: 0, ttl: 0 } : null
+  });
+}
+// One volley = the full bullet fan (1 forward + Front Bullets + Diagonal pairs).
+function fireOneVolley(){
+  if(!gameMode.active || gameMode.exiting) return;
+  var s = gameMode.surfaceState;
+  var M = gameFiringDir();
+  var nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
+  var dir;
+  if(crosshairActive()){
+    // Drifting in chase view: converge bullets on the crosshair (camera centre ray).
+    var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+    var aimPoint = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST);
+    dir = aimPoint.sub(nose);
+    if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
+  } else {
+    // Everywhere else (normal driving, locked-on, top-down): fire straight out of the ship.
+    dir = M.clone();
+  }
+  // base + Front Bullet extras (slightly fanned so they read as separate rounds)
+  spawnSkillBullet(nose, dir, 0);
+  for(var f = 1; f <= skillFx.frontBullet; f++){
+    var off = (f % 2 === 1 ? 1 : -1) * 0.01 * Math.ceil(f / 2);
+    spawnSkillBullet(nose, dir, off);
+  }
+  // Diagonal: `diagonal` pairs spread across a fan, denser per stack
+  if(skillFx.diagonal > 0){
+    var up = s.groundNormal, maxAng = 0.55;
+    for(var dgi = 1; dgi <= skillFx.diagonal; dgi++){
+      var ang = maxAng * dgi / skillFx.diagonal;
+      spawnSkillBullet(nose, dir.clone().applyAxisAngle(up, ang), 0);
+      spawnSkillBullet(nose, dir.clone().applyAxisAngle(up, -ang), 0);
+    }
+  }
+  sfxShoot();
+}
+// Split Shot: on a bullet hit, spawn child bullets perpendicular to its travel (one less split gen).
+function spawnSplitChildren(b, hitPos){
+  if(!b.split || b.split <= 0) return;
+  var up = gameMode.surfaceState.groundNormal;
+  var fwd = b.vel.clone(); if(fwd.lengthSq() < 1e-9) fwd.set(0, 0, 1); fwd.normalize();
+  var side = new THREE.Vector3().crossVectors(fwd, up); if(side.lengthSq() < 1e-9) side.set(1, 0, 0); side.normalize();
+  var speed = 0.16;
+  for(var sgn = -1; sgn <= 1; sgn += 2){
+    var sdir = fwd.clone().multiplyScalar(0.4).addScaledVector(side, sgn).normalize();
+    var mesh = new THREE.Mesh(new THREE.SphereGeometry(b.big ? 0.006 : 0.0035, 8, 6), new THREE.MeshBasicMaterial({ color: 0xc9a3ff }));
+    mesh.position.copy(hitPos); mesh.frustumCulled = false; mesh.renderOrder = 5;
+    var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xb98cff, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false }));
+    glow.scale.set(0.018, 0.018, 1); mesh.add(glow); scene.add(mesh);
+    gameBullets.push({ mesh: mesh, vel: sdir.multiplyScalar(speed), life: 0, maxLife: 70, dmg: b.dmg * 0.6, big: b.big, homing: b.homing, split: b.split - 1, orbit: null });
+  }
+}
+// Per-frame bullet steering: Multi-Shot volley queue + Tracking Eye homing + Orbiting Shot orbits.
+function updateSkillBullets(){
+  // drain queued multishot volleys
+  if(skillFx.volleys.length){
+    for(var v = skillFx.volleys.length - 1; v >= 0; v--){
+      if(--skillFx.volleys[v] <= 0){ skillFx.volleys.splice(v, 1); fireOneVolley(); }
+    }
+  }
+  if(!gameBullets.length) return;
+  var up = gameMode.surfaceState.groundNormal;
+  for(var i = 0; i < gameBullets.length; i++){
+    var b = gameBullets[i];
+    if(b.orbit){
+      var o = b.orbit;
+      if(o.phase === 'seek'){
+        var tg = nearestGameEnemy(b.mesh.position, 0.32);
+        if(tg){ o.target = tg.ref; o.kind = tg.kind; o.center = tg.pos; o.phase = 'orbit'; o.ttl = 36 + o.stacks * 8;
+          var rel = b.mesh.position.clone().sub(o.center); o.angle = Math.atan2(rel.dot(new THREE.Vector3().crossVectors(up, gameMode.surfaceState.forward)), rel.dot(gameMode.surfaceState.forward)); }
+      } else if(o.phase === 'orbit'){
+        var alive = (o.kind === 'tank') ? combat.enemies.indexOf(o.target) >= 0 : combat.balls.indexOf(o.target) >= 0;
+        if(!alive){ o.phase = 'seek'; o.target = null; }
+        else {
+          o.center = (o.kind === 'tank') ? o.target.position : o.target.mesh.position;
+          var rad = 0.05 * (1 + 0.5 * o.stacks);
+          o.angle += 0.22 * (1 + 0.4 * o.stacks);
+          var tA = gameMode.surfaceState.forward.clone(); tA.sub(up.clone().multiplyScalar(tA.dot(up))); if(tA.lengthSq() < 1e-9) tA.set(1, 0, 0); tA.normalize();
+          var tB = new THREE.Vector3().crossVectors(up, tA).normalize();
+          b.mesh.position.copy(o.center).addScaledVector(tA, Math.cos(o.angle) * rad).addScaledVector(tB, Math.sin(o.angle) * rad).addScaledVector(up, 0.01);
+          if(--o.ttl <= 0){ o.phase = 'strike'; b.vel.copy(o.center).sub(b.mesh.position); if(b.vel.lengthSq() > 1e-9) b.vel.setLength(0.16); }
+          continue;   // orbiting → skip straight-line move this frame
+        }
+      }
+      // 'strike' falls through to normal movement below
+    }
+    if(b.homing && (!b.orbit || b.orbit.phase !== 'orbit')){
+      var ht = nearestGameEnemy(b.mesh.position, 0.6);
+      if(ht){
+        var want = ht.pos.clone().sub(b.mesh.position); if(want.lengthSq() > 1e-9){ want.normalize();
+          var sp = b.vel.length() || 0.16; b.vel.lerp(want.multiplyScalar(sp), 0.18); if(b.vel.lengthSq() > 1e-9) b.vel.setLength(sp); }
+      }
+    }
+  }
+}
+
+// ── Orbiting companions: drones (auto-fire) + spinning orbs (ram), with the Electric Net link ──
+var companions = { drones: [], orbs: [], net: null, netGeo: null, _frame: 0 };
+function makeCompanionMesh(color, r){
+  var g = new THREE.Group();
+  var core = new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8), new THREE.MeshBasicMaterial({ color: color }));
+  g.add(core);
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: color, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glow.scale.set(r * 4, r * 4, 1); g.add(glow);
+  g.frustumCulled = false; g.renderOrder = 5;
+  scene.add(g);
+  return g;
+}
+// Match drone/orb mesh counts to the equipped stacks (3 each per stack).
+function syncCompanions(){
+  if(!scene) return;
+  var nDrone = skillFx.drone * 3, nOrb = skillFx.orb * 3;
+  while(companions.drones.length < nDrone){ companions.drones.push({ mesh: makeCompanionMesh(0x55ffcc, 0.012), cd: Math.floor(Math.random() * 40) }); }
+  while(companions.drones.length > nDrone){ var d = companions.drones.pop(); scene.remove(d.mesh); }
+  while(companions.orbs.length < nOrb){ companions.orbs.push({ mesh: makeCompanionMesh(0xff66bb, 0.013), cd: 0 }); }
+  while(companions.orbs.length > nOrb){ var o = companions.orbs.pop(); scene.remove(o.mesh); }
+  if(!skillFx.electricNet && companions.net){ companions.net.visible = false; }
+}
+function clearCompanions(){
+  for(var i = 0; i < companions.drones.length; i++) scene.remove(companions.drones[i].mesh);
+  for(var j = 0; j < companions.orbs.length; j++) scene.remove(companions.orbs[j].mesh);
+  companions.drones.length = 0; companions.orbs.length = 0;
+  if(companions.net){ scene.remove(companions.net); companions.net = null; companions.netGeo = null; }
+}
+function fireDroneShot(from, target){
+  var dir = target.clone().sub(from); if(dir.lengthSq() < 1e-9) return; dir.normalize();
+  var mesh = new THREE.Mesh(new THREE.SphereGeometry(0.0035, 6, 5), new THREE.MeshBasicMaterial({ color: 0x55ffcc }));
+  mesh.position.copy(from); mesh.frustumCulled = false; mesh.renderOrder = 5;
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0x88ffe0, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glow.scale.set(0.016, 0.016, 1); mesh.add(glow); scene.add(mesh);
+  gameBullets.push({ mesh: mesh, vel: dir.multiplyScalar(0.14), life: 0, maxLife: 80, dmg: 8, big: false, homing: false, split: 0, orbit: null });
+}
+function updateCompanions(){
+  if(!gameMode.ship || (companions.drones.length === 0 && companions.orbs.length === 0)) return;
+  companions._frame++;
+  var ship = gameMode.ship, up = gameMode.surfaceState.groundNormal;
+  var tA = gameMode.surfaceState.forward.clone(); tA.sub(up.clone().multiplyScalar(tA.dot(up))); if(tA.lengthSq() < 1e-9) tA.set(1, 0, 0); tA.normalize();
+  var tB = new THREE.Vector3().crossVectors(up, tA).normalize();
+  var ts = skillFx.timeScale;
+  // drones: orbit one way, auto-fire at the nearest enemy
+  var dN = companions.drones.length;
+  var dSpin = (0.03 + skillFx.droneSpeed * 0.02) * ts;
+  var dRad = 0.11, dHt = 0.05;
+  for(var i = 0; i < dN; i++){
+    var dr = companions.drones[i];
+    var ang = companions._frame * dSpin + (i / dN) * Math.PI * 2;
+    dr.mesh.position.copy(ship.position).addScaledVector(tA, Math.cos(ang) * dRad).addScaledVector(tB, Math.sin(ang) * dRad).addScaledVector(up, dHt);
+    dr.cd -= ts;
+    if(dr.cd <= 0){
+      var tg = nearestGameEnemy(dr.mesh.position, 0.9);
+      if(tg){ fireDroneShot(dr.mesh.position.clone(), tg.pos.clone()); dr.cd = Math.max(14, 48 - skillFx.droneSpeed * 8); }
+      else dr.cd = 12;
+    }
+  }
+  // spinning orbs: orbit the OTHER way + contract, ram enemies on contact
+  var oN = companions.orbs.length;
+  var oSpin = (0.045 + skillFx.orbSpeed * 0.025) * ts;
+  var oBase = 0.1, oContract = 0.045;
+  for(var j = 0; j < oN; j++){
+    var ob = companions.orbs[j];
+    var oa = -companions._frame * oSpin - (j / oN) * Math.PI * 2;
+    var rad = oBase - oContract * (0.5 + 0.5 * Math.sin(companions._frame * 0.04 * ts + j));
+    ob.mesh.position.copy(ship.position).addScaledVector(tA, Math.cos(oa) * rad).addScaledVector(tB, Math.sin(oa) * rad).addScaledVector(up, 0.035);
+    ob.cd -= ts;
+    if(ob.cd <= 0){
+      var hit = nearestGameEnemy(ob.mesh.position, 0.05);
+      if(hit){
+        if(hit.kind === 'tank'){ dealDamageToTank(hit.ref, 18); if(hit.ref.userData.hp <= 0){ killTank(hit.ref); relock(); } }
+        else { hit.ref.hp -= 18; combat.totalDamage += 18; spawnDamageNumber(hit.ref.mesh.position.clone().addScaledVector(hit.ref.normal, 0.04), 18, false); if(hit.ref.hp <= 0){ killBall(hit.ref); relock(); } }
+        ob.cd = 30;
+      }
+    }
+  }
+  // Electric Net: link the companions in a ring + chain-zap enemies near any segment
+  if(skillFx.electricNet){
+    var nodes = [];
+    for(var di = 0; di < dN; di++) nodes.push(companions.drones[di].mesh.position);
+    for(var oi = 0; oi < oN; oi++) nodes.push(companions.orbs[oi].mesh.position);
+    if(nodes.length >= 2){
+      if(!companions.net){
+        companions.netGeo = new THREE.BufferGeometry();
+        companions.netGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(64 * 2 * 3), 3));
+        companions.net = new THREE.LineSegments(companions.netGeo, new THREE.LineBasicMaterial({ color: 0x66ffff, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false }));
+        companions.net.frustumCulled = false; companions.net.renderOrder = 5; scene.add(companions.net);
+      }
+      companions.net.visible = true;
+      var arr = companions.netGeo.attributes.position.array, seg = 0;
+      for(var n = 0; n < nodes.length && seg < 64; n++){
+        var a = nodes[n], bnode = nodes[(n + 1) % nodes.length];
+        arr[seg * 6] = a.x; arr[seg * 6 + 1] = a.y; arr[seg * 6 + 2] = a.z;
+        arr[seg * 6 + 3] = bnode.x; arr[seg * 6 + 4] = bnode.y; arr[seg * 6 + 5] = bnode.z;
+        seg++;
+      }
+      companions.netGeo.setDrawRange(0, seg * 2);
+      companions.netGeo.attributes.position.needsUpdate = true;
+      // chain dmg: every ~10 frames, zap enemies inside the companion ring radius
+      if(companions._frame % 8 === 0){
+        for(var ei = combat.enemies.length - 1; ei >= 0; ei--){
+          var en = combat.enemies[ei]; if(en.userData.building > 0) continue;
+          if(en.position.distanceTo(ship.position) < dRad + 0.04){ dealDamageToTank(en, 6); if(en.userData.hp <= 0){ killTank(en); relock(); } }
+        }
+        for(var bi = combat.balls.length - 1; bi >= 0; bi--){
+          var bk = combat.balls[bi]; if(bk.building > 0) continue;
+          if(bk.mesh.position.distanceTo(ship.position) < dRad + 0.04){ bk.hp -= 6; combat.totalDamage += 6; if(bk.hp <= 0){ killBall(bk); relock(); } }
+        }
+      }
+    } else if(companions.net){ companions.net.visible = false; }
+  } else if(companions.net){ companions.net.visible = false; }
+}
+
+// ── Crazy Daisy: monster-truck wheels on the ship + run-over explosions ──
+var daisyWheels = [];
+function syncDaisyWheels(){
+  if(skillFx.crazyDaisy){
+    if(daisyWheels.length === 0 && gameMode.shipVisual){
+      var wheelGeo = new THREE.TorusGeometry(0.5, 0.22, 8, 14);
+      var wheelMat = new THREE.MeshStandardMaterial({ color: 0x222228, roughness: 0.7, metalness: 0.3, emissive: 0x110a14, emissiveIntensity: 0.4 });
+      var pos = [[-0.9, -0.5, 0.7], [0.9, -0.5, 0.7], [-0.9, -0.5, -0.7], [0.9, -0.5, -0.7]];
+      for(var i = 0; i < 4; i++){
+        var w = new THREE.Mesh(wheelGeo, wheelMat);
+        w.position.set(pos[i][0], pos[i][1], pos[i][2]);
+        w.rotation.y = Math.PI / 2;
+        gameMode.shipVisual.add(w); daisyWheels.push(w);
+      }
+    }
+  } else if(daisyWheels.length){
+    for(var j = 0; j < daisyWheels.length; j++){ if(daisyWheels[j].parent) daisyWheels[j].parent.remove(daisyWheels[j]); }
+    daisyWheels.length = 0;
+  }
+}
+function gameDaisyExplosion(pos){
+  var radius = 0.16, dmg = 80;
+  for(var i = combat.enemies.length - 1; i >= 0; i--){
+    var en = combat.enemies[i]; if(en.userData.building > 0) continue;
+    if(en.position.distanceTo(pos) < radius + (en.userData.collideR || 0.1)){ dealDamageToTank(en, dmg); if(en.userData.hp <= 0){ killTank(en); relock(); } }
+  }
+  for(var b = combat.balls.length - 1; b >= 0; b--){
+    var bk = combat.balls[b]; if(bk.building > 0) continue;
+    if(bk.mesh.position.distanceTo(pos) < radius + bk.r){ bk.hp -= dmg; combat.totalDamage += dmg; if(bk.hp <= 0){ killBall(bk); relock(); } }
+  }
+  var ring = new THREE.Mesh(new THREE.RingGeometry(0.6, 1.0, 24),
+    new THREE.MeshBasicMaterial({ color: 0xffaa33, transparent: true, opacity: 0.95, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  ring.position.copy(pos).addScaledVector(gameMode.surfaceState.groundNormal, 0.01);
+  ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), gameMode.surfaceState.groundNormal);
+  ring.frustumCulled = false; ring.renderOrder = 6; scene.add(ring);
+  gameStompRings.push({ mesh: ring, t: 0, max: 18, radius: radius });
+  sfxEnemyDies(pos);
+}
+function updateCrazyDaisy(){
+  if(!skillFx.crazyDaisy || !gameMode.ship) return;
+  // spin the wheels with speed
+  var spin = Math.abs(gameMode.surfaceState.speed) * 60;
+  for(var w = 0; w < daisyWheels.length; w++) daisyWheels[w].rotation.x += spin;
+  var ship = gameMode.ship, now = performance.now();
+  for(var i = combat.enemies.length - 1; i >= 0; i--){
+    var en = combat.enemies[i]; if(en.userData.building > 0) continue;
+    if(en.position.distanceTo(ship.position) < (en.userData.collideR || 0.1) + 0.03){
+      if(now - (en.userData._daisyCd || 0) > 300){ en.userData._daisyCd = now; gameDaisyExplosion(en.position.clone()); }
+    }
+  }
+}
+
+// ── Drift Fire: a burning trail dropped while drifting that scorches enemies for ~7s ──
+var driftFire = { segs: [] };
+function updateDriftFire(){
+  var s = gameMode.surfaceState;
+  if(skillFx.driftFire && s.isDrifting && gameMode.ship){
+    if(driftFire.segs.length < 220 && companions._frame % 2 === 0){
+      var mat = new THREE.MeshBasicMaterial({ map: getCombatGlowTex(), color: 0xff7722, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+      var q = new THREE.Mesh(new THREE.PlaneGeometry(0.05, 0.05), mat);
+      q.position.copy(gameMode.ship.position).addScaledVector(s.groundNormal, 0.004);
+      q.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), s.groundNormal);
+      q.frustumCulled = false; q.renderOrder = 4; scene.add(q);
+      driftFire.segs.push({ mesh: q, pos: q.position.clone(), life: 0, max: 420 });   // ~7s at 60fps
+    }
+  }
+  for(var i = driftFire.segs.length - 1; i >= 0; i--){
+    var fseg = driftFire.segs[i]; fseg.life++;
+    var f = fseg.life / fseg.max;
+    fseg.mesh.material.opacity = (1 - f) * 0.85;
+    fseg.mesh.scale.setScalar(1 + f * 0.8);
+    // burn enemies standing in the flame
+    if(fseg.life % 12 === 0){
+      for(var e = combat.enemies.length - 1; e >= 0; e--){
+        var en = combat.enemies[e]; if(en.userData.building > 0) continue;
+        if(en.position.distanceTo(fseg.pos) < 0.05 + (en.userData.collideR || 0.1)){ dealDamageToTank(en, 5); if(en.userData.hp <= 0){ killTank(en); relock(); } }
+      }
+      for(var bl = combat.balls.length - 1; bl >= 0; bl--){
+        var bk = combat.balls[bl]; if(bk.building > 0) continue;
+        if(bk.mesh.position.distanceTo(fseg.pos) < 0.05 + bk.r){ bk.hp -= 5; combat.totalDamage += 5; if(bk.hp <= 0){ killBall(bk); relock(); } }
+      }
+    }
+    if(fseg.life >= fseg.max){ scene.remove(fseg.mesh); fseg.mesh.geometry.dispose(); fseg.mesh.material.dispose(); driftFire.segs.splice(i, 1); }
+  }
+}
+function clearDriftFire(){ for(var i = 0; i < driftFire.segs.length; i++){ scene.remove(driftFire.segs[i].mesh); driftFire.segs[i].mesh.geometry.dispose(); driftFire.segs[i].mesh.material.dispose(); } driftFire.segs.length = 0; }
+
+// Drift Focus slow-mo: ease combat timeScale toward 0.5^stacks while drifting, 1 otherwise.
+function updateDriftFocus(){
+  var target = (skillFx.driftFocus > 0 && gameMode.surfaceState.isDrifting) ? Math.pow(0.5, skillFx.driftFocus) : 1;
+  skillFx.timeScale += (target - skillFx.timeScale) * 0.15;
+}
+
+// Master per-frame tick for all skill systems (called from updateCombat → paused + region-agnostic).
+function updateSkillSystems(){
+  updateDriftFocus();
+  updateCompanions();
+  updateDriftFire();
+  updateCrazyDaisy();
+  updateStompRings();
+}
+// Free every transient skill mesh (called on game exit / combat clear). Equipped skills persist.
+function clearSkillSystems(){
+  clearCompanions(); clearDriftFire(); clearStompRings();
+  skillFx.volleys.length = 0; skillFx.timeScale = 1;
+}
+
+// ── Immortality toggle (I key) ───────────────────────────────────────────────────────
+function toggleGodMode(){
+  combat.godMode = !combat.godMode;
+  if(combat.godMode){ combat.player.dead = false; combat.player.hp = combat.player.maxHp; }   // revive + top off
+  updateGodModeHud();
+}
+var godHudEl = null;
+function updateGodModeHud(){
+  if(!godHudEl){
+    var el = document.createElement('div');
+    el.id = 'god-hud';
+    el.textContent = '★ IMMORTAL';
+    el.style.cssText = 'position:fixed;left:50%;top:42px;transform:translateX(-50%);z-index:56;display:none;'
+      + 'font-family:Arial,sans-serif;font-weight:800;font-size:13px;letter-spacing:2px;color:#ffe34a;'
+      + 'background:rgba(40,32,8,0.7);border:1px solid rgba(255,210,60,0.5);border-radius:6px;padding:3px 10px;'
+      + 'text-shadow:0 1px 4px rgba(0,0,0,0.7);pointer-events:none;';
+    document.body.appendChild(el); godHudEl = el;
+  }
+  godHudEl.style.display = (combat.godMode && gameMode.active && !gameMode.exiting) ? 'block' : 'none';
+}
+
+// ── Skill loadout editor (the in-game INVENTORY icon, or the B key) ───────────────────
+// A DOM panel listing all 25 skills with −/+ steppers so the player can pick exactly how many
+// of each they want at any time. Pauses the game (shares the skillMenuOpen() gate).
+var skillManager = { open: false, el: null, gridEl: null, _built: false };
+gameSkills.unequip = function(id){
+  var idx = this.equipped.indexOf(id);
+  if(idx >= 0){ this.equipped.splice(idx, 1); applyGameUpgrades(); updateSkillHud(); return true; }
+  return false;
+};
+function buildSkillManagerDom(){
+  if(skillManager._built) return;
+  var el = document.createElement('div');
+  el.id = 'skill-manager';
+  el.style.cssText = 'position:fixed;inset:0;z-index:121;display:none;flex-direction:column;align-items:center;'
+    + 'background:rgba(8,8,16,0.82);backdrop-filter:blur(3px);font-family:Arial,sans-serif;padding:26px 16px;box-sizing:border-box;overflow:hidden;';
+  var title = document.createElement('div');
+  title.style.cssText = 'font-size:22px;font-weight:800;letter-spacing:3px;color:#cfd4e6;margin-bottom:4px;';
+  title.textContent = 'LOADOUT — SKILLS';
+  el.appendChild(title);
+  var sub = document.createElement('div');
+  sub.style.cssText = 'font-size:11px;color:rgba(255,255,255,0.5);margin-bottom:16px;letter-spacing:1px;';
+  sub.textContent = 'click −/+ to set how many of each skill you want  ·  B or ESC to close';
+  el.appendChild(sub);
+  var grid = document.createElement('div');
+  grid.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;justify-content:center;align-content:flex-start;'
+    + 'max-width:920px;max-height:74vh;overflow-y:auto;padding:6px;';
+  el.appendChild(grid);
+  var done = document.createElement('div');
+  done.textContent = 'DONE';
+  done.style.cssText = 'margin-top:16px;padding:9px 26px;border-radius:9px;cursor:pointer;font-weight:800;letter-spacing:2px;'
+    + 'color:#dfe4f4;background:rgba(30,28,46,0.95);border:2px solid #7a55b0;box-shadow:0 0 14px rgba(130,90,210,0.45);';
+  done.onclick = closeSkillManager;
+  el.appendChild(done);
+  document.body.appendChild(el);
+  skillManager.el = el; skillManager.gridEl = grid; skillManager._built = true;
+}
+function renderSkillManager(){
+  var grid = skillManager.gridEl; grid.innerHTML = '';
+  Object.keys(gameUpgradeDefs).forEach(function(id){
+    var def = gameUpgradeDefs[id], r = GAME_RARITY[def.rarity], cnt = gameSkills.getCount(id);
+    var card = document.createElement('div');
+    card.style.cssText = 'width:188px;padding:11px 12px;border-radius:11px;background:rgba(20,18,32,0.95);'
+      + 'border:2px solid ' + r.border + ';box-shadow:0 0 9px ' + r.glow + ';display:flex;flex-direction:column;';
+    card.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">'
+      + '<div style="font-size:22px;">' + def.icon + '</div>'
+      + '<div style="flex:1;"><div style="color:' + r.color + ';font-size:13px;font-weight:800;line-height:1.15;">' + def.name + '</div>'
+      + '<div style="color:rgba(255,255,255,0.4);font-size:9px;letter-spacing:1px;">' + r.name.toUpperCase() + (def.stackable ? '  ·  MAX ' + def.maxStack : '') + '</div></div></div>'
+      + '<div style="color:rgba(255,255,255,0.6);font-size:10px;line-height:1.35;margin:7px 0;min-height:40px;">' + def.desc + '</div>';
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:6px;';
+    var minus = document.createElement('div');
+    minus.textContent = '−';
+    minus.style.cssText = 'width:30px;height:28px;line-height:26px;text-align:center;border-radius:7px;cursor:pointer;font-size:18px;font-weight:800;'
+      + 'color:#fff;background:rgba(60,40,40,0.9);border:1px solid rgba(255,120,120,0.4);user-select:none;';
+    minus.onclick = function(){ gameSkills.unequip(id); renderSkillManager(); };
+    var count = document.createElement('div');
+    count.textContent = cnt + (def.stackable ? ' / ' + def.maxStack : '');
+    count.style.cssText = 'flex:1;text-align:center;font-size:13px;font-weight:800;color:' + (cnt > 0 ? r.color : 'rgba(255,255,255,0.35)') + ';';
+    var plus = document.createElement('div');
+    plus.textContent = '+';
+    plus.style.cssText = 'width:30px;height:28px;line-height:26px;text-align:center;border-radius:7px;cursor:pointer;font-size:18px;font-weight:800;'
+      + 'color:#fff;background:rgba(40,55,40,0.9);border:1px solid rgba(120,255,120,0.4);user-select:none;';
+    plus.onclick = function(){ gameSkills.equip(id); renderSkillManager(); };
+    row.appendChild(minus); row.appendChild(count); row.appendChild(plus);
+    card.appendChild(row);
+    grid.appendChild(card);
+  });
+}
+function openSkillManager(){
+  if(skillManager.open || (skillMenu && skillMenu.open)) return;
+  buildSkillManagerDom();
+  renderSkillManager();
+  skillManager.open = true;
+  skillManager.el.style.display = 'flex';
+}
+function closeSkillManager(){
+  skillManager.open = false;
+  if(skillManager.el) skillManager.el.style.display = 'none';
+}
+
+// ══════════════════════════════════════════════
+// MULTIPLAYER — Stage 1: seamless 2-player co-op transport + the partner's ship.
+// PeerJS P2P (room-code lobby). Opt-in, so single-player is untouched. Stage 1 syncs each
+// player's ship (full pose + shipVisual animation + boost/drift flags → local FX); the shared
+// host-authoritative enemy/bullet world arrives in Stage 2.
+// ══════════════════════════════════════════════
+var MP_PREFIX = 'CHRYSO-';
+var MP = {
+  peer: null, conn: null, isHost: false, connected: false, role: null,
+  roomCode: '', sendRate: 33, lastSend: 0, nextId: 1,
+  remote: {
+    ship: null, shipVisual: null, region: 0, hasState: false, lastRecv: 0,
+    pos: new THREE.Vector3(), quat: new THREE.Quaternion(),
+    vr: new THREE.Vector3(), vp: new THREE.Vector3(),
+    flags: { drift:false, boost:false, air:false, slam:false },
+    skills: {}, hp: 100
+  },
+  fx: null
+};
+function mpRegionId(){
+  if(gameMode.fly && gameMode.fly.active) return 2;             // free-flight (still the crystal world)
+  if(gameMode.portal && gameMode.portal.inside) return 1;       // inside the dome
+  return 0;                                                      // on the crystal
+}
+function mpWorldOf(region){ return region === 1 ? 1 : 0; }       // dome is its own world; crystal+fly share one
+function mpRoomCode(){ var s = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', c = ''; for(var i = 0; i < 5; i++) c += s[Math.floor(Math.random() * s.length)]; return c; }
+
+// ── Connection lifecycle (mirrors Orbicule's setupConnection/mpSend) ──
+function mpHost(){
+  if(typeof Peer === 'undefined'){ mpLobbyStatus('PeerJS failed to load — check your connection.', '#ff8888'); return; }
+  mpDisconnect();
+  MP.isHost = true; MP.role = 'host'; MP.roomCode = mpRoomCode();
+  try { MP.peer = new Peer(MP_PREFIX + MP.roomCode, { debug: 0 }); } catch(e){ mpLobbyStatus('Could not start host.', '#ff8888'); return; }
+  MP.peer.on('open', function(){ mpShowCode(MP.roomCode); mpLobbyStatus('Share the code — waiting for a friend…', '#9ad0ff'); });
+  MP.peer.on('connection', function(conn){ MP.conn = conn; mpSetupConn(conn); });
+  MP.peer.on('error', function(err){ mpLobbyStatus('Host error: ' + ((err && err.type) || err), '#ff8888'); });
+}
+function mpJoin(code){
+  if(typeof Peer === 'undefined'){ mpLobbyStatus('PeerJS failed to load.', '#ff8888'); return; }
+  code = (code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if(code.length < 4){ mpLobbyStatus('Enter the room code.', '#ffcc66'); return; }
+  mpDisconnect();
+  MP.isHost = false; MP.role = 'guest'; MP.roomCode = code;
+  try { MP.peer = new Peer(undefined, { debug: 0 }); } catch(e){ mpLobbyStatus('Could not start.', '#ff8888'); return; }
+  MP.peer.on('open', function(){
+    mpLobbyStatus('Connecting to ' + code + '…', '#9ad0ff');
+    var conn = MP.peer.connect(MP_PREFIX + code, { reliable: true });
+    MP.conn = conn; mpSetupConn(conn);
+  });
+  MP.peer.on('error', function(err){ mpLobbyStatus('Join error: ' + ((err && err.type) || err), '#ff8888'); });
+}
+function mpSetupConn(conn){
+  conn.on('open', function(){
+    MP.connected = true;
+    MP.guestHp = combat.player.maxHp; MP.nextId = 1; mpClearWorld();
+    if(mpIsGuest()) combat.spawned = false;   // drop the guest's local sim; it mirrors the host now
+    mpBuildRemoteShip();
+    mpUpdateBadge();
+    mpLobbyStatus('Connected! Your friend is in the game.', '#88ff99');
+    setTimeout(mpCloseLobby, 900);
+  });
+  conn.on('data', mpOnData);
+  conn.on('close', function(){ MP.connected = false; mpHideRemote(); mpClearWorld(); mpUpdateBadge(); mpLobbyStatus('Disconnected.', '#ffcc66'); });
+  conn.on('error', function(){});
+}
+function mpSend(data){ if(MP.connected && MP.conn && MP.conn.open){ try { MP.conn.send(data); } catch(e){} } }
+function mpDisconnect(){
+  if(MP.conn){ try { MP.conn.close(); } catch(e){} MP.conn = null; }
+  if(MP.peer){ try { MP.peer.destroy(); } catch(e){} MP.peer = null; }
+  MP.connected = false; mpHideRemote(); mpUpdateBadge();
+}
+function mpOnData(data){
+  if(!data || !data.type) return;
+  if(data.type === 'ship') mpApplyShip(data);
+  else if(data.type === 'world'){ if(mpIsGuest()) mpApplyWorld(data); }       // guest: mirror the host's world
+  else if(data.type === 'fire'){ if(MP.isHost) mpHostSpawnGuestVolley(data); } // host: spawn the guest's authoritative bullets
+  else if(data.type === 'respawn'){ if(mpIsGuest()) mpApplyRespawn(data); }   // host told the guest to respawn
+  else if(data.type === 'xp'){ if(mpIsGuest()) spawnXPBurst(new THREE.Vector3(data.p[0], data.p[1], data.p[2]), new THREE.Vector3(data.n[0], data.n[1], data.n[2]), data.c); } // shared kill → guest's own XP
+}
+function mpApplyRespawn(d){
+  var ship = gameMode.ship; if(!ship) return;
+  ship.position.set(d.p[0], d.p[1], d.p[2]);
+  gameMode.surfaceState.speed = 0; gameMode.surfaceState.airborne = false; gameMode.surfaceState.freeFalling = false;
+  gameMode.fly.vel.set(0, 0, 0);
+}
+
+// ── Ship state serialize / apply ──
+function mpSkillSummary(){
+  return { drone: skillFx.drone, orb: skillFx.orb, net: skillFx.electricNet ? 1 : 0,
+           daisy: skillFx.crazyDaisy ? 1 : 0, fire: skillFx.driftFire ? 1 : 0 };
+}
+function mpSerializeShip(){
+  var s = gameMode.surfaceState, ship = gameMode.ship, sv = gameMode.shipVisual;
+  var region = mpRegionId();
+  var p = ship.position.clone();
+  if(region === 1 && gameMode.portal && gameMode.portal.D) p.sub(gameMode.portal.D);   // dome-local
+  return {
+    type: 'ship', region: region,
+    p: [p.x, p.y, p.z],
+    q: [ship.quaternion.x, ship.quaternion.y, ship.quaternion.z, ship.quaternion.w],
+    vr: [sv.rotation.x, sv.rotation.y, sv.rotation.z],
+    vp: [sv.position.x, sv.position.y, sv.position.z],
+    f: { d: !!s.isDrifting, b: !!gameMode.physics.isBoosting, a: !!s.airborne, sl: !!s.slamming, g: combat.godMode ? 1 : 0 },
+    sk: mpSkillSummary(),
+    hp: combat.player.hp
+  };
+}
+function mpApplyShip(d){
+  var r = MP.remote;
+  r.region = d.region; r.hasState = true; r.lastRecv = performance.now();
+  if(MP.isHost && d.f) combat.guestGod = !!d.f.g;   // host honours the guest's immortality toggle
+  r.pos.set(d.p[0], d.p[1], d.p[2]);
+  r.quat.set(d.q[0], d.q[1], d.q[2], d.q[3]);
+  r.vr.set(d.vr[0], d.vr[1], d.vr[2]);
+  r.vp.set(d.vp[0], d.vp[1], d.vp[2]);
+  r.flags.drift = !!(d.f && d.f.d); r.flags.boost = !!(d.f && d.f.b);
+  r.flags.air = !!(d.f && d.f.a); r.flags.slam = !!(d.f && d.f.sl);
+  r.skills = d.sk || {}; r.hp = (d.hp != null) ? d.hp : r.hp;
+}
+
+// ── Remote ship mesh (reuse the local ship geometry, distinct teal tint) ──
+function mpBuildRemoteShip(){
+  if(MP.remote.ship){ MP.remote.ship.visible = false; return; }
+  if(typeof GAME_SHIP_POSITIONS === 'undefined' || !scene) return;
+  var ship = new THREE.Group();
+  var sv = new THREE.Group();
+  ship.add(sv);
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(GAME_SHIP_POSITIONS), 3));   // clone (local build mutates the shared array)
+  geo.setIndex(new THREE.BufferAttribute(GAME_SHIP_INDICES, 1));
+  geo.computeVertexNormals(); geo.computeBoundingBox();
+  var c = new THREE.Vector3(); geo.boundingBox.getCenter(c); geo.translate(-c.x, -c.y, -c.z);
+  var mat = new THREE.MeshStandardMaterial({ color: 0x55ccaa, transparent: true, opacity: 0.96, roughness: 0.15, metalness: 0.3, emissive: 0x1e7a5e, emissiveIntensity: 0.6 });
+  var mesh = new THREE.Mesh(geo, mat); mesh.rotation.set(0, Math.PI / 2, 0); sv.add(mesh);
+  var edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: 0xbbffe6, transparent: true, opacity: 0.85 }));
+  edges.rotation.copy(mesh.rotation); sv.add(edges);
+  ship.scale.setScalar(0.014);
+  ship.visible = false;
+  scene.add(ship);
+  MP.remote.ship = ship; MP.remote.shipVisual = sv;
+}
+function mpHideRemote(){ if(MP.remote.ship) MP.remote.ship.visible = false; }
+
+// ── Per-frame: interpolate the remote ship into the right region + drive its boost/drift FX ──
+function mpUpdateRemoteShip(){
+  var r = MP.remote;
+  if(MP.fx) mpFxStep();   // always step existing particles so they fade out
+  if(!MP.connected || !r.ship || !r.hasState){ if(r.ship) r.ship.visible = false; return; }
+  var sameWorld = (mpWorldOf(mpRegionId()) === mpWorldOf(r.region));
+  // Drop the remote if its packets went stale (peer froze) so it doesn't hang in place forever.
+  if(performance.now() - r.lastRecv > 4000) sameWorld = false;
+  r.ship.visible = sameWorld;
+  if(!sameWorld) return;
+  var target = r.pos.clone();
+  if(r.region === 1 && gameMode.portal && gameMode.portal.D) target.add(gameMode.portal.D);   // back into our dome instance
+  r.ship.position.lerp(target, 0.4);
+  r.ship.quaternion.slerp(r.quat, 0.4);
+  r.shipVisual.rotation.set(r.vr.x, r.vr.y, r.vr.z);
+  r.shipVisual.position.set(r.vp.x, r.vp.y, r.vp.z);
+  // per-frame velocity estimate of the partner ship (host uses it to lead-aim enemy shells)
+  if(MP._remotePrev) MP.remoteVel.copy(r.ship.position).sub(MP._remotePrev);
+  else MP._remotePrev = new THREE.Vector3();
+  MP._remotePrev.copy(r.ship.position);
+  mpRemoteFxEmit();
+  mpUpdateMarker();
+}
+
+// ── Lightweight remote boost-plume + drift-spark emitter (self-contained additive Points) ──
+function mpEnsureFx(){
+  if(MP.fx) return MP.fx;
+  var max = 260;
+  var pos = new Float32Array(max * 3), col = new Float32Array(max * 3), al = new Float32Array(max);
+  for(var i = 0; i < max; i++) pos[i * 3 + 1] = -99999;
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('mcolor', new THREE.BufferAttribute(col, 3));
+  geo.setAttribute('alpha', new THREE.BufferAttribute(al, 1));
+  var mat = new THREE.ShaderMaterial({
+    uniforms: { pr: { value: Math.min(window.devicePixelRatio, 2) } },
+    vertexShader: ['attribute float alpha; attribute vec3 mcolor; varying float vA; varying vec3 vC; uniform float pr;',
+      'void main(){ vA = alpha; vC = mcolor; vec4 mv = modelViewMatrix * vec4(position,1.0); gl_PointSize = pr * (2.2 / -mv.z); gl_PointSize = clamp(gl_PointSize, 2.0, 40.0); gl_Position = projectionMatrix * mv; }'].join('\n'),
+    fragmentShader: ['varying float vA; varying vec3 vC; void main(){ float d = length(gl_PointCoord - 0.5) * 2.0; if(d > 1.0) discard; gl_FragColor = vec4(vC, vA * (1.0 - d)); }'].join('\n'),
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+  });
+  var pts = new THREE.Points(geo, mat); pts.frustumCulled = false; pts.renderOrder = 4; scene.add(pts);
+  var data = []; for(var j = 0; j < max; j++) data.push({ alive: false, vx: 0, vy: 0, vz: 0, life: 0, maxLife: 1 });
+  MP.fx = { geo: geo, pos: pos, col: col, al: al, pts: pts, max: max, data: data, head: 0 };
+  return MP.fx;
+}
+function mpFxEmit(px, py, pz, vx, vy, vz, cr, cg, cb, maxLife){
+  var fx = mpEnsureFx(), i = -1;
+  for(var k = 0; k < fx.max; k++){ var idx = (fx.head + k) % fx.max; if(!fx.data[idx].alive){ i = idx; break; } }
+  if(i < 0) return; fx.head = (i + 1) % fx.max;
+  var d = fx.data[i]; d.alive = true; d.vx = vx; d.vy = vy; d.vz = vz; d.life = 0; d.maxLife = maxLife;
+  fx.pos[i * 3] = px; fx.pos[i * 3 + 1] = py; fx.pos[i * 3 + 2] = pz;
+  fx.col[i * 3] = cr; fx.col[i * 3 + 1] = cg; fx.col[i * 3 + 2] = cb; fx.al[i] = 1;
+}
+function mpRemoteFxEmit(){
+  var r = MP.remote; if(!r.ship || !r.ship.visible) return;
+  // Drift: reuse the EXACT drift-spark system at the partner's ship (orange pixels + streaks).
+  if(r.flags.drift){
+    spawnGameDriftParticles({ ship: r.ship, dir: (r.vr.y >= 0 ? 1 : -1), speed: gameMode.physics.maxSpeed });
+  }
+  // Boost: a bright purple plume (the local boost trail is a single-ship ribbon, so the partner
+  // gets this matching-colour plume instead — full pixel-parity is Stage 3).
+  if(r.flags.boost){
+    var p = r.ship.position;
+    var fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(r.ship.quaternion);   // local +Z = forward
+    if(fwd.lengthSq() > 1e-9) fwd.normalize();
+    var back = fwd.multiplyScalar(-1);
+    for(var i = 0; i < 5; i++){
+      mpFxEmit(p.x + back.x * 0.012, p.y + back.y * 0.012, p.z + back.z * 0.012,
+        back.x * 0.013 + (Math.random() - 0.5) * 0.006, back.y * 0.013 + (Math.random() - 0.5) * 0.006, back.z * 0.013 + (Math.random() - 0.5) * 0.006,
+        0.72, 0.42, 1.0, 18 + Math.random() * 10);
+    }
+  }
+}
+function mpFxStep(){
+  var fx = MP.fx; if(!fx) return; var any = false;
+  for(var i = 0; i < fx.max; i++){
+    var d = fx.data[i]; if(!d.alive) continue; any = true;
+    d.life++;
+    if(d.life >= d.maxLife){ d.alive = false; fx.pos[i * 3 + 1] = -99999; fx.al[i] = 0; continue; }
+    fx.pos[i * 3] += d.vx; fx.pos[i * 3 + 1] += d.vy; fx.pos[i * 3 + 2] += d.vz;
+    fx.al[i] = 1 - d.life / d.maxLife;
+  }
+  fx.geo.attributes.position.needsUpdate = true;
+  fx.geo.attributes.alpha.needsUpdate = true;
+  fx.geo.attributes.mcolor.needsUpdate = true;
+}
+function mpClearFx(){ var fx = MP.fx; if(!fx) return; for(var i = 0; i < fx.max; i++){ fx.data[i].alive = false; fx.pos[i * 3 + 1] = -99999; fx.al[i] = 0; } fx.geo.attributes.position.needsUpdate = true; fx.geo.attributes.alpha.needsUpdate = true; }
+
+// ── Throttled send of the local ship state (called each frame from animate) ──
+function mpTick(){
+  if(!MP.connected || !gameMode.active) return;
+  var now = performance.now();
+  if(now - MP.lastSend >= MP.sendRate){ MP.lastSend = now; mpSend(mpSerializeShip()); }
+  mpSendWorld();   // host broadcasts the authoritative combat world (no-op on the guest)
+}
+
+// ── Connection badge + partner marker (DOM) ──
+var mpBadgeEl = null, mpMarkerEl = null;
+function mpUpdateBadge(){
+  if(!mpBadgeEl){
+    var el = document.createElement('div'); el.id = 'mp-badge';
+    el.style.cssText = 'position:fixed;left:50%;top:64px;transform:translateX(-50%);z-index:56;display:none;'
+      + 'font-family:Arial,sans-serif;font-weight:800;font-size:12px;letter-spacing:2px;color:#88ffcc;'
+      + 'background:rgba(10,30,26,0.7);border:1px solid rgba(90,220,180,0.5);border-radius:6px;padding:3px 10px;'
+      + 'text-shadow:0 1px 4px rgba(0,0,0,0.7);pointer-events:none;';
+    document.body.appendChild(el); mpBadgeEl = el;
+  }
+  mpBadgeEl.textContent = '● P2 ' + (MP.isHost ? 'HOSTING ' + MP.roomCode : 'CONNECTED');
+  mpBadgeEl.style.display = (MP.connected && gameMode.active && !gameMode.exiting) ? 'block' : 'none';
+}
+function mpUpdateMarker(){
+  if(!mpMarkerEl){
+    var el = document.createElement('div'); el.id = 'mp-marker';
+    el.style.cssText = 'position:fixed;z-index:55;pointer-events:none;display:none;font-family:Arial,sans-serif;'
+      + 'font-weight:800;font-size:11px;letter-spacing:1px;color:#aaffdd;text-shadow:0 1px 4px rgba(0,0,0,0.8);transform:translate(-50%,-50%);white-space:nowrap;';
+    el.textContent = '◆ P2';
+    document.body.appendChild(el); mpMarkerEl = el;
+  }
+  var r = MP.remote;
+  if(!MP.connected || !r.ship || !r.ship.visible){ mpMarkerEl.style.display = 'none'; return; }
+  var sp = r.ship.position.clone().project(camera);
+  var onScreen = sp.z < 1 && Math.abs(sp.x) <= 1 && Math.abs(sp.y) <= 1;
+  var x, y;
+  if(onScreen){
+    x = (sp.x * 0.5 + 0.5) * window.innerWidth;
+    y = (-sp.y * 0.5 + 0.5) * window.innerHeight - 26;   // float above the ship
+  } else {
+    // clamp to a screen-edge arrow toward the partner
+    var dx = sp.x, dy = -sp.y; if(sp.z >= 1){ dx = -dx; dy = -dy; }
+    var ang = Math.atan2(dy, dx);
+    var mx = Math.cos(ang), my = Math.sin(ang);
+    var hw = window.innerWidth * 0.5 - 24, hh = window.innerHeight * 0.5 - 24;
+    var sc = Math.min(Math.abs(hw / (mx || 1e-6)), Math.abs(hh / (my || 1e-6)));
+    x = window.innerWidth * 0.5 + mx * sc; y = window.innerHeight * 0.5 + my * sc;
+  }
+  mpMarkerEl.style.left = x + 'px'; mpMarkerEl.style.top = y + 'px';
+  mpMarkerEl.style.display = 'block';
+}
+
+// ── Lobby (DOM overlay, like the skill manager; pauses the game while open) ──
+var mpLobby = { el: null, statusEl: null, codeEl: null, inputEl: null, open: false, _built: false };
+function mpBuildLobby(){
+  if(mpLobby._built) return;
+  var el = document.createElement('div'); el.id = 'mp-lobby';
+  el.style.cssText = 'position:fixed;inset:0;z-index:123;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;'
+    + 'background:rgba(8,10,18,0.86);backdrop-filter:blur(3px);font-family:Arial,sans-serif;color:#cfd4e6;';
+  var title = document.createElement('div');
+  title.style.cssText = 'font-size:24px;font-weight:800;letter-spacing:3px;color:#9ad0ff;';
+  title.textContent = 'CO-OP MULTIPLAYER';
+  var sub = document.createElement('div');
+  sub.style.cssText = 'font-size:12px;color:rgba(255,255,255,0.5);letter-spacing:1px;margin-bottom:6px;';
+  sub.textContent = 'host a room and share the code, or join a friend’s code';
+  var hostBtn = document.createElement('div');
+  hostBtn.textContent = 'HOST A ROOM';
+  hostBtn.style.cssText = 'padding:11px 30px;border-radius:10px;cursor:pointer;font-weight:800;letter-spacing:2px;color:#dff;background:rgba(20,40,36,0.95);border:2px solid #3aa088;box-shadow:0 0 14px rgba(60,200,160,0.4);';
+  hostBtn.onclick = mpHost;
+  var code = document.createElement('div'); code.style.cssText = 'font-size:30px;font-weight:900;letter-spacing:8px;color:#88ffcc;display:none;margin:4px 0;';
+  var row = document.createElement('div'); row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-top:6px;';
+  var input = document.createElement('input');
+  input.type = 'text'; input.maxLength = 6; input.placeholder = 'CODE';
+  input.style.cssText = 'width:120px;padding:9px 12px;font-size:18px;font-weight:800;letter-spacing:4px;text-align:center;text-transform:uppercase;'
+    + 'border-radius:9px;border:2px solid #5a6aa0;background:rgba(20,22,40,0.95);color:#dfe4f4;outline:none;';
+  var joinBtn = document.createElement('div');
+  joinBtn.textContent = 'JOIN';
+  joinBtn.style.cssText = 'padding:9px 22px;border-radius:9px;cursor:pointer;font-weight:800;letter-spacing:2px;color:#dff;background:rgba(20,28,46,0.95);border:2px solid #5a6aa0;';
+  joinBtn.onclick = function(){ mpJoin(input.value); };
+  input.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ mpJoin(input.value); e.preventDefault(); } });
+  row.appendChild(input); row.appendChild(joinBtn);
+  var status = document.createElement('div'); status.style.cssText = 'font-size:13px;min-height:18px;color:#9ad0ff;margin-top:8px;';
+  var close = document.createElement('div');
+  close.textContent = 'CLOSE'; close.style.cssText = 'margin-top:16px;padding:7px 22px;border-radius:8px;cursor:pointer;font-weight:700;letter-spacing:2px;color:#cfd4e6;background:rgba(30,28,46,0.9);border:1px solid #555;';
+  close.onclick = mpCloseLobby;
+  el.appendChild(title); el.appendChild(sub); el.appendChild(hostBtn); el.appendChild(code); el.appendChild(row); el.appendChild(status); el.appendChild(close);
+  document.body.appendChild(el);
+  mpLobby.el = el; mpLobby.statusEl = status; mpLobby.codeEl = code; mpLobby.inputEl = input; mpLobby._built = true;
+}
+function mpOpenLobby(){ mpBuildLobby(); mpLobby.open = true; mpLobby.el.style.display = 'flex'; if(MP.connected) mpLobbyStatus('Connected.', '#88ff99'); else mpLobbyStatus('', '#9ad0ff'); }
+function mpCloseLobby(){ mpLobby.open = false; if(mpLobby.el) mpLobby.el.style.display = 'none'; }
+function mpLobbyStatus(msg, color){ if(mpLobby.statusEl){ mpLobby.statusEl.textContent = msg; mpLobby.statusEl.style.color = color || '#9ad0ff'; } }
+function mpShowCode(code){ if(mpLobby.codeEl){ mpLobby.codeEl.textContent = code; mpLobby.codeEl.style.display = 'block'; } }
+
+// ══════════════════════════════════════════════
+// MULTIPLAYER — Stage 2: host-authoritative shared combat. The HOST runs the only real sim
+// (updateCombat as today) and broadcasts a compact world snapshot; the GUEST stops simulating
+// and renders MIRROR objects reconciled by netId. The guest sends fire-intents so its bullets
+// (with its own skills) are spawned authoritatively on the host and hurt the shared enemies; the
+// host applies enemy damage to the guest too. So every enemy + bullet is identical on both screens.
+// ══════════════════════════════════════════════
+MP.world = null; MP.lastWorldSend = 0; MP.worldRate = 50;   // ~20Hz world snapshots
+MP.mirror = { e: {}, b: {}, eb: {}, pb: {} };               // netId → mesh (guest)
+MP.guestHp = 100;                                           // host's authoritative copy of the guest's HP
+function mpIsGuest(){ return MP.connected && !MP.isHost; }
+function mpId(o){ return (o.netId != null) ? o.netId : (o.netId = MP.nextId++); }
+
+// ── Host: serialize the whole combat world into a compact snapshot ──
+function mpSerializeWorld(){
+  var e = [], b = [], eb = [], pb = [], i;
+  for(i = 0; i < combat.enemies.length; i++){ var t = combat.enemies[i], u = t.userData;
+    e.push([mpId(u), +t.position.x.toFixed(4), +t.position.y.toFixed(4), +t.position.z.toFixed(4),
+      +t.quaternion.x.toFixed(3), +t.quaternion.y.toFixed(3), +t.quaternion.z.toFixed(3), +t.quaternion.w.toFixed(3),
+      Math.round(u.hp), u.maxHp, u.building | 0, +u.normal.x.toFixed(3), +u.normal.y.toFixed(3), +u.normal.z.toFixed(3)]); }
+  for(i = 0; i < combat.balls.length; i++){ var bl = combat.balls[i];
+    b.push([mpId(bl), +bl.mesh.position.x.toFixed(4), +bl.mesh.position.y.toFixed(4), +bl.mesh.position.z.toFixed(4),
+      +bl.mesh.quaternion.x.toFixed(3), +bl.mesh.quaternion.y.toFixed(3), +bl.mesh.quaternion.z.toFixed(3), +bl.mesh.quaternion.w.toFixed(3),
+      Math.round(bl.hp), +bl.normal.x.toFixed(3), +bl.normal.y.toFixed(3), +bl.normal.z.toFixed(3), bl.building | 0]); }
+  for(i = 0; i < combat.enemyBullets.length; i++){ var p = combat.enemyBullets[i];
+    eb.push([mpId(p), +p.mesh.position.x.toFixed(4), +p.mesh.position.y.toFixed(4), +p.mesh.position.z.toFixed(4),
+      +p.vel.x.toFixed(4), +p.vel.y.toFixed(4), +p.vel.z.toFixed(4), p.noStretch ? 1 : 0]); }
+  for(i = 0; i < gameBullets.length; i++){ var g = gameBullets[i];
+    pb.push([mpId(g), +g.mesh.position.x.toFixed(4), +g.mesh.position.y.toFixed(4), +g.mesh.position.z.toFixed(4),
+      +g.vel.x.toFixed(4), +g.vel.y.toFixed(4), +g.vel.z.toFixed(4), g.big ? 1 : 0, g.owner | 0]); }
+  return { type: 'world', e: e, b: b, eb: eb, pb: pb,
+    w: { a: combat.arenaActive ? 1 : 0, wv: combat.wave, lf: combat.enemies.length, st: Math.ceil((combat.spawnTimer || 0) / 60) },
+    h1: Math.round(combat.player.hp), h2: Math.round(MP.guestHp) };
+}
+function mpSendWorld(){
+  if(!MP.connected || !MP.isHost || !gameMode.active) return;
+  var now = performance.now();
+  if(now - MP.lastWorldSend < MP.worldRate) return;
+  MP.lastWorldSend = now;
+  mpSend(mpSerializeWorld());
+}
+
+// ── Guest: mirror builders (reuse the real meshes so they look identical) ──
+function mpMirrorEbulletMesh(spiral){
+  if(spiral && combat._sbGeo){ var m = new THREE.Mesh(combat._sbGeo, combat._sbMat); m.frustumCulled = false; m.renderOrder = 5; scene.add(m); return m; }
+  if(!combat._ebGeo){ combat._ebGeo = new THREE.SphereGeometry(0.012, 8, 8); combat._ebMat = new THREE.MeshBasicMaterial({ color: 0xff9980 }); }
+  var mesh = new THREE.Mesh(combat._ebGeo, combat._ebMat);
+  mesh.frustumCulled = false; mesh.renderOrder = 5;
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xff7755, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glow.scale.set(0.05, 0.05, 1); mesh.add(glow); scene.add(mesh); return mesh;
+}
+function mpMirrorPbulletMesh(big, owner){
+  var sz = big ? 0.008 : 0.004;
+  var col = owner === 1 ? 0x66e0ff : (big ? 0xff7adf : 0xc9a3ff);   // guest = teal, host = purple
+  var mesh = new THREE.Mesh(new THREE.SphereGeometry(sz, 8, 6), new THREE.MeshBasicMaterial({ color: col }));
+  mesh.frustumCulled = false; mesh.renderOrder = 5;
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: owner === 1 ? 0x9af0ff : 0xb98cff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+  glow.scale.set(big ? 0.05 : 0.022, big ? 0.05 : 0.022, 1); mesh.add(glow); scene.add(mesh); return mesh;
+}
+// ── Guest: reconcile mirrors from a snapshot (create / update-target / remove) ──
+function mpApplyWorld(w){
+  MP.world = w;
+  var seenE = {}, seenB = {}, seenEb = {}, seenPb = {}, i, id, row, m;
+  // tanks
+  for(i = 0; i < w.e.length; i++){ row = w.e[i]; id = row[0]; seenE[id] = 1;
+    m = MP.mirror.e[id];
+    if(!m){ m = buildTank(); scene.add(m); m.userData.hpBarEl = mpMakeBar(); m.userData.hpFillEl = m.userData.hpBarEl.firstChild; MP.mirror.e[id] = m; }
+    m.userData._tp = new THREE.Vector3(row[1], row[2], row[3]);
+    m.userData._tq = new THREE.Quaternion(row[4], row[5], row[6], row[7]);
+    m.userData.hp = row[8]; m.userData.maxHp = row[9];
+    m.userData.normal = new THREE.Vector3(row[11], row[12], row[13]);
+    m.scale.setScalar(TANK_SCALE * (row[10] > 0 ? 0.4 : 1));   // shrunk while building
+  }
+  for(id in MP.mirror.e){ if(!seenE[id]){ var tk = MP.mirror.e[id]; if(tk.userData.hpBarEl) tk.userData.hpBarEl.remove(); scene.remove(tk); tk.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); }); delete MP.mirror.e[id]; } }
+  // balls
+  for(i = 0; i < w.b.length; i++){ row = w.b[i]; id = row[0]; seenB[id] = 1;
+    m = MP.mirror.b[id];
+    if(!m){ m = buildBall(); MP.mirror.b[id] = m; }
+    m.userData._tp = new THREE.Vector3(row[1], row[2], row[3]);
+    m.userData._tq = new THREE.Quaternion(row[4], row[5], row[6], row[7]);
+    m.scale.setScalar(row[12] > 0 ? 0.3 : 1);
+  }
+  for(id in MP.mirror.b){ if(!seenB[id]){ scene.remove(MP.mirror.b[id]); delete MP.mirror.b[id]; } }
+  // enemy bullets
+  for(i = 0; i < w.eb.length; i++){ row = w.eb[i]; id = row[0]; seenEb[id] = 1;
+    m = MP.mirror.eb[id];
+    if(!m){ m = mpMirrorEbulletMesh(row[7] === 1); MP.mirror.eb[id] = m; }
+    m.userData._tp = new THREE.Vector3(row[1], row[2], row[3]);
+    m.userData._tv = new THREE.Vector3(row[4], row[5], row[6]);
+    m.position.copy(m.userData._tp);
+  }
+  for(id in MP.mirror.eb){ if(!seenEb[id]){ scene.remove(MP.mirror.eb[id]); delete MP.mirror.eb[id]; } }
+  // player bullets — skip the guest's OWN (owner 1): it renders its predicted ones locally
+  for(i = 0; i < w.pb.length; i++){ row = w.pb[i]; id = row[0]; var owner = row[8];
+    if(owner === 1){ continue; }
+    seenPb[id] = 1;
+    m = MP.mirror.pb[id];
+    if(!m){ m = mpMirrorPbulletMesh(row[7] === 1, owner); MP.mirror.pb[id] = m; }
+    m.userData._tp = new THREE.Vector3(row[1], row[2], row[3]);
+    m.userData._tv = new THREE.Vector3(row[4], row[5], row[6]);
+    m.position.copy(m.userData._tp);
+  }
+  for(id in MP.mirror.pb){ if(!seenPb[id]){ scene.remove(MP.mirror.pb[id]); delete MP.mirror.pb[id]; } }
+  // HUD: reflect the host's authoritative HP + wave state
+  combat.player.hp = w.h2;
+  combat.arenaActive = w.w.a === 1; combat.wave = w.w.wv;
+}
+// ── Guest: per-frame smoothing — lerp tanks/balls to target, integrate bullets by velocity ──
+function mpInterpolateWorld(){
+  var id, m;
+  for(id in MP.mirror.e){ m = MP.mirror.e[id]; if(m.userData._tp){ m.position.lerp(m.userData._tp, 0.5); m.quaternion.slerp(m.userData._tq, 0.5); } }
+  for(id in MP.mirror.b){ m = MP.mirror.b[id]; if(m.userData._tp){ m.position.lerp(m.userData._tp, 0.5); m.quaternion.slerp(m.userData._tq, 0.5); } }
+  for(id in MP.mirror.eb){ m = MP.mirror.eb[id]; if(m.userData._tv){ m.position.addScaledVector(m.userData._tv, 1); if(m.userData._tv.lengthSq() > 1e-9) m.lookAt(m.position.clone().add(m.userData._tv)); } }
+  for(id in MP.mirror.pb){ m = MP.mirror.pb[id]; if(m.userData._tv){ m.position.addScaledVector(m.userData._tv, 1); } }
+}
+function mpClearWorld(){
+  for(var eid in MP.mirror.e){ var et = MP.mirror.e[eid]; if(et.userData.hpBarEl) et.userData.hpBarEl.remove(); }
+  ['e', 'b', 'eb', 'pb'].forEach(function(k){ for(var id in MP.mirror[k]){ var m = MP.mirror[k][id]; if(m.parent) scene.remove(m); } MP.mirror[k] = {}; });
+  MP.world = null;
+}
+// Floating red HP bar (DOM) for a guest mirror tank — matches the host's enemy bars.
+function mpMakeBar(){
+  var bar = document.createElement('div');
+  bar.style.cssText = 'position:fixed;z-index:55;width:70px;height:7px;margin-left:-35px;'
+    + 'background:rgba(40,12,12,0.85);border:1px solid rgba(0,0,0,0.5);border-radius:3px;'
+    + 'pointer-events:none;display:none;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.6);';
+  var fill = document.createElement('div');
+  fill.style.cssText = 'height:100%;width:100%;background:linear-gradient(90deg,#ff5a4a,#cc3333);border-radius:2px;';
+  bar.appendChild(fill); document.body.appendChild(bar);
+  return bar;
+}
+function mpUpdateMirrorBars(){
+  for(var id in MP.mirror.e){
+    var t = MP.mirror.e[id], u = t.userData; if(!u.hpBarEl) continue;
+    var n = u.normal || new THREE.Vector3(0, 1, 0);
+    var bp = t.position.clone().addScaledVector(n, 0.16).project(camera);
+    if(bp.z > 1){ u.hpBarEl.style.display = 'none'; continue; }
+    u.hpBarEl.style.display = 'block';
+    u.hpBarEl.style.left = ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
+    u.hpBarEl.style.top = ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
+    u.hpFillEl.style.width = Math.max(0, u.hp / u.maxHp * 100) + '%';
+  }
+}
+// ── Guest combat tick (replaces the local sim while a guest): HUD + mirror interpolation. ──
+function mpGuestCombat(dt){
+  if(!combat.spawned){ ensureCombatHUD(); combat.spawned = true; }
+  showCombatHUD(true);
+  mpInterpolateWorld();
+  mpUpdateMirrorBars();   // enemy HP bars over the mirrored tanks
+  updateXPOrbs();         // the guest's own XP orbs (spawned from shared-kill events) magnet + collect
+  updateDamageNumbers();
+  // reflect HP bar + damage counter + wave banner from the latest snapshot
+  if(combat.hpFillEl){ combat.hpFillEl.style.width = Math.max(0, combat.player.hp / combat.player.maxHp * 100) + '%';
+    combat.hpFillEl.style.background = combat.player.hp / combat.player.maxHp > 0.3 ? 'linear-gradient(90deg,#48e07a,#2fae5c)' : 'linear-gradient(90deg,#ff6a4a,#cc3333)'; }
+  if(combat.waveEl){
+    if(combat.arenaActive){ combat.waveEl.style.display = 'block';
+      combat.waveEl.textContent = MP.world ? ('WAVE ' + combat.wave + (MP.world.w.st > 0 ? '  ·  INCOMING ' + MP.world.w.st : '  ·  ' + MP.world.w.lf + ' LEFT')) : '';
+    } else combat.waveEl.style.display = 'none';
+  }
+  // mirror tank HP bars
+  for(var id in MP.mirror.e){ var t = MP.mirror.e[id]; /* lightweight: skip per-tank DOM bars on guest for now */ }
+}
+
+// ── Guest fire-intent → host spawns the guest's authoritative bullets (its own skills) ──
+function mpFireSkillSummary(){
+  return { front: skillFx.frontBullet, diag: skillFx.diagonal, big: skillFx.bigBullet ? 1 : 0,
+    vel: skillFx.velocity, split: skillFx.splitShot, orbit: skillFx.orbitingShot, track: skillFx.tracking ? 1 : 0, multi: skillFx.multiShot };
+}
+function mpSendFireIntent(){
+  var s = gameMode.surfaceState, M = gameFiringDir();
+  var nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
+  var dir;
+  if(crosshairActive()){
+    var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+    dir = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST).sub(nose);
+    if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
+  } else dir = M.clone();
+  var sv = gameMode._shipVel || new THREE.Vector3();
+  mpSend({ type: 'fire', o: [nose.x, nose.y, nose.z], d: [dir.x, dir.y, dir.z], sv: [sv.x, sv.y, sv.z], up: [s.groundNormal.x, s.groundNormal.y, s.groundNormal.z], sk: mpFireSkillSummary() });
+}
+// Host: spawn the guest's full bullet fan with the guest's skills (owner = 1).
+function mpHostSpawnGuestVolley(d){
+  var o = new THREE.Vector3(d.o[0], d.o[1], d.o[2]);
+  var dir = new THREE.Vector3(d.d[0], d.d[1], d.d[2]); if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.set(0, 0, 1);
+  var up = new THREE.Vector3(d.up[0], d.up[1], d.up[2]); if(up.lengthSq() < 1e-9) up.set(0, 1, 0);
+  var sv = new THREE.Vector3(d.sv[0], d.sv[1], d.sv[2]);
+  var sk = d.sk || {};
+  function spawn(orig, dr, lateral){
+    dr = dr.clone(); if(dr.lengthSq() > 1e-9) dr.normalize();
+    var pos = orig.clone();
+    if(lateral){ var rt = new THREE.Vector3().crossVectors(dr, up); if(rt.lengthSq() > 1e-9){ rt.normalize(); pos.addScaledVector(rt, lateral); } }
+    var vel = dr.clone().multiplyScalar(0.18).add(sv);
+    var dmg = PLAYER_BULLET_DAMAGE * (sk.big ? 3.5 : 1) * (1 + 0.5 * (sk.vel || 0));
+    var szb = sk.big ? 0.008 : 0.004;
+    var mesh = new THREE.Mesh(new THREE.SphereGeometry(szb, 8, 6), new THREE.MeshBasicMaterial({ color: 0x66e0ff }));
+    mesh.position.copy(orig); mesh.frustumCulled = false; mesh.renderOrder = 5;
+    var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0x9af0ff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+    glow.scale.set(sk.big ? 0.05 : 0.022, sk.big ? 0.05 : 0.022, 1); mesh.add(glow); scene.add(mesh);
+    gameBullets.push({ mesh: mesh, vel: vel, life: 0, maxLife: sk.orbit ? 240 : 90, dmg: dmg, big: !!sk.big, homing: !!sk.track, split: sk.split || 0,
+      orbit: (sk.orbit > 0) ? { stacks: sk.orbit, phase: 'seek', target: null, angle: 0, ttl: 0 } : null, owner: 1 });
+  }
+  spawn(o, dir, 0);
+  for(var f = 1; f <= (sk.front || 0); f++){ spawn(o, dir, (f % 2 === 1 ? 1 : -1) * 0.01 * Math.ceil(f / 2)); }
+  if(sk.diag > 0){ var maxAng = 0.55; for(var g = 1; g <= sk.diag; g++){ var ang = maxAng * g / sk.diag; spawn(o, dir.clone().applyAxisAngle(up, ang), 0); spawn(o, dir.clone().applyAxisAngle(up, -ang), 0); } }
+  for(var mlt = 0; mlt < (sk.multi || 0); mlt++){ (function(dd){ setTimeout(function(){ if(MP.connected) mpHostSpawnGuestVolley(dd); }, 100 * (mlt + 1)); })(d); }
+}
+// Host: apply enemy damage to the GUEST too (its ship is MP.remote.ship). Called from the host's
+// enemy-bullet / ball / tank collision against the guest's position; tracked in MP.guestHp.
+function mpHurtGuest(amount){
+  if(!MP.isHost || !MP.connected) return;
+  if(combat.guestGod) return;
+  MP.guestHp = Math.max(0, MP.guestHp - amount);
+}
+
+// ── Stage 3: enemies engage BOTH players. mpNearestPlayer(pos) returns the closer of {host ship,
+// guest ship}; single-player (not connected) always returns the host ship → zero behaviour change.
+MP.remoteVel = new THREE.Vector3(); MP._remotePrev = null;
+var _mpZeroVec = new THREE.Vector3();
+function mpNearestPlayer(pos){
+  var hp = gameMode.ship.position;
+  if(!MP.isHost || !MP.connected || !MP.remote.ship || !MP.remote.ship.visible){
+    return { pos: hp, vel: gameMode._shipVel || _mpZeroVec, isGuest: false };
+  }
+  var gp = MP.remote.ship.position;
+  if(pos.distanceToSquared(hp) <= pos.distanceToSquared(gp)) return { pos: hp, vel: gameMode._shipVel || _mpZeroVec, isGuest: false };
+  return { pos: gp, vel: MP.remoteVel, isGuest: true };
+}
+// Host: when the guest's HP hits 0, brief downtime then revive (+ teleport back to spawn in the dome arena).
+function mpHostGuestDeathCheck(now){
+  if(!MP.isHost || !MP.connected) return;
+  if(MP.guestHp <= 0 && !MP.guestDeadT){ MP.guestDeadT = now; }
+  if(MP.guestDeadT && now - MP.guestDeadT > 1400){
+    MP.guestHp = combat.player.maxHp; MP.guestDeadT = 0;
+    if(combat.arenaActive && combat.domeSpawn) mpSend({ type: 'respawn', p: [combat.domeSpawn.x, combat.domeSpawn.y, combat.domeSpawn.z] });
+  }
+}
+
 // Kick off a mid-air barrel roll in the given direction (-1 left, +1 right). Captures
 // the ship's current world-right at trigger time so the lateral dash stays on a fixed
 // axis even as the visual roll spins shipVisual around. No-op if grounded or already
@@ -15665,6 +17668,7 @@ function triggerSlam(){
   if(!gameMode.active || gameMode.fly.active) return;
   var s = gameMode.surfaceState;
   if(!s.airborne) return;
+  s.slamming = true; s.slamAirTime = s.airTime;   // Ground Stomp: explode on landing, scaled by air time
   if(s.freeFalling){
     // Free-fall slam — drive fly.vel hard toward the nearest surface (down the
     // current ground normal). Gravity keeps compounding it, so the magnetic
@@ -15681,6 +17685,7 @@ function triggerSlam(){
 
 function gameKeyDown(e) {
   if(!gameMode.active && !gameMode.entering) return;
+  if(skillMenuOpen()){ handleSkillMenuKey(e); return; }   // level-up picker: 1/2/3 to choose, swallow movement
   var k = e.key ? e.key.toLowerCase() : '';
   if(k === 'w' || k === 'arrowup') gameMode.keys.w = true;
   else if(k === 'a' || k === 'arrowleft') {
@@ -15704,11 +17709,13 @@ function gameKeyDown(e) {
   else if(k === 'shift') gameMode.keys.shift = true;
   else if(k === 'q') gameMode.keys.q = true;
   else if(k === 'e') gameMode.keys.e = true;
+  else if(k === 'c') gameMode.keys.charge = true;   // Boost Charge: hold to charge, release to blast
   else if(k === ' ') {
     gameMode.keys.space = true;
-    // Surface mode: Space (non-repeat) triggers a jump. Fly mode keeps using space for
-    // vertical thrust (handled in updateFlightPhysicsAndCamera).
-    if(!e.repeat && gameMode.active && !gameMode.fly.active && !gameMode.surfaceState.airborne){
+    // Surface mode: Space (non-repeat) requests a jump. tryGameJump allows a ground hop OR an
+    // air re-jump while +1 Jump budget remains. Holding SPACE airborne hovers (no re-jump — the
+    // repeat guard means a held key doesn't re-request). Fly mode uses space for vertical thrust.
+    if(!e.repeat && gameMode.active && !gameMode.fly.active){
       gameMode.wantJump = true;
     }
   }
@@ -15716,6 +17723,9 @@ function gameKeyDown(e) {
   else if(k === 'enter') { if(gameMode.active) { combat.enterFiring = true; fireBullet(); e.preventDefault(); } }   // hold Enter to fire
   else if(k === 'l' && !e.repeat) { if(gameMode.active) { toggleLockOn(); e.preventDefault(); } }   // lock-on camera toggle
   else if(k === 't' && !e.repeat) { if(gameMode.active) { spawnEnemyNearPlayer(); e.preventDefault(); } }   // spawn an enemy near the player
+  else if(k === 'i' && !e.repeat) { if(gameMode.active) { toggleGodMode(); e.preventDefault(); } }   // immortality toggle
+  else if(k === 'b' && !e.repeat) { if(gameMode.active) { openSkillManager(); e.preventDefault(); } }   // loadout / skill editor
+  else if(k === 'm' && !e.repeat) { if(gameMode.active) { mpOpenLobby(); e.preventDefault(); } }   // co-op multiplayer lobby
   else if(k === 'p' && !e.repeat) { if(gameMode.active) toggleFlightMode(); }
   else if(k === 'escape') {
     if(gameMode.active && !gameMode.exiting) {
@@ -15736,6 +17746,7 @@ function gameKeyUp(e) {
   else if(k === 'shift') gameMode.keys.shift = false;
   else if(k === 'q') gameMode.keys.q = false;
   else if(k === 'e') gameMode.keys.e = false;
+  else if(k === 'c') gameMode.keys.charge = false;
   else if(k === ' ') gameMode.keys.space = false;
   else if(k === 'control') gameMode.keys.ctrl = false;
   else if(k === 'enter') combat.enterFiring = false;   // stop hold-to-fire
@@ -16606,6 +18617,7 @@ function updatePortalInterior(){
   var P = gameMode.portal, p = gameMode.physics, k = gameMode.keys, t = gameMode.touch, s = gameMode.surfaceState, ship = gameMode.ship;
   // Free-flight (P) works inside the dome just like outside — hand off to the flight controller,
   // then keep the ship contained in the chute on the way down.
+  if(skillMenuOpen()) return;   // level-up skill picker pauses the game
   if(gameMode.fly.active){ updateFlightPhysicsAndCamera(); containInChute(); return; }
   var cx = P.DX, cz = P.domeCz, floorY = P.domeFloorY, roomR = P.domeR;
   var domeGrip = 0.7;   // how far the magnetic grip reaches before the ship free-falls
@@ -16620,19 +18632,10 @@ function updatePortalInterior(){
   var speedMetric = Math.max(Math.abs(s.speed), gameMode.fly.vel.length());
   s.running = p.isBoosting || speedMetric > p.maxSpeed * (10/15);   // running (drift/flip) gate = 10 km/h
   updateSpeedCounter(speedMetric);
+  updateBoostCharge();   // Boost Charge: hold CTRL (still) to charge, release to blast forward
 
-  // jump → hop (+ jump barrel-roll combo, same as crystal)
-  if(gameMode.wantJump){
-    gameMode.wantJump = false;
-    if(!s.airborne){
-      s.airborne = true; s.freeFalling = false; s.vertVel = p.jumpImpulse; s.airTime = 0; s.jumpAxis.copy(s.groundNormal).normalize();
-      s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; s.driftTime = 0;
-      var nowJ = (typeof performance!=='undefined'?performance.now():Date.now());
-      var aH = k.a || (nowJ-gameMode.lastATime)<gameMode.jumpRollWindow, dH = k.d || (nowJ-gameMode.lastDTime)<gameMode.jumpRollWindow, rd = 0;
-      if(aH&&dH) rd = (gameMode.lastATime>=gameMode.lastDTime)?1:-1; else if(aH) rd = 1; else if(dH) rd = -1;
-      if(rd!==0) triggerBarrelRoll(rd);
-    }
-  }
+  // jump → hop, or a +1 Jump air re-jump (handled in tryGameJump)
+  if(gameMode.wantJump){ gameMode.wantJump = false; tryGameJump(); }
 
   // ── drift detection (copied from crystal) ──
   var wantsDriftLeft  = (k.a && !k.w) || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15) || (t.active && t.driftHold && t.driftDir < 0);
@@ -16642,7 +18645,8 @@ function updatePortalInterior(){
   var canDriftNow = s.running && (s.isDrifting ? (spdAbs > p.maxSpeed*p.driftContinueSpeedRatio) : (spdAbs > p.maxSpeed*p.driftEntrySpeedRatio));
   if(wantsDrift && canDriftNow && !s.airborne){
     if(!s.isDrifting){ s.driftTime = 0; s.driftEntrySpeed = spdAbs; }
-    s.isDrifting = true; s.driftTime += 1; s.driftDirection = wantsDriftLeft ? 1 : -1; s.driftTargetAngle = s.driftDirection*(Math.PI*0.5);
+    s.isDrifting = true; s.driftTime += 1; s.driftDirection = wantsDriftLeft ? 1 : -1;
+    s.driftTargetAngle = s.driftDirection * (p.hasGaugeDrift ? Math.min(s.driftTime * GAUGE_DRIFT_RATE, Math.PI * 0.5) : (Math.PI * 0.5));   // Gauge Drift
     spawnGameDriftParticles(); spawnDriftTrench();
   } else { s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; }
   s.driftAngle += (s.driftTargetAngle - s.driftAngle) * 0.12;
@@ -16655,7 +18659,7 @@ function updatePortalInterior(){
   var driftTight = 0; if(t.active && t.driftHold) driftTight = t.driftTight; if(k.s) driftTight = Math.max(driftTight, 1);
   if(!(fwdAxis < -0.01 && s.speed > 0.0005)) s.brakeTime = 0;       // reset brake ramp when not braking
   if(s.isDrifting){
-    if(s.driftTime <= p.driftSustainTime){ var ds = s.speed < 0 ? -1 : 1; if(Math.abs(s.speed) < s.driftEntrySpeed) s.speed = ds * s.driftEntrySpeed; }
+    if(p.hasZeroFriction || s.driftTime <= p.driftSustainTime){ var ds = s.speed < 0 ? -1 : 1; if(Math.abs(s.speed) < s.driftEntrySpeed) s.speed = ds * s.driftEntrySpeed; }   // Zero Friction Drift
     else { s.speed -= Math.sign(s.speed || 1) * p.driftDecel; s.speed *= 0.998; if(driftTight > 0) s.speed *= (1 - driftTight * 0.015); }
   } else if(fwdAxis < -0.01 && s.speed > 0.0005){
     // BRAKING — ramped decel (gentle → firm); falls through to reverse once stopped.
@@ -16690,7 +18694,7 @@ function updatePortalInterior(){
   //    chute) via closest-point-on-surface, the same magnetic feel as the crystal. Airborne hops
   //    and falls move along the takeoff normal, then re-stick to whatever surface is nearest. ──
   if(s.airborne){
-    s.vertVel -= p.jumpGravity; ship.position.addScaledVector(s.jumpAxis, s.vertVel); s.airTime += 1;
+    s.vertVel -= gameJumpGravity(); ship.position.addScaledVector(s.jumpAxis, s.vertVel); s.airTime += 1;   // Hover-aware gravity
     if(s.barrelRoll.active){ s.barrelRoll.progress = Math.min(1, s.barrelRoll.progress + 1/s.barrelRoll.duration); var brP = s.barrelRoll.progress; var lat = s.barrelRoll.lateralPeak*(1-brP)*(1-brP); ship.position.addScaledVector(s.barrelRoll.lateralDir, lat); if(brP >= 1){ s.barrelRoll.active = false; s.barrelRoll.progress = 0; } }
     var cpL = closestPointOnDome(ship.position);
     if(cpL){
@@ -16875,6 +18879,7 @@ function testCross(fromA, toA, dstFloorY){
 }
 
 function updatePortalTest(){
+  if(skillMenuOpen()) return;   // level-up skill picker pauses the game
   var P=gameMode.portal;
   if(!P.inB){ flatDrive(P.tAcfg.cx,P.tAcfg.cz,P.tAcfg.floorY,P.tAcfg.R); testCross(P.srcAnchor,P.dstAnchor,P.tBcfg.floorY); }
   else      { flatDrive(P.tBcfg.cx,P.tBcfg.cz,P.tBcfg.floorY,P.tBcfg.R); testCross(P.dstAnchor,P.srcAnchor,P.tAcfg.floorY); }
@@ -17049,6 +19054,12 @@ function init(){
   renderer.domElement.addEventListener('contextmenu',function(e){ if(gameMode.active && !gameMode.exiting) e.preventDefault(); });
   renderer.domElement.addEventListener('touchstart',onTS,{passive:false});renderer.domElement.addEventListener('touchmove',onTM,{passive:false});renderer.domElement.addEventListener('touchend',onTE);
   renderer.domElement.addEventListener('wheel',function(e){
+    // Mini-game: the wheel zooms the chase camera (out → eventually a top-down survey view).
+    if(gameMode.active && !gameMode.exiting){
+      e.preventDefault();
+      gameMode.camZoom = Math.max(CAM_ZOOM_MIN, Math.min(CAM_ZOOM_MAX, gameMode.camZoom + (e.deltaY > 0 ? 0.28 : -0.28)));
+      return;
+    }
     // Lightbox: wheel zooms the image instead of scrolling the page/camera. Also bumps
     // lastInteract so the snap-back timer resets each scroll.
     if(imgLightbox.active || imgLightbox.entering || imgLightbox.exiting){
@@ -17248,7 +19259,16 @@ function animate(){
         checkPortalEntry();
       }
     }
+    checkGameLanded();   // airborne→grounded transition: reset jump/hover budgets + Ground Stomp blast
   }
+  // Open the level-up skill picker when a package is pending and we're in a safe (non-transition) state.
+  if(gameSkills.pending > 0 && !skillMenuOpen() && gameMode.active && !gameMode.entering && !gameMode.exiting && !gameMode.decelerating){
+    openSkillPicker();
+  }
+  // Multiplayer: throttled local ship send + interpolate the partner's ship + connection badge.
+  mpTick();
+  mpUpdateRemoteShip();
+  mpUpdateBadge();
   // Drift particles age every frame (even when not drifting, so existing streaks finish out)
   updateGameDriftParticles();
   updateDriftTrench();
@@ -17257,7 +19277,7 @@ function animate(){
   updateCombat(dt);
   updateBoostFuel(dt);
   updateGameAudio();
-  updateCrosshair(gameMode.active && !gameMode.exiting && !combat.lockTarget);
+  updateCrosshair(crosshairActive());   // only shown (and used) while drifting in chase view
   if(!gameMode.active) hideSpeedCounter();
 
   floors.forEach(function(fl){
