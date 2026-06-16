@@ -704,6 +704,26 @@ var gameMode = {
     camBackDist: 0.45,
     camUpDist: 0.15
   },
+  // First-person POV mode (toggle with F) — hold a gun, mouse-look + WASD + jump + dash, shoot the
+  // existing enemies. Surface-relative (camera up = ground normal) so it works on the crystal AND
+  // in the dome. Purely a LOCAL view/movement change: ship.position still updates, so a co-op
+  // partner keeps seeing your ship via the normal sync.
+  fps: {
+    active: false,
+    yaw: 0, pitch: 0,                    // mouse-look (pitch clamped); yaw applied to `forward` per frame
+    forward: new THREE.Vector3(1, 0, 0), // world tangent heading (re-projected onto the surface each frame)
+    vel: new THREE.Vector3(),            // tangential walk/dash velocity (world space)
+    vertVel: 0, airborne: false,         // jump along the surface normal
+    dashCd: 0,                           // frames until dash is ready again
+    eyeHeight: 0.03,                     // camera sits this far off the surface (≈ a few ship-heights)
+    moveSpeed: 0.012, dashSpeed: 0.05, jumpImpulse: 0.022, gravity: 0.0011,
+    sens: 0.0022,                        // mouse-look sensitivity (radians per pixel)
+    camProg: 0, camTarget: 0, transRate: 0.06,   // camera blend: 0 = third-person chase, 1 = first-person eye
+    // Riding a co-op partner's ship: jump onto their ship (in ship mode) and get carried.
+    riding: false, rideOffset: new THREE.Vector3(), mountCd: 0,
+    mountRadius: 0.09, deckRadius: 0.03, deckSpeed: 0.004, deckHeight: 0.018,
+    gun: null, muzzle: null, bobT: 0, recoil: 0, _built: false
+  },
   keys: {w:false, a:false, s:false, d:false, shift:false, q:false, e:false, space:false, ctrl:false, charge:false},
   // Camera state (saved on entry, restored on exit)
   savedCamPos: new THREE.Vector3(),
@@ -10456,6 +10476,8 @@ function renderGlassFBO() {
   // doesn't sample itself through the FBO and ghost into a recursive blur.
   var gjFboVis = gameJoystick.group ? gameJoystick.group.visible : false;
   if(gameJoystick.group) gameJoystick.group.visible = false;
+  var fpsGunFboVis = gameMode.fps.gun ? gameMode.fps.gun.visible : false;
+  if(gameMode.fps.gun) gameMode.fps.gun.visible = false;   // keep the gun out of glass reflections
   // In-game windows — hide during refraction capture
   var gwoFbo = gameUI.options && gameUI.options.group ? gameUI.options.group.visible : false;
   var gwiFbo = gameUI.inventory && gameUI.inventory.group ? gameUI.inventory.group.visible : false;
@@ -10506,6 +10528,7 @@ function renderGlassFBO() {
   if(dm.closingStarTemps){for(var csti2=0;csti2<dm.closingStarTemps.length;csti2++) dm.closingStarTemps[csti2].visible=true;}
   if(altImgBar.group) altImgBar.group.visible = _aibFboVis;
   if(gameJoystick.group) gameJoystick.group.visible = gjFboVis;
+  if(gameMode.fps.gun) gameMode.fps.gun.visible = fpsGunFboVis;
   if(gameUI.options && gameUI.options.group) gameUI.options.group.visible = gwoFbo;
   if(gameUI.inventory && gameUI.inventory.group) gameUI.inventory.group.visible = gwiFbo;
   cart.iconGroup.visible = !cartBroken;
@@ -12919,6 +12942,7 @@ function positionShipOnSurface() {
 
 function exitGameMode() {
   if(!gameMode.active || gameMode.exiting) return;
+  if(gameMode.fps.active) fpsForceOff();   // drop first-person + release the mouse before leaving (no animation)
   // If quitting from inside the portal, pop back to the crystal first so the exit
   // transition starts from a valid pose near the gallery floor.
   if(gameMode.portal && gameMode.portal.inside){
@@ -13342,6 +13366,7 @@ function animateGameTransition() {
 function updateGamePhysicsAndCamera() {
   if(!gameMode.active) return;
   if(skillMenuOpen()) return;   // level-up skill picker pauses the game
+  if(gameMode.fps.active) { updateFpsPhysicsAndCamera(); return; }   // first-person POV (crystal surface)
   if(gameMode.fly.active) { updateFlightPhysicsAndCamera(); return; }
 
   var p = gameMode.physics;
@@ -13910,6 +13935,247 @@ function updateFlightPhysicsAndCamera() {
     camera.up.lerp(camLocalUp, 0.12); camera.up.normalize();
   }
   camera.lookAt(lookAt);
+}
+
+// ══════════════════════════════════════════════
+// FIRST-PERSON (FPS) MODE — toggle with F. Hold a gun, mouse-look + WASD + jump + dash, shoot the
+// existing enemies. Surface-relative (camera up = ground normal) so it works on the crystal AND in
+// the dome. Local view/movement only — ship.position still updates, so co-op partners see your ship.
+// ══════════════════════════════════════════════
+function buildFpsGun(){
+  var f = gameMode.fps;
+  if(f.gun){ return; }
+  var g = new THREE.Group();
+  var matBody = new THREE.MeshStandardMaterial({ color: 0x8a66cc, roughness: 0.3, metalness: 0.55, emissive: 0x3a2060, emissiveIntensity: 0.6 });
+  var matDark = new THREE.MeshStandardMaterial({ color: 0x2a2238, roughness: 0.55, metalness: 0.45 });
+  var body = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.46, 1.5), matBody); body.position.set(0, 0, -0.2); g.add(body);
+  var barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 1.25, 10), matDark); barrel.rotation.x = Math.PI / 2; barrel.position.set(0, 0.12, -1.05); g.add(barrel);
+  var grip = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.62, 0.34), matBody); grip.position.set(0, -0.46, 0.28); grip.rotation.x = 0.28; g.add(grip);
+  var edge = new THREE.LineSegments(new THREE.EdgesGeometry(body.geometry), new THREE.LineBasicMaterial({ color: 0xddbbff, transparent: true, opacity: 0.85 }));
+  edge.position.copy(body.position); g.add(edge);
+  var muzzle = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xffd0ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false }));
+  muzzle.position.set(0, 0.12, -1.75); muzzle.scale.set(0.001, 0.001, 1); g.add(muzzle);
+  f.muzzle = muzzle;
+  g.scale.setScalar(0.011);          // hand-held size for the tiny world; positioned per-frame at the camera
+  g.renderOrder = 30;
+  g.frustumCulled = false;
+  g.traverse(function(c){ c.layers.set(1); c.frustumCulled = false; });   // sharp overlay layer (drawn on top)
+  g.visible = false;
+  scene.add(g);
+  f.gun = g; f._built = true;
+}
+// Place the gun in front of the camera with walk-bob + recoil kick; fade the muzzle flash.
+function updateFpsGun(moveSpd){
+  var f = gameMode.fps; if(!f.gun) return;
+  var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  var camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+  var camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+  var mv = Math.min(1, moveSpd / Math.max(f.moveSpeed, 1e-6));
+  f.bobT += 0.35 + mv * 0.55;
+  var bobY = Math.sin(f.bobT) * 0.0016 * mv;
+  var bobX = Math.cos(f.bobT * 0.5) * 0.0012 * mv;
+  f.gun.position.copy(camera.position)
+    .addScaledVector(camRight, 0.018 + bobX)
+    .addScaledVector(camUp, -0.016 + bobY)
+    .addScaledVector(camFwd, 0.044 - f.recoil * 0.012);
+  f.gun.quaternion.copy(camera.quaternion);
+  f.gun.rotateX(f.recoil * 0.3);          // muzzle climbs with recoil
+  if(f.muzzle){
+    if(f.recoil > 0.02){ var sz = 0.01 + f.recoil * 0.03; f.muzzle.scale.set(sz, sz, 1); f.muzzle.material.opacity = Math.min(1, f.recoil * 1.6); }
+    else f.muzzle.material.opacity = 0;
+  }
+  f.recoil *= 0.78; if(f.recoil < 0.001) f.recoil = 0;
+}
+var _fpsM = new THREE.Matrix4(), _fpsZero = new THREE.Vector3(0, 0, 0), _fpsNegF = new THREE.Vector3(),
+    _fpsQ = new THREE.Quaternion(), _fpsUp2 = new THREE.Vector3(), _fpsR3 = new THREE.Vector3();
+// Ship → FPS: carry the ship's current velocity into the FPS walk (tangential) + jump (vertical)
+// velocity, so toggling in doesn't kill momentum — you keep gliding and settle to walk speed.
+function fpsMomentumIntoWalk(){
+  var f = gameMode.fps, s = gameMode.surfaceState;
+  var up0 = s.groundNormal.clone(); if(up0.lengthSq() < 1e-9) up0.set(0, 1, 0); else up0.normalize();
+  f.vel.set(0, 0, 0);
+  if(s.freeFalling || s.airborne) f.vel.copy(gameMode.fly.vel).addScaledVector(s.forward, s.speed);
+  else f.vel.copy(s.forward).multiplyScalar(s.speed);
+  var vUp = f.vel.dot(up0);
+  f.vel.addScaledVector(up0, -vUp);                 // tangential part → walk velocity
+  if(s.airborne || s.freeFalling){ f.airborne = true; f.vertVel = vUp; }
+  else { f.airborne = false; f.vertVel = 0; }
+}
+// Enter (or re-enter mid-exit) first-person. Sets camTarget=1 so the camera ANIMATES in; the
+// movement physics take over immediately, so a high-speed entry glides on its inherited momentum.
+function enterFpsMode(){
+  var f = gameMode.fps;
+  if(!f.active){
+    if(gameMode.fly.active) toggleFlightMode();        // mutually exclusive with flight
+    buildFpsGun();
+    var s = gameMode.surfaceState;
+    f.active = true;
+    f.forward.copy(s.forward); if(f.forward.lengthSq() < 1e-9) f.forward.set(1, 0, 0); f.forward.normalize();
+    f.yaw = 0; f.pitch = 0; f.dashCd = 0; f.recoil = 0; f.bobT = 0;
+    f.riding = false; f.mountCd = 0;
+    fpsMomentumIntoWalk();                              // seamless: keep the ship's momentum
+    s.airborne = false; s.freeFalling = false; s.isDrifting = false;   // ship-state quiet while FPS owns movement
+  }
+  f.camTarget = 1;                                     // animate the camera into the eye pose
+  if(gameMode.ship) gameMode.ship.visible = false;     // you ARE the character now
+  if(f.gun) f.gun.visible = true;
+  if(renderer && renderer.domElement && renderer.domElement.requestPointerLock){ try { renderer.domElement.requestPointerLock(); } catch(e){} }
+  updateCrosshair(true);
+}
+// Begin the OUT transition: reveal the ship + release the mouse NOW, but keep FPS physics running
+// (so movement/momentum stay continuous) until the camera blend reaches the chase pose, at which
+// point finalizeFpsExit() hands control back to the ship with the momentum preserved.
+function exitFpsMode(){
+  var f = gameMode.fps; if(!f.active || f.camTarget === 0) return;
+  f.camTarget = 0; f.riding = false;                   // hop off any ride; the pull-back is a normal fall
+  if(gameMode.ship) gameMode.ship.visible = true;      // reveal the ship for the pull-back swoop
+  if(f.gun) f.gun.visible = false;
+  if(document.pointerLockElement && document.exitPointerLock){ try { document.exitPointerLock(); } catch(e){} }
+  updateCrosshair(false);
+}
+// Camera reached the chase pose → ship physics resumes with the FPS momentum folded in.
+function finalizeFpsExit(){
+  var f = gameMode.fps, s = gameMode.surfaceState;
+  f.active = false; f.camProg = 0;
+  s.forward.copy(f.forward); if(s.forward.lengthSq() < 1e-9) s.forward.set(1, 0, 0); s.forward.normalize();
+  var fwdSpeed = f.vel.dot(s.forward);                 // forward component of the walk velocity → surface speed
+  var cap = gameMode.physics.boostMaxSpeed;
+  s.speed = Math.max(-cap * 0.6, Math.min(cap, fwdSpeed));
+  if(f.airborne){
+    s.airborne = true; s.freeFalling = false; s.vertVel = f.vertVel; s.airTime = 0;
+    s.jumpAxis.copy(s.groundNormal).normalize(); gameMode.fly.vel.set(0, 0, 0);
+  } else {
+    s.airborne = false; s.freeFalling = false; s.vertVel = 0;
+  }
+  s.isDrifting = false; s.driftAngle = 0; s.driftTargetAngle = 0;
+}
+// Immediate teardown (no animation) — used when quitting the game or switching to flight.
+function fpsForceOff(){
+  var f = gameMode.fps;
+  if(f.active){ exitFpsMode(); finalizeFpsExit(); }   // exitFpsMode reveals ship + unlocks; finalize hands off
+  f.camProg = 0; f.camTarget = 0; f.riding = false;
+  if(gameMode.ship) gameMode.ship.visible = true;
+  if(f.gun) f.gun.visible = false;
+}
+function toggleFpsMode(){
+  if(!gameMode.active || gameMode.exiting) return;
+  var f = gameMode.fps;
+  if(f.active && f.camTarget !== 0) exitFpsMode();   // engaged → animate back out
+  else enterFpsMode();                                // off, or mid-exit → animate (back) in
+}
+// Core FPS update — gated from updateGamePhysicsAndCamera (crystal/fly) AND updatePortalInterior (dome).
+function updateFpsPhysicsAndCamera(){
+  if(skillMenuOpen()) return;
+  var f = gameMode.fps, s = gameMode.surfaceState, k = gameMode.keys, ship = gameMode.ship;
+  var inDome = gameMode.portal && gameMode.portal.inside;
+  // ── mount handling: an FPS player can jump onto a co-op partner's SHIP and ride it ──
+  var rs = (typeof MP !== 'undefined' && MP.connected && MP.remote) ? MP.remote.ship : null;
+  var canRide = !!(rs && rs.visible && !MP.remote.isFps);   // only ride a real ship (not another FPS player)
+  if(f.mountCd > 0) f.mountCd--;
+  if(f.riding && !canRide){ f.riding = false; f.airborne = true; f.vertVel = 0; }   // partner left → drop off
+  if(!f.riding && canRide && f.mountCd === 0 && f.vertVel <= 0.006 && ship.position.distanceTo(rs.position) < f.mountRadius){
+    f.riding = true; f.airborne = false; f.vertVel = 0; f.vel.set(0, 0, 0);
+    var rel0 = ship.position.clone().sub(rs.position).applyQuaternion(_fpsQ.copy(rs.quaternion).invert());
+    rel0.y = 0; if(rel0.length() > f.deckRadius) rel0.setLength(f.deckRadius);
+    f.rideOffset.copy(rel0);
+  }
+
+  // ── "up" is the surface normal, or the ship's deck normal while riding ──
+  var up;
+  if(f.riding) up = _fpsUp2.set(0, 1, 0).applyQuaternion(rs.quaternion).normalize();
+  else { up = s.groundNormal; if(up.lengthSq() < 1e-9) up.set(0, 1, 0); else up.normalize(); }
+
+  // ── heading: yaw rotates `forward` around up; keep it tangent ──
+  if(f.yaw){ f.forward.applyAxisAngle(up, f.yaw); f.yaw = 0; }
+  f.forward.addScaledVector(up, -f.forward.dot(up));
+  if(f.forward.lengthSq() < 1e-9){ f.forward.set(1, 0, 0).addScaledVector(up, -up.x); }
+  f.forward.normalize();
+  var right = new THREE.Vector3().crossVectors(f.forward, up).normalize();
+  var mf = (k.w ? 1 : 0) + (k.s ? -1 : 0), mr = (k.d ? 1 : 0) + (k.a ? -1 : 0);
+
+  if(f.riding){
+    // ── RIDING: jump = dismount (leap off carrying the ship's momentum), else walk the deck + ride ──
+    if(gameMode.wantJump){
+      gameMode.wantJump = false; f.riding = false; f.airborne = true; f.mountCd = 25;
+      var rv = MP.remoteVel || _fpsZero, rvUp = rv.dot(up);
+      f.vel.copy(rv).addScaledVector(up, -rvUp);              // inherit the ship's tangential momentum
+      f.vertVel = f.jumpImpulse + Math.max(0, rvUp);          // + its climb + your jump
+      ship.position.addScaledVector(up, 0.012);               // hop off the deck so nothing re-catches
+      updateSpeedCounter(f.vel.length());
+    } else {
+      if(mf || mr){                                            // small deck walk, clamped to the ship
+        var wd = new THREE.Vector3().addScaledVector(f.forward, mf).addScaledVector(right, mr);
+        if(wd.lengthSq() > 1e-9){
+          wd.normalize().multiplyScalar(f.deckSpeed).applyQuaternion(_fpsQ.copy(rs.quaternion).invert()); wd.y = 0;
+          f.rideOffset.add(wd);
+          if(f.rideOffset.length() > f.deckRadius) f.rideOffset.setLength(f.deckRadius);
+        }
+      }
+      ship.position.copy(rs.position).add(_fpsR3.copy(f.rideOffset).applyQuaternion(rs.quaternion)).addScaledVector(up, f.deckHeight);
+      updateSpeedCounter(MP.remoteVel ? MP.remoteVel.length() : 0);
+    }
+  } else {
+    // ── normal FPS movement (WASD + dash) + jump + surface grip ──
+    var wish = new THREE.Vector3().addScaledVector(f.forward, mf).addScaledVector(right, mr);
+    var moving = wish.lengthSq() > 1e-9; if(moving) wish.normalize();
+    if(f.dashCd > 0) f.dashCd--;
+    if(k.shift && moving && f.dashCd === 0){ f.vel.addScaledVector(wish, f.dashSpeed); f.dashCd = 40; }
+    var ts = moving ? f.moveSpeed : 0;
+    f.vel.x += (wish.x * ts - f.vel.x) * 0.25;
+    f.vel.y += (wish.y * ts - f.vel.y) * 0.25;
+    f.vel.z += (wish.z * ts - f.vel.z) * 0.25;
+    f.vel.addScaledVector(up, -f.vel.dot(up));   // keep walk velocity tangent
+    ship.position.addScaledVector(f.vel, 1);
+    updateSpeedCounter(f.vel.length());
+
+    // ── jump + gravity along the surface normal ──
+    if(gameMode.wantJump){ gameMode.wantJump = false; if(!f.airborne){ f.vertVel = f.jumpImpulse; f.airborne = true; } }
+    if(f.airborne){ f.vertVel -= f.gravity; ship.position.addScaledVector(up, f.vertVel); }
+
+    // ── grip to the surface (crystal OR dome) → update the live ground normal + land ──
+    var cp = inDome ? closestPointOnDome(ship.position) : closestPointOnCrystal(ship.position);
+    if(cp){
+      var alt = ship.position.clone().sub(cp.point).dot(cp.normal);
+      if(!f.airborne){ ship.position.copy(cp.point); }
+      else if(f.vertVel <= 0 && alt <= 0.002){ ship.position.copy(cp.point); f.airborne = false; f.vertVel = 0; }
+      s.groundNormal.copy(cp.normal).normalize();
+      up = s.groundNormal;
+    }
+  }
+
+  // keep the ship's heading + world orientation tracking the surface frame — so the chase pose used
+  // by the exit transition is valid, and the co-op partner sees your ship oriented while you walk.
+  s.forward.copy(f.forward);
+  _fpsM.lookAt(_fpsZero, _fpsNegF.copy(f.forward).multiplyScalar(-1), up);
+  ship.quaternion.setFromRotationMatrix(_fpsM);
+
+  // ── first-person eye pose ──
+  var rightC = new THREE.Vector3().crossVectors(f.forward, up).normalize();
+  var eyePos = ship.position.clone().addScaledVector(up, f.eyeHeight);
+  var eyeLook = eyePos.clone().add(f.forward.clone().applyAxisAngle(rightC, f.pitch));
+
+  // ── transition blend: ease the camera between the third-person chase pose and the eye pose ──
+  if(f.camProg < f.camTarget) f.camProg = Math.min(f.camTarget, f.camProg + f.transRate);
+  else if(f.camProg > f.camTarget) f.camProg = Math.max(f.camTarget, f.camProg - f.transRate);
+  var blend = f.camProg * f.camProg * (3 - 2 * f.camProg);   // smoothstep ease
+  if(blend >= 0.999){
+    camera.position.copy(eyePos);
+    camera.up.copy(up).normalize();
+    camera.lookAt(eyeLook);
+  } else {
+    var chase = gameCamPose();                               // behind-the-ship pose to blend with
+    camera.position.copy(chase.pos).lerp(eyePos, blend);
+    camera.up.copy(chase.up).lerp(up, blend);
+    if(camera.up.lengthSq() > 1e-9) camera.up.normalize(); else camera.up.copy(up);
+    camera.lookAt(chase.lookAt.clone().lerp(eyeLook, blend));
+  }
+  var fovBase = (gameMode.fovBase != null) ? gameMode.fovBase : 75;
+  if(Math.abs(camera.fov - fovBase) > 0.1){ camera.fov = fovBase; camera.updateProjectionMatrix(); }
+
+  updateFpsGun(f.vel.length());
+
+  // exit complete (camera back at the chase pose) → hand control to ship physics with momentum kept
+  if(f.camTarget === 0 && f.camProg <= 0.0001) finalizeFpsExit();
 }
 
 // ── Drift particle effects ──
@@ -16702,18 +16968,27 @@ function spawnSkillBullet(origin, dir, lateral){
 function fireOneVolley(){
   if(!gameMode.active || gameMode.exiting) return;
   var s = gameMode.surfaceState;
-  var M = gameFiringDir();
-  var nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
-  var dir;
-  if(crosshairActive()){
-    // Drifting in chase view: converge bullets on the crosshair (camera centre ray).
-    var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-    var aimPoint = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST);
-    dir = aimPoint.sub(nose);
-    if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
+  var nose, dir;
+  if(gameMode.fps.active){
+    // First-person: fire straight down the camera/crosshair from the gun muzzle.
+    var camF = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+    if(camF.lengthSq() > 1e-9) camF.normalize(); else camF.set(0, 0, 1);
+    nose = camera.position.clone().addScaledVector(camF, 0.05);
+    dir = camF;
+    gameMode.fps.recoil = 1;   // kick the gun + flash the muzzle (driven in updateFpsGun)
   } else {
-    // Everywhere else (normal driving, locked-on, top-down): fire straight out of the ship.
-    dir = M.clone();
+    var M = gameFiringDir();
+    nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
+    if(crosshairActive()){
+      // Drifting in chase view: converge bullets on the crosshair (camera centre ray).
+      var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      var aimPoint = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST);
+      dir = aimPoint.sub(nose);
+      if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
+    } else {
+      // Everywhere else (normal driving, locked-on, top-down): fire straight out of the ship.
+      dir = M.clone();
+    }
   }
   // base + Front Bullet extras (slightly fanned so they read as separate rounds)
   spawnSkillBullet(nose, dir, 0);
@@ -17129,7 +17404,7 @@ var MP = {
     pos: new THREE.Vector3(), quat: new THREE.Quaternion(),
     vr: new THREE.Vector3(), vp: new THREE.Vector3(),
     flags: { drift:false, boost:false, air:false, slam:false },
-    skills: {}, hp: 100
+    skills: {}, hp: 100, isFps: false, gunner: null
   },
   fx: null
 };
@@ -17171,6 +17446,7 @@ function mpSetupConn(conn){
     MP.guestHp = combat.player.maxHp; MP.nextId = 1; mpClearWorld();
     if(mpIsGuest()) combat.spawned = false;   // drop the guest's local sim; it mirrors the host now
     mpBuildRemoteShip();
+    if(!MP._heartbeat) MP._heartbeat = setInterval(mpHeartbeat, 250);   // keep sending while backgrounded
     mpUpdateBadge();
     mpLobbyStatus('Connected! Your friend is in the game.', '#88ff99');
     setTimeout(mpCloseLobby, 900);
@@ -17219,7 +17495,7 @@ function mpSerializeShip(){
     q: [ship.quaternion.x, ship.quaternion.y, ship.quaternion.z, ship.quaternion.w],
     vr: [sv.rotation.x, sv.rotation.y, sv.rotation.z],
     vp: [sv.position.x, sv.position.y, sv.position.z],
-    f: { d: !!s.isDrifting, b: !!gameMode.physics.isBoosting, a: !!s.airborne, sl: !!s.slamming, g: combat.godMode ? 1 : 0 },
+    f: { d: !!s.isDrifting, b: !!gameMode.physics.isBoosting, a: !!s.airborne, sl: !!s.slamming, g: combat.godMode ? 1 : 0, fp: gameMode.fps.active ? 1 : 0 },
     sk: mpSkillSummary(),
     hp: combat.player.hp
   };
@@ -17235,11 +17511,38 @@ function mpApplyShip(d){
   r.flags.drift = !!(d.f && d.f.d); r.flags.boost = !!(d.f && d.f.b);
   r.flags.air = !!(d.f && d.f.a); r.flags.slam = !!(d.f && d.f.sl);
   r.skills = d.sk || {}; r.hp = (d.hp != null) ? d.hp : r.hp;
+  r.isFps = !!(d.f && d.f.fp);   // partner is in first-person → don't let an FPS player ride them
 }
 
 // ── Remote ship mesh (reuse the local ship geometry, distinct teal tint) ──
+// Placeholder "little guy holding a gun" — shown (instead of the ship) when the partner is in
+// FPS/gunner mode, so you can tell at a glance. Built feet-at-origin, head +Y, facing +Z, in raw
+// units (the parent ship's 0.014 scale sizes it). Teal to match the remote ship = "player 2".
+// (TEMP procedural model; swap for a rigged GLB later — just replace the meshes in this group.)
+function mpBuildGunnerAvatar(){
+  var g = new THREE.Group();
+  var body = new THREE.MeshStandardMaterial({ color: 0x55ccaa, transparent: true, opacity: 0.96, roughness: 0.4, metalness: 0.3, emissive: 0x1e7a5e, emissiveIntensity: 0.55 });
+  var dark = new THREE.MeshStandardMaterial({ color: 0x224a3a, roughness: 0.6, metalness: 0.35 });
+  function box(w, h, d, x, y, z, m){ var b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m || body); b.position.set(x, y, z); g.add(b); return b; }
+  box(0.32, 1.0, 0.34, -0.22, 0.5, 0, dark);                         // left leg
+  box(0.32, 1.0, 0.34,  0.22, 0.5, 0, dark);                         // right leg
+  var torso = box(0.82, 1.15, 0.5, 0, 1.6, 0, body);                 // torso
+  var head = new THREE.Mesh(new THREE.SphereGeometry(0.36, 12, 9), body); head.position.set(0, 2.5, 0); g.add(head);
+  box(0.22, 0.22, 0.82, -0.3, 1.78, 0.36, body);                     // arms reaching forward to the gun
+  box(0.22, 0.22, 0.82,  0.3, 1.78, 0.36, body);
+  box(0.28, 0.32, 0.5, 0, 1.74, 0.68, dark);                         // gun body
+  var barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.075, 0.8, 10), dark); barrel.rotation.x = Math.PI / 2; barrel.position.set(0, 1.82, 1.08); g.add(barrel);
+  var em = new THREE.LineBasicMaterial({ color: 0xbbffe6, transparent: true, opacity: 0.8 });   // teal wireframe accents
+  var te = new THREE.LineSegments(new THREE.EdgesGeometry(torso.geometry), em); te.position.copy(torso.position); g.add(te);
+  var he = new THREE.LineSegments(new THREE.EdgesGeometry(head.geometry), em); he.position.copy(head.position); g.add(he);
+  return g;
+}
 function mpBuildRemoteShip(){
-  if(MP.remote.ship){ MP.remote.ship.visible = false; return; }
+  if(MP.remote.ship){
+    MP.remote.ship.visible = false;
+    if(!MP.remote.gunner){ var rg = mpBuildGunnerAvatar(); rg.visible = false; MP.remote.ship.add(rg); MP.remote.gunner = rg; }
+    return;
+  }
   if(typeof GAME_SHIP_POSITIONS === 'undefined' || !scene) return;
   var ship = new THREE.Group();
   var sv = new THREE.Group();
@@ -17255,6 +17558,10 @@ function mpBuildRemoteShip(){
   edges.rotation.copy(mesh.rotation); sv.add(edges);
   ship.scale.setScalar(0.014);
   ship.visible = false;
+  var gunner = mpBuildGunnerAvatar();   // the FPS-mode avatar (hidden until the partner enters gunner mode)
+  gunner.visible = false;
+  ship.add(gunner);
+  MP.remote.gunner = gunner;
   scene.add(ship);
   MP.remote.ship = ship; MP.remote.shipVisual = sv;
 }
@@ -17269,7 +17576,7 @@ function mpUpdateRemoteShip(){
   // Drop the remote if its packets went stale (peer froze) so it doesn't hang in place forever.
   if(performance.now() - r.lastRecv > 4000) sameWorld = false;
   r.ship.visible = sameWorld;
-  if(!sameWorld) return;
+  if(!sameWorld){ mpUpdateMarker(); return; }   // hide the marker too (don't leave it frozen on screen)
   var target = r.pos.clone();
   if(r.region === 1 && gameMode.portal && gameMode.portal.D) target.add(gameMode.portal.D);   // back into our dome instance
   r.ship.position.lerp(target, 0.4);
@@ -17280,6 +17587,18 @@ function mpUpdateRemoteShip(){
   if(MP._remotePrev) MP.remoteVel.copy(r.ship.position).sub(MP._remotePrev);
   else MP._remotePrev = new THREE.Vector3();
   MP._remotePrev.copy(r.ship.position);
+  // FPS partner → show the little gunner guy in place of the ship (so you can tell their mode).
+  // Only swap to the gunner if we actually have one built — otherwise ALWAYS keep the ship visible
+  // (never leave the partner invisible).
+  var showGun = !!r.isFps && !!r.gunner;
+  if(r.shipVisual) r.shipVisual.visible = !showGun;
+  if(r.gunner){
+    r.gunner.visible = showGun;
+    if(showGun){
+      var spd = MP.remoteVel ? MP.remoteVel.length() : 0;
+      r.gunner.position.set(0, Math.sin(performance.now() * 0.012) * Math.min(spd / 0.012, 1) * 0.16, 0);   // gentle walk bob
+    }
+  }
   mpRemoteFxEmit();
   mpUpdateMarker();
 }
@@ -17355,6 +17674,14 @@ function mpTick(){
   var now = performance.now();
   if(now - MP.lastSend >= MP.sendRate){ MP.lastSend = now; mpSend(mpSerializeShip()); }
   mpSendWorld();   // host broadcasts the authoritative combat world (no-op on the guest)
+}
+// Heartbeat: animate()/rAF is paused while a tab is in the BACKGROUND, so mpTick stops firing and
+// the partner would go "stale" (>4s) and vanish on the other screen — the classic two-tabs-in-one-
+// window failure. setInterval keeps firing (throttled to ~1/s in background, still well under the
+// 4s stale-drop), so we keep sending position even when this tab isn't focused. WebRTC 'data'
+// events still arrive in a background tab, so the partner stays alive both ways.
+function mpHeartbeat(){
+  if(document.hidden && MP.connected && gameMode.active && !gameMode.exiting) mpTick();
 }
 
 // ── Connection badge + partner marker (DOM) ──
@@ -17617,7 +17944,13 @@ function mpSendFireIntent(){
   var s = gameMode.surfaceState, M = gameFiringDir();
   var nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
   var dir;
-  if(crosshairActive()){
+  if(gameMode.fps.active){
+    // First-person guest: aim down the camera so host-spawned bullets match the crosshair.
+    var camF = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+    if(camF.lengthSq() > 1e-9) camF.normalize(); else camF.set(0, 0, 1);
+    nose = camera.position.clone().addScaledVector(camF, 0.05);
+    dir = camF;
+  } else if(crosshairActive()){
     var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
     dir = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST).sub(nose);
     if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
@@ -17792,8 +18125,10 @@ function gameKeyDown(e) {
   else if(k === 'b' && !e.repeat) { if(gameMode.active) { openSkillManager(); e.preventDefault(); } }   // loadout / skill editor
   else if(k === 'm' && !e.repeat) { if(gameMode.active) { mpOpenLobby(); e.preventDefault(); } }   // co-op multiplayer lobby
   else if(k === 'p' && !e.repeat) { if(gameMode.active) toggleFlightMode(); }
+  else if(k === 'f' && !e.repeat) { if(gameMode.active) { toggleFpsMode(); e.preventDefault(); } }   // first-person POV toggle
   else if(k === 'escape') {
-    if(gameMode.active && !gameMode.exiting) {
+    if(gameMode.fps.active) { exitFpsMode(); }   // first Esc leaves first-person back to the ship
+    else if(gameMode.active && !gameMode.exiting) {
       // If currently flying, snap back to surface first so the exit transition has a valid pose.
       if(gameMode.fly.active) snapFromFlyToSurface();
       exitGameMode();
@@ -17826,6 +18161,7 @@ function gameKeyUp(e) {
 //          gravity pulls it toward the nearest planet, magnetic stick
 //          catches it when close enough to walk. No teleport.
 function toggleFlightMode() {
+  if(gameMode.fps.active) fpsForceOff();   // flight + FPS are mutually exclusive (immediate, no animation)
   if(!gameMode.fly.active) {
     // Surface → Fly: turn off gravity, keep current position + orientation.
     // User now controls thrust directly via WASD/Q/E/Space/Ctrl/Shift.
@@ -18683,6 +19019,7 @@ function updatePortalInterior(){
   // Free-flight (P) works inside the dome just like outside — hand off to the flight controller,
   // then keep the ship contained in the chute on the way down.
   if(skillMenuOpen()) return;   // level-up skill picker pauses the game
+  if(gameMode.fps.active){ updateFpsPhysicsAndCamera(); return; }   // first-person POV (dome floor/walls)
   if(gameMode.fly.active){ updateFlightPhysicsAndCamera(); containInChute(); return; }
   var cx = P.DX, cz = P.domeCz, floorY = P.domeFloorY, roomR = P.domeR;
   var domeGrip = 0.7;   // how far the magnetic grip reaches before the ship free-falls
@@ -19102,8 +19439,21 @@ function init(){
   createGodRays();
   window.addEventListener('resize',onResize);window.addEventListener('scroll',onScroll);
   window.addEventListener('mousemove',function(e){
+    // First-person mouse-look (only while pointer-locked in FPS) — accumulate yaw/pitch.
+    if(gameMode.fps.active && document.pointerLockElement === renderer.domElement){
+      gameMode.fps.yaw   -= (e.movementX || 0) * gameMode.fps.sens;
+      gameMode.fps.pitch -= (e.movementY || 0) * gameMode.fps.sens;
+      var lim = Math.PI * 0.5 * 0.95;
+      if(gameMode.fps.pitch >  lim) gameMode.fps.pitch =  lim;
+      if(gameMode.fps.pitch < -lim) gameMode.fps.pitch = -lim;
+      return;
+    }
     camMouseX=(e.clientX/renderer.domElement.clientWidth)*2-1;
     camMouseY=(e.clientY/renderer.domElement.clientHeight)*2-1;
+  });
+  // Losing pointer lock (Esc / tab-away) drops out of first-person cleanly.
+  document.addEventListener('pointerlockchange',function(){
+    if(gameMode.fps.active && document.pointerLockElement !== renderer.domElement) exitFpsMode();
   });
   renderer.domElement.addEventListener('mousedown',onMD);renderer.domElement.addEventListener('mousemove',onMM);
   renderer.domElement.addEventListener('mouseup',onMU);renderer.domElement.addEventListener('mouseleave',onMU);
@@ -19342,7 +19692,7 @@ function animate(){
   updateCombat(dt);
   updateBoostFuel(dt);
   updateGameAudio();
-  updateCrosshair(crosshairActive());   // only shown (and used) while drifting in chase view
+  updateCrosshair(crosshairActive() || (gameMode.fps.active && gameMode.fps.camTarget !== 0));   // shown drifting, OR in first-person (not during the exit pull-back)
   if(!gameMode.active) hideSpeedCounter();
 
   floors.forEach(function(fl){
@@ -19798,6 +20148,9 @@ function animate(){
   // so the blurred copy doesn't shadow the sharp layer-1 overlay pass.
   var gjVis = gameJoystick.group ? gameJoystick.group.visible : false;
   if(gameJoystick.group) gameJoystick.group.visible = false;
+  // FPS gun viewmodel — same treatment: hide in the postFBO pass, redrawn sharp in the overlay.
+  var fpsGunVis = gameMode.fps.gun ? gameMode.fps.gun.visible : false;
+  if(gameMode.fps.gun) gameMode.fps.gun.visible = false;
   // In-game windows — hidden in the postFBO pass, redrawn sharp in the layer-1 overlay
   var gwoVis = gameUI.options && gameUI.options.group ? gameUI.options.group.visible : false;
   var gwiVis = gameUI.inventory && gameUI.inventory.group ? gameUI.inventory.group.visible : false;
@@ -19853,6 +20206,7 @@ function animate(){
   if(navMenu.group) navMenu.group.visible=true;
   if(pdv.group) pdv.group.visible=pdvVis;
   if(gameJoystick.group) gameJoystick.group.visible=gjVis;
+  if(gameMode.fps.gun) gameMode.fps.gun.visible=fpsGunVis;
   if(gameUI.options && gameUI.options.group) gameUI.options.group.visible=gwoVis;
   if(gameUI.inventory && gameUI.inventory.group) gameUI.inventory.group.visible=gwiVis;
   for(var _nb4=0;_nb4<navMenu.buttons.length;_nb4++){
