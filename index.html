@@ -637,9 +637,9 @@ var gameMode = {
     // gentle and a long hold brings you to a controlled stop instead of snapping. Per-frame decel
     // ramps brakeMin → brakeMax over brakeRampFrames (quadratic ease-in). Once stopped it falls
     // through to normal reverse thrust.
-    brakeMin: 0.00003,
-    brakeMax: 0.00044,
-    brakeRampFrames: 100,
+    brakeMin: 0.00010,
+    brakeMax: 0.00140,
+    brakeRampFrames: 45,
     // Drift-exit "fling out of orbit": on release, keep applying the drift's yaw rate but decay it
     // each frame, so the heading keeps arcing then straightens instead of snapping straight.
     driftExitDecay: 0.92,
@@ -712,19 +712,23 @@ var gameMode = {
     active: false,
     yaw: 0, pitch: 0,                    // mouse-look (pitch clamped); yaw applied to `forward` per frame
     forward: new THREE.Vector3(1, 0, 0), // world tangent heading (re-projected onto the surface each frame)
-    vel: new THREE.Vector3(),            // tangential walk/dash velocity (world space)
-    vertVel: 0, airborne: false,         // jump along the surface normal
+    vel: new THREE.Vector3(),            // FULL 3D world velocity (Titanfall-style momentum movement)
+    vertVel: 0, airborne: false,         // vertVel kept in sync (= vel·up) for the riding/mount checks
     dashCd: 0,                           // frames until dash is ready again
-    eyeHeight: 0.03,                     // camera sits this far off the surface (≈ a few ship-heights)
-    moveSpeed: 0.012, dashSpeed: 0.05, jumpImpulse: 0.022, gravity: 0.0011,
+    sliding: false, crouchProg: 0,       // ALT-slide (low friction → momentum carries) + crouch-cam blend
+    _shiftPrev: false,                   // edge-detect the strong dash (tap, not auto-repeat)
+    grapple: { active: false, point: new THREE.Vector3(), t: 0 },   // grappling hook: pull toward an anchor
+    grappleLine: null,
+    eyeHeight: 0.015,                    // camera sits this far off the surface — 2× SMALLER (a tiny gunner)
+    moveSpeed: 0.012, dashSpeed: 0.06, jumpImpulse: 0.022, gravity: 0.0011,
     sens: 0.0022,                        // mouse-look sensitivity (radians per pixel)
     camProg: 0, camTarget: 0, transRate: 0.06,   // camera blend: 0 = third-person chase, 1 = first-person eye
     // Riding a co-op partner's ship: jump onto their ship (in ship mode) and get carried.
     riding: false, rideOffset: new THREE.Vector3(), mountCd: 0,
-    mountRadius: 0.09, deckRadius: 0.03, deckSpeed: 0.004, deckHeight: 0.018,
+    mountRadius: 0.13, deckRadius: 0.04, deckSpeed: 0.004, deckHeight: 0.03,   // tuned for the 2× bigger ship
     gun: null, muzzle: null, bobT: 0, recoil: 0, _built: false
   },
-  keys: {w:false, a:false, s:false, d:false, shift:false, q:false, e:false, space:false, ctrl:false, charge:false},
+  keys: {w:false, a:false, s:false, d:false, shift:false, q:false, e:false, space:false, ctrl:false, charge:false, alt:false},
   // Camera state (saved on entry, restored on exit)
   savedCamPos: new THREE.Vector3(),
   savedCamQuat: new THREE.Quaternion(),
@@ -733,12 +737,16 @@ var gameMode = {
                             // plane (0.001) so the crystal directly under the chase
                             // camera doesn't get clipped through.
   // Chase camera offsets — in tangent frame, scaled for planet
-  camBackDist: 0.12,
-  camUpDist: 0.05,
+  camBackDist: 0.15,
+  camUpDist: 0.06,
   // Camera zoom (scroll wheel / two-finger pinch). 1 = default chase; larger pulls the camera
   // back, and past CAM_ZOOM_TOPDOWN_START it tilts toward a straight-overhead survey view.
   // Reset to 1 on game entry.
   camZoom: 1,
+  // Desktop camera-follow steering: mouseDX accumulates raw horizontal mouse movement (px); each
+  // physics frame consumes it as a DIRECT heading/drift-aim rotation = movementX × shipAimSens
+  // (rad/px). Move the mouse → the ship turns by that much and holds (no rate, no self-centring).
+  mouseDX: 0, shipAimSens: 0.008, _wasAimMode: false,
   camPinch: { active: false, startDist: 0, startZoom: 1 },
   // Touch joystick — single-finger drag from touch origin.
   // Vertical drag = throttle (up = faster forward), horizontal drag = yaw (left/right turn).
@@ -7789,7 +7797,7 @@ function makeGameWindow(kind, title, W, H){
 }
 
 function ensureGameWindows(){
-  if(!gameUI.options)   gameUI.options   = makeGameWindow('options', 'OPTIONS', 4.4, 5.4);
+  if(!gameUI.options)   gameUI.options   = makeGameWindow('options', 'OPTIONS', 4.4, 6.2);
   if(!gameUI.inventory) gameUI.inventory = makeGameWindow('inventory', 'INVENTORY', 4.2, 3.8);
 }
 
@@ -7804,6 +7812,7 @@ function buildOptionsContent(win){
   // Stepper rows: −/+ around a value. CAMERA ZOOM = how close the chase cam sits to the ship
   // (lower = closer); FOV = camera field of view; MUSIC / SFX = master volume dials (0–100%).
   var rows = [
+    {label:'MOUSE SENS',  val:Math.round(gameMode.shipAimSens * 1000) + '', dec:'opt-sens-dec', inc:'opt-sens-inc'},
     {label:'CAMERA ZOOM', val:gameMode.camBackDist.toFixed(2), dec:'opt-zoom-dec', inc:'opt-zoom-inc'},
     {label:'FOV',         val:Math.round(gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + '', dec:'opt-fov-dec',  inc:'opt-fov-inc'},
     {label:'MUSIC',       val:Math.round(sfx.musicVol * 100) + '%', dec:'opt-music-dec', inc:'opt-music-inc'},
@@ -7879,7 +7888,9 @@ function toggleGameWindow(kind){
 function closeGameWindow(win){ if(win){ win.open = false; win.target = 0; } }
 
 function handleGameOption(actionId){
-  if(actionId === 'opt-zoom-dec')      gameMode.camBackDist = Math.max(0.04, gameMode.camBackDist - 0.02); // closer
+  if(actionId === 'opt-sens-dec')      gameMode.shipAimSens = Math.max(0.002, +(gameMode.shipAimSens - 0.002).toFixed(3));   // mouse steering / drift-aim sensitivity
+  else if(actionId === 'opt-sens-inc') gameMode.shipAimSens = Math.min(0.06,  +(gameMode.shipAimSens + 0.002).toFixed(3));
+  else if(actionId === 'opt-zoom-dec')      gameMode.camBackDist = Math.max(0.04, gameMode.camBackDist - 0.02); // closer
   else if(actionId === 'opt-zoom-inc') gameMode.camBackDist = Math.min(0.50, gameMode.camBackDist + 0.02); // farther
   else if(actionId === 'opt-fov-dec'){ gameMode.fovBase = Math.max(40, (gameMode.fovBase != null ? gameMode.fovBase : camera.fov) - 5); }
   else if(actionId === 'opt-fov-inc'){ gameMode.fovBase = Math.min(120, (gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + 5); }
@@ -11873,6 +11884,36 @@ function createStarField() {
   starField = new THREE.Points(geo, mat);
   scene.add(starField);
 }
+// Stars for the DOME sky — same twinkle shader as the website, on PORTAL_LAYER, in an upper-hemisphere
+// shell above the dome floor (shares starField.material so it twinkles off the same time uniform).
+function createDomeStars(P, gB){
+  if(typeof starField === 'undefined' || !starField || !starField.material) return null;
+  var count = 700;
+  var positions = new Float32Array(count*3), sizes = new Float32Array(count), phases = new Float32Array(count),
+      speeds = new Float32Array(count), brightness = new Float32Array(count), spikeLen = new Float32Array(count);
+  for(var i=0;i<count;i++){
+    var theta = Math.random()*Math.PI*2, phi = Math.acos(Math.random()), r = 22 + Math.random()*55;   // upper hemisphere
+    positions[i*3]   = P.DX + r*Math.sin(phi)*Math.cos(theta);
+    positions[i*3+1] = P.domeFloorY + r*Math.cos(phi);          // up from the floor
+    positions[i*3+2] = P.domeCz + r*Math.sin(phi)*Math.sin(theta);
+    var roll = Math.random();
+    if(roll<0.6){ sizes[i]=0.8+Math.random()*1.5; brightness[i]=0.15+Math.random()*0.35; spikeLen[i]=0.1+Math.random()*0.3; }
+    else if(roll<0.9){ sizes[i]=2.0+Math.random()*2.5; brightness[i]=0.4+Math.random()*0.4; spikeLen[i]=0.3+Math.random()*0.4; }
+    else { sizes[i]=4.0+Math.random()*4.0; brightness[i]=0.7+Math.random()*0.3; spikeLen[i]=0.5+Math.random()*0.5; }
+    phases[i]=Math.random()*Math.PI*2; speeds[i]=0.3+Math.random()*2.5;
+  }
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions,3));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(sizes,1));
+  geo.setAttribute('aPhase', new THREE.BufferAttribute(phases,1));
+  geo.setAttribute('aSpeed', new THREE.BufferAttribute(speeds,1));
+  geo.setAttribute('aBright', new THREE.BufferAttribute(brightness,1));
+  geo.setAttribute('aSpike', new THREE.BufferAttribute(spikeLen,1));
+  var stars = new THREE.Points(geo, starField.material);     // share the twinkle shader (same time uniform)
+  stars.frustumCulled = false; stars.renderOrder = -1; stars.layers.set(PORTAL_LAYER);
+  gB.add(stars); P.stars = stars;
+  return stars;
+}
 
 // ── Planets scattered in the background ──
 var planets = [];
@@ -12366,8 +12407,8 @@ function buildGameMode() {
   shipEdges.rotation.copy(shipMesh.rotation);
   shipVisual.add(shipEdges);
 
-  // Whole ship scales down so it looks like a tiny craft on the ~0.9-radius crystal
-  ship.scale.setScalar(0.014);
+  // Whole ship scales down so it looks like a tiny craft on the ~0.9-radius crystal (2× the old size)
+  ship.scale.setScalar(0.028);
   g.add(ship);
 
   gameMode.group = g;
@@ -12393,6 +12434,7 @@ function enterGameMode() {
   showSkillHud(true);
   updateGodModeHud();   // re-show the IMMORTAL badge if it was left on
   gameMode.camZoom = 1; gameMode.camPinch.active = false;   // start at the default chase zoom
+  gameMode._camAlt = null; gameMode._camExcess = 0;         // fresh jump-damp state (no stale value from a prior session)
   // Warm up the boost-trail meshes NOW (under the entry animation) so the first boost press
   // doesn't hitch building geometry + compiling shaders. renderer.compile pre-links the new
   // shader programs; cached ones are skipped.
@@ -12778,6 +12820,26 @@ function hallwayTubeGrip(probePos){
            aHat: aHat, C: C, axialFloor: P.axialFloor }; // frame for the hard floor clamp
 }
 
+// Is `probePos` within the carved +Y hole bore — i.e. the legit hallway you DRIVE into? The
+// grounded grip uses this to tell "driving down the hole" (allowed to sit below the outer skin)
+// apart from "fell inside the solid crystal" (the bug — gets ejected back to the surface). Pure
+// math against the portal-tube frame, so a raycast can't miss it. Returns false when no portal is
+// built (a plain convex crystal — then EVERY below-skin position is a bug to eject).
+function shipInHoleBore(probePos){
+  var P = gameMode.portal;
+  if(!P || !P.built || !P.crystal || !P.holeDir || P.hallMouth == null) return false;
+  var cs = P.crystal; cs.updateMatrixWorld(true);
+  var aHat = P.holeDir.clone().transformDirection(cs.matrixWorld).normalize();
+  var C = new THREE.Vector3(); cs.getWorldPosition(C);
+  var rel = probePos.clone().sub(C);
+  var axial = rel.dot(aHat);
+  var perpDist = rel.addScaledVector(aHat, -axial).length();
+  // a little margin so the rim/mouth transition isn't ejected mid-step
+  return perpDist <= (P.tubeR || 0.14) * 1.25 &&
+         axial >= P.axialFloor - 0.30 &&
+         axial <= P.hallMouth + 0.25;
+}
+
 // ── Closest point on a triangle (Ericson, Real-Time Collision Detection) ──
 var _cpAB=new THREE.Vector3(),_cpAC=new THREE.Vector3(),_cpAP=new THREE.Vector3(),
     _cpBP=new THREE.Vector3(),_cpCP=new THREE.Vector3(),_cpE=new THREE.Vector3();
@@ -12942,6 +13004,7 @@ function positionShipOnSurface() {
 
 function exitGameMode() {
   if(!gameMode.active || gameMode.exiting) return;
+  if(playerDeath.active){ endPlayerDeath(); combat.player.dead = false; combat.player.hp = combat.player.maxHp; }   // clear a death-in-progress
   if(gameMode.fps.active) fpsForceOff();   // drop first-person + release the mouse before leaving (no animation)
   // If quitting from inside the portal, pop back to the crystal first so the exit
   // transition starts from a valid pose near the gallery floor.
@@ -12963,7 +13026,7 @@ function exitGameMode() {
   closeSkillManager();
   showSkillHud(false);
   updateGodModeHud();   // hide the IMMORTAL badge while out of the game
-  mpHideRemote(); mpClearFx(); mpClearWorld(); mpUpdateBadge();   // hide the partner ship + FX + mirrored world + badge
+  mpHideRemote(); mpClearFx(); mpClearWorld(); mpClearReviveOrbs(); mpUpdateBadge();   // hide the partner ship + FX + mirrored world + revive orbs + badge
   // Clear key state so nothing sticks after exit
   var k = gameMode.keys;
   k.w = k.a = k.s = k.d = k.shift = k.q = k.e = k.space = k.ctrl = false;
@@ -13063,8 +13126,8 @@ function killGalleryEffects(gf) {
 }
 
 // Camera-zoom tuning (scroll wheel / pinch). Zoom out past TOPDOWN_START eases to overhead at END.
-var CAM_ZOOM_MIN = 0.6, CAM_ZOOM_MAX = 7.0;
-var CAM_ZOOM_TOPDOWN_START = 2.4, CAM_ZOOM_TOPDOWN_END = 4.0;   // full top-down at 4×; 4×→7× keeps rising higher
+var CAM_ZOOM_MIN = 0.6, CAM_ZOOM_MAX = 14.0;                    // max zoom-out DOUBLED (was 7×)
+var CAM_ZOOM_TOPDOWN_START = 7.0, CAM_ZOOM_TOPDOWN_END = 11.0;  // stay in the angled chase much longer; only go overhead WAY out (full at 11×, 11×→14× keeps rising)
 function computeChaseCamPose() {
   // Returns {pos, lookAt, up} for the chase camera.
   //
@@ -13079,7 +13142,7 @@ function computeChaseCamPose() {
   // clamping the ship to the screen edge. A slight roll into the drift is still applied.
   var s = gameMode.surfaceState;
   var up = s.groundNormal.clone();
-  var S = gameMode.ship.position.clone();
+  var S = gameMode.ship.position.clone();   // pure function of ship pos (the jump-damp is applied to the live camera, not here)
   var z = gameMode.camZoom || 1;                       // scroll/pinch zoom — pulls the camera back
   var d = gameMode.camBackDist * z, h = gameMode.camUpDist * z;
   var F = s.forward;
@@ -13107,7 +13170,7 @@ function computeChaseCamPose() {
   // drift threshold; blending the whole pose by this factor is what removes the disorienting jolt.)
   var target = s.isDrifting ? 1 : 0;
   var b = gameMode._driftCamBlend || 0;
-  b += (target - b) * 0.09;
+  b += (target - b) * 0.06;   // slower = smoother, damped swing into/out of the drift cam (was 0.09)
   if(b < 0.0008) b = 0;
   gameMode._driftCamBlend = b;
   if(b <= 0.0008){
@@ -13131,7 +13194,7 @@ function computeChaseCamPose() {
   // Camera-to-ship distance. The non-drift pose sits back d AND up h, so its radius is √(d²+h²).
   // The drift pose is pulled a little FURTHER out (DRIFT_CAM_ZOOM) so the drift framing reads a
   // touch wider — tweak this if you want more/less zoom-out on drift.
-  var DRIFT_CAM_ZOOM = 1.12;
+  var DRIFT_CAM_ZOOM = 1.4;   // pull the drift cam further back so it doesn't read zoomed-in vs the chase (was 1.12)
   var camRadiusBase = Math.sqrt(d * d + h * h);
   var camRadius = camRadiusBase * DRIFT_CAM_ZOOM;
   var posD = S.clone().addScaledVector(shipDir, -camRadius);
@@ -13185,6 +13248,22 @@ function computeLockCamPose(target){
   // look at ≈ the midpoint between ship and enemy, lifted slightly off the surface
   var lookAt = S.clone().addScaledVector(toEnemy, 0.5).addScaledVector(up, 0.02);
   return { pos: pos, lookAt: lookAt, up: up };
+}
+
+// Height-damped camera. A JUMP shouldn't lift the view: we track the ship's ALTITUDE above the
+// surface, lag a damped copy of it, and expose the difference (_camExcess = how much higher the ship
+// is than the camera should follow). The camera-apply then shifts the chase pose DOWN by that excess
+// along the surface normal — so the camera holds its height and you see the ship hop up. computeChase
+// stays a pure function of ship position (keeps the portal seam exact); this only affects the live cam.
+var GAME_CAM_JUMP_DAMP = 0.1;   // per-frame catch-up of the camera to the ship's jump height (lower = steadier)
+function updateCamAnchor(inDome){
+  var ship = gameMode.ship;
+  var foot = inDome ? closestPointOnDome(ship.position) : closestPointOnCrystal(ship.position);
+  if(!foot){ gameMode._camAlt = null; gameMode._camExcess = 0; return; }
+  var alt = ship.position.clone().sub(foot.point).dot(foot.normal);
+  if(gameMode._camAlt == null || gameMode.portal.snapCam) gameMode._camAlt = alt;   // init / portal-cross → snap (no lag)
+  else gameMode._camAlt += (alt - gameMode._camAlt) * GAME_CAM_JUMP_DAMP;
+  gameMode._camExcess = alt - gameMode._camAlt;   // hop height the camera hasn't followed yet
 }
 
 // Arc-lerp a camera position from `fromPos` to `toPos` around `center`. The direction
@@ -13363,9 +13442,202 @@ function animateGameTransition() {
 // Jumps are just an upward impulse into fly.vel that flips airborne
 // true; the airborne branch handles the arc and re-landing uniformly.
 // ══════════════════════════════════════════════
+
+// ══════════════════════════════════════════════
+// PLAYER DEATH ANIMATION — on death the ship shatters into ~9 PHYSICS FRAGMENTS that fly apart
+// carrying your momentum (gameMode._shipVel), tumble + fall under gravity + fade, while the camera
+// pulls onto a glowing CENTER CORE. Gated from updateGamePhysicsAndCamera + updatePortalInterior.
+// ══════════════════════════════════════════════
+var playerDeath = { active:false, frags:[], core:null, coreVel:null, camOff:null, camOffMin:0, t:0, max:115,
+  mom:new THREE.Vector3(), up:new THREE.Vector3(), fmat:null, inDome:false, coreR:0, coreStill:0,
+  spot:null, gauge:0, downActive:false, orbStartT:0 };   // spot/gauge/downActive/orbStartT drive the co-op revive orb
+var _pdOff = new THREE.Vector3(), _pdOut = new THREE.Vector3(), _pdVt = new THREE.Vector3(), _pdAxis = new THREE.Vector3();
+function startPlayerDeath(){
+  if(playerDeath.active || !gameMode.ship || typeof scene === 'undefined') return;
+  var d = playerDeath, ship = gameMode.ship;
+  d.active = true; d.t = 0; d.camOff = null;
+  if(gameMode._shipVel) d.mom.copy(gameMode._shipVel); else d.mom.set(0, 0, 0);   // the momentum I had
+  d.up.copy(gameMode.surfaceState.groundNormal);
+  if(d.up.lengthSq() < 1e-9) d.up.set(0, 1, 0); else d.up.normalize();
+  d.inDome = !!(gameMode.portal && gameMode.portal.inside);   // which surface the fragments collide with
+  d.spot = ship.position.clone(); d.gauge = 0; d.downActive = false; d.coreStill = 0; d.orbStartT = 0;   // revive orb (extends once the core rests)
+  ship.visible = false;
+  if(gameMode.fps.gun) gameMode.fps.gun.visible = false;
+  buildDeathFragments(ship.position.clone(), ship.quaternion.clone(), ship.scale.x || 0.028);
+  if(d.core){ d.camOff = camera.position.clone().sub(d.core.position); d.camOffMin = d.camOff.length() * 0.5; }   // hold the chase angle; don't over-zoom
+}
+function buildDeathFragments(worldPos, worldQuat, scale){
+  var d = playerDeath, i;
+  for(i = 0; i < d.frags.length; i++){ scene.remove(d.frags[i].mesh); if(d.frags[i].geo) d.frags[i].geo.dispose(); }
+  d.frags.length = 0;
+  if(d.fmat){ d.fmat.dispose(); d.fmat = null; }
+  var pos = GAME_SHIP_POSITIONS, idx = GAME_SHIP_INDICES;
+  // centre the ship geometry the same way buildGameMode does, so fragments line up with the ship
+  var minX = 1e9, minY = 1e9, minZ = 1e9, maxX = -1e9, maxY = -1e9, maxZ = -1e9;
+  for(i = 0; i < pos.length; i += 3){ var x = pos[i], y = pos[i+1], z = pos[i+2];
+    if(x < minX) minX = x; if(y < minY) minY = y; if(z < minZ) minZ = z;
+    if(x > maxX) maxX = x; if(y > maxY) maxY = y; if(z > maxZ) maxZ = z; }
+  var cx = (minX+maxX)/2, cy = (minY+maxY)/2, cz = (minZ+maxZ)/2;
+  var fmat = new THREE.MeshStandardMaterial({ color: 0x9977cc, transparent: true, opacity: 0.97, roughness: 0.18, metalness: 0.3, emissive: 0x553388, emissiveIntensity: 0.55 });
+  d.fmat = fmat;
+  var triCount = (idx.length / 3) | 0, NF = 9, perFrag = Math.ceil(triCount / NF);
+  for(var fI = 0; fI < NF; fI++){
+    var t0 = fI * perFrag, t1 = Math.min(triCount, t0 + perFrag);
+    if(t0 >= t1) break;
+    var verts = [], fcx = 0, fcy = 0, fcz = 0, vc = 0, t, k;
+    for(t = t0; t < t1; t++){ for(k = 0; k < 3; k++){
+      var vi = idx[t*3+k]*3, vx = pos[vi]-cx, vy = pos[vi+1]-cy, vz = pos[vi+2]-cz;
+      verts.push(vx, vy, vz); fcx += vx; fcy += vy; fcz += vz; vc++;
+    } }
+    if(vc === 0) continue;
+    fcx /= vc; fcy /= vc; fcz /= vc;
+    var arr = new Float32Array(verts.length);
+    for(var v = 0; v < verts.length; v += 3){ arr[v] = verts[v]-fcx; arr[v+1] = verts[v+1]-fcy; arr[v+2] = verts[v+2]-fcz; }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+    g.computeVertexNormals();
+    g.computeBoundingSphere();
+    var frR = (g.boundingSphere ? g.boundingSphere.radius : 0.3) * scale;   // collision radius (world)
+    var m = new THREE.Mesh(g, fmat);
+    var off = _pdOff.set(fcx, fcy, fcz).multiplyScalar(scale).applyQuaternion(worldQuat);
+    m.position.copy(worldPos).add(off);
+    m.quaternion.copy(worldQuat);
+    m.scale.setScalar(scale);
+    m.frustumCulled = false; m.renderOrder = 5;
+    scene.add(m);
+    var outDir = _pdOut.set(fcx, fcy, fcz).applyQuaternion(worldQuat);   // burst outward from the ship centre
+    if(outDir.lengthSq() > 1e-9) outDir.normalize(); else outDir.copy(d.up);
+    var burst = 0.005 + Math.random() * 0.009;
+    var vel = d.mom.clone().addScaledVector(outDir, burst).addScaledVector(d.up, 0.004 + Math.random() * 0.008);
+    vel.x += (Math.random()-0.5) * 0.006; vel.y += (Math.random()-0.5) * 0.006; vel.z += (Math.random()-0.5) * 0.006;
+    var ang = new THREE.Vector3((Math.random()-0.5)*0.32, (Math.random()-0.5)*0.32, (Math.random()-0.5)*0.32);
+    d.frags.push({ mesh: m, vel: vel, ang: ang, geo: g, r: frR });
+  }
+  // glowing center core — the camera's focal point
+  var coreR = 0.012 * (scale / 0.028);
+  var core = new THREE.Mesh(new THREE.SphereGeometry(coreR, 14, 10), new THREE.MeshBasicMaterial({ color: 0xffe0ff }));
+  core.position.copy(worldPos);
+  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xff8ae0, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false }));
+  glow.scale.set(coreR * 7, coreR * 7, 1); core.add(glow);
+  core.frustumCulled = false; core.renderOrder = 6;
+  scene.add(core);
+  d.core = core; d.coreR = coreR; d.coreVel = d.mom.clone().multiplyScalar(0.55);   // the core drifts with your momentum (slower)
+}
+function updatePlayerDeath(){
+  var d = playerDeath; if(!d.active) return;
+  d.t++;
+  var grav = 0.001;
+  for(var i = 0; i < d.frags.length; i++){
+    var fr = d.frags[i];
+    fr.vel.addScaledVector(d.up, -grav);   // gravity pulls toward the surface
+    fr.vel.multiplyScalar(0.992);          // light air drag → the bits keep their momentum
+    fr.mesh.position.add(fr.vel);
+    // ── ground collision: bounce, then SLIDE + ROLL across the surface, continuing the momentum ──
+    var cp = d.inDome ? closestPointOnDome(fr.mesh.position) : closestPointOnCrystal(fr.mesh.position);
+    var grounded = false;
+    if(cp){
+      var rest = fr.r * 0.5;
+      var alt = _pdOff.copy(fr.mesh.position).sub(cp.point).dot(cp.normal);
+      if(alt < rest){
+        fr.mesh.position.copy(cp.point).addScaledVector(cp.normal, rest);   // sit on the surface
+        var vn = fr.vel.dot(cp.normal);
+        if(vn < 0) fr.vel.addScaledVector(cp.normal, -vn * 1.42);           // cancel into-surface + bouncy reflect (~0.42)
+        var vn2 = fr.vel.dot(cp.normal);
+        _pdVt.copy(fr.vel).addScaledVector(cp.normal, -vn2);              // tangential = sliding velocity
+        fr.vel.addScaledVector(_pdVt, -0.04);                            // very light friction → it keeps sliding
+        grounded = true;
+      }
+    }
+    if(grounded){
+      var sp = _pdVt.length();   // roll in the direction of travel (no-slip): axis = vt × n, rate = |vt|/r
+      if(sp > 1e-6){ _pdAxis.crossVectors(_pdVt, cp.normal); if(_pdAxis.lengthSq() > 1e-12){ _pdAxis.normalize(); fr.mesh.rotateOnWorldAxis(_pdAxis, sp / Math.max(fr.r, 1e-4)); } }
+      fr.ang.multiplyScalar(0.9);   // bleed the free tumble while rolling on the ground
+    } else {
+      fr.mesh.rotateX(fr.ang.x); fr.mesh.rotateY(fr.ang.y); fr.mesh.rotateZ(fr.ang.z);   // tumble in the air
+    }
+  }
+  if(d.core){
+    d.coreVel.addScaledVector(d.up, -grav * 0.5); d.coreVel.multiplyScalar(0.992);
+    d.core.position.add(d.coreVel);
+    // the core (the orb the camera follows) bounces + slides on the ground too
+    var ccp = d.inDome ? closestPointOnDome(d.core.position) : closestPointOnCrystal(d.core.position);
+    if(ccp){
+      var calt = _pdOff.copy(d.core.position).sub(ccp.point).dot(ccp.normal);
+      if(calt < d.coreR){
+        d.core.position.copy(ccp.point).addScaledVector(ccp.normal, d.coreR);   // rest on the surface
+        var cvn = d.coreVel.dot(ccp.normal);
+        if(cvn < 0) d.coreVel.addScaledVector(ccp.normal, -cvn * 1.42);         // cancel into-surface + bounce
+        var cvn2 = d.coreVel.dot(ccp.normal);
+        _pdOut.copy(d.coreVel).addScaledVector(ccp.normal, -cvn2);             // tangential
+        d.coreVel.addScaledVector(_pdOut, -0.1);                              // a touch more friction so it settles near the spot
+      }
+    }
+    // ── co-op: the revive RANGE ORB only extends once the core has been stationary for ~2s ──
+    if(MP.connected && !d.downActive){
+      if(d.coreVel.length() < 0.0015) d.coreStill++; else d.coreStill = 0;
+      if(d.coreStill > 120 || d.t > 480){   // 2s stationary (or an 8s safety cap)
+        d.spot = d.core.position.clone(); d.gauge = 0; d.downActive = true; d.orbStartT = performance.now();
+      }
+    }
+    var pulse = 1 + 0.28 * Math.sin(d.t * 0.5);
+    d.core.scale.setScalar(0.7 * pulse);
+    if(!d.camOff) d.camOff = camera.position.clone().sub(d.core.position);
+    if(d.camOff.length() > d.camOffMin) d.camOff.multiplyScalar(0.992);   // dolly in, but stop before it's inside the core
+    camera.position.copy(d.core.position).add(d.camOff);
+    camera.up.copy(d.up).normalize();
+    camera.lookAt(d.core.position);
+  }
+  var fovB = (gameMode.fovBase != null) ? gameMode.fovBase : 70;
+  if(Math.abs(camera.fov - fovB) > 0.1){ camera.fov = fovB; camera.updateProjectionMatrix(); }
+}
+function endPlayerDeath(){
+  var d = playerDeath, i;
+  for(i = 0; i < d.frags.length; i++){ scene.remove(d.frags[i].mesh); if(d.frags[i].geo) d.frags[i].geo.dispose(); }
+  d.frags.length = 0;
+  if(d.fmat){ d.fmat.dispose(); d.fmat = null; }
+  if(d.core){ scene.remove(d.core); d.core.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); }); d.core = null; }
+  d.active = false; d.camOff = null; d.t = 0; d.downActive = false; d.gauge = 0; d.spot = null; d.coreStill = 0;
+  if(gameMode.ship) gameMode.ship.visible = !gameMode.fps.active;   // restore the right visual for the mode
+  if(gameMode.fps.gun) gameMode.fps.gun.visible = !!(gameMode.fps.active && gameMode.fps.camTarget !== 0);
+}
+
+// Desktop control = CAMERA-FOLLOW. Each physics frame we consume the raw horizontal mouse movement
+// accumulated since the last frame (gameMode.mouseDX) and turn it into a DIRECT heading rotation in
+// radians — move the mouse, the ship turns by that much and HOLDS (no rate, no self-centering: the
+// old offset→turn-rate model is what made it keep spinning until you re-centred). Returns
+// { dyaw, side }: dyaw is the signed heading delta (mouse-right → turn right); side is the armed
+// drift key (1 = A/left, -1 = D/right, 0 = none). While a drift is armed the same dyaw builds the
+// drift AIM angle instead of rotating the heading (see updateGamePhysicsAndCamera).
+var GAME_DRIFT_MAX_ANGLE = Math.PI * 0.92;   // how far the mouse can swing the drift aim — big range
+var GAME_DRIFT_BASE_ANGLE = Math.PI * 0.5;   // press A/D → snap straight into THIS much drift (no mouse needed); mouse fine-aims from here
+function gameKbDrift(){
+  var k = gameMode.keys;
+  var dyaw = -(gameMode.mouseDX || 0) * (gameMode.shipAimSens || 0.008);   // mouse-right → turn right
+  gameMode.mouseDX = 0;   // consume — one heading delta per frame
+  var side = k.a ? 1 : (k.d ? -1 : 0);
+  return { dyaw: dyaw, side: side };
+}
+// The ship wants the mouse locked while it's the active surface-driving view AND nothing clickable
+// (a menu/window/lobby/skill picker) is open — so menus stay usable (release the lock for them).
+function shipWantsPointerLock(){
+  return gameMode.active && !gameMode.exiting && !gameMode.fps.active && !gameMode.fly.active
+    && !skillMenuOpen()
+    && !(typeof gameUI !== 'undefined' && gameUI.options && gameUI.options.open)
+    && !(typeof gameUI !== 'undefined' && gameUI.inventory && gameUI.inventory.open);
+}
+// Release the ship's mouse-lock whenever a menu opens / we leave the ship (re-locks on the next
+// canvas click). FPS owns its own lock, so leave that alone.
+function updateShipPointerLock(){
+  if(typeof renderer === 'undefined' || !renderer.domElement) return;
+  if(document.pointerLockElement === renderer.domElement && !gameMode.fps.active && !shipWantsPointerLock()){
+    try { document.exitPointerLock(); } catch(e){}
+  }
+}
+
 function updateGamePhysicsAndCamera() {
   if(!gameMode.active) return;
   if(skillMenuOpen()) return;   // level-up skill picker pauses the game
+  if(playerDeath.active){ updatePlayerDeath(); return; }   // death animation owns the camera + physics
   if(gameMode.fps.active) { updateFpsPhysicsAndCamera(); return; }   // first-person POV (crystal surface)
   if(gameMode.fly.active) { updateFlightPhysicsAndCamera(); return; }
 
@@ -13380,14 +13652,15 @@ function updateGamePhysicsAndCamera() {
   // Two speed states: WALKING (W only, capped at ~15 km/h) and RUNNING (Shift/boost — 2× the
   // W acceleration and the cap lifts toward boostMaxSpeed). Anything above the walk cap counts
   // as running, the only state where drifting + flips are allowed.
-  var fwdAxis = 0, yawAxis = 0;
+  var fwdAxis = 0, yawAxis = 0, mDyaw = 0, mDriftSide = 0, aimMode = false;
   if(t.active){
     fwdAxis = t.throttle;
     yawAxis = t.yaw;
     p.isBoosting = t.boost && boostAllowed();
   } else {
     fwdAxis = (k.w ? 1 : 0) + ((k.s && !gameMode.sBrakeLock) ? -0.6 : 0);
-    yawAxis = (k.a ? -1 : 0) + (k.d ? 1 : 0);
+    var _kd = gameKbDrift();   // direct camera-follow yaw; A/D arm a drift
+    mDyaw = _kd.dyaw; mDriftSide = _kd.side;
     p.isBoosting = k.shift && boostAllowed();
   }
   // Boost drives forward on its own (you don't also have to hold W to run).
@@ -13411,39 +13684,47 @@ function updateGamePhysicsAndCamera() {
   // vertical behaviour then splits: hop when airborne, magnetic stick when grounded.
   // ═══════════════════════════════════════════════
   if(!s.freeFalling){
-    // ── Drift detection (unchanged from original gunner drift) ──
-    var wantsDriftLeft  = (k.a && !k.w)
-                        || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15)
-                        || (t.active && t.driftHold && t.driftDir < 0);
-    var wantsDriftRight = (k.d && !k.w)
-                        || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15)
-                        || (t.active && t.driftHold && t.driftDir > 0);
-    var wantsDrift = wantsDriftLeft || wantsDriftRight;
+    // ── Drift detection ── touch keeps the swipe/yaw drift; desktop ARMS with A/D and the mouse builds
+    //    the aim (camera-follow). Sweep the aim back to centre → disengage (slide straight + accelerate).
+    // Drifting is a RUNNING-only move — above the walk cap (~15 km/h) to start, ends if you slow to walking.
     var spdAbs = Math.abs(s.speed);
-    // Drifting is a RUNNING-only move — you must be above the walk cap (~15 km/h) to start one,
-    // and it ends if you drop back into walking speed.
     var canEnter = s.running && spdAbs > p.maxSpeed * p.driftEntrySpeedRatio;
     var canContinue = s.running && spdAbs > p.maxSpeed * p.driftContinueSpeedRatio;
     var canDriftNow = s.isDrifting ? canContinue : canEnter;
-
-    if(wantsDrift && canDriftNow && !s.airborne) {
-      if(!s.isDrifting) {
-        s.driftTime = 0;
-        s.driftEntrySpeed = spdAbs;
-      }
-      s.isDrifting = true;
-      s.driftTime += 1;
-      s.driftDirection = wantsDriftLeft ? 1 : -1;
-      // Gauge Drift: ramp the angle up with hold (tap = small, hold = full 90°) instead of snapping.
-      s.driftTargetAngle = s.driftDirection * (p.hasGaugeDrift ? Math.min(s.driftTime * GAUGE_DRIFT_RATE, Math.PI * 0.5) : (Math.PI * 0.5));
-      spawnGameDriftParticles();
-      spawnDriftTrench();
+    if(t.active){
+      // TOUCH: swipe/Gauge drift (unchanged).
+      var wantsDriftLeft  = (t.yaw < -0.6 && Math.abs(t.throttle) < 0.15) || (t.driftHold && t.driftDir < 0);
+      var wantsDriftRight = (t.yaw >  0.6 && Math.abs(t.throttle) < 0.15) || (t.driftHold && t.driftDir > 0);
+      if((wantsDriftLeft || wantsDriftRight) && canDriftNow && !s.airborne){
+        if(!s.isDrifting){ s.driftTime = 0; s.driftEntrySpeed = spdAbs; }
+        s.isDrifting = true; s.driftTime += 1; s.driftDirection = wantsDriftLeft ? 1 : -1;
+        s.driftTargetAngle = s.driftDirection * (p.hasGaugeDrift ? Math.min(s.driftTime * GAUGE_DRIFT_RATE, Math.PI * 0.5) : (Math.PI * 0.5));
+        spawnGameDriftParticles(); spawnDriftTrench();
+      } else { s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; }
     } else {
-      s.isDrifting = false;
-      s.driftDirection = 0;
-      s.driftTargetAngle = 0;
+      // DESKTOP camera-follow: A/D ARM a drift; the mouse (mDyaw) directly BUILDS the aim angle while
+      // the heading is released to momentum (it only corners). aimMode = "mouse is aiming, not steering".
+      aimMode = mDriftSide !== 0 && canDriftNow && !s.airborne;
+      if(aimMode){
+        if(!gameMode._wasAimMode) s.driftTargetAngle = mDriftSide * GAME_DRIFT_BASE_ANGLE;   // press A/D → SNAP straight into a turned drift (no mouse needed)
+        s.driftTargetAngle += mDyaw;   // the mouse fine-aims from the base
+        s.driftTargetAngle = mDriftSide === 1   // A = LEFT drift (positive), D = RIGHT (negative)
+          ? Math.max(0, Math.min(GAME_DRIFT_MAX_ANGLE, s.driftTargetAngle))
+          : Math.max(-GAME_DRIFT_MAX_ANGLE, Math.min(0, s.driftTargetAngle));
+        s.driftDirection = mDriftSide;
+        if(Math.abs(s.driftTargetAngle) > 0.08){           // aim off the travel line → actively drifting
+          if(!s.isDrifting){ s.driftTime = 0; s.driftEntrySpeed = spdAbs; }
+          s.isDrifting = true; s.driftTime += 1;
+          spawnGameDriftParticles(); spawnDriftTrench();
+        } else {
+          s.isDrifting = false;   // aim ≈ travel line → slide straight + accelerate (sweep out to re-drift)
+        }
+      } else {
+        s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0;   // not armed → the mouse steers the heading
+      }
     }
-    s.driftAngle += (s.driftTargetAngle - s.driftAngle) * 0.12;
+    s.driftAngle += (s.driftTargetAngle - s.driftAngle) * (t.active ? 0.12 : 0.85);   // near-1:1 so the aim tracks the mouse
+    gameMode._wasAimMode = aimMode;   // rising-edge tracking for the press-to-snap above
 
     // ── Thrust ramp + s.speed update ──
     var hasFwd = Math.abs(fwdAxis) > 0.01;
@@ -13526,6 +13807,7 @@ function updateGamePhysicsAndCamera() {
       var driftYaw = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase) * ramp;
       driftYaw *= (1 + driftTight * 0.7);
       var dy = driftYaw * s.driftDirection;
+      if(!t.active) dy *= Math.min(1, Math.abs(s.driftAngle) / GAME_DRIFT_MAX_ANGLE);   // path corners ∝ how far you're aiming into the drift
       s.forward.applyAxisAngle(s.groundNormal, dy);
       s.driftExitYaw = dy;   // remember the orbital yaw to fling out of on release
     } else {
@@ -13535,8 +13817,9 @@ function updateGamePhysicsAndCamera() {
         s.driftExitYaw *= p.driftExitDecay;
         if(Math.abs(s.driftExitYaw) < 1e-5) s.driftExitYaw = 0;
       }
-      if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01) {
-        s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis);
+      if(!s.barrelRoll.active){
+        if(t.active){ if(Math.abs(yawAxis) > 0.01) s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis); }
+        else if(!aimMode) s.forward.applyAxisAngle(s.groundNormal, mDyaw);   // DIRECT camera-follow steering (mouse → heading)
       }
     }
     s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
@@ -13615,10 +13898,33 @@ function updateGamePhysicsAndCamera() {
     // the far inner side and flip you, and you walk straight off the face down into the hallway.
     var cp = closestPointOnCrystal(ship.position);
     if(cp) {
-      var normalSmooth = 0.18 + Math.min(0.20, Math.abs(s.speed) * 30);
-      s.groundNormal.lerp(cp.normal, normalSmooth).normalize();
-      var target = cp.point.clone().addScaledVector(s.groundNormal, s.hoverHeight);
-      ship.position.lerp(target, 0.5);
+      // ── Bulletproof outer-skin guard ──────────────────────────────────────────
+      // closestPointOnCrystal's normal points surface→ship. While grounded the ship must
+      // always ride the OUTER skin, but a fast tangential move across a facet edge/vertex
+      // (or a shove) can dip it a hair BELOW the skin. Once inside, the nearest face's
+      // surface→ship normal flips to point INWARD (toward the crystal centre), so the
+      // magnetic stick below would glue the ship to the inside and pull it ever deeper —
+      // that's the "fell inside the crystal" bug. Detect the inward flip via the radial
+      // direction and, unless we're legitimately in the carved +Y hole bore, HARD-pop the
+      // ship back onto the outer side of that same face (no lerp lag, so it can't be
+      // sucked back in). You only ever get inside the crystal for real by driving/flying
+      // into the hole, which keeps us inside the bore (or runs the airborne path) — so this
+      // never fights real portal entry.
+      var rOut = ship.position.clone().sub(gameMode.surface.center);
+      var penetrated = false;
+      if(rOut.lengthSq() > 1e-9){
+        rOut.normalize();
+        if(cp.normal.dot(rOut) < 0 && !shipInHoleBore(ship.position)) penetrated = true;
+      }
+      if(penetrated){
+        s.groundNormal.copy(rOut);                                          // hard outward normal
+        ship.position.copy(cp.point).addScaledVector(rOut, s.hoverHeight);  // shove out to the skin
+      } else {
+        var normalSmooth = 0.18 + Math.min(0.20, Math.abs(s.speed) * 30);
+        s.groundNormal.lerp(cp.normal, normalSmooth).normalize();
+        var target = cp.point.clone().addScaledVector(s.groundNormal, s.hoverHeight);
+        ship.position.lerp(target, 0.5);
+      }
       s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
       if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
       var vN = fly.vel.dot(s.groundNormal);
@@ -13835,15 +14141,17 @@ function updateGamePhysicsAndCamera() {
   camera.updateProjectionMatrix();
 
   // === Chase camera (lock-on aware) ===
+  updateCamAnchor(false);   // jump-damp: shift the pose down by the hop excess so the view holds its height
   var chase = gameCamPose();
+  if(gameMode._camExcess){ var _ex = s.groundNormal.clone().multiplyScalar(gameMode._camExcess); chase.pos.sub(_ex); chase.lookAt.sub(_ex); }
   if(gameMode.portal.snapCam){
     // first frame after a portal cross — snap straight to the chase pose so there's no roll/glide
     camera.position.copy(chase.pos); camera.up.copy(chase.up).normalize();
     gameMode.portal.snapCam = false;
   } else {
-    var camLerp = gameMode.surfaceState.isDrifting ? 0.5 : 0.18;   // track the rotating drift cam tightly
+    var camLerp = gameMode.surfaceState.isDrifting ? 0.13 : 0.18;   // damped: ease into the drift swing instead of snapping
     camera.position.lerp(chase.pos, camLerp);
-    camera.up.lerp(chase.up, gameMode.surfaceState.isDrifting ? 0.3 : 0.12); camera.up.normalize();
+    camera.up.lerp(chase.up, 0.12); camera.up.normalize();
   }
   camera.lookAt(chase.lookAt);
 }
@@ -13956,7 +14264,7 @@ function buildFpsGun(){
   var muzzle = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xffd0ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false }));
   muzzle.position.set(0, 0.12, -1.75); muzzle.scale.set(0.001, 0.001, 1); g.add(muzzle);
   f.muzzle = muzzle;
-  g.scale.setScalar(0.011);          // hand-held size for the tiny world; positioned per-frame at the camera
+  g.scale.setScalar(0.0055);         // hand-held size — 2× SMALLER to match the tiny gunner; positioned per-frame at the camera
   g.renderOrder = 30;
   g.frustumCulled = false;
   g.traverse(function(c){ c.layers.set(1); c.frustumCulled = false; });   // sharp overlay layer (drawn on top)
@@ -13972,12 +14280,12 @@ function updateFpsGun(moveSpd){
   var camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
   var mv = Math.min(1, moveSpd / Math.max(f.moveSpeed, 1e-6));
   f.bobT += 0.35 + mv * 0.55;
-  var bobY = Math.sin(f.bobT) * 0.0016 * mv;
-  var bobX = Math.cos(f.bobT * 0.5) * 0.0012 * mv;
+  var bobY = Math.sin(f.bobT) * 0.0008 * mv;
+  var bobX = Math.cos(f.bobT * 0.5) * 0.0006 * mv;
   f.gun.position.copy(camera.position)
-    .addScaledVector(camRight, 0.018 + bobX)
-    .addScaledVector(camUp, -0.016 + bobY)
-    .addScaledVector(camFwd, 0.044 - f.recoil * 0.012);
+    .addScaledVector(camRight, 0.009 + bobX)
+    .addScaledVector(camUp, -0.008 + bobY)
+    .addScaledVector(camFwd, 0.022 - f.recoil * 0.006);
   f.gun.quaternion.copy(camera.quaternion);
   f.gun.rotateX(f.recoil * 0.3);          // muzzle climbs with recoil
   if(f.muzzle){
@@ -13996,10 +14304,9 @@ function fpsMomentumIntoWalk(){
   f.vel.set(0, 0, 0);
   if(s.freeFalling || s.airborne) f.vel.copy(gameMode.fly.vel).addScaledVector(s.forward, s.speed);
   else f.vel.copy(s.forward).multiplyScalar(s.speed);
-  var vUp = f.vel.dot(up0);
-  f.vel.addScaledVector(up0, -vUp);                 // tangential part → walk velocity
-  if(s.airborne || s.freeFalling){ f.airborne = true; f.vertVel = vUp; }
-  else { f.airborne = false; f.vertVel = 0; }
+  if(s.airborne || s.freeFalling){ f.airborne = true; }                         // keep the FULL 3D velocity (vertical carries)
+  else { f.vel.addScaledVector(up0, -f.vel.dot(up0)); f.airborne = false; }      // grounded → tangent only
+  f.vertVel = f.vel.dot(up0);
 }
 // Enter (or re-enter mid-exit) first-person. Sets camTarget=1 so the camera ANIMATES in; the
 // movement physics take over immediately, so a high-speed entry glides on its inherited momentum.
@@ -14013,6 +14320,7 @@ function enterFpsMode(){
     f.forward.copy(s.forward); if(f.forward.lengthSq() < 1e-9) f.forward.set(1, 0, 0); f.forward.normalize();
     f.yaw = 0; f.pitch = 0; f.dashCd = 0; f.recoil = 0; f.bobT = 0;
     f.riding = false; f.mountCd = 0;
+    f.sliding = false; f.crouchProg = 0; f._shiftPrev = false; fpsReleaseGrapple();   // fresh momentum-movement state
     fpsMomentumIntoWalk();                              // seamless: keep the ship's momentum
     s.airborne = false; s.freeFalling = false; s.isDrifting = false;   // ship-state quiet while FPS owns movement
   }
@@ -14028,6 +14336,7 @@ function enterFpsMode(){
 function exitFpsMode(){
   var f = gameMode.fps; if(!f.active || f.camTarget === 0) return;
   f.camTarget = 0; f.riding = false;                   // hop off any ride; the pull-back is a normal fall
+  fpsReleaseGrapple(); f.sliding = false;              // drop the hook / stop sliding when leaving FPS
   if(gameMode.ship) gameMode.ship.visible = true;      // reveal the ship for the pull-back swoop
   if(f.gun) f.gun.visible = false;
   if(document.pointerLockElement && document.exitPointerLock){ try { document.exitPointerLock(); } catch(e){} }
@@ -14063,6 +14372,54 @@ function toggleFpsMode(){
   if(f.active && f.camTarget !== 0) exitFpsMode();   // engaged → animate back out
   else enterFpsMode();                                // off, or mid-exit → animate (back) in
 }
+// ═══ Titanfall-style momentum-movement tuning (all at the tiny ship/world scale). ═══
+var FPS_WALK_SPEED = 0.012, FPS_GROUND_ACCEL = 0.20, FPS_GROUND_FRIC = 0.14, FPS_STOP_SPEED = 0.004;
+var FPS_DASH_CD = 32;                                   // frames between dashes
+var FPS_SLIDE_MIN = 0.008, FPS_SLIDE_BOOST = 0.010;     // need this speed to slide; entry nudge (slide-hop)
+var FPS_SLIDE_FRIC = 0.006, FPS_SLIDE_STEER = 0.013, FPS_SLIDE_ACCEL = 0.05, FPS_SLIDE_END = 0.004;
+var FPS_AIR_DRAG = 0.997, FPS_AIR_SPEED = 0.012, FPS_AIR_ACCEL = 0.10;   // low drag + air-strafe accel
+var FPS_GRAPPLE_PULL = 0.0045, FPS_GRAPPLE_MAXSPD = 0.10, FPS_GRAPPLE_RELEASE = 0.06, FPS_GRAPPLE_MAXT = 180;
+var FPS_GRAPPLE_RANGE = 3.0, FPS_GRAPPLE_STEP = 0.05;
+var _fpsWish = new THREE.Vector3(), _fpsTmp = new THREE.Vector3(), _fpsRay = new THREE.Vector3();
+var _fpsUp3 = new THREE.Vector3(), _fpsTransQ = new THREE.Quaternion();
+// Quake-style accelerate: only adds speed UP TO wishSpeed in the wish direction (lets you keep / build
+// momentum perpendicular — air-strafing). friction: scrape speed each frame (low friction = momentum keeps).
+function fpsAccel(vel, wishDir, wishSpeed, accel){
+  var cur = vel.dot(wishDir), add = wishSpeed - cur;
+  if(add <= 0) return;
+  vel.addScaledVector(wishDir, Math.min(accel * wishSpeed, add));
+}
+function fpsFric(vel, fric){
+  var sp = vel.length(); if(sp < 1e-7) return;
+  var drop = Math.max(sp, FPS_STOP_SPEED) * fric;
+  vel.multiplyScalar(Math.max(0, sp - drop) / sp);
+}
+// Grapple target: march the aim ray out from the eye until it meets the surface (crystal or dome).
+// Returns the world anchor point, or null if you're aiming off into space (nothing to hook).
+function fpsGrappleTarget(){
+  var inDome = gameMode.portal && gameMode.portal.inside;
+  _fpsRay.set(0, 0, -1).applyQuaternion(camera.quaternion); if(_fpsRay.lengthSq() < 1e-9) return null; _fpsRay.normalize();
+  for(var d = FPS_GRAPPLE_STEP; d <= FPS_GRAPPLE_RANGE; d += FPS_GRAPPLE_STEP){
+    _fpsTmp.copy(camera.position).addScaledVector(_fpsRay, d);
+    var cp = inDome ? closestPointOnDome(_fpsTmp) : closestPointOnCrystal(_fpsTmp);
+    if(cp && _fpsTmp.clone().sub(cp.point).dot(cp.normal) <= 0.01) return cp.point.clone();   // ray reached the surface
+  }
+  return null;
+}
+function fpsFireGrapple(){
+  var f = gameMode.fps; if(!f.active || f.camTarget !== 1) return;
+  var pt = fpsGrappleTarget();
+  if(!pt) return;
+  f.grapple.active = true; f.grapple.point.copy(pt); f.grapple.t = 0;
+  f.airborne = true; f.sliding = false;
+  if(!f.grappleLine){
+    var lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+    f.grappleLine = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0x9af0ff, transparent: true, opacity: 0.9 }));
+    f.grappleLine.frustumCulled = false; f.grappleLine.renderOrder = 6; scene.add(f.grappleLine);
+  }
+  f.grappleLine.visible = true;
+}
+function fpsReleaseGrapple(){ var f = gameMode.fps; f.grapple.active = false; if(f.grappleLine) f.grappleLine.visible = false; }
 // Core FPS update — gated from updateGamePhysicsAndCamera (crystal/fly) AND updatePortalInterior (dome).
 function updateFpsPhysicsAndCamera(){
   if(skillMenuOpen()) return;
@@ -14099,7 +14456,8 @@ function updateFpsPhysicsAndCamera(){
       gameMode.wantJump = false; f.riding = false; f.airborne = true; f.mountCd = 25;
       var rv = MP.remoteVel || _fpsZero, rvUp = rv.dot(up);
       f.vel.copy(rv).addScaledVector(up, -rvUp);              // inherit the ship's tangential momentum
-      f.vertVel = f.jumpImpulse + Math.max(0, rvUp);          // + its climb + your jump
+      f.vel.addScaledVector(up, f.jumpImpulse + Math.max(0, rvUp));   // + its climb + your jump (into the 3D velocity)
+      f.vertVel = f.vel.dot(up);
       ship.position.addScaledVector(up, 0.012);               // hop off the deck so nothing re-catches
       updateSpeedCounter(f.vel.length());
     } else {
@@ -14115,32 +14473,89 @@ function updateFpsPhysicsAndCamera(){
       updateSpeedCounter(MP.remoteVel ? MP.remoteVel.length() : 0);
     }
   } else {
-    // ── normal FPS movement (WASD + dash) + jump + surface grip ──
-    var wish = new THREE.Vector3().addScaledVector(f.forward, mf).addScaledVector(right, mr);
-    var moving = wish.lengthSq() > 1e-9; if(moving) wish.normalize();
+    // ═══ TITANFALL-STYLE MOMENTUM MOVEMENT (f.vel = full 3D world velocity) ═══
+    _fpsWish.set(0, 0, 0).addScaledVector(f.forward, mf).addScaledVector(right, mr);
+    var moving = _fpsWish.lengthSq() > 1e-9; if(moving) _fpsWish.normalize();
+    var grounded = !f.airborne && !f.grapple.active;
+
+    // ── strong DASH (tap Shift — edge-detected so it doesn't auto-repeat) ──
     if(f.dashCd > 0) f.dashCd--;
-    if(k.shift && moving && f.dashCd === 0){ f.vel.addScaledVector(wish, f.dashSpeed); f.dashCd = 40; }
-    var ts = moving ? f.moveSpeed : 0;
-    f.vel.x += (wish.x * ts - f.vel.x) * 0.25;
-    f.vel.y += (wish.y * ts - f.vel.y) * 0.25;
-    f.vel.z += (wish.z * ts - f.vel.z) * 0.25;
-    f.vel.addScaledVector(up, -f.vel.dot(up));   // keep walk velocity tangent
+    if(k.shift && !f._shiftPrev && f.dashCd === 0){
+      _fpsTmp.copy(moving ? _fpsWish : f.forward);
+      f.vel.addScaledVector(_fpsTmp, f.dashSpeed);   // a strong burst; low friction (or a slide) makes it CARRY
+      f.dashCd = FPS_DASH_CD; f.recoil = Math.max(f.recoil, 0.5);
+    }
+    f._shiftPrev = k.shift;
+
+    // ── SLIDE (hold ALT, grounded + moving): kill friction so momentum (esp. a dash) carries ──
+    var speed = f.vel.length();
+    if(k.alt && grounded && speed > FPS_SLIDE_MIN && !f.sliding){
+      f.sliding = true;
+      if(speed > 1e-6) f.vel.addScaledVector(_fpsTmp.copy(f.vel).divideScalar(speed), FPS_SLIDE_BOOST);   // slide-hop nudge
+    }
+    if(f.sliding && (!k.alt || f.airborne || f.vel.length() < FPS_SLIDE_END)) f.sliding = false;
+
+    // ── GRAPPLE pull (3D, overrides ground accel) ──
+    if(f.grapple.active){
+      _fpsTmp.copy(f.grapple.point).sub(ship.position);
+      var gdist = _fpsTmp.length();
+      if(gdist < FPS_GRAPPLE_RELEASE || f.grapple.t > FPS_GRAPPLE_MAXT){ fpsReleaseGrapple(); }
+      else {
+        _fpsTmp.divideScalar(gdist);
+        f.vel.addScaledVector(_fpsTmp, FPS_GRAPPLE_PULL);
+        if(f.vel.lengthSq() > FPS_GRAPPLE_MAXSPD * FPS_GRAPPLE_MAXSPD) f.vel.setLength(FPS_GRAPPLE_MAXSPD);
+        f.airborne = true; grounded = false; f.sliding = false; f.grapple.t++;
+      }
+    }
+
+    if(!f.grapple.active){
+      if(grounded && !f.sliding){
+        fpsFric(f.vel, FPS_GROUND_FRIC);
+        if(moving) fpsAccel(f.vel, _fpsWish, FPS_WALK_SPEED, FPS_GROUND_ACCEL);
+      } else if(grounded){   // sliding
+        fpsFric(f.vel, FPS_SLIDE_FRIC);
+        if(moving) fpsAccel(f.vel, _fpsWish, FPS_SLIDE_STEER, FPS_SLIDE_ACCEL);
+      } else {               // airborne
+        f.vel.multiplyScalar(FPS_AIR_DRAG);
+        if(moving) fpsAccel(f.vel, _fpsWish, FPS_AIR_SPEED, FPS_AIR_ACCEL);
+      }
+      // jump
+      if(gameMode.wantJump){ gameMode.wantJump = false; if(grounded){ f.vel.addScaledVector(up, f.jumpImpulse); f.airborne = true; grounded = false; } }
+      // gravity (airborne, not grappling)
+      if(f.airborne) f.vel.addScaledVector(up, -f.gravity);
+    }
+
+    _fpsUp3.copy(up);   // surface normal this frame's motion was computed in (for parallel transport below)
     ship.position.addScaledVector(f.vel, 1);
     updateSpeedCounter(f.vel.length());
 
-    // ── jump + gravity along the surface normal ──
-    if(gameMode.wantJump){ gameMode.wantJump = false; if(!f.airborne){ f.vertVel = f.jumpImpulse; f.airborne = true; } }
-    if(f.airborne){ f.vertVel -= f.gravity; ship.position.addScaledVector(up, f.vertVel); }
-
-    // ── grip to the surface (crystal OR dome) → update the live ground normal + land ──
+    // ── grip to the surface (crystal OR dome) — NOT while grappling (the hook flies you in 3D) ──
     var cp = inDome ? closestPointOnDome(ship.position) : closestPointOnCrystal(ship.position);
     if(cp){
-      var alt = ship.position.clone().sub(cp.point).dot(cp.normal);
-      if(!f.airborne){ ship.position.copy(cp.point); }
-      else if(f.vertVel <= 0 && alt <= 0.002){ ship.position.copy(cp.point); f.airborne = false; f.vertVel = 0; }
-      s.groundNormal.copy(cp.normal).normalize();
+      var nrm = cp.normal, alt = ship.position.clone().sub(cp.point).dot(nrm);
+      if(!f.grapple.active){
+        if(!f.airborne){
+          // PARALLEL-TRANSPORT the velocity onto the new tangent frame so speed follows the planet's
+          // curve (a world-fixed vector would point off into space on this tiny sphere and get scrubbed
+          // away — that was bleeding all the slide/dash momentum). Then snap down + ensure purely tangent.
+          _fpsTransQ.setFromUnitVectors(_fpsUp3, nrm); f.vel.applyQuaternion(_fpsTransQ);
+          ship.position.copy(cp.point); f.vel.addScaledVector(nrm, -f.vel.dot(nrm));
+        }
+        else if(f.vel.dot(nrm) <= 0 && alt <= 0.004){ ship.position.copy(cp.point); f.airborne = false; f.vel.addScaledVector(nrm, -f.vel.dot(nrm)); }   // land
+      }
+      s.groundNormal.copy(nrm).normalize();
       up = s.groundNormal;
     }
+    f.vertVel = f.vel.dot(up);   // keep the riding/mount checks (which read vertVel) consistent
+  }
+  // crouch-cam blend (lower the eye while sliding)
+  f.crouchProg += ((f.sliding ? 1 : 0) - f.crouchProg) * 0.2;
+  // grapple rope line (eye → anchor)
+  if(f.grappleLine && f.grappleLine.visible && f.grapple.active){
+    var lp = f.grappleLine.geometry.attributes.position.array;
+    lp[0] = camera.position.x; lp[1] = camera.position.y; lp[2] = camera.position.z;
+    lp[3] = f.grapple.point.x; lp[4] = f.grapple.point.y; lp[5] = f.grapple.point.z;
+    f.grappleLine.geometry.attributes.position.needsUpdate = true;
   }
 
   // keep the ship's heading + world orientation tracking the surface frame — so the chase pose used
@@ -14151,7 +14566,7 @@ function updateFpsPhysicsAndCamera(){
 
   // ── first-person eye pose ──
   var rightC = new THREE.Vector3().crossVectors(f.forward, up).normalize();
-  var eyePos = ship.position.clone().addScaledVector(up, f.eyeHeight);
+  var eyePos = ship.position.clone().addScaledVector(up, f.eyeHeight * (1 - 0.55 * f.crouchProg));   // lower while sliding
   var eyeLook = eyePos.clone().add(f.forward.clone().applyAxisAngle(rightC, f.pitch));
 
   // ── transition blend: ease the camera between the third-person chase pose and the eye pose ──
@@ -14316,8 +14731,8 @@ function clearGameDriftParticles() {
 }
 
 // ── 1:1 wing contouring ──────────────────────────────────────────────────────────────
-// Half the ship's wingspan in WORLD units (ship.scale ≈ 0.014, body ~2.4 wide → ~0.017 half).
-var GAME_WING_HALF_SPAN = 0.018;
+// Half the ship's wingspan in WORLD units (ship.scale 0.028, body ~2.4 wide → ~0.034 half).
+var GAME_WING_HALF_SPAN = 0.036;
 var GAME_WING_BANK_GAIN = 0.8;     // how strongly the ship banks to match the lateral slope
 // While GROUNDED and NOT drifting, sample the crystal surface under each wingtip and:
 //   • bank the ship (roll) so its wings follow the local surface slope, and
@@ -14664,7 +15079,7 @@ function updateGameAudio(){
 var gameBullets = [];
 var gameBulletMat = null;
 var lastFireTime = 0;
-var GAME_AIM_DIST = 0.6;   // convergence distance: where the crosshair's aim point sits ahead of the camera
+var GAME_AIM_AHEAD = 0.38;   // crosshair convergence: how far PAST the ship the aim point sits along the centre ray
 // The world-space firing direction = the ship's model facing (travel rotated by the drift yaw),
 // which is exactly what the drift camera centres on.
 function gameFiringDir(){
@@ -14673,6 +15088,25 @@ function gameFiringDir(){
   if(s.driftAngle) M.applyAxisAngle(s.groundNormal, s.driftAngle);
   if(M.lengthSq() > 1e-9) M.normalize();
   return M;
+}
+// Crosshair-convergence aim direction (used while drifting in chase view, where bullets line up on
+// the screen-centre crosshair). Aims a fixed distance PAST THE SHIP along the centre ray, so it
+// scales with zoom: a fixed distance from the CAMERA (the old bug) falls behind the ship when zoomed
+// out, which threw the bullets up into the air. Falls back to the straight firing dir M if degenerate.
+function gameCrosshairDir(nose, M){
+  var up = gameMode.surfaceState.groundNormal;
+  var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+  if(camFwd.lengthSq() <= 1e-9) return M.clone();
+  camFwd.normalize();
+  var distToShip = camera.position.distanceTo(gameMode.ship.position);
+  var dir = camera.position.clone().addScaledVector(camFwd, distToShip + GAME_AIM_AHEAD).sub(nose);
+  // Flatten into the surface tangent plane. The drift cam sits ABOVE the ship, so its centre ray
+  // passes above it — aiming at any point on that ray tilts bullets UP by an amount that grows with
+  // zoom (the residual "upward curve"). Stripping the normal component keeps the horizontal crosshair
+  // convergence but fires dead-flat along the ground at every zoom.
+  dir.addScaledVector(up, -dir.dot(up));
+  if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
+  return dir;
 }
 // True once the chase camera has started tilting toward the top-down survey view.
 function gameInTopDown(){ return (gameMode.camZoom || 1) > CAM_ZOOM_TOPDOWN_START; }
@@ -14687,7 +15121,7 @@ function crosshairActive(){
   return !!gameMode.surfaceState.isDrifting;
 }
 function fireBullet(){
-  if(!gameMode.active || gameMode.exiting) return;
+  if(!gameMode.active || gameMode.exiting || playerDeath.active) return;   // no firing while dead
   var now = performance.now();
   var cap = skillFx.bigBullet ? 330 : 110;   // Big Bullet = 3× slower fire; otherwise ~9/s (hold Enter)
   if(now - lastFireTime < cap) return;
@@ -14725,7 +15159,7 @@ function updateGameBullets(){
   }
 }
 function disposeGameBullet(b){
-  scene.remove(b.mesh);   // geometry + materials are SHARED (sharedBullet*) — only detach, never dispose.
+  freeBulletMesh(b.mesh);   // recycle to the pool (geometry + materials are SHARED — never dispose).
 }
 function clearGameBullets(){
   for(var i = 0; i < gameBullets.length; i++) disposeGameBullet(gameBullets[i]);
@@ -15403,13 +15837,8 @@ function spawnEnemyShell(barrel, dir){
   var tip = new THREE.Vector3();
   barrel.getWorldPosition(tip);
   tip.addScaledVector(dir, 0.04);                      // nudge out past the (now larger) barrel
-  var mesh = new THREE.Mesh(combat._ebGeo, combat._ebMat);
+  var mesh = acquireBulletMesh(combat._ebGeo, combat._ebMat, GAME_LOW_FX ? null : sharedBulletGlow(0xff7755, 0.9), 0.05);
   mesh.position.copy(tip);
-  mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(sharedBulletGlow(0xff7755, 0.9));
-  glow.scale.set(0.05, 0.05, 1);
-  mesh.add(glow);
-  scene.add(mesh);
   combat.enemyBullets.push({ mesh: mesh, vel: dir.clone().multiplyScalar(ENEMY_BULLET_SPEED), life: 0, maxLife: 320, dmg: 16 });
 }
 // A tank firing = ALL FOUR cannons unload at once. The tracking (active) cannon LEADS the player
@@ -15433,7 +15862,7 @@ function fireEnemyShell(tank){
   }
 }
 function disposeEnemyBullet(b){
-  scene.remove(b.mesh);   // shared geometry + glow material — only detach, never dispose.
+  freeBulletMesh(b.mesh);   // recycle to the pool — shared geometry + glow material, never dispose.
 }
 
 // ── Spiral barrage ── each second you're in a tank's vicinity it has a small chance to wind up
@@ -15457,13 +15886,8 @@ function spawnSpiralShell(pos, dir, gravAxis, floorH){
     combat._sbGeo = new THREE.SphereGeometry(0.022, 12, 12);
     combat._sbMat = new THREE.MeshBasicMaterial({ color: 0xff6633 });   // deeper/fatter than normal shells
   }
-  var mesh = new THREE.Mesh(combat._sbGeo, combat._sbMat);
+  var mesh = acquireBulletMesh(combat._sbGeo, combat._sbMat, GAME_LOW_FX ? null : sharedBulletGlow(0xff7744, 0.95), 0.09);
   mesh.position.copy(pos);
-  mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(sharedBulletGlow(0xff7744, 0.95));
-  glow.scale.set(0.09, 0.09, 1);
-  mesh.add(glow);
-  scene.add(mesh);
   combat.enemyBullets.push({ mesh: mesh, vel: dir.clone().multiplyScalar(SPIRAL_BULLET_SPEED), life: 0, maxLife: 600, dmg: 12, noStretch: true, hitR: 0.042,
     grav: SPIRAL_BULLET_GRAV, gravAxis: (gravAxis ? gravAxis.clone() : new THREE.Vector3(0, 1, 0)), floorH: floorH });
 }
@@ -15760,6 +16184,7 @@ function hurtPlayer(amount, srcPos){
     combat.player.hp = 0;
     combat.player.dead = true;
     combat.player.deadT = performance.now();
+    startPlayerDeath();   // shatter the ship into physics fragments + focus the camera on the core
   }
 }
 
@@ -16043,25 +16468,30 @@ function updateCombat(dt){
     if(p.life >= p.maxLife){ disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1); }
   }
 
-  // Player death → brief downtime then revive at full HP
-  if(combat.player.dead && now - combat.player.deadT > 1400){
-    combat.player.dead = false;
-    combat.player.hp = combat.player.maxHp;
-    for(var eb = 0; eb < combat.enemyBullets.length; eb++) disposeEnemyBullet(combat.enemyBullets[eb]);
-    combat.enemyBullets.length = 0;
-    // Dome wave arena: dying sends you BACK TO SPAWN and restarts from wave 1.
-    if(combat.arenaActive){
-      resetDomeArena();   // clears enemies + re-arms (wave restarts on next floor touch)
-      if(combat.domeSpawn){
-        gameMode.ship.position.copy(combat.domeSpawn);
-        gameMode.surfaceState.speed = 0;
-        gameMode.surfaceState.airborne = false;
-        gameMode.surfaceState.freeFalling = false;
-        gameMode.fly.vel.set(0, 0, 0);
+  // Player death → co-op downed/revive-orb (MP) OR quick auto-revive (single-player)
+  if(combat.player.dead){
+    if(mpReviveActive()){
+      mpUpdateOwnDowned(now, dt);   // 30s downed window; partner standing in the orb revives you
+    } else if(now - combat.player.deadT > 1900){
+      combat.player.dead = false;
+      combat.player.hp = combat.player.maxHp;
+      endPlayerDeath();   // clear the fragments/core + restore the ship
+      for(var eb = 0; eb < combat.enemyBullets.length; eb++) disposeEnemyBullet(combat.enemyBullets[eb]);
+      combat.enemyBullets.length = 0;
+      // Dome wave arena: dying sends you BACK TO SPAWN and restarts from wave 1.
+      if(combat.arenaActive){
+        resetDomeArena();   // clears enemies + re-arms (wave restarts on next floor touch)
+        if(combat.domeSpawn){
+          gameMode.ship.position.copy(combat.domeSpawn);
+          gameMode.surfaceState.speed = 0;
+          gameMode.surfaceState.airborne = false;
+          gameMode.surfaceState.freeFalling = false;
+          gameMode.fly.vel.set(0, 0, 0);
+        }
       }
     }
   }
-  mpHostGuestDeathCheck(now);   // co-op: revive the guest after a brief downtime (+ teleport in the arena)
+  mpHostGuestDeathCheck(now, dt);   // co-op: the host revives the downed guest from its revive orb
 
   // HUD
   showCombatHUD(true);
@@ -16678,6 +17108,7 @@ function updateBoostCharge(){
 // Global airborne→grounded transition: reset jump/hover budgets + fire the stomp explosion. Runs
 // once per frame in animate() so it catches landings from ANY of the (several) landing code-paths.
 function checkGameLanded(){
+  if(playerDeath.active) return;   // physics frozen during the death animation
   var s = gameMode.surfaceState;
   var air = !!s.airborne;
   if(gameMode._wasAir === undefined){ gameMode._wasAir = air; return; }
@@ -16928,6 +17359,27 @@ var _bulletGeoCache = {}, _bulletMatCache = {}, _bulletGlowCache = {};
 function sharedBulletGeo(sz, ws, hs){ ws = ws || 8; hs = hs || 6; var k = sz + '_' + ws + '_' + hs; return _bulletGeoCache[k] || (_bulletGeoCache[k] = new THREE.SphereGeometry(sz, ws, hs)); }
 function sharedBulletMat(col){ return _bulletMatCache[col] || (_bulletMatCache[col] = new THREE.MeshBasicMaterial({ color: col })); }
 function sharedBulletGlow(col, op){ var k = col + '_' + op; return _bulletGlowCache[k] || (_bulletGlowCache[k] = new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: col, transparent: true, opacity: op, blending: THREE.AdditiveBlending, depthWrite: false })); }
+// Mobile/touch = LOW-FX: drop the additive glow sprites (the #1 fillrate cost once the screen fills
+// with bullets — additive transparent overdraw murders mobile GPUs) AND recycle bullet meshes through
+// a shared pool so firing allocates nothing and never churns the scene graph (the hitch on each shot).
+var GAME_LOW_FX = (function(){ var ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+  return /Android|webOS|iPhone|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(ua)
+    || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1) || /iPad|Tablet/i.test(ua); })();
+var _bulletPool = [];   // recycled bullet meshes (shared by player + enemy bullets): sphere mesh + optional glow sprite child
+function acquireBulletMesh(geo, mat, glowMat, glowScale){
+  var m = _bulletPool.pop();
+  if(!m){
+    m = new THREE.Mesh(geo, mat);
+    m.frustumCulled = false; m.renderOrder = 5;
+    if(!GAME_LOW_FX && glowMat){ m._glow = new THREE.Sprite(glowMat); m.add(m._glow); }
+    scene.add(m);
+  }
+  m.geometry = geo; m.material = mat; m.visible = true;
+  m.scale.set(1, 1, 1); m.quaternion.identity();   // reset any prior stretch/aim (enemy bullets lookAt + stretch on reuse)
+  if(m._glow){ m._glow.material = glowMat; m._glow.scale.set(glowScale, glowScale, 1); }
+  return m;
+}
+function freeBulletMesh(m){ if(m){ m.visible = false; _bulletPool.push(m); } }   // recycle (never dispose — geo/mats are shared)
 
 function spawnSkillBullet(origin, dir, lateral){
   var s = gameMode.surfaceState, p = gameMode.physics;
@@ -16949,15 +17401,10 @@ function spawnSkillBullet(origin, dir, lateral){
   }
   var sz = skillFx.bigBullet ? 0.008 : 0.004;
   var col = skillFx.bigBullet ? 0xff7adf : 0xc9a3ff;
-  var mesh = new THREE.Mesh(sharedBulletGeo(sz), sharedBulletMat(col));
-  mesh.position.copy(origin);
-  mesh.frustumCulled = false; mesh.renderOrder = 5;
   var glowC = skillFx.bigBullet ? 0xff8ae0 : (skillFx.velocity ? 0xe0a0ff : 0xb98cff);
-  var glow = new THREE.Sprite(sharedBulletGlow(glowC, 0.85));
   var gs = skillFx.bigBullet ? 0.05 : 0.022;
-  glow.scale.set(gs, gs, 1);
-  mesh.add(glow);
-  scene.add(mesh);
+  var mesh = acquireBulletMesh(sharedBulletGeo(sz), sharedBulletMat(col), GAME_LOW_FX ? null : sharedBulletGlow(glowC, 0.85), gs);
+  mesh.position.copy(origin);
   gameBullets.push({
     mesh: mesh, vel: vel, life: 0, maxLife: skillFx.orbitingShot ? 240 : 90, dmg: dmg,
     big: skillFx.bigBullet, homing: skillFx.tracking, split: skillFx.splitShot,
@@ -16980,11 +17427,8 @@ function fireOneVolley(){
     var M = gameFiringDir();
     nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
     if(crosshairActive()){
-      // Drifting in chase view: converge bullets on the crosshair (camera centre ray).
-      var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-      var aimPoint = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST);
-      dir = aimPoint.sub(nose);
-      if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
+      // Drifting in chase view: converge bullets on the crosshair (zoom-scaled — see gameCrosshairDir).
+      dir = gameCrosshairDir(nose, M);
     } else {
       // Everywhere else (normal driving, locked-on, top-down): fire straight out of the ship.
       dir = M.clone();
@@ -17016,10 +17460,8 @@ function spawnSplitChildren(b, hitPos){
   var speed = 0.16;
   for(var sgn = -1; sgn <= 1; sgn += 2){
     var sdir = fwd.clone().multiplyScalar(0.4).addScaledVector(side, sgn).normalize();
-    var mesh = new THREE.Mesh(sharedBulletGeo(b.big ? 0.006 : 0.0035), sharedBulletMat(0xc9a3ff));
-    mesh.position.copy(hitPos); mesh.frustumCulled = false; mesh.renderOrder = 5;
-    var glow = new THREE.Sprite(sharedBulletGlow(0xb98cff, 0.8));
-    glow.scale.set(0.018, 0.018, 1); mesh.add(glow); scene.add(mesh);
+    var mesh = acquireBulletMesh(sharedBulletGeo(b.big ? 0.006 : 0.0035), sharedBulletMat(0xc9a3ff), GAME_LOW_FX ? null : sharedBulletGlow(0xb98cff, 0.8), 0.018);
+    mesh.position.copy(hitPos);
     gameBullets.push({ mesh: mesh, vel: sdir.multiplyScalar(speed), life: 0, maxLife: 70, dmg: b.dmg * 0.6, big: b.big, homing: b.homing, split: b.split - 1, orbit: null });
   }
 }
@@ -17097,10 +17539,8 @@ function clearCompanions(){
 }
 function fireDroneShot(from, target){
   var dir = target.clone().sub(from); if(dir.lengthSq() < 1e-9) return; dir.normalize();
-  var mesh = new THREE.Mesh(sharedBulletGeo(0.0035, 6, 5), sharedBulletMat(0x55ffcc));
-  mesh.position.copy(from); mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(sharedBulletGlow(0x88ffe0, 0.8));
-  glow.scale.set(0.016, 0.016, 1); mesh.add(glow); scene.add(mesh);
+  var mesh = acquireBulletMesh(sharedBulletGeo(0.0035, 6, 5), sharedBulletMat(0x55ffcc), GAME_LOW_FX ? null : sharedBulletGlow(0x88ffe0, 0.8), 0.016);
+  mesh.position.copy(from);
   gameBullets.push({ mesh: mesh, vel: dir.multiplyScalar(0.14), life: 0, maxLife: 80, dmg: 8, big: false, homing: false, split: 0, orbit: null });
 }
 function updateCompanions(){
@@ -17404,9 +17844,13 @@ var MP = {
     pos: new THREE.Vector3(), quat: new THREE.Quaternion(),
     vr: new THREE.Vector3(), vp: new THREE.Vector3(),
     flags: { drift:false, boost:false, air:false, slam:false },
-    skills: {}, hp: 100, isFps: false, gunner: null
+    skills: {}, hp: 100, isFps: false, gunner: null,
+    downActive: false, downSpot: new THREE.Vector3()   // partner is downed → their revive orb is here
   },
-  fx: null
+  fx: null,
+  guestRevT: 0, guestGauge: 0,   // host-side: guest revive window start + gauge
+  downGauge: { h: -1, gu: -1 },  // guest-side: gauges broadcast by the host (-1 = not downed)
+  reviveOrbs: []
 };
 function mpRegionId(){
   if(gameMode.fly && gameMode.fly.active) return 2;             // free-flight (still the crystal world)
@@ -17444,6 +17888,8 @@ function mpSetupConn(conn){
   conn.on('open', function(){
     MP.connected = true;
     MP.guestHp = combat.player.maxHp; MP.nextId = 1; mpClearWorld();
+    MP.guestRevT = 0; MP.guestGauge = 0; MP.downGauge = { h: -1, gu: -1 };
+    MP.remote.downActive = false;
     if(mpIsGuest()) combat.spawned = false;   // drop the guest's local sim; it mirrors the host now
     mpBuildRemoteShip();
     if(!MP._heartbeat) MP._heartbeat = setInterval(mpHeartbeat, 250);   // keep sending while backgrounded
@@ -17452,7 +17898,7 @@ function mpSetupConn(conn){
     setTimeout(mpCloseLobby, 900);
   });
   conn.on('data', mpOnData);
-  conn.on('close', function(){ MP.connected = false; mpHideRemote(); mpClearWorld(); mpUpdateBadge(); mpLobbyStatus('Disconnected.', '#ffcc66'); });
+  conn.on('close', function(){ MP.connected = false; mpHideRemote(); mpClearWorld(); mpClearReviveOrbs(); mpUpdateBadge(); mpLobbyStatus('Disconnected.', '#ffcc66'); });
   conn.on('error', function(){});
 }
 function mpSend(data){ if(MP.connected && MP.conn && MP.conn.open){ try { MP.conn.send(data); } catch(e){} } }
@@ -17497,7 +17943,10 @@ function mpSerializeShip(){
     vp: [sv.position.x, sv.position.y, sv.position.z],
     f: { d: !!s.isDrifting, b: !!gameMode.physics.isBoosting, a: !!s.airborne, sl: !!s.slamming, g: combat.godMode ? 1 : 0, fp: gameMode.fps.active ? 1 : 0 },
     sk: mpSkillSummary(),
-    hp: combat.player.hp
+    hp: combat.player.hp,
+    // downed-revive: am I downed, and where did my revive orb extend (raw world coords)?
+    dn: playerDeath.downActive ? 1 : 0,
+    ds: (playerDeath.downActive && playerDeath.spot) ? [playerDeath.spot.x, playerDeath.spot.y, playerDeath.spot.z] : null
   };
 }
 function mpApplyShip(d){
@@ -17512,6 +17961,8 @@ function mpApplyShip(d){
   r.flags.air = !!(d.f && d.f.a); r.flags.slam = !!(d.f && d.f.sl);
   r.skills = d.sk || {}; r.hp = (d.hp != null) ? d.hp : r.hp;
   r.isFps = !!(d.f && d.f.fp);   // partner is in first-person → don't let an FPS player ride them
+  r.downActive = !!d.dn;   // partner is downed → their revive orb is active
+  if(d.ds) r.downSpot.set(d.ds[0], d.ds[1], d.ds[2]);
 }
 
 // ── Remote ship mesh (reuse the local ship geometry, distinct teal tint) ──
@@ -17535,6 +17986,7 @@ function mpBuildGunnerAvatar(){
   var em = new THREE.LineBasicMaterial({ color: 0xbbffe6, transparent: true, opacity: 0.8 });   // teal wireframe accents
   var te = new THREE.LineSegments(new THREE.EdgesGeometry(torso.geometry), em); te.position.copy(torso.position); g.add(te);
   var he = new THREE.LineSegments(new THREE.EdgesGeometry(head.geometry), em); he.position.copy(head.position); g.add(he);
+  g.scale.setScalar(0.25);   // the parent ship is now 0.028 (2×); this keeps the gunner ~half the old on-screen size
   return g;
 }
 function mpBuildRemoteShip(){
@@ -17556,7 +18008,7 @@ function mpBuildRemoteShip(){
   var mesh = new THREE.Mesh(geo, mat); mesh.rotation.set(0, Math.PI / 2, 0); sv.add(mesh);
   var edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: 0xbbffe6, transparent: true, opacity: 0.85 }));
   edges.rotation.copy(mesh.rotation); sv.add(edges);
-  ship.scale.setScalar(0.014);
+  ship.scale.setScalar(0.028);   // matches the local ship's 2× size
   ship.visible = false;
   var gunner = mpBuildGunnerAvatar();   // the FPS-mode avatar (hidden until the partner enters gunner mode)
   gunner.visible = false;
@@ -17801,7 +18253,10 @@ function mpSerializeWorld(){
       +g.vel.x.toFixed(4), +g.vel.y.toFixed(4), +g.vel.z.toFixed(4), g.big ? 1 : 0, g.owner | 0]); }
   return { type: 'world', e: e, b: b, eb: eb, pb: pb,
     w: { a: combat.arenaActive ? 1 : 0, wv: combat.wave, lf: combat.enemies.length, st: Math.ceil((combat.spawnTimer || 0) / 60) },
-    h1: Math.round(combat.player.hp), h2: Math.round(MP.guestHp) };
+    h1: Math.round(combat.player.hp), h2: Math.round(MP.guestHp),
+    // revive gauges broadcast to the guest (-1 = that player isn't downed yet): host's own + the guest's
+    dn: { h: (combat.player.dead && playerDeath.downActive) ? +(playerDeath.gauge || 0).toFixed(3) : -1,
+          gu: (MP.guestHp <= 0 && MP.remote.downActive) ? +(MP.guestGauge || 0).toFixed(3) : -1 } };
 }
 function mpSendWorld(){
   if(!MP.connected || !MP.isHost || !gameMode.active) return;
@@ -17817,16 +18272,16 @@ function mpMirrorEbulletMesh(spiral){
   if(!combat._ebGeo){ combat._ebGeo = new THREE.SphereGeometry(0.012, 8, 8); combat._ebMat = new THREE.MeshBasicMaterial({ color: 0xff9980 }); }
   var mesh = new THREE.Mesh(combat._ebGeo, combat._ebMat);
   mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: 0xff7755, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
-  glow.scale.set(0.05, 0.05, 1); mesh.add(glow); scene.add(mesh); return mesh;
+  if(!GAME_LOW_FX){ var glow = new THREE.Sprite(sharedBulletGlow(0xff7755, 0.9)); glow.scale.set(0.05, 0.05, 1); mesh.add(glow); }
+  scene.add(mesh); return mesh;
 }
 function mpMirrorPbulletMesh(big, owner){
   var sz = big ? 0.008 : 0.004;
   var col = owner === 1 ? 0x66e0ff : (big ? 0xff7adf : 0xc9a3ff);   // guest = teal, host = purple
   var mesh = new THREE.Mesh(sharedBulletGeo(sz), sharedBulletMat(col));
   mesh.frustumCulled = false; mesh.renderOrder = 5;
-  var glow = new THREE.Sprite(sharedBulletGlow(owner === 1 ? 0x9af0ff : 0xb98cff, 0.85));
-  glow.scale.set(big ? 0.05 : 0.022, big ? 0.05 : 0.022, 1); mesh.add(glow); scene.add(mesh); return mesh;
+  if(!GAME_LOW_FX){ var glow = new THREE.Sprite(sharedBulletGlow(owner === 1 ? 0x9af0ff : 0xb98cff, 0.85)); glow.scale.set(big ? 0.05 : 0.022, big ? 0.05 : 0.022, 1); mesh.add(glow); }
+  scene.add(mesh); return mesh;
 }
 // ── Guest: reconcile mirrors from a snapshot (create / update-target / remove) ──
 function mpApplyWorld(w){
@@ -17876,6 +18331,7 @@ function mpApplyWorld(w){
   // HUD: reflect the host's authoritative HP + wave state
   combat.player.hp = w.h2;
   combat.arenaActive = w.w.a === 1; combat.wave = w.w.wv;
+  if(w.dn) MP.downGauge = w.dn;   // revive gauges (rendered on the guest's orbs)
 }
 // ── Guest: per-frame smoothing — lerp tanks/balls to target, integrate bullets by velocity ──
 function mpInterpolateWorld(){
@@ -17917,6 +18373,10 @@ function mpUpdateMirrorBars(){
 function mpGuestCombat(dt){
   if(!combat.spawned){ ensureCombatHUD(); combat.spawned = true; }
   showCombatHUD(true);
+  // Guest death anim: the host owns HP (mirrored into combat.player.hp), so trigger/clear the
+  // shatter from the mirrored HP rather than the local hurtPlayer path.
+  if(combat.player.hp <= 0 && !playerDeath.active && gameMode.active && !gameMode.exiting) startPlayerDeath();
+  else if(combat.player.hp > 0 && playerDeath.active) endPlayerDeath();
   mpInterpolateWorld();
   mpUpdateMirrorBars();   // enemy HP bars over the mirrored tanks
   relock();               // lock-on: re-acquire the nearest mirror if the locked one died
@@ -17951,9 +18411,7 @@ function mpSendFireIntent(){
     nose = camera.position.clone().addScaledVector(camF, 0.05);
     dir = camF;
   } else if(crosshairActive()){
-    var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-    dir = camera.position.clone().addScaledVector(camFwd, GAME_AIM_DIST).sub(nose);
-    if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
+    dir = gameCrosshairDir(nose, M);
   } else dir = M.clone();
   var sv = gameMode._shipVel || new THREE.Vector3();
   mpSend({ type: 'fire', o: [nose.x, nose.y, nose.z], d: [dir.x, dir.y, dir.z], sv: [sv.x, sv.y, sv.z], up: [s.groundNormal.x, s.groundNormal.y, s.groundNormal.z], sk: mpFireSkillSummary() });
@@ -17972,10 +18430,9 @@ function mpHostSpawnGuestVolley(d){
     var vel = dr.clone().multiplyScalar(0.18).add(sv);
     var dmg = PLAYER_BULLET_DAMAGE * (sk.big ? 3.5 : 1) * (1 + 0.5 * (sk.vel || 0));
     var szb = sk.big ? 0.008 : 0.004;
-    var mesh = new THREE.Mesh(sharedBulletGeo(szb), sharedBulletMat(0x66e0ff));
-    mesh.position.copy(orig); mesh.frustumCulled = false; mesh.renderOrder = 5;
-    var glow = new THREE.Sprite(sharedBulletGlow(0x9af0ff, 0.85));
-    glow.scale.set(sk.big ? 0.05 : 0.022, sk.big ? 0.05 : 0.022, 1); mesh.add(glow); scene.add(mesh);
+    var gsb = sk.big ? 0.05 : 0.022;
+    var mesh = acquireBulletMesh(sharedBulletGeo(szb), sharedBulletMat(0x66e0ff), GAME_LOW_FX ? null : sharedBulletGlow(0x9af0ff, 0.85), gsb);
+    mesh.position.copy(orig);
     gameBullets.push({ mesh: mesh, vel: vel, life: 0, maxLife: sk.orbit ? 240 : 90, dmg: dmg, big: !!sk.big, homing: !!sk.track, split: sk.split || 0,
       orbit: (sk.orbit > 0) ? { stacks: sk.orbit, phase: 'seek', target: null, angle: 0, ttl: 0 } : null, owner: 1 });
   }
@@ -18005,14 +18462,92 @@ function mpNearestPlayer(pos){
   if(pos.distanceToSquared(hp) <= pos.distanceToSquared(gp)) return { pos: hp, vel: gameMode._shipVel || _mpZeroVec, isGuest: false };
   return { pos: gp, vel: MP.remoteVel, isGuest: true };
 }
-// Host: when the guest's HP hits 0, brief downtime then revive (+ teleport back to spawn in the dome arena).
-function mpHostGuestDeathCheck(now){
+// ══════════════════════════════════════════════
+// CO-OP DOWNED / REVIVE-ORB — when a player dies in MP, a transparent RANGE ORB extends from the
+// wreckage once the death core has rested ~2s. The OTHER (alive) player has 30s to revive: standing
+// inside the orb pushes a gauge up; 30s of cumulative standing fills it and revives the downed
+// player (in place). Host-authoritative (host owns both HPs): the dead player's machine decides
+// where its orb sits (broadcast via the ship packet); the HOST computes both gauges + the revives.
+// ══════════════════════════════════════════════
+var REVIVE_WINDOW = 30000;   // ms the orb stays active before the downed player just respawns
+var REVIVE_FILL = 30;        // seconds of standing in the orb to fill the gauge
+var REVIVE_RADIUS = 0.13;    // partner must be within this of the orb centre
+function mpReviveActive(){ return MP.connected && !!(MP.remote && MP.remote.ship); }   // need a live partner
+// HOST / single-player own death (called from updateCombat while combat.player.dead && mpReviveActive).
+function mpUpdateOwnDowned(now, dt){
+  var pd = playerDeath;
+  if(!pd.downActive) return;   // orb hasn't extended yet (core still settling) — keep waiting
+  var partner = MP.remote.ship;
+  var inOrb = MP.guestHp > 0 && partner && partner.visible && !MP.remote.downActive
+              && partner.position.distanceTo(pd.spot) < REVIVE_RADIUS;
+  if(inOrb) pd.gauge = Math.min(1, pd.gauge + dt / REVIVE_FILL);
+  if(pd.gauge >= 1){ gameMode.ship.position.copy(pd.spot); mpReviveSelf(); }   // revived where you went down
+  else if(now - pd.orbStartT > REVIVE_WINDOW){ mpReviveSelf(); }               // nobody made it → respawn
+}
+function mpReviveSelf(){
+  combat.player.dead = false; combat.player.hp = combat.player.maxHp;
+  endPlayerDeath();   // clears the wreckage + down state
+  for(var eb = 0; eb < combat.enemyBullets.length; eb++) disposeEnemyBullet(combat.enemyBullets[eb]);
+  combat.enemyBullets.length = 0;
+}
+// Host: drive the GUEST's downed/revive from the guest's broadcast orb (MP.remote.downActive/downSpot).
+function mpHostGuestDeathCheck(now, dt){
   if(!MP.isHost || !MP.connected) return;
-  if(MP.guestHp <= 0 && !MP.guestDeadT){ MP.guestDeadT = now; }
-  if(MP.guestDeadT && now - MP.guestDeadT > 1400){
-    MP.guestHp = combat.player.maxHp; MP.guestDeadT = 0;
-    if(combat.arenaActive && combat.domeSpawn) mpSend({ type: 'respawn', p: [combat.domeSpawn.x, combat.domeSpawn.y, combat.domeSpawn.z] });
+  if(MP.guestHp <= 0 && MP.remote.downActive){   // guest dead AND its revive orb has extended
+    if(!MP.guestRevT){ MP.guestRevT = now; MP.guestGauge = 0; }   // window starts when the orb extends
+    var hostIn = !combat.player.dead && gameMode.ship.position.distanceTo(MP.remote.downSpot) < REVIVE_RADIUS;
+    if(hostIn) MP.guestGauge = Math.min(1, MP.guestGauge + dt / REVIVE_FILL);
+    if(MP.guestGauge >= 1 || now - MP.guestRevT > REVIVE_WINDOW){
+      MP.guestHp = combat.player.maxHp; MP.guestRevT = 0; MP.guestGauge = 0;
+      var sp = MP.remote.downSpot;
+      mpSend({ type: 'respawn', p: [sp.x, sp.y, sp.z] });   // revive the guest at its orb spot
+    }
+  } else if(MP.guestHp > 0){ MP.guestRevT = 0; MP.guestGauge = 0; }   // alive again
+}
+// Transparent revive RANGE ORB (a translucent sphere + an inner gauge sphere that grows 0→1).
+function mpMakeReviveOrb(){
+  var orb = new THREE.Mesh(new THREE.SphereGeometry(REVIVE_RADIUS, 20, 16),
+    new THREE.MeshBasicMaterial({ color: 0xff5555, transparent: true, opacity: 0.18, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  orb.frustumCulled = false; orb.renderOrder = 4;
+  var fill = new THREE.Mesh(new THREE.SphereGeometry(REVIVE_RADIUS * 0.97, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0x66ff99, transparent: true, opacity: 0.3, depthWrite: false, blending: THREE.AdditiveBlending }));
+  orb.add(fill); orb.userData.fill = fill;
+  scene.add(orb);
+  return orb;
+}
+// Render an orb for each active downed player (pooled). Positions are local; gauges come from the
+// host (own) or the broadcast (guest renders from MP.downGauge).
+function updateReviveOrbs(){
+  if(!MP.reviveOrbs) MP.reviveOrbs = [];
+  var list = [];
+  if(MP.connected && gameMode.active && !gameMode.exiting){
+    if(MP.isHost){
+      if(combat.player.dead && playerDeath.downActive && playerDeath.spot) list.push({ p: playerDeath.spot, g: playerDeath.gauge || 0 });
+      if(MP.guestHp <= 0 && MP.remote.downActive) list.push({ p: MP.remote.downSpot, g: MP.guestGauge || 0 });
+    } else {
+      var dg = MP.downGauge || { h: -1, gu: -1 };
+      if(combat.player.dead && playerDeath.downActive && playerDeath.spot && dg.gu >= 0) list.push({ p: playerDeath.spot, g: dg.gu });   // my own orb
+      if(MP.remote.downActive && dg.h >= 0) list.push({ p: MP.remote.downSpot, g: dg.h });   // the host's orb
+    }
   }
+  while(MP.reviveOrbs.length < list.length) MP.reviveOrbs.push(mpMakeReviveOrb());
+  var tt = performance.now() * 0.004;
+  for(var j = 0; j < MP.reviveOrbs.length; j++){
+    var orb = MP.reviveOrbs[j];
+    if(j < list.length){
+      orb.visible = true;
+      orb.position.copy(list[j].p);
+      var g = Math.max(0, Math.min(1, list[j].g));
+      orb.material.color.setRGB(1 - g * 0.7, 0.3 + g * 0.6, 0.3);                 // red → green as the gauge fills
+      orb.material.opacity = 0.14 + 0.07 * Math.sin(tt + j) + g * 0.12;            // gentle pulse, brighter when full
+      if(orb.userData.fill) orb.userData.fill.scale.setScalar(Math.max(0.001, g)); // inner sphere = the gauge
+    } else orb.visible = false;
+  }
+}
+function mpClearReviveOrbs(){
+  if(MP.reviveOrbs){ for(var i = 0; i < MP.reviveOrbs.length; i++) MP.reviveOrbs[i].visible = false; }
+  playerDeath.downActive = false; playerDeath.gauge = 0;
+  MP.guestRevT = 0; MP.guestGauge = 0; MP.downGauge = { h: -1, gu: -1 };
 }
 
 // Kick off a mid-air barrel roll in the given direction (-1 left, +1 right). Captures
@@ -18118,6 +18653,7 @@ function gameKeyDown(e) {
     }
   }
   else if(k === 'control') gameMode.keys.ctrl = true;
+  else if(k === 'alt') { gameMode.keys.alt = true; e.preventDefault(); }   // FPS: hold ALT to slide
   else if(k === 'enter') { if(gameMode.active) { combat.enterFiring = true; fireBullet(); e.preventDefault(); } }   // hold Enter to fire
   else if(k === 'l' && !e.repeat) { if(gameMode.active) { toggleLockOn(); e.preventDefault(); } }   // lock-on camera toggle
   else if(k === 't' && !e.repeat) { if(gameMode.active) { spawnEnemyNearPlayer(); e.preventDefault(); } }   // spawn an enemy near the player
@@ -18149,6 +18685,7 @@ function gameKeyUp(e) {
   else if(k === 'c') gameMode.keys.charge = false;
   else if(k === ' ') gameMode.keys.space = false;
   else if(k === 'control') gameMode.keys.ctrl = false;
+  else if(k === 'alt') gameMode.keys.alt = false;
   else if(k === 'enter') combat.enterFiring = false;   // stop hold-to-fire
 }
 
@@ -18468,6 +19005,7 @@ function buildPortal(){
   var l2 = new THREE.PointLight(0x88aaff, 1.1, 150); l2.position.set(P.DX, P.domeFloorY + 16, P.domeCz - 18); gB.add(l2);
   if(PORTAL_DEBUG_WIRE) applyDebugWire(gB, 0x224a3a, 0x66ff99);   // Region B dome/tunnel: green faces / green wire
   gB.traverse(function(o){ o.layers.set(PORTAL_LAYER); });
+  createDomeStars(P, gB);   // starry sky overhead (sets its own PORTAL_LAYER after the traverse)
   scene.add(gB); P.regionB = gB;
 
   // ── Render targets + virtual camera ──
@@ -18494,16 +19032,35 @@ function buildPortal(){
   // the centre), so its opening stays flush with the perimeter and you slide down the inner surface
   // instead of being shot into the open middle.
   var domeCy = P.domeFloorY + P.domeR;                         // sphere centre
-  var holeOut = new THREE.Vector3(0, 0.4, 1).normalize();      // outward wall normal at the hole (upper +Z side)
+  // GROUND-LEVEL HALLWAY entrance: the doorway sits at the +Z floor edge and the chute runs HORIZONTALLY
+  // inward (−Z) across the floor — so crossing the portal walks you in FLAT, like a hallway. The triangular
+  // hole is ROLLED so its longest edge is the FLAT BASE resting on the ground (apex pointing UP), not a
+  // vertex stabbing into the floor; and the doorway height is set so that base sits right on the floor.
+  var entryDir = new THREE.Vector3(0, 0, -1);                  // heads inward, across the floor
   P.dstAnchor = new THREE.Object3D();
-  P.dstAnchor.position.set(P.DX + holeOut.x*P.domeR*0.96, domeCy + holeOut.y*P.domeR*0.96, P.domeCz + holeOut.z*P.domeR*0.96);  // just inside the wall so the whole tunnel sits inside the sphere
-  // Entry direction = down along the wall (tangent) but leaning INWARD, so the tunnel tunnels INTO
-  // the sphere (hugging just inside the wall) instead of splaying out across the surface, and opens
-  // flush on the inner wall. The outward-poking half of the imaged tunnel is clipped below.
-  var down = new THREE.Vector3(0,-1,0);
-  var entryDir = down.clone().addScaledVector(holeOut, -down.dot(holeOut)).normalize();   // tangent-down
-  entryDir.addScaledVector(holeOut, -0.55).normalize();        // lean inward → tunnels into the sphere
-  P.dstAnchor.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1), entryDir);
+  var _bz = entryDir.clone(), _by0 = new THREE.Vector3(0,1,0), _bx0 = new THREE.Vector3().crossVectors(_by0, _bz).normalize();
+  _by0.crossVectors(_bz, _bx0).normalize();                   // upright base frame (local +Y = world up)
+  // Roll φ around the entry axis so the triangle's LONGEST edge becomes the horizontal base + apex up.
+  var phi = 0, hbase = 0;
+  if(P.seamTri && P.seamTri.length === 3){
+    var et = P.seamTri.map(function(c){ return [-c[0], c[1]]; });   // dome triangle corners in anchor-local XY (= exitTri)
+    var cand = [[0,1,2],[1,2,0],[2,0,1]];   // [edgeJ, edgeK, apex]
+    var bestAbs = 1e9;
+    cand.forEach(function(c){   // pick the edge needing the SMALLEST roll to become the flat base (least seam-pop)
+      var j=c[0], kk=c[1], ap=c[2];
+      var f = Math.atan2(-(et[j][1]-et[kk][1]), et[j][0]-et[kk][0]);
+      function _hh(x,y){ return x*Math.sin(f) + y*Math.cos(f); }
+      if(_hh(et[ap][0],et[ap][1]) < _hh(et[j][0],et[j][1])) f += Math.PI;   // keep apex ABOVE the base
+      while(f >  Math.PI) f -= 2*Math.PI; while(f < -Math.PI) f += 2*Math.PI;
+      if(Math.abs(f) < bestAbs){ bestAbs = Math.abs(f); phi = f; hbase = et[j][0]*Math.sin(f) + et[j][1]*Math.cos(f); }
+    });
+  }
+  var doorH = -hbase + 0.008;                                  // lift so the flat base rests on the floor
+  P.dstAnchor.position.set(P.DX, P.domeFloorY + doorH, P.domeCz + P.domeR * 1.15);
+  var _cphi = Math.cos(phi), _sphi = Math.sin(phi);
+  var _bx = _bx0.clone().multiplyScalar(_cphi).addScaledVector(_by0, _sphi);
+  var _by = _bx0.clone().multiplyScalar(-_sphi).addScaledVector(_by0, _cphi);
+  P.dstAnchor.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(_bx, _by, _bz));
   P.dstAnchor.layers.set(PORTAL_LAYER);
   scene.add(P.dstAnchor);
   P.domeTopY = P.dstAnchor.position.y;                         // hole height (kept for references)
@@ -18766,6 +19323,7 @@ function pointInSeamTri(px, py, t){
   return !(neg && pos);
 }
 function checkPortalEntry(){
+  if(playerDeath.active) return;   // camera is on the death core, not the player — don't trip the portal
   var P = gameMode.portal;
   if(!P.built || P.inside || !P.srcAnchor){ P._prevSigned = null; P._prevWorld = null; return; }
   if(P.entryCooldown > 0) P.entryCooldown--;   // brief grace after exiting so you don't bounce back in
@@ -18851,6 +19409,7 @@ function leaveToCrystal(){
 // (teleportPortal folds the camera too), so the framing matches on both sides.
 var _exRel = new THREE.Vector3(), _exVel = new THREE.Vector3();
 function checkPortalExit(){
+  if(playerDeath.active) return;   // death core drives the camera; don't trip the portal
   var P = gameMode.portal;
   if(!P.built || !P.inside || !P.inB || !P.dstAnchor){ P._exPrevSigned = null; P._exPrevWorld = null; return; }
   // Lock the exit during the dome wave arena — you're committed to the fight, so getting bumped up
@@ -19019,6 +19578,7 @@ function updatePortalInterior(){
   // Free-flight (P) works inside the dome just like outside — hand off to the flight controller,
   // then keep the ship contained in the chute on the way down.
   if(skillMenuOpen()) return;   // level-up skill picker pauses the game
+  if(playerDeath.active){ updatePlayerDeath(); return; }   // death animation owns the camera + physics
   if(gameMode.fps.active){ updateFpsPhysicsAndCamera(); return; }   // first-person POV (dome floor/walls)
   if(gameMode.fly.active){ updateFlightPhysicsAndCamera(); containInChute(); return; }
   var cx = P.DX, cz = P.domeCz, floorY = P.domeFloorY, roomR = P.domeR;
@@ -19026,9 +19586,9 @@ function updatePortalInterior(){
 
   // input — matches the overworld: boost = Shift (drives forward on its own); "running" is any
   // speed above the walk cap (gates drift + flips). Same km/h counter, too.
-  var fwdAxis = 0, yawAxis = 0;
+  var fwdAxis = 0, yawAxis = 0, mDyaw = 0, mDriftSide = 0, aimMode = false;
   if(t.active){ fwdAxis = t.throttle; yawAxis = t.yaw; p.isBoosting = t.boost && boostAllowed(); }
-  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); yawAxis = (k.a?-1:0)+(k.d?1:0); p.isBoosting = k.shift && boostAllowed(); }
+  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); var _kd = gameKbDrift(); mDyaw = _kd.dyaw; mDriftSide = _kd.side; p.isBoosting = k.shift && boostAllowed(); }
   if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
   if(s.airborne && fwdAxis < 0) fwdAxis = 0;   // no braking in the air (S mid-air is slam-only)
   var speedMetric = Math.max(Math.abs(s.speed), gameMode.fly.vel.length());
@@ -19039,19 +19599,35 @@ function updatePortalInterior(){
   // jump → hop, or a +1 Jump air re-jump (handled in tryGameJump)
   if(gameMode.wantJump){ gameMode.wantJump = false; tryGameJump(); }
 
-  // ── drift detection (copied from crystal) ──
-  var wantsDriftLeft  = (k.a && !k.w) || (t.active && t.yaw < -0.6 && Math.abs(t.throttle) < 0.15) || (t.active && t.driftHold && t.driftDir < 0);
-  var wantsDriftRight = (k.d && !k.w) || (t.active && t.yaw >  0.6 && Math.abs(t.throttle) < 0.15) || (t.active && t.driftHold && t.driftDir > 0);
-  var wantsDrift = wantsDriftLeft || wantsDriftRight;
+  // ── drift detection (camera-follow, same as crystal) ── desktop: A/D arm; the mouse builds the aim.
   var spdAbs = Math.abs(s.speed);
   var canDriftNow = s.running && (s.isDrifting ? (spdAbs > p.maxSpeed*p.driftContinueSpeedRatio) : (spdAbs > p.maxSpeed*p.driftEntrySpeedRatio));
-  if(wantsDrift && canDriftNow && !s.airborne){
-    if(!s.isDrifting){ s.driftTime = 0; s.driftEntrySpeed = spdAbs; }
-    s.isDrifting = true; s.driftTime += 1; s.driftDirection = wantsDriftLeft ? 1 : -1;
-    s.driftTargetAngle = s.driftDirection * (p.hasGaugeDrift ? Math.min(s.driftTime * GAUGE_DRIFT_RATE, Math.PI * 0.5) : (Math.PI * 0.5));   // Gauge Drift
-    spawnGameDriftParticles(); spawnDriftTrench();
-  } else { s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; }
-  s.driftAngle += (s.driftTargetAngle - s.driftAngle) * 0.12;
+  if(t.active){
+    var wantsDriftLeft  = (t.yaw < -0.6 && Math.abs(t.throttle) < 0.15) || (t.driftHold && t.driftDir < 0);
+    var wantsDriftRight = (t.yaw >  0.6 && Math.abs(t.throttle) < 0.15) || (t.driftHold && t.driftDir > 0);
+    if((wantsDriftLeft || wantsDriftRight) && canDriftNow && !s.airborne){
+      if(!s.isDrifting){ s.driftTime = 0; s.driftEntrySpeed = spdAbs; }
+      s.isDrifting = true; s.driftTime += 1; s.driftDirection = wantsDriftLeft ? 1 : -1;
+      s.driftTargetAngle = s.driftDirection * (p.hasGaugeDrift ? Math.min(s.driftTime * GAUGE_DRIFT_RATE, Math.PI * 0.5) : (Math.PI * 0.5));
+      spawnGameDriftParticles(); spawnDriftTrench();
+    } else { s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; }
+  } else {
+    aimMode = mDriftSide !== 0 && canDriftNow && !s.airborne;   // a drift key held while fast enough = mouse aims, doesn't steer
+    if(aimMode){
+      if(!gameMode._wasAimMode) s.driftTargetAngle = mDriftSide * GAME_DRIFT_BASE_ANGLE;   // press A/D → SNAP straight into a turned drift
+      s.driftTargetAngle += mDyaw;   // mouse fine-aims from the base
+      s.driftTargetAngle = mDriftSide === 1   // A = LEFT (positive), D = RIGHT (negative)
+        ? Math.max(0, Math.min(GAME_DRIFT_MAX_ANGLE, s.driftTargetAngle))
+        : Math.max(-GAME_DRIFT_MAX_ANGLE, Math.min(0, s.driftTargetAngle));
+      s.driftDirection = mDriftSide;
+      if(Math.abs(s.driftTargetAngle) > 0.08){
+        if(!s.isDrifting){ s.driftTime = 0; s.driftEntrySpeed = spdAbs; }
+        s.isDrifting = true; s.driftTime += 1; spawnGameDriftParticles(); spawnDriftTrench();
+      } else { s.isDrifting = false; }   // aim ≈ travel line → slide straight + accelerate
+    } else { s.isDrifting = false; s.driftDirection = 0; s.driftTargetAngle = 0; }
+  }
+  s.driftAngle += (s.driftTargetAngle - s.driftAngle) * (t.active ? 0.12 : 0.85);
+  gameMode._wasAimMode = aimMode;   // rising-edge tracking for the press-to-snap
 
   // ── thrust + speed (matches the overworld: boost = 2× accel, walk cap holds momentum) ──
   var hasFwd = Math.abs(fwdAxis) > 0.01;
@@ -19086,8 +19662,8 @@ function updatePortalInterior(){
   if(p.isBoosting) spawnBoostTrail();
 
   // ── yaw + tangential move (copied) ──
-  if(s.isDrifting){ var ramp = Math.min(1, s.driftTime/p.driftRampTime); var dY = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase)*ramp; dY *= (1 + driftTight*0.7); dY *= s.driftDirection; s.forward.applyAxisAngle(s.groundNormal, dY); s.driftExitYaw = dY; }
-  else { if(Math.abs(s.driftExitYaw||0) > 1e-5){ s.forward.applyAxisAngle(s.groundNormal, s.driftExitYaw); s.driftExitYaw *= p.driftExitDecay; if(Math.abs(s.driftExitYaw) < 1e-5) s.driftExitYaw = 0; } if(!s.barrelRoll.active && Math.abs(yawAxis) > 0.01){ s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis); } }
+  if(s.isDrifting){ var ramp = Math.min(1, s.driftTime/p.driftRampTime); var dY = p.driftTurnBase + (p.driftTurnMax - p.driftTurnBase)*ramp; dY *= (1 + driftTight*0.7); dY *= s.driftDirection; if(!t.active) dY *= Math.min(1, Math.abs(s.driftAngle)/GAME_DRIFT_MAX_ANGLE); s.forward.applyAxisAngle(s.groundNormal, dY); s.driftExitYaw = dY; }
+  else { if(Math.abs(s.driftExitYaw||0) > 1e-5){ s.forward.applyAxisAngle(s.groundNormal, s.driftExitYaw); s.driftExitYaw *= p.driftExitDecay; if(Math.abs(s.driftExitYaw) < 1e-5) s.driftExitYaw = 0; } if(!s.barrelRoll.active){ if(t.active){ if(Math.abs(yawAxis) > 0.01) s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis); } else if(!aimMode) s.forward.applyAxisAngle(s.groundNormal, mDyaw); } }   // desktop: DIRECT camera-follow steering
   s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
   if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
   if(Math.abs(s.speed) > 0.00001) ship.position.addScaledVector(s.forward, s.speed);
@@ -19150,13 +19726,15 @@ function updatePortalInterior(){
   // ── chase camera — IDENTICAL framing to the crystal (computeChaseCamPose) so the portal-folded
   //    crystal pose equals the dome pose exactly: the cross is then truly seamless (no aim snap).
   //    Lock-on aware so the dome tank can be locked too. ──
+  updateCamAnchor(true);   // jump-damp: shift the pose down by the hop excess so the view holds its height
   var chase = gameCamPose();
+  if(gameMode._camExcess){ var _exP = gameMode.surfaceState.groundNormal.clone().multiplyScalar(gameMode._camExcess); chase.pos.sub(_exP); chase.lookAt.sub(_exP); }
   if(P.snapCam){
     // first frame after the portal cross — snap so the view doesn't roll/slide as it re-settles
     camera.position.copy(chase.pos); camera.up.copy(chase.up).normalize();
     P.snapCam = false;
   } else {
-    var camLerpP = gameMode.surfaceState.isDrifting ? 0.5 : 0.18; camera.position.lerp(chase.pos, camLerpP); camera.up.lerp(chase.up, gameMode.surfaceState.isDrifting ? 0.3 : 0.12); camera.up.normalize();
+    var camLerpP = gameMode.surfaceState.isDrifting ? 0.13 : 0.18; camera.position.lerp(chase.pos, camLerpP); camera.up.lerp(chase.up, 0.12); camera.up.normalize();
   }
   camera.lookAt(chase.lookAt);
 
@@ -19450,6 +20028,12 @@ function init(){
     }
     camMouseX=(e.clientX/renderer.domElement.clientWidth)*2-1;
     camMouseY=(e.clientY/renderer.domElement.clientHeight)*2-1;
+    // Ship steering = CAMERA-FOLLOW: accumulate the RAW horizontal mouse movement; each physics frame
+    // consumes it as a direct heading/aim rotation that holds when you stop (no rate / no centring).
+    // Works locked (infinite range, hidden cursor) and unlocked (limited by the screen edge).
+    if(gameMode.active && !gameMode.fps.active){
+      gameMode.mouseDX = (gameMode.mouseDX || 0) + (e.movementX || 0);
+    }
   });
   // Losing pointer lock (Esc / tab-away) drops out of first-person cleanly.
   document.addEventListener('pointerlockchange',function(){
@@ -19459,12 +20043,19 @@ function init(){
   renderer.domElement.addEventListener('mouseup',onMU);renderer.domElement.addEventListener('mouseleave',onMU);
   // Combat: hold left mouse to fire the weapon while playing (ignored over in-game glass windows/icons)
   renderer.domElement.addEventListener('mousedown',function(e){
-    if(gameMode.active && !gameMode.exiting && !gameUITouchHitTest(e.clientX,e.clientY)){
-      if(e.button===0) combat.mouseFiring=true;
-      else if(e.button===2){ toggleLockOn(); e.preventDefault(); }   // right-click toggles lock-on
+    var locked = document.pointerLockElement === renderer.domElement;
+    if(gameMode.active && !gameMode.exiting && (locked || !gameUITouchHitTest(e.clientX,e.clientY))){
+      if(e.button===0){
+        combat.mouseFiring=true;
+        // First click into the play area LOCKS the mouse for ship steering (relative aim).
+        if(!locked && shipWantsPointerLock() && renderer.domElement.requestPointerLock){
+          try { renderer.domElement.requestPointerLock(); } catch(err){}
+        }
+      }
+      else if(e.button===2){ if(gameMode.fps.active) fpsFireGrapple(); else toggleLockOn(); e.preventDefault(); }   // FPS: grapple · ship: lock-on
     }
   });
-  window.addEventListener('mouseup',function(e){ if(e.button===0) combat.mouseFiring=false; });
+  window.addEventListener('mouseup',function(e){ if(e.button===0) combat.mouseFiring=false; else if(e.button===2 && gameMode.fps.active) fpsReleaseGrapple(); });
   // Suppress the browser context menu over the canvas while playing (so right-click can lock on)
   renderer.domElement.addEventListener('contextmenu',function(e){ if(gameMode.active && !gameMode.exiting) e.preventDefault(); });
   renderer.domElement.addEventListener('touchstart',onTS,{passive:false});renderer.domElement.addEventListener('touchmove',onTM,{passive:false});renderer.domElement.addEventListener('touchend',onTE);
@@ -19472,7 +20063,7 @@ function init(){
     // Mini-game: the wheel zooms the chase camera (out → eventually a top-down survey view).
     if(gameMode.active && !gameMode.exiting){
       e.preventDefault();
-      gameMode.camZoom = Math.max(CAM_ZOOM_MIN, Math.min(CAM_ZOOM_MAX, gameMode.camZoom + (e.deltaY > 0 ? 0.28 : -0.28)));
+      gameMode.camZoom = Math.max(CAM_ZOOM_MIN, Math.min(CAM_ZOOM_MAX, gameMode.camZoom + (e.deltaY > 0 ? 0.45 : -0.45)));   // bigger step for the doubled zoom range
       return;
     }
     // Lightbox: wheel zooms the image instead of scrolling the page/camera. Also bumps
@@ -19684,6 +20275,8 @@ function animate(){
   mpTick();
   mpUpdateRemoteShip();
   mpUpdateBadge();
+  updateReviveOrbs();   // co-op downed: render the transparent revive range orb(s)
+  updateShipPointerLock();   // free the mouse-lock when a menu is open / we leave the ship
   // Drift particles age every frame (even when not drifting, so existing streaks finish out)
   updateGameDriftParticles();
   updateDriftTrench();
@@ -19692,7 +20285,7 @@ function animate(){
   updateCombat(dt);
   updateBoostFuel(dt);
   updateGameAudio();
-  updateCrosshair(crosshairActive() || (gameMode.fps.active && gameMode.fps.camTarget !== 0));   // shown drifting, OR in first-person (not during the exit pull-back)
+  updateCrosshair((crosshairActive() || (gameMode.fps.active && gameMode.fps.camTarget !== 0)) && !playerDeath.active);   // shown drifting / in first-person; hidden during the death animation
   if(!gameMode.active) hideSpeedCounter();
 
   floors.forEach(function(fl){
