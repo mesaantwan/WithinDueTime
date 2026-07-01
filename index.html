@@ -13676,7 +13676,7 @@ function updateGamePhysicsAndCamera() {
     fwdAxis = (k.w ? 1 : 0) + ((k.s && !gameMode.sBrakeLock) ? -0.6 : 0);
     var _kd = gameKbDrift();   // direct camera-follow yaw; A/D arm a drift
     mDyaw = _kd.dyaw; mDriftSide = _kd.side;
-    p.isBoosting = gameMode.wBoost && boostAllowed();   // double-tap-W boost (was Shift)
+    p.isBoosting = (gameMode.wBoost || k.shift) && boostAllowed();   // boost: double-tap-W OR Shift
   }
   // Boost drives forward on its own (you don't also have to hold W to run).
   if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
@@ -14210,7 +14210,7 @@ function updateFlightPhysicsAndCamera() {
   }
   var pitchAxis = (k.q ? 1 : 0) + (k.e ? -1 : 0);    // Q = nose up, E = nose down
   var vertAxis  = (k.space ? 1 : 0) + (k.ctrl ? -1 : 0);
-  var isBoosting = (gameMode.wBoost || (t.active && t.boost)) && boostAllowed();   // double-tap-W boost (was Shift)
+  var isBoosting = (gameMode.wBoost || k.shift || (t.active && t.boost)) && boostAllowed();   // boost: double-tap-W / Shift / touch
   gameMode.physics.isBoosting = isBoosting;   // so the boost-fuel bar drains in flight too
 
   // Thrust ramp
@@ -21763,7 +21763,7 @@ function updatePortalInterior(){
   // speed above the walk cap (gates drift + flips). Same km/h counter, too.
   var fwdAxis = 0, yawAxis = 0, mDyaw = 0, mDriftSide = 0, aimMode = false;
   if(t.active){ fwdAxis = t.throttle; yawAxis = t.yaw; p.isBoosting = t.boost && boostAllowed(); }
-  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); var _kd = gameKbDrift(); mDyaw = _kd.dyaw; mDriftSide = _kd.side; p.isBoosting = gameMode.wBoost && boostAllowed(); }
+  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); var _kd = gameKbDrift(); mDyaw = _kd.dyaw; mDriftSide = _kd.side; p.isBoosting = (gameMode.wBoost || k.shift) && boostAllowed(); }
   if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
   if(s.airborne && fwdAxis < 0) fwdAxis = 0;   // no braking in the air (S mid-air is slam-only)
   var speedMetric = Math.max(Math.abs(s.speed), gameMode.fly.vel.length());
@@ -21995,7 +21995,7 @@ function flatDrive(cx, cz, floorY, roomR){
   s.groundNormal.set(0,1,0);
   var fwdAxis=0, yawAxis=0;
   if(t.active){ fwdAxis=t.throttle; yawAxis=t.yaw; p.isBoosting=t.boost && boostAllowed(); }
-  else { fwdAxis=(k.w?1:0)+(k.s?-0.6:0); yawAxis=(k.a?-1:0)+(k.d?1:0); p.isBoosting=gameMode.wBoost&&boostAllowed(); }
+  else { fwdAxis=(k.w?1:0)+(k.s?-0.6:0); yawAxis=(k.a?-1:0)+(k.d?1:0); p.isBoosting=(gameMode.wBoost||k.shift)&&boostAllowed(); }
   if(gameMode.wantJump){
     gameMode.wantJump=false;
     if(!s.airborne){ s.airborne=true; s.freeFalling=false; s.vertVel=p.jumpImpulse; s.airTime=0; s.jumpAxis.set(0,1,0);
@@ -22345,6 +22345,42 @@ function init(){
 }
 
 // ══════════════════════════════════════════════
+// FIXED-TIMESTEP GAME SIMULATION
+// The mini-game physics integrate per-CALL (position += velocity, life++, etc.), so on a high-refresh
+// screen (120/144/240Hz) the game ran that many times faster. We now advance the SIMULATION at a fixed
+// 60Hz via an accumulator (animate() calls this N times to consume the real elapsed time), so movement/
+// physics are framerate-independent. Rendering, UI, audio + networking still run once per drawn frame.
+// ══════════════════════════════════════════════
+var GAME_FIXED_DT = 1 / 60;   // simulation step (matches the 60fps the game was tuned at)
+var _gameSimAccum = 0;
+function stepGameSim(dt){
+  // transition + physics + camera (mirrors the old per-frame order)
+  if(gameMode.decelerating) animateGameDecel();
+  if(gameMode.entering || gameMode.exiting) animateGameTransition();
+  if(gameMode.active){
+    if(gameMode.portal.testMode){
+      updatePortalTest();                 // TEMP: flat-plane ↔ room sandbox (decoupled from the crystal)
+    } else {
+      buildPortal();
+      if(gameMode.portal.inside){
+        updatePortalInterior();
+        checkPortalExit();      // drive/fly back up through the ceiling hole → back to the crystal
+      } else {
+        updateGamePhysicsAndCamera();
+        checkPortalEntry();
+      }
+    }
+    checkGameLanded();   // airborne→grounded transition: reset jump/hover budgets + Ground Stomp blast
+  }
+  updateGameDriftParticles();
+  updateDriftTrench();
+  updateBoostTrail();
+  updateGameBullets();
+  updateCombat(dt);
+  updateBoostFuel(dt);
+}
+
+// ══════════════════════════════════════════════
 // MAIN LOOP
 // ══════════════════════════════════════════════
 function animate(){
@@ -22484,40 +22520,29 @@ function animate(){
 
   // Game mode — transition + physics + camera. Runs AFTER website camera setup
   // so it overrides position.y / lookAt that the camera-y lerp and tilt code applied.
-  if(gameMode.decelerating) animateGameDecel();
-  if(gameMode.entering || gameMode.exiting) animateGameTransition();
-  if(gameMode.active){
-    if(gameMode.portal.testMode){
-      updatePortalTest();                 // TEMP: flat-plane ↔ room sandbox (decoupled from the crystal)
-    } else {
-      buildPortal();
-      if(gameMode.portal.inside){
-        updatePortalInterior();
-        checkPortalExit();      // drive/fly back up through the ceiling hole → back to the crystal
-      } else {
-        updateGamePhysicsAndCamera();
-        checkPortalEntry();
-      }
+  // Advance the mini-game simulation at a FIXED 60Hz (framerate-independent) — see stepGameSim.
+  if(gameMode.active || gameMode.entering || gameMode.exiting || gameMode.decelerating){
+    _gameSimAccum += dt;
+    if(_gameSimAccum > 0.25) _gameSimAccum = 0.25;   // clamp after a stall/tab-switch (no spiral of death)
+    var _simSteps = 0;
+    while(_gameSimAccum >= GAME_FIXED_DT && _simSteps < 5){
+      stepGameSim(GAME_FIXED_DT);
+      _gameSimAccum -= GAME_FIXED_DT;
+      _simSteps++;
     }
-    checkGameLanded();   // airborne→grounded transition: reset jump/hover budgets + Ground Stomp blast
+  } else {
+    _gameSimAccum = 0;
   }
   // Open the level-up skill picker when a package is pending and we're in a safe (non-transition) state.
   if(gameSkills.pending > 0 && !skillMenuOpen() && gameMode.active && !gameMode.entering && !gameMode.exiting && !gameMode.decelerating){
     openSkillPicker();
   }
-  // Multiplayer: throttled local ship send + interpolate the partner's ship + connection badge.
+  // Per-frame (render/UI/network): throttled local ship send + interpolate the partner + badge.
   mpTick();
   mpUpdateRemoteShip();
   mpUpdateBadge();
   updateReviveOrbs();   // co-op downed: render the transparent revive range orb(s)
   updateShipPointerLock();   // free the mouse-lock when a menu is open / we leave the ship
-  // Drift particles age every frame (even when not drifting, so existing streaks finish out)
-  updateGameDriftParticles();
-  updateDriftTrench();
-  updateBoostTrail();
-  updateGameBullets();
-  updateCombat(dt);
-  updateBoostFuel(dt);
   updateGameAudio();
   updateCrosshair((crosshairActive() || (gameMode.fps.active && gameMode.fps.camTarget !== 0)) && !playerDeath.active);   // shown drifting / in first-person; hidden during the death animation
   if(!gameMode.active) hideSpeedCounter();
