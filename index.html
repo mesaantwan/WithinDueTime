@@ -13196,19 +13196,23 @@ function computeChaseCamPose() {
   var sxMax = halfH * 0.5;
   var sx = Math.max(-sxMax, Math.min(sxMax, driftA));
   var sy = -Math.min(0.13, halfV * 0.3);
+  // How far into the drift we are across the FULL drift range → drives the camera pull-in + roll.
+  var driftFrac = Math.min(1, Math.abs(driftA) / GAME_DRIFT_MAX_ANGLE);
+  // At hard drift, ease the ship's on-screen offset back toward centre so it can't hug/leave the edge.
+  var sxEff = sx * (1 - 0.45 * driftFrac);
   var right = new THREE.Vector3().crossVectors(M, up).normalize();
-  var shipDir = M.clone().addScaledVector(right, Math.tan(sx)).addScaledVector(up, Math.tan(sy));
+  var shipDir = M.clone().addScaledVector(right, Math.tan(sxEff)).addScaledVector(up, Math.tan(sy));
   if(shipDir.lengthSq() > 1e-9) shipDir.normalize();
   // Camera-to-ship distance. The non-drift pose sits back d AND up h, so its radius is √(d²+h²).
-  // The drift pose is pulled a little FURTHER out (DRIFT_CAM_ZOOM) so the drift framing reads a
-  // touch wider — tweak this if you want more/less zoom-out on drift.
-  var DRIFT_CAM_ZOOM = 1.4;   // pull the drift cam further back so it doesn't read zoomed-in vs the chase (was 1.12)
+  // The drift pose starts a touch wider (DRIFT_CAM_ZOOM) but is pulled IN as the view rotates — the
+  // camera physically moves closer + swings behind the rotated aim M — so however far left/right you
+  // look, the ship stays framed and the crosshair (screen centre = M) stays put.
+  var DRIFT_CAM_ZOOM = 1.4;
   var camRadiusBase = Math.sqrt(d * d + h * h);
-  var camRadius = camRadiusBase * DRIFT_CAM_ZOOM;
+  var camRadius = camRadiusBase * (DRIFT_CAM_ZOOM - 0.6 * driftFrac);
   var posD = S.clone().addScaledVector(shipDir, -camRadius);
   var lookD = posD.clone().addScaledVector(M, 1.0);
   var upD = up.clone();
-  var driftFrac = Math.min(1, Math.abs(driftA) / (Math.PI * 0.5));
   var rollQ = new THREE.Quaternion().setFromAxisAngle(M, -driftFrac * 0.18 * (driftA < 0 ? -1 : 1));
   upD.applyQuaternion(rollQ);
 
@@ -13672,7 +13676,7 @@ function updateGamePhysicsAndCamera() {
     fwdAxis = (k.w ? 1 : 0) + ((k.s && !gameMode.sBrakeLock) ? -0.6 : 0);
     var _kd = gameKbDrift();   // direct camera-follow yaw; A/D arm a drift
     mDyaw = _kd.dyaw; mDriftSide = _kd.side;
-    p.isBoosting = k.shift && boostAllowed();
+    p.isBoosting = gameMode.wBoost && boostAllowed();   // double-tap-W boost (was Shift)
   }
   // Boost drives forward on its own (you don't also have to hold W to run).
   if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
@@ -14206,7 +14210,7 @@ function updateFlightPhysicsAndCamera() {
   }
   var pitchAxis = (k.q ? 1 : 0) + (k.e ? -1 : 0);    // Q = nose up, E = nose down
   var vertAxis  = (k.space ? 1 : 0) + (k.ctrl ? -1 : 0);
-  var isBoosting = (k.shift || (t.active && t.boost)) && boostAllowed();
+  var isBoosting = (gameMode.wBoost || (t.active && t.boost)) && boostAllowed();   // double-tap-W boost (was Shift)
   gameMode.physics.isBoosting = isBoosting;   // so the boost-fuel bar drains in flight too
 
   // Thrust ramp
@@ -15306,8 +15310,11 @@ var combat = {
   hpBarEl: null, hpFillEl: null, dmgCounterEl: null, flashEl: null, fireBtnEl: null,
   mouseFiring: false, touchFiring: false, enterFiring: false,
   lockTarget: null, lockMode: false, reticleEl: null, lockBtnEl: null,   // lock-on camera target + mode + HUD
-  // Dome wave arena: touch the floor → 5 tanks, clear them → 10 → 20 → 40 → … ; die → back to spawn.
+  // Dome arena: touch the floor → the 10-minute meteor storm begins. Difficulty scales continuously
+  // with the elapsed clock (no rounds); enemies rain down inside flaming meteors; 10:00 → boss.
   arenaActive: false, wave: 0, waveSize: 0, scaleMul: 1, domeSpawn: null, waveEl: null,
+  startMs: 0, elapsed: 0, meteorTimer: 0, meteors: [], ballRush: false,
+  bossActive: false, bossDone: false, boss: null,
   foes: [],             // wasps (aerial strafers) + mortars (arcing lobbers) — independent of tanks
   puddles: [],          // burning ground puddles dropped by mortar shells
   balls: [],            // rolling chaser balls — 3 spawned per tank, ram the player
@@ -15478,6 +15485,13 @@ var WAVE_SPAWN_PER_ENEMY = 0.18;   // each extra enemy in the wave widens the sp
 var WAVE_SPAWN_MAX_R = 2.4;        // hard cap on spawn distance from the player
 // Every 5 waves the enemies gain +150% HP & damage (×2.5, compounding): waves 1-5 ×1, 6-10 ×2.5, 11-15 ×6.25 …
 function combatScaleForWave(w){ return w >= 1 ? Math.pow(2.5, Math.floor((w - 1) / 5)) : 1; }
+// ── CONTINUOUS DIFFICULTY (replaces rounds) ── enemy HP/damage/XP and the meteor storm's frequency +
+// cluster size ramp smoothly with the elapsed clock. By 10:00 it's a near-unsurvivable swarm; then the
+// boss lands. Kept on roughly the same scale as the old wave end-game (×2.5 every ~3:20 ≈ old +5 waves).
+var GAME_RUN_SECONDS = 600;        // 10:00 → boss phase
+var BALL_RUSH_START = 300, BALL_RUSH_END = 360;   // 5:00–6:00 ball-only rush
+function combatScaleForTime(t){ return Math.pow(2.5, t / 200); }   // ×1 @0s, ×2.5 @3:20, ×6.25 @6:40, ×15.6 @10:00
+function gameRampNow(){ return Math.min(1, (combat.elapsed || 0) / GAME_RUN_SECONDS); }
 // Weighted random enemy for a wave slot. Balls are the most common; wasps + mortars(cannons) tie for
 // second; tanks are the rarest (they're big — a swarm of them is too much).
 function pickWaveEnemy(){
@@ -15524,7 +15538,7 @@ function sampleMapSpawnPoint(){
       var dir = new THREE.Vector3(rxy * Math.cos(th), uu, rxy * Math.sin(th));
       var pos = bd.center.clone().addScaledVector(dir, bd.radius), inside = false;
       for(var bi = 0; bi < blds.length; bi++){
-        var bl = blds[bi], dd = _arenaTmp.copy(pos).sub(bl.footBase);
+        var bl = blds[bi], dd = _arenaTmp.copy(pos).sub(bd.center).sub(bl.footBase);   // footBase is body-local
         if(Math.abs(dd.dot(bl.footU)) < bl.footW / 2 + 0.3 && Math.abs(dd.dot(bl.footV)) < bl.footD / 2 + 0.3){ inside = true; break; }
       }
       if(!inside) return { pos: pos, normal: dir };
@@ -15585,37 +15599,320 @@ function clearSpawnQueue(){
   }
   combat.spawnQueue.length = 0; combat.spawnTimer = 0;
 }
-// Run the dome arena: first floor-touch starts wave 1 (1 tank); clearing a wave adds one more
-// (1→2→3→4→5→…), after a downtime. Death is handled in updateCombat (back to spawn + restart).
+
+// ══════════════════════════════════════════════
+// METEOR STORM — every enemy now arrives inside a flaming meteor that falls out of deep space and
+// slams the planet. A growing RED circle telegraphs the impact point (reaching full size exactly as
+// the rock lands, so you know where + when); the camera shakes harder the closer you are; standing
+// under one deals a heavy hit; the impact throws out a surface-contour shockwave + explosion and the
+// enemy payload emerges. Frequency + cluster size ramp with the clock → near-unsurvivable by 10:00.
+// ══════════════════════════════════════════════
+var METEOR_FALL_FRAMES = 140, METEOR_START_DIST = 9, METEOR_MAX_RING = 0.42;   // ring max = impact core radius
+var METEOR_CORE_DMG = 34, METEOR_SHAKE_RANGE = 3.2, METEOR_BOOM_FRAMES = 22, METEOR_BOOM_R = 1.1;
+var SHOCK_MAX_R = 1.35, SHOCK_FRAMES = 46, SHOCK_DMG = 10;   // shockwave auto-hits once → keep it lighter than a direct core hit
+
+// How often a meteor tick fires (frames) and how big the swarm may get — both ramp toward chaos.
+// Starts calm (~600 frames ≈ 10s between meteors) and eases down to a frantic ~22 by 10:00.
+function meteorInterval(ramp){ var base = 22 + 578 * (1 - ramp) * (1 - ramp); if(combat.ballRush) base *= 0.5; return Math.max(9, base | 0); }
+function meteorCap(ramp){ return 40 + Math.floor(ramp * 170); }   // soft cap on concurrent enemies (perf guard)
+function scheduleMeteors(ramp){
+  var live = combat.enemies.length + combat.balls.length + combat.foes.length;
+  if(live >= meteorCap(ramp)) return;
+  var burst = 1 + Math.floor(ramp * 2.9);          // 1..3 meteors per tick
+  if(combat.ballRush) burst = Math.max(burst, 2);
+  for(var b = 0; b < burst; b++) spawnMeteor(buildCluster(ramp));
+}
+// Enemies riding one meteor. 1 early → up to ~5 late; the 5:00–6:00 rush is balls only.
+function buildCluster(ramp){
+  var n = 1 + Math.floor(ramp * 4.5), arr = [];
+  for(var i = 0; i < n; i++) arr.push(combat.ballRush ? 'ball' : pickWaveEnemy());
+  return arr;
+}
+// A surface impact point: biased near the player (keeps the fight close) but never ON the player, and
+// spaced away from other pending impacts. Projects a random direction onto the icosahedron via
+// closestPointOnDome so the point + normal sit on a real facet.
+function sampleMeteorImpact(){
+  var bd = combat.bodies && combat.bodies[0]; if(!bd) return null;
+  var ship = gameMode.ship.position, fallback = null;
+  var _mt1 = new THREE.Vector3(), _mt2 = new THREE.Vector3();
+  for(var a = 0; a < 20; a++){
+    var dir;
+    if(Math.random() < 0.7){
+      var up = ship.clone().sub(bd.center); if(up.lengthSq() < 1e-6) up.set(0, 1, 0); up.normalize();
+      tangentBasis(up, _mt1, _mt2);
+      var ang = Math.random() * Math.PI * 2, rad = 0.6 + Math.random() * 2.2;
+      dir = up.clone().addScaledVector(_mt1, Math.cos(ang) * rad / bd.radius).addScaledVector(_mt2, Math.sin(ang) * rad / bd.radius).normalize();
+    } else {
+      var uu = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2, rxy = Math.sqrt(Math.max(0, 1 - uu * uu));
+      dir = new THREE.Vector3(rxy * Math.cos(th), uu, rxy * Math.sin(th));
+    }
+    var cp = closestPointOnDome(bd.center.clone().addScaledVector(dir, bd.radius * 1.05));
+    if(!cp) continue;
+    var p = cp.point;
+    if(p.distanceTo(ship) < 0.7) continue;                         // never drop straight on the player
+    var ok = true;
+    for(var e = 0; e < combat.meteors.length; e++){ if(combat.meteors[e].impact.distanceTo(p) < 0.8){ ok = false; break; } }
+    if(ok) return { pos: p.clone(), normal: cp.normal.clone() };
+    fallback = { pos: p.clone(), normal: cp.normal.clone() };
+  }
+  return fallback;
+}
+// A glowing on-fire rock; local +Y oriented to the outward normal so the fire trail streams spaceward.
+function makeMeteorMesh(normal){
+  var grp = new THREE.Group();
+  var rock = new THREE.Mesh(new THREE.IcosahedronGeometry(0.085, 0), new THREE.MeshStandardMaterial({ color: 0x2a1206, emissive: 0xff5a1e, emissiveIntensity: 1.5, roughness: 1, metalness: 0, flatShading: true }));
+  grp.add(rock);
+  var aura = new THREE.Mesh(new THREE.SphereGeometry(0.15, 12, 10), new THREE.MeshBasicMaterial({ color: 0xff6a2a, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending, depthWrite: false }));
+  grp.add(aura);
+  var trail = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.95, 12, 1, true), new THREE.MeshBasicMaterial({ color: 0xffb24a, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+  trail.position.y = 0.46; grp.add(trail);
+  grp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal.clone().normalize());
+  grp.userData = { rock: rock, aura: aura, trail: trail };
+  scene.add(grp);
+  return grp;
+}
+// Red impact telegraph: a disc+ring on the surface, scaled 0 → METEOR_MAX_RING over the fall so it
+// reaches full size right as the meteor lands. Built at unit radius; updateMeteors scales it.
+function makeMeteorRing(pos, normal){
+  var grp = new THREE.Group();
+  var disc = new THREE.Mesh(new THREE.CircleGeometry(1, 40), new THREE.MeshBasicMaterial({ color: 0xff1a1a, transparent: true, opacity: 0.2, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  var ring = new THREE.Mesh(new THREE.RingGeometry(0.9, 1.0, 44), new THREE.MeshBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  ring.position.z = 0.0006; grp.add(disc); grp.add(ring);
+  grp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize());
+  grp.position.copy(pos).addScaledVector(normal, 0.006); grp.renderOrder = 4;
+  grp.userData = { disc: disc, ring: ring };
+  scene.add(grp);
+  return grp;
+}
+// Host: pick an impact + fire a meteor; mirror it to a co-op guest (guest runs the visual/shake/damage
+// but not the enemy payload — the host owns/streams enemies).
+function spawnMeteor(cluster){
+  var s = sampleMeteorImpact(); if(!s) return;
+  _addMeteor(s.pos, s.normal, cluster, METEOR_FALL_FRAMES);
+  if(MP.isHost && MP.connected) mpSend({ type: 'meteor', x: s.pos.x, y: s.pos.y, z: s.pos.z, nx: s.normal.x, ny: s.normal.y, nz: s.normal.z, T: METEOR_FALL_FRAMES });
+}
+function _addMeteor(pos, normal, cluster, T){
+  var jitter = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5);
+  if(jitter.lengthSq() < 1e-6) jitter.set(0, 1, 0); jitter.normalize();
+  var start = pos.clone().addScaledVector(normal, METEOR_START_DIST).addScaledVector(jitter, METEOR_START_DIST * 0.22);
+  var mesh = makeMeteorMesh(normal); mesh.position.copy(start);
+  combat.meteors.push({ impact: pos.clone(), normal: normal.clone(), start: start, T: T, t: 0, cluster: cluster || [], mesh: mesh, ring: makeMeteorRing(pos, normal), impacted: false });
+}
+// Contour shockwave ring (lies flat on the impact facet → rolls across the surface) + a quick boom flash.
+function spawnShockwave(pos, normal){
+  if(!combat.shockwaves) combat.shockwaves = [];
+  var ring = new THREE.Mesh(new THREE.RingGeometry(0.86, 1.0, 48), new THREE.MeshBasicMaterial({ color: 0xffa347, transparent: true, opacity: 0.75, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize());
+  ring.position.copy(pos).addScaledVector(normal, 0.012); ring.renderOrder = 4; scene.add(ring);
+  combat.shockwaves.push({ mesh: ring, kind: 'wave', pos: pos.clone(), t: 0, hitPlayer: false });
+}
+function spawnExplosion(pos, normal){
+  if(!combat.shockwaves) combat.shockwaves = [];
+  var boom = new THREE.Mesh(new THREE.SphereGeometry(0.12, 14, 12), new THREE.MeshBasicMaterial({ color: 0xffb24a, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+  boom.position.copy(pos).addScaledVector(normal, 0.04); boom.renderOrder = 5; scene.add(boom);
+  combat.shockwaves.push({ mesh: boom, kind: 'boom', t: 0 });
+}
+// The moment a meteor lands: explosion + contour shockwave + proximity shake spike + direct hit if you
+// were under it + emerge the enemy payload (host only).
+function meteorImpact(m){
+  spawnExplosion(m.impact, m.normal);
+  spawnShockwave(m.impact, m.normal);
+  var d = gameMode.ship.position.distanceTo(m.impact), prox = Math.max(0, 1 - d / METEOR_SHAKE_RANGE);
+  combat._impactShake = Math.max(combat._impactShake || 0, 0.10 + prox * 0.12);
+  if(d < METEOR_MAX_RING + 0.05 && !mpIsGuest()) hurtPlayer(METEOR_CORE_DMG, m.impact);   // "moved under it" → heavy damage (host owns HP in co-op)
+  // Co-op: the host is authoritative for the guest's HP too → damage the guest if IT stood under this meteor.
+  if(MP.isHost && MP.connected && MP.remote.ship && MP.remote.ship.visible && MP.remote.ship.position.distanceTo(m.impact) < METEOR_MAX_RING + 0.05) mpHurtGuest(METEOR_CORE_DMG);
+  if(!mpIsGuest() && m.cluster && m.cluster.length) spawnMeteorPayload(m);
+}
+function spawnMeteorPayload(m){
+  var n = m.cluster.length, tb1 = new THREE.Vector3(), tb2 = new THREE.Vector3();
+  tangentBasis(m.normal, tb1, tb2);
+  for(var i = 0; i < n; i++){
+    var ang = (i / Math.max(1, n)) * Math.PI * 2 + Math.random(), rad = n > 1 ? 0.12 + Math.random() * 0.14 : 0;
+    var p = m.impact.clone().addScaledVector(tb1, Math.cos(ang) * rad).addScaledVector(tb2, Math.sin(ang) * rad);
+    var cp = closestPointOnDome(p), pos = cp ? cp.point.clone().addScaledVector(cp.normal, 0.01) : p, nrm = cp ? cp.normal.clone() : m.normal.clone();
+    var kind = m.cluster[i];
+    if(kind === 'ball') addBall(pos, nrm, 0, true, null);
+    else if(kind === 'wasp' || kind === 'mortar') addFoe(kind, pos, nrm, true);
+    else addTank(pos, nrm, 6.0, true);
+  }
+}
+// Per-frame: fall the meteors, grow their rings, roll shockwaves, and drive the proximity camera shake.
+function updateMeteors(){
+  if(!combat.shockwaves) combat.shockwaves = [];
+  var ship = gameMode.ship.position;
+  var shake = (combat._impactShake = (combat._impactShake || 0) * 0.88);
+  for(var i = combat.meteors.length - 1; i >= 0; i--){
+    var m = combat.meteors[i]; m.t++;
+    var pr = Math.min(1, m.t / m.T), fall = pr * pr;   // accelerating fall
+    m.mesh.position.lerpVectors(m.start, m.impact, fall);
+    if(m.mesh.userData.rock) m.mesh.userData.rock.material.emissiveIntensity = 1.3 + Math.random() * 0.6;
+    m.ring.scale.setScalar(Math.max(0.001, METEOR_MAX_RING * pr));
+    var pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.02);
+    m.ring.userData.ring.material.opacity = 0.5 + 0.4 * pulse + 0.3 * pr;
+    m.ring.userData.disc.material.opacity = 0.12 + 0.2 * pr;
+    if(pr > 0.35){ var d = ship.distanceTo(m.impact), prox = Math.max(0, 1 - d / METEOR_SHAKE_RANGE); shake = Math.max(shake, prox * pr * 0.13); }
+    if(pr >= 1 && !m.impacted){ m.impacted = true; meteorImpact(m); disposeRing(m.mesh); disposeRing(m.ring); combat.meteors.splice(i, 1); }
+  }
+  for(var j = combat.shockwaves.length - 1; j >= 0; j--){
+    var w = combat.shockwaves[j]; w.t++;
+    if(w.kind === 'boom'){
+      var bf = w.t / METEOR_BOOM_FRAMES; if(bf >= 1){ disposeRing(w.mesh); combat.shockwaves.splice(j, 1); continue; }
+      w.mesh.scale.setScalar(0.2 + bf * METEOR_BOOM_R); w.mesh.material.opacity = (1 - bf) * 0.85; continue;
+    }
+    var f = w.t / SHOCK_FRAMES; if(f >= 1){ disposeRing(w.mesh); combat.shockwaves.splice(j, 1); continue; }
+    var radius = f * SHOCK_MAX_R; w.mesh.scale.setScalar(Math.max(0.001, radius)); w.mesh.material.opacity = (1 - f) * 0.7;
+    // shockwave is purely visual now — only a direct meteor core hit (in meteorImpact) damages the player.
+  }
+  if(typeof postQuad !== 'undefined' && postQuad && postQuad.material && postQuad.material.uniforms && postQuad.material.uniforms.shakeAmount){
+    postQuad.material.uniforms.shakeAmount.value = Math.min(0.22, shake);
+    if(postQuad.material.uniforms.shakeTime) postQuad.material.uniforms.shakeTime.value = performance.now() * 0.06;
+  }
+}
+// Boss phase entry: wipe the whole arena of regular enemies (+ their bullets + in-flight meteors) so
+// THE CORE fights you alone. Host-only; the guest's mirrors clear automatically next world snapshot
+// (empty enemy arrays → mpApplyWorld removes them). Loose XP orbs are kept so you can still collect.
+function despawnAllEnemies(){
+  for(var i = 0; i < combat.enemies.length; i++) disposeTank(combat.enemies[i]);
+  combat.enemies.length = 0;
+  clearBalls(); clearFoes(); clearPuddles(); clearDying(); clearMeteors();
+  for(var j = 0; j < combat.enemyBullets.length; j++) disposeEnemyBullet(combat.enemyBullets[j]);
+  combat.enemyBullets.length = 0;
+}
+function clearMeteors(){
+  if(combat.meteors){ for(var i = 0; i < combat.meteors.length; i++){ disposeRing(combat.meteors[i].mesh); disposeRing(combat.meteors[i].ring); } combat.meteors.length = 0; }
+  if(combat.shockwaves){ for(var j = 0; j < combat.shockwaves.length; j++) disposeRing(combat.shockwaves[j].mesh); combat.shockwaves.length = 0; }
+  else combat.shockwaves = [];
+  combat._impactShake = 0;
+  if(typeof postQuad !== 'undefined' && postQuad && postQuad.material && postQuad.material.uniforms && postQuad.material.uniforms.shakeAmount) postQuad.material.uniforms.shakeAmount.value = 0;
+}
+
+// ══════════════════════════════════════════════
+// BOSS — "THE CORE". At 10:00 the normal storm stops and a colossal flaming meteor-core falls from
+// deep space (long telegraph + massive impact), embeds in the planet, and fights through 3 HP-gated
+// phases: meteor rain → contour shockwave slams → add spawns, each escalating. Kill it to win.
+// ══════════════════════════════════════════════
+var BOSS_FALL_FRAMES = 200;
+var BOSS_HP_TANKS = 15;   // boss HP ≈ this many current-tier tanks (tunable)
+function makeBossMesh(){
+  var grp = new THREE.Group();
+  var core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.4, 1), new THREE.MeshStandardMaterial({ color: 0x3a1408, emissive: 0xff4a12, emissiveIntensity: 1.6, roughness: 1, metalness: 0, flatShading: true }));
+  grp.add(core);
+  var aura = new THREE.Mesh(new THREE.SphereGeometry(0.6, 16, 12), new THREE.MeshBasicMaterial({ color: 0xff5a2a, transparent: true, opacity: 0.3, blending: THREE.AdditiveBlending, depthWrite: false }));
+  grp.add(aura);
+  grp.userData = { core: core, aura: aura };
+  scene.add(grp);
+  return grp;
+}
+function spawnBoss(){
+  var s = sampleMeteorImpact(); if(!s){ combat.bossActive = false; combat.bossDone = true; return; }
+  var maxHp = Math.round(BOSS_HP_TANKS * 250 * (combat.scaleMul || 1));
+  var mesh = makeBossMesh();
+  var start = s.pos.clone().addScaledVector(s.normal, METEOR_START_DIST * 1.6);
+  mesh.position.copy(start);
+  combat.boss = { mesh: mesh, hp: maxHp, maxHp: maxHp, pos: s.pos.clone(), normal: s.normal.clone(), start: start,
+    state: 'falling', t: 0, T: BOSS_FALL_FRAMES, hitR: 0.42, phase: 1, atkTimer: 120, atkIdx: -1, ring: makeMeteorRing(s.pos, s.normal) };
+}
+// One boss attack, cycling rain → slam → adds; counts/cadence escalate with the phase.
+function bossAttack(bs){
+  bs.atkIdx = (bs.atkIdx + 1) % 3;
+  if(bs.atkIdx === 0){                                    // meteor rain
+    var c = bs.phase >= 3 ? 5 : bs.phase >= 2 ? 3 : 2;
+    for(var i = 0; i < c; i++) spawnMeteor(buildCluster(0.4));
+  } else if(bs.atkIdx === 1){                             // contour shockwave slam(s)
+    spawnShockwave(bs.pos, bs.normal);
+    if(bs.phase >= 3) spawnShockwave(bs.pos, bs.normal);
+  } else {                                                // adds
+    var na = bs.phase >= 3 ? 4 : bs.phase >= 2 ? 3 : 2, tb1 = new THREE.Vector3(), tb2 = new THREE.Vector3();
+    tangentBasis(bs.normal, tb1, tb2);
+    for(var a = 0; a < na; a++){
+      var ang = Math.random() * Math.PI * 2, rad = 0.25 + Math.random() * 0.22;
+      var p = bs.pos.clone().addScaledVector(tb1, Math.cos(ang) * rad).addScaledVector(tb2, Math.sin(ang) * rad);
+      var cp = closestPointOnDome(p), pos = cp ? cp.point.clone().addScaledVector(cp.normal, 0.01) : p, nrm = cp ? cp.normal.clone() : bs.normal.clone();
+      if(Math.random() < 0.6) addBall(pos, nrm, 0, true, null); else addFoe('wasp', pos, nrm, true);
+    }
+  }
+}
+function updateBoss(){
+  var bs = combat.boss; if(!bs) return;
+  if(bs.state === 'falling'){
+    bs.t++;
+    var pr = Math.min(1, bs.t / bs.T), fall = pr * pr;
+    bs.mesh.position.lerpVectors(bs.start, bs.pos.clone().addScaledVector(bs.normal, 0.35), fall);
+    if(bs.ring){ bs.ring.scale.setScalar(Math.max(0.001, METEOR_MAX_RING * 2.4 * pr)); bs.ring.userData.ring.material.opacity = 0.6 + 0.4 * pr; }
+    var d0 = gameMode.ship.position.distanceTo(bs.pos), prox0 = Math.max(0, 1 - d0 / (METEOR_SHAKE_RANGE * 1.6));
+    combat._impactShake = Math.max(combat._impactShake || 0, prox0 * pr * 0.16);
+    if(pr >= 1){
+      bs.state = 'active';
+      spawnExplosion(bs.pos, bs.normal); spawnShockwave(bs.pos, bs.normal);
+      combat._impactShake = Math.max(combat._impactShake || 0, 0.2);
+      if(bs.ring){ disposeRing(bs.ring); bs.ring = null; }
+    }
+    return;
+  }
+  bs.mesh.position.copy(bs.pos).addScaledVector(bs.normal, 0.35);
+  bs.mesh.rotation.y += 0.01;
+  if(bs.mesh.userData.core) bs.mesh.userData.core.material.emissiveIntensity = 1.4 + Math.random() * 0.4;
+  var fr = bs.hp / bs.maxHp; bs.phase = fr > 0.66 ? 1 : fr > 0.33 ? 2 : 3;
+  if(!mpIsGuest()){
+    bs.atkTimer--;
+    if(bs.atkTimer <= 0){ bossAttack(bs); bs.atkTimer = bs.phase >= 3 ? 70 : bs.phase >= 2 ? 100 : 140; }
+  }
+}
+function killBoss(){
+  var bs = combat.boss; if(!bs) return;
+  spawnExplosion(bs.pos, bs.normal); spawnShockwave(bs.pos, bs.normal);
+  combat._impactShake = Math.max(combat._impactShake || 0, 0.22);
+  spawnXPBurst(bs.pos, bs.normal, 120);   // big victory payout
+  if(bs.mesh) disposeRing(bs.mesh);
+  if(bs.ring) disposeRing(bs.ring);
+  combat.boss = null; combat.bossActive = false; combat.bossDone = true; combat._victory = true;
+}
+function clearBoss(){
+  if(combat.boss){ if(combat.boss.mesh) disposeRing(combat.boss.mesh); if(combat.boss.ring) disposeRing(combat.boss.ring); combat.boss = null; }
+  combat._victory = false;
+}
+// Run the dome arena: first floor-touch starts the 10-minute clock and builds the planet+moon; from
+// then on it's a CONTINUOUS meteor storm whose intensity ramps with the elapsed time until the 10:00
+// boss. Death is handled in updateCombat (back to spawn + restart).
 function updateDomeArena(){
   var P = gameMode.portal, s = gameMode.surfaceState, ship = gameMode.ship;
   if(combat.player.dead) return;   // mid-death; the respawn logic in updateCombat handles reset
-  updateMap();     // raise/sink the (legacy flat) buildings
-  updateArena();   // raise the planet/moon city + (Phase 3) advance the moon's orbit
-  // Downtime + telegraph → spawn the queued wave when the timer runs out.
-  if(combat.spawnTimer > 0){
-    combat.spawnTimer--;
-    updateSpawnTelegraph();
-    if(combat.spawnTimer <= 0) commitWaveSpawn();
-    return;
-  }
-  var grounded = !s.airborne && !s.freeFalling;
-  var nearFloor = ship.position.y < P.domeFloorY + 0.5;   // actually down on the dome floor, not the chute
+  updateArena();   // advance the moon's orbit
+  // ── Activation: first time the ship touches down near the floor, start the run ──
   if(!combat.arenaActive){
+    var grounded = !s.airborne && !s.freeFalling;
+    var nearFloor = ship.position.y < P.domeFloorY + 0.5;   // actually down on the dome floor, not the chute
     if(grounded && nearFloor){
       combat.arenaActive = true;
-      combat.wave = 1; combat.waveSize = 1; combat.scaleMul = combatScaleForWave(1);
+      combat.startMs = performance.now(); combat.elapsed = 0; combat.scaleMul = combatScaleForTime(0);
       combat.domeSpawn = ship.position.clone();   // where to send the player back to on death
+      combat.meteorTimer = WAVE1_DELAY;           // brief grace before the first meteor falls
+      combat.ballRush = false; combat.bossActive = false; combat.bossDone = false;
       combat.mapSwitching = false;
-      if(!mpIsGuest()) generateArena((Math.random() * 1e9) | 0);   // build the planet (city + moon in later phases)
-      beginWaveSpawn(combat.waveSize, WAVE1_DELAY);
+      if(!mpIsGuest()) generateArena((Math.random() * 1e9) | 0);   // build the icosahedron planet + moon
     }
-  } else if(!combat.mapSwitching && combat.enemies.length === 0 && combat.foes.length === 0 && combat.balls.length === 0 && combat.spawnQueue.length === 0){
-    // Wave cleared (every enemy dead) → next wave. Every 5 rounds: switch the map (sink → regen →
-    // rise → then spawn, all driven in updateMap); otherwise just queue the next wave after downtime.
-    combat.wave++; combat.waveSize = combat.wave; combat.scaleMul = combatScaleForWave(combat.wave);
-    if(combat.map && (combat.wave - 1) % 5 === 0 && combat.wave > 1){ combat.mapSwitching = true; combat.map.phase = 'sinking'; }
-    else beginWaveSpawn(combat.waveSize, WAVE_DOWNTIME);
+    return;
+  }
+  // (Co-op guests never reach here — updateCombat routes them to mpGuestCombat, which animates the
+  //  host-synced meteors + boss mirror. This path is host / single-player only.)
+  // ── Continuous, time-scaled difficulty ──
+  combat.elapsed = (performance.now() - combat.startMs) / 1000;
+  var ramp = gameRampNow();
+  combat.scaleMul = combatScaleForTime(combat.elapsed);
+  combat.ballRush = (combat.elapsed >= BALL_RUSH_START && combat.elapsed < BALL_RUSH_END);
+  updateMeteors();   // advance falling meteors + red telegraph rings + impacts (shake/shockwave/spawn)
+  // ── 10:00 → boss phase: stop the normal storm; the boss owns the arena ──
+  if(!combat.bossActive && !combat.bossDone && combat.elapsed >= GAME_RUN_SECONDS){
+    combat.bossActive = true;
+    if(!mpIsGuest()){ despawnAllEnemies(); spawnBoss(); }   // clear the whole swarm, then drop THE CORE
+  }
+  if(combat.bossActive){ updateBoss(); return; }
+  if(combat.bossDone) return;   // boss beaten → the run is won; the storm stays over
+  // ── Meteor scheduler (host-authoritative; guest mirrors via synced 'meteor' messages) ──
+  if(!mpIsGuest()){
+    combat.meteorTimer--;
+    if(combat.meteorTimer <= 0){ scheduleMeteors(ramp); combat.meteorTimer = meteorInterval(ramp); }
   }
 }
 function resetDomeArena(){
@@ -15623,9 +15920,10 @@ function resetDomeArena(){
   combat.enemies.length = 0;
   clearBalls();
   clearFoes(); clearPuddles();
-  clearSpawnQueue();
+  clearSpawnQueue(); clearMeteors(); clearBoss();
   clearDying(); clearXPOrbs();   // wipe in-flight death FX + loose orbs (XP/level itself persists)
   combat.arenaActive = false; combat.wave = 0; combat.waveSize = 0; combat.scaleMul = 1;
+  combat.elapsed = 0; combat.ballRush = false; combat.bossActive = false; combat.bossDone = false;
   combat.mapSwitching = false;
   clearMap(); clearArena();
 }
@@ -15707,7 +16005,12 @@ function addRamp(grp, tris, faces, cx, cz, baseY, w, d, h, side, curved, rng){
 // ── PLANET ARENA ── the city now wraps a spherical planet (+ an orbiting moon, Phase 3) with RADIAL
 // gravity, instead of the flat floor. `combat.bodies` holds the gravity bodies; the ship/enemies grip
 // the nearest body's sphere via closestPointOnDome, and gravity pulls toward the nearest centre.
-var PLANET_R = 9.5, MOON_R = 3.5, MOON_GAP = 0.35, MOON_ORBIT_SPEED = 0.0035, _arenaTmp = new THREE.Vector3(), _arenaTmp2 = new THREE.Vector3();
+// Large icosahedron planet + matching moon. ICOSA_IN = inradius/circumradius (face-center dist ÷
+// vertex dist) for a regular icosahedron — lets us place the flat top FACE at the drop-in height and
+// tune the moon gap face-to-face rather than sphere-to-sphere. Radii are big so each facet is a large
+// flat battlefield with only occasional ridges.
+var ICOSA_IN = 0.794654;
+var PLANET_R = 16, MOON_R = 5, MOON_GAP = 0.5, MOON_ORBIT_SPEED = 0.0012, _arenaTmp = new THREE.Vector3(), _arenaTmp2 = new THREE.Vector3();
 // Nearest body by SURFACE ALTITUDE (dist-to-centre − radius), not centre distance — so a small moon
 // passing overhead doesn't out-pull the planet you're standing on; the pull only flips once you've
 // jumped past the gap midpoint (= the jump-the-gap capture).
@@ -15753,7 +16056,7 @@ function pushOrientedBox(grp, tris, boxes, base, u, v, up, w, d, h){
 function buildCityOnBody(body, rng, minN, maxN){
   var R = body.radius;
   var n = minN + Math.floor(rng() * (maxN - minN + 1)), placed = [];
-  var poleDir = (body.kind === 'planet' && combat.domeSpawn) ? combat.domeSpawn.clone().sub(body.center).normalize() : new THREE.Vector3(0, 1, 0);
+  var poleDir = new THREE.Vector3(0, 1, 0);   // planet's +Y drop-in pole (deterministic; kept clear of buildings)
   for(var i = 0; i < n; i++){
     var ok = false, dir, w, d, h, footR, tries = 0;
     while(!ok && tries++ < 40){
@@ -15785,34 +16088,93 @@ function buildCityOnBody(body, rng, minN, maxN){
       footBase: base.clone(), footU: u.clone(), footV: v.clone(), footW: w, footD: d });
   }
 }
-// A gravity body: a sphere mesh + wireframe in its own group (group at body.center; geometry local).
+// Rotate an icosahedron geometry so its most +Y face points straight up — the ship drops in on the
+// north pole, so we want a flat FACE there (not a pointy vertex) for a clean landing.
+function orientFaceUp(geo){
+  var p = geo.attributes.position, best = -Infinity, bx = 0, by = 1, bz = 0;
+  for(var i = 0; i < p.count; i += 3){
+    var cx = (p.getX(i) + p.getX(i + 1) + p.getX(i + 2)) / 3, cy = (p.getY(i) + p.getY(i + 1) + p.getY(i + 2)) / 3, cz = (p.getZ(i) + p.getZ(i + 1) + p.getZ(i + 2)) / 3;
+    if(cy > best){ best = cy; bx = cx; by = cy; bz = cz; }
+  }
+  var from = new THREE.Vector3(bx, by, bz).normalize();
+  var q = new THREE.Quaternion().setFromUnitVectors(from, new THREE.Vector3(0, 1, 0));
+  geo.applyMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(q));   // BufferGeometry has applyMatrix4 (not applyQuaternion) in this three build
+}
+// Cached grid-line texture for the planet surface: bright cyan grid on a dark ground, used as both the
+// diffuse map and the emissive map so the lines glow. RepeatWrapping tiles it across the facets.
+var _planetGridTex = null;
+function planetGridTexture(){
+  if(_planetGridTex) return _planetGridTex;
+  var c = document.createElement('canvas'); c.width = c.height = 256;
+  var g = c.getContext('2d');
+  g.fillStyle = '#0b1526'; g.fillRect(0, 0, 256, 256);
+  g.strokeStyle = '#6ad0ff';
+  var step = 32;
+  for(var i = 0; i <= 256; i += step){
+    g.lineWidth = (i % (step * 4) === 0) ? 3 : 1.4;   // heavier every 4th line
+    g.beginPath(); g.moveTo(i + 0.5, 0); g.lineTo(i + 0.5, 256); g.stroke();
+    g.beginPath(); g.moveTo(0, i + 0.5); g.lineTo(256, i + 0.5); g.stroke();
+  }
+  var t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(5, 5);
+  _planetGridTex = t; return t;
+}
+// A gravity body: a large flat-faced ICOSAHEDRON (20 faces) in its own group (group at body.center;
+// geometry local). `tris` is the 20 face triangles as a flat body-local float array, fed through
+// closestPointOnTris inside closestPointOnDome so the ship/enemies/bullets grip the flat facets. The
+// big radius keeps each facet a large "flat plane"; ridges fold ~41.8° where faces meet.
 function makeBody(center, radius, kind){
   var P = gameMode.portal, grp = new THREE.Group(); grp.position.copy(center);
-  var sph = new THREE.Mesh(new THREE.SphereGeometry(radius, 48, 32), new THREE.MeshStandardMaterial({ color: kind === 'moon' ? 0x2a2733 : 0x24242b, roughness: 0.9, metalness: 0.15, emissive: kind === 'moon' ? 0x100a18 : 0x0a0a14, emissiveIntensity: 0.4 }));
-  grp.add(sph);
-  var wire = new THREE.Mesh(new THREE.SphereGeometry(radius * 1.002, kind === 'moon' ? 20 : 24, kind === 'moon' ? 14 : 16), new THREE.MeshBasicMaterial({ color: kind === 'moon' ? 0x7a6ad0 : 0x55555c, wireframe: true, transparent: true, opacity: 0.22 }));
+  var geo = new THREE.IcosahedronGeometry(radius, 0);   // 20 flat faces
+  if(geo.index) geo = geo.toNonIndexed();                // ensure the position array IS the 20 tri-soup faces (for closestPointOnTris + flat shading)
+  orientFaceUp(geo);
+  geo.computeVertexNormals();
+  // Self-lit (strong emissive) so a big flat facet reads even when no dome light hits it head-on — a
+  // dark unlit face would otherwise fill the screen as pure black. The PLANET wears a glowing grid-line
+  // texture (map + emissiveMap); the moon keeps a plain faceted look.
+  var mat;
+  if(kind === 'moon'){
+    mat = new THREE.MeshStandardMaterial({ color: 0x353040, roughness: 0.85, metalness: 0.1, emissive: 0x2a2038, emissiveIntensity: 0.95, flatShading: true });
+  } else {
+    var grid = planetGridTexture();
+    mat = new THREE.MeshStandardMaterial({ color: 0x1a2740, roughness: 0.85, metalness: 0.1, map: grid, emissive: 0xffffff, emissiveMap: grid, emissiveIntensity: 0.7, flatShading: true });
+  }
+  var mesh = new THREE.Mesh(geo, mat);
+  grp.add(mesh);
+  var wire = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: kind === 'moon' ? 0x9a7ad0 : 0x6ad0ff, transparent: true, opacity: 0.7 }));
   grp.add(wire);
   grp.traverse(function(o){ o.layers.set(PORTAL_LAYER); });
   P.regionB.add(grp);
-  return { center: center.clone(), radius: radius, kind: kind, group: grp, buildings: [] };
+  return { center: center.clone(), radius: radius, innerR: radius * ICOSA_IN, kind: kind, group: grp, buildings: [], tris: new Float32Array(geo.attributes.position.array) };
 }
 // Build the planet + its city (top at the drop-in height so you land on the pole) + an orbiting moon.
 function generateArena(seed){
   clearArena();
   var P = gameMode.portal; if(!P || !P.regionB) return;
+  try{ _generateArenaInner(P, seed); }
+  catch(e){
+    combat._arenaErr = (e && e.message) || String(e);
+    // build failed → don't strand the player on a hidden floor
+    if(P.floorMesh) P.floorMesh.visible = true;
+    if(P.gridMesh) P.gridMesh.visible = true;
+    combat.bodies = null;
+  }
+}
+function _generateArenaInner(P, seed){
   if(P.floorMesh) P.floorMesh.visible = false;
   if(P.gridMesh) P.gridMesh.visible = false;
   var rng = mulberry32((seed >>> 0) || 1);
-  var topY = (combat.domeSpawn ? combat.domeSpawn.y : P.domeFloorY);
-  var pc = new THREE.Vector3(P.DX, topY - PLANET_R, P.domeCz);
+  // Anchor on the CONSTANT floor height + a fixed pole (not the per-peer landing point) so the host and
+  // a co-op guest build byte-identical bodies from the same seed. Planet's flat top FACE = domeFloorY
+  // (you land on the +Y north-pole facet); moon orbit phase comes from the seeded rng → peers stay in sync.
+  var pc = new THREE.Vector3(P.DX, P.domeFloorY - PLANET_R * ICOSA_IN, P.domeCz);
   var planet = makeBody(pc, PLANET_R, 'planet');
-  buildCityOnBody(planet, rng, Math.max(8, MAP_BUILD_MAX - 12), MAP_BUILD_MAX);
-  // Moon: a smaller body orbiting the planet in a tilted plane, close enough to JUMP the gap.
-  var ORB = PLANET_R + MOON_R + MOON_GAP;
+  // Moon: a smaller icosahedron of the SAME shape, orbiting the planet in a tilted plane. Gap is tuned
+  // face-to-face (inradii) so the flat facets pass close enough to jump / free-fall the gap between them.
+  var ORB = (PLANET_R + MOON_R) * ICOSA_IN + MOON_GAP;
   var orbit = { R: ORB, theta: rng() * Math.PI * 2, speed: MOON_ORBIT_SPEED, axisA: new THREE.Vector3(1, 0, 0), axisB: new THREE.Vector3(0, 0.32, 0.95).normalize(), planetC: pc.clone() };
   var mc = pc.clone().addScaledVector(orbit.axisA, Math.cos(orbit.theta) * ORB).addScaledVector(orbit.axisB, Math.sin(orbit.theta) * ORB);
   var moon = makeBody(mc, MOON_R, 'moon'); moon.orbit = orbit;
-  buildCityOnBody(moon, rng, GAME_LOW_FX ? 3 : 4, GAME_LOW_FX ? 5 : 7);
   combat.bodies = [planet, moon];
   combat.arenaSeed = (seed >>> 0) || 1;
   if(MP.isHost && MP.connected) mpSend({ type: 'arena', seed: combat.arenaSeed });   // co-op: guest rebuilds identically (+ orbit phase synced)
@@ -15823,13 +16185,14 @@ function resolveArenaBuildings(ship, s){
   if(!combat.bodies) return false;
   var hov = s.hoverHeight || 0.008, pad = hov, band = hov + 0.035, contact = false, pp = ship.position;
   for(var bi = 0; bi < combat.bodies.length; bi++){
-    var blds = combat.bodies[bi].buildings;
+    var body = combat.bodies[bi], blds = body.buildings, c = body.center;
+    var lpx = pp.x - c.x, lpy = pp.y - c.y, lpz = pp.z - c.z;   // ship in this body's local space
     for(var i = 0; i < blds.length; i++){
       var b = blds[i]; if(!b.solid) continue;
-      var ex = pp.x - b.center.x, ey = pp.y - b.center.y, ez = pp.z - b.center.z, rr = b.radius + band + 0.05;
+      var ex = lpx - b.center.x, ey = lpy - b.center.y, ez = lpz - b.center.z, rr = b.radius + band + 0.05;
       if(ex * ex + ey * ey + ez * ez > rr * rr) continue;
       for(var j = 0; j < b.boxes.length; j++){
-        var bx = b.boxes[j], dx = pp.x - bx.base.x, dy = pp.y - bx.base.y, dz = pp.z - bx.base.z;
+        var bx = b.boxes[j], dx = lpx - bx.base.x, dy = lpy - bx.base.y, dz = lpz - bx.base.z;
         var lx = dx*bx.u.x + dy*bx.u.y + dz*bx.u.z, ly = dx*bx.up.x + dy*bx.up.y + dz*bx.up.z, lz = dx*bx.v.x + dy*bx.v.y + dz*bx.v.z;
         var hw = bx.w / 2, hd = bx.d / 2;
         if(lx > -hw-band && lx < hw+band && ly > -band && ly < bx.h+band && lz > -hd-band && lz < hd+band){
@@ -15839,7 +16202,9 @@ function resolveArenaBuildings(ship, s){
           if(m === mY){ if(pYmax < pYmin){ ly = bx.h + pad; lnUp = 1; } else { ly = -pad; lnUp = -1; } }
           else if(m === mX){ if(pXmax < pXmin){ lx = hw + pad; lnU = 1; } else { lx = -hw - pad; lnU = -1; } }
           else { if(pZmax < pZmin){ lz = hd + pad; lnV = 1; } else { lz = -hd - pad; lnV = -1; } }
-          pp.set(bx.base.x + bx.u.x*lx + bx.up.x*ly + bx.v.x*lz, bx.base.y + bx.u.y*lx + bx.up.y*ly + bx.v.y*lz, bx.base.z + bx.u.z*lx + bx.up.z*ly + bx.v.z*lz);
+          // local box coords → body-local → world (add the body centre back)
+          lpx = bx.base.x + bx.u.x*lx + bx.up.x*ly + bx.v.x*lz; lpy = bx.base.y + bx.u.y*lx + bx.up.y*ly + bx.v.y*lz; lpz = bx.base.z + bx.u.z*lx + bx.up.z*ly + bx.v.z*lz;
+          pp.set(c.x + lpx, c.y + lpy, c.z + lpz);
           s.groundNormal.set(bx.u.x*lnU + bx.up.x*lnUp + bx.v.x*lnV, bx.u.y*lnU + bx.up.y*lnUp + bx.v.y*lnV, bx.u.z*lnU + bx.up.z*lnUp + bx.v.z*lnV).normalize();
           var fd = s.forward.dot(s.groundNormal); s.forward.addScaledVector(s.groundNormal, -fd);
           if(s.forward.lengthSq() < 1e-4){ s.forward.copy(bx.up).addScaledVector(s.groundNormal, -bx.up.dot(s.groundNormal)); if(s.forward.lengthSq() < 1e-6) s.forward.copy(bx.u); }
@@ -15852,19 +16217,22 @@ function resolveArenaBuildings(ship, s){
   }
   return contact;
 }
-// Per-frame: raise the buildings (radially) on every body. (Phase 3 also advances the moon's orbit.)
+// Per-frame: advance the moon's orbit (translate the body group). Buildings are gone; the flat facets
+// need no per-frame work.
 function updateArena(){
   if(!combat.bodies) return;
   for(var bi = 0; bi < combat.bodies.length; bi++){
-    var blds = combat.bodies[bi].buildings;
-    for(var i = 0; i < blds.length; i++){
-      var b = blds[i];
-      if(b.delay > 0){ b.delay--; b.group.position.copy(b.up).multiplyScalar(-b.riseOff); continue; }
-      if(b.t < 1){ b.t += 1 / 45; if(b.t > 1) b.t = 1; }
-      var e = b.t * b.t * (3 - 2 * b.t); b.group.position.copy(b.up).multiplyScalar(-b.riseOff * (1 - e)); b.solid = (b.t >= 1);
+    var body = combat.bodies[bi];
+    if(body.orbit){
+      var o = body.orbit; o.theta += o.speed;
+      body.center.copy(o.planetC).addScaledVector(o.axisA, Math.cos(o.theta) * o.R).addScaledVector(o.axisB, Math.sin(o.theta) * o.R);
+      body.group.position.copy(body.center);
     }
   }
 }
+// Buildings removed — the arena no longer rebuilds a city; the icosahedron planet/moon persist for the
+// whole run. Kept as a no-op so any lingering caller (co-op sync) stays harmless.
+function switchArenaCity(seed){ combat.arenaSeed = (seed >>> 0) || 1; }
 function generateMap(seed){
   clearMap();
   var P = gameMode.portal; if(!P || !P.regionB) return;
@@ -15968,6 +16336,7 @@ var BALLS_PER_TANK = 3;
 // independently and die normally — no further split). BALL_MAX caps the live ball count so splits
 // can't run away across waves now that balls outlive their tanks.
 var BALL_SPLIT = 3, BALL_CHILD_SCALE = 0.55, BALL_CHILD_HP = 26, BALL_CHILD_SPEEDMUL = 1.5, BALL_MAX = 48;
+var BALL_HIT_MUL = 2.8;   // bullets vs balls: much bigger hit radius than the visual orb (easier to shoot both sizes)
 function buildBall(){
   if(!combat._ballGeo){
     combat._ballGeo = new THREE.SphereGeometry(BALL_RADIUS, 16, 12);
@@ -16028,11 +16397,19 @@ function disposeBall(b){
 // Roll every ball toward the player, separate balls that overlap, ram the player on contact, spin
 // to match motion, and project each ball's floating health bar. Three passes so the ball↔ball
 // push-apart sees every ball's post-move position before re-gripping them to the surface.
+// Performance LOD: enemies farther than this (from the NEAREST player — host + co-op guest, via
+// mpNearestPlayer) have their per-frame AI/physics paused. They freeze in place until a player comes
+// back within range. Simulation is host-only, so this is automatically co-op-correct (the guest just
+// mirrors the frozen positions) and keeps a big off-screen swarm from tanking the frame rate.
+var ENEMY_SIM_RANGE = 8.0, _ENEMY_SIM_R2 = ENEMY_SIM_RANGE * ENEMY_SIM_RANGE;
 function updateBalls(){
   if(!combat.balls.length || !gameMode.ship) return;
   var ship = gameMode.ship, now = performance.now(), balls = combat.balls;
   var inDome = gameMode.portal && gameMode.portal.inside;
   // ── Pass 1: build-up materialize OR steer toward the player + integrate ──
+  // `act` = the near/active balls; the far ones freeze (LOD) and are skipped by all three passes —
+  // this also drops the O(n²) pass-2 collisions to O(active²).
+  var act = [];
   for(var i = 0; i < balls.length; i++){
     var b = balls[i];
     if(b.building > 0){
@@ -16044,17 +16421,19 @@ function updateBalls(){
       if(b.building === 0){ b.mesh.scale.setScalar(1); if(b.mesh.material){ b.mesh.material.opacity = 1; b.mesh.material.transparent = false; } }
       continue;   // inactive while materializing
     }
-    var toP = _ballV3.copy(mpNearestPlayer(b.mesh.position).pos).sub(b.mesh.position);   // co-op: chase the nearer player
+    var npp = mpNearestPlayer(b.mesh.position);   // co-op: chase / range-check the nearer player
+    if(b.mesh.position.distanceToSquared(npp.pos) > _ENEMY_SIM_R2){ if(b.hpBarEl) b.hpBarEl.style.display = 'none'; continue; }   // LOD: freeze far balls
+    act.push(b);
+    var toP = _ballV3.copy(npp.pos).sub(b.mesh.position);
     var flat = toP.addScaledVector(b.normal, -toP.dot(b.normal));
     if(flat.lengthSq() > 1e-9){ flat.normalize(); b.vel.addScaledVector(flat, BALL_ACCEL); }
     if(b.vel.length() > BALL_SPEED) b.vel.setLength(BALL_SPEED);
     b.mesh.position.addScaledVector(b.vel, skillFx.timeScale * (b.slowMul || 1));   // Drift Focus + Ice slow
   }
-  // ── Pass 2: ball↔ball collision — push overlapping pairs apart + trade their closing velocity ──
-  for(var a = 0; a < balls.length; a++){
-    for(var c2 = a + 1; c2 < balls.length; c2++){
-      var ba = balls[a], bb = balls[c2];
-      if(ba.building > 0 || bb.building > 0) continue;   // materializing balls don't collide yet
+  // ── Pass 2: ball↔ball collision (active only) — push overlapping pairs apart + trade closing vel ──
+  for(var a = 0; a < act.length; a++){
+    for(var c2 = a + 1; c2 < act.length; c2++){
+      var ba = act[a], bb = act[c2];
       var minD = ba.r + bb.r, dsq = ba.mesh.position.distanceToSquared(bb.mesh.position);
       if(dsq < minD * minD && dsq > 1e-12){              // squared early-out → no alloc/sqrt for non-overlapping pairs
         var dd2 = Math.sqrt(dsq);
@@ -16071,10 +16450,9 @@ function updateBalls(){
       }
     }
   }
-  // ── Pass 3: grip to surface, spin, ram the player, project the health bar ──
-  for(var k = 0; k < balls.length; k++){
-    var bk = balls[k];
-    if(bk.building > 0) continue;   // still materializing
+  // ── Pass 3: grip to surface, spin, ram the player, project the health bar (active only) ──
+  for(var k = 0; k < act.length; k++){
+    var bk = act[k];
     var cp = inDome ? closestPointOnDome(bk.mesh.position) : closestPointOnCrystal(bk.mesh.position);
     if(cp){
       bk.normal.copy(cp.normal).normalize();
@@ -16174,6 +16552,9 @@ function spawnXPBurst(pos, normal, count){
   var t1 = new THREE.Vector3(1, 0, 0); if(Math.abs(n.dot(t1)) > 0.9) t1.set(0, 0, 1);
   var right = new THREE.Vector3().crossVectors(n, t1).normalize();
   var fwd = new THREE.Vector3().crossVectors(right, n).normalize();
+  // XP scales up over the run (√ of the difficulty curve) so income keeps pace with the ever-tankier
+  // enemies — drops grow over time on roughly the same scale as before. Keyed off elapsed (both peers).
+  var xpVal = XP_ORB_VALUE * Math.sqrt(combatScaleForTime(combat.elapsed || 0));
   for(var i = 0; i < count; i++){
     if(combat.xpOrbs.length >= XP_MAX) break;
     var mesh = new THREE.Mesh(combat._xpGeo, combat._xpMat);
@@ -16184,7 +16565,7 @@ function spawnXPBurst(pos, normal, count){
     scene.add(mesh);
     var ang = Math.random() * Math.PI * 2, spd = 0.005 + Math.random() * 0.016;
     var vel = right.clone().multiplyScalar(Math.cos(ang) * spd).addScaledVector(fwd, Math.sin(ang) * spd).addScaledVector(n, 0.008 + Math.random() * 0.016);
-    combat.xpOrbs.push({ mesh: mesh, vel: vel, normal: n.clone(), grounded: false, life: 0, maxLife: 1400, value: XP_ORB_VALUE });
+    combat.xpOrbs.push({ mesh: mesh, vel: vel, normal: n.clone(), grounded: false, life: 0, maxLife: 1400, value: xpVal });
   }
 }
 function disposeXPOrb(o){ scene.remove(o.mesh); }   // all geo/mats are shared — nothing per-orb to free
@@ -16452,6 +16833,7 @@ function disposeEnemyBullet(b){
 // ══════════════════════════════════════════════
 var WASP_HP = 90, WASP_R = 0.05, WASP_ALT = 0.28, WASP_ORBIT_R = 0.7, WASP_SPEED = 0.012,
     WASP_FIRE = 26, WASP_SHOT_SPD = 0.045, WASP_SHOT_DMG = 6, WASP_DIVE_EVERY = 300, WASP_DIVE_FRAMES = 40;
+var MORTAR_RANGE = 4.2, _MORTAR_RANGE2 = MORTAR_RANGE * MORTAR_RANGE;   // lobber only fires within this range (was effectively unlimited)
 var MORTAR_HP = 180, MORTAR_R = 0.08, MORTAR_FIRE = 140, MORTAR_GRAV = 0.0006, MORTAR_FLIGHT = 70,
     MORTAR_PUDDLE_R = 0.16, MORTAR_PUDDLE_FRAMES = 160, MORTAR_PUDDLE_DMG = 5;
 var FOE_BUILD_FRAMES = 48;
@@ -16750,6 +17132,7 @@ function updateFoes(){
       continue;
     }
     var np = mpNearestPlayer(f.position);
+    if(f.position.distanceToSquared(np.pos) > _ENEMY_SIM_R2){ if(f.hpBarEl) f.hpBarEl.style.display = 'none'; if(f.appBarEl) f.appBarEl.style.display = 'none'; continue; }   // LOD: pause far wasps/mortars
     if(f.kind === 'wasp') updateWasp(f, np, now, inDome);
     else updateMortar(f, np, now);
     // Body HP bar: shown for mortars + PHASE-2 wasps; a phase-1 wasp shows its APPARATUS bar instead
@@ -16902,7 +17285,7 @@ function updateWaspGrounded(f, np, now, inDome){
 // drops a burning puddle. A ground ring telegraphs the landing point during the shell's flight.
 function updateMortar(f, np, now){
   var mz = (f.mesh.userData && f.mesh.userData.muzzle) ? f.mesh.userData.muzzle.material : null;
-  if(now - f.lastShot > (1000 / 60) * MORTAR_FIRE / (f.slowMul || 1)){
+  if(f.position.distanceToSquared(np.pos) < _MORTAR_RANGE2 && now - f.lastShot > (1000 / 60) * MORTAR_FIRE / (f.slowMul || 1)){
     f.lastShot = now;
     var n = f.normal;
     var T = np.pos.clone().addScaledVector(np.vel || new THREE.Vector3(), MORTAR_FLIGHT * 0.6);   // lead the player
@@ -17256,8 +17639,9 @@ function switchArena(arena){
   combat.enemies.length = 0;
   clearBalls();
   clearFoes(); clearPuddles();
-  clearSpawnQueue();
+  clearSpawnQueue(); clearMeteors(); clearBoss();
   clearDying(); clearXPOrbs();
+  combat.elapsed = 0; combat.ballRush = false; combat.bossActive = false; combat.bossDone = false;
   for(var j = 0; j < combat.enemyBullets.length; j++) disposeEnemyBullet(combat.enemyBullets[j]);
   combat.enemyBullets.length = 0;
   clearGameBullets();   // stray player bullets belong to the region we just left
@@ -17272,8 +17656,9 @@ function clearCombat(){
   clearMap(); clearArena();
   clearBalls();
   clearFoes(); clearPuddles();
-  clearSpawnQueue();
+  clearSpawnQueue(); clearMeteors(); clearBoss();
   clearDying(); clearXPOrbs();
+  combat.elapsed = 0; combat.ballRush = false; combat.bossActive = false; combat.bossDone = false;
   for(var j = 0; j < combat.enemyBullets.length; j++) disposeEnemyBullet(combat.enemyBullets[j]);
   combat.enemyBullets.length = 0;
   for(var k = combat.damageNumbers.length - 1; k >= 0; k--){ combat.damageNumbers[k].el.style.display = 'none'; combat.damageNumbers[k]._active = false; }   // release back to the pool (don't remove from DOM)
@@ -17404,6 +17789,19 @@ function updateCombat(dt){
   for(var bi = gameBullets.length - 1; bi >= 0; bi--){
     var b = gameBullets[bi];
     var hitTank = null, bpos = b.mesh.position;
+    // Boss "The Core" takes hits first (its own big hull).
+    if(combat.boss && combat.boss.state === 'active'){
+      var _bs = combat.boss, _brr = _bs.hitR + (b.hitR || BULLET_HIT_R);
+      if(bpos.distanceToSquared(_bs.mesh.position) < _brr * _brr){
+        var _bdmg = b.dmg || PLAYER_BULLET_DAMAGE;
+        _bs.hp -= _bdmg; combat.totalDamage += _bdmg;
+        spawnDamageNumber(_bs.mesh.position.clone().addScaledVector(_bs.normal, 0.12), _bdmg, false);
+        sfxEnemyDamage(_bs.mesh.position);
+        disposeGameBullet(b); gameBullets.splice(bi, 1);
+        if(_bs.hp <= 0) killBoss();
+        continue;
+      }
+    }
     for(var ei = 0; ei < combat.enemies.length; ei++){
       var en = combat.enemies[ei];
       if(en.userData.building > 0) continue;   // can't shoot a materializing tank
@@ -17464,7 +17862,7 @@ function updateCombat(dt){
     for(var bki = 0; bki < combat.balls.length; bki++){
       var bk = combat.balls[bki];
       if(bk.building > 0) continue;   // can't shoot a materializing ball
-      var bkr = bk.r + (b.hitR || BULLET_HIT_R);
+      var bkr = bk.r * BALL_HIT_MUL + (b.hitR || BULLET_HIT_R);
       if(bpos.distanceToSquared(bk.mesh.position) < bkr * bkr){   // squared → no sqrt
         var bdmg = b.dmg || PLAYER_BULLET_DAMAGE;
         bk.hp -= bdmg; combat.totalDamage += bdmg;
@@ -17502,6 +17900,7 @@ function updateCombat(dt){
 
     var tnp = mpNearestPlayer(tank.position);   // co-op: track/aim the closer of the two players
     var dist = tank.position.distanceTo(tnp.pos);
+    if(dist > ENEMY_SIM_RANGE){ if(d.hpBarEl) d.hpBarEl.style.display = 'none'; continue; }   // LOD: pause far tanks (no tracking/firing/spiral)
 
     // ── Spiral barrage trigger ── linger in a tank's attack range too long and it winds up a big
     // charge, spins its 4 barrels, and unloads a slow, fat spiral of shells. Otherwise it does its
@@ -17676,11 +18075,16 @@ function updateCombat(dt){
   if(combat.waveEl){
     if(combat.arenaActive){
       combat.waveEl.style.display = 'block';
-      if(combat.spawnTimer > 0){
-        combat.waveEl.textContent = 'WAVE ' + combat.wave + '  ·  INCOMING ' + Math.ceil(combat.spawnTimer / 60);
-      } else {
-        combat.waveEl.textContent = 'WAVE ' + combat.wave + '  ·  ' + (combat.enemies.length + combat.foes.length) + ' LEFT';
-      }
+      var _sec = Math.max(0, Math.floor(GAME_RUN_SECONDS - combat.elapsed));
+      var _clock = ((_sec / 60) | 0) + ':' + (_sec % 60 < 10 ? '0' : '') + (_sec % 60);
+      var _cnt = combat.enemies.length + combat.foes.length + combat.balls.length;
+      if(combat._victory) combat.waveEl.textContent = '★ THE CORE DESTROYED ★';
+      else if(combat.bossActive) combat.waveEl.textContent = combat.boss ? ('◈ THE CORE ◈  ·  ' + Math.max(0, Math.ceil(combat.boss.hp / combat.boss.maxHp * 100)) + '%') : '◈ THE CORE ◈';
+      else if(combat.ballRush) combat.waveEl.textContent = 'BALL RUSH  ·  ' + _clock;
+      else combat.waveEl.textContent = _clock + '  ·  ' + _cnt + ' ENEMIES';
+      // TEMP DIAGNOSTIC — remove once the arena/meteors are confirmed working.
+      combat.waveEl.textContent += combat._arenaErr ? (' | ERR: ' + combat._arenaErr)
+        : (' | b:' + (combat.bodies ? combat.bodies.length : 0) + ' m:' + (combat.meteors ? combat.meteors.length : 0) + ' t:' + combat.meteorTimer);
     } else {
       combat.waveEl.style.display = 'none';
     }
@@ -18623,6 +19027,7 @@ function attachStreakGlow(m, col, coreR){
 }
 function freeBulletMesh(m){ if(m){ m.visible = false; _bulletPool.push(m); } }   // recycle (never dispose — geo/mats are shared)
 
+var GAME_AIM_CURVE_FRAMES = 8;   // how many frames a bullet takes to curve from the ship's nose onto the crosshair line
 function spawnSkillBullet(origin, dir, lateral){
   var s = gameMode.surfaceState, p = gameMode.physics;
   dir = dir.clone(); if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.set(0, 0, 1);
@@ -18633,7 +19038,14 @@ function spawnSkillBullet(origin, dir, lateral){
     if(right.lengthSq() > 1e-9){ right.normalize(); pos.addScaledVector(right, lateral); }
   }
   var BULLET_SPEED = 0.18 * (1 + 0.3 * (skillFx.overclock || 0));   // Overclock: faster bullets → longer streaks
-  var vel = dir.clone().multiplyScalar(BULLET_SPEED);
+  // Curving aim: in chase view the bullet LEAVES THE SHIP along its nose (ship-forward), then curves
+  // over the next few frames to line up with the crosshair-raycast direction (`dir`). FPS fires straight.
+  var launchDir = dir, aimDir = null, curve = 0;
+  if(!(gameMode.fps && gameMode.fps.active)){
+    var M = gameFiringDir();
+    if(M && M.lengthSq() > 1e-9 && M.dot(dir) < 0.9995){ launchDir = M.clone().normalize(); aimDir = dir.clone(); curve = GAME_AIM_CURVE_FRAMES; }
+  }
+  var vel = launchDir.clone().multiplyScalar(BULLET_SPEED);
   if(gameMode._shipVel) vel.add(gameMode._shipVel);
   var dmg = PLAYER_BULLET_DAMAGE;
   if(skillFx.bigBullet) dmg *= 3.5;
@@ -18654,6 +19066,7 @@ function spawnSkillBullet(origin, dir, lateral){
   mesh.position.copy(origin);
   gameBullets.push({
     mesh: mesh, vel: vel, life: 0, maxLife: skillFx.orbitingShot ? 240 : 90, dmg: dmg,
+    aimDir: aimDir, curve: curve,   // curving-aim: steer toward the crosshair dir for `curve` frames
     hitR: skillFx.bigBullet ? BULLET_HIT_R * 2 : BULLET_HIT_R,
     big: skillFx.bigBullet, homing: skillFx.tracking, split: skillFx.splitShot,
     fire: skillFx.fireBullet, ice: skillFx.iceBullet, electric: skillFx.electric,
@@ -19014,6 +19427,14 @@ function updateSkillBullets(){
   var up = gameMode.surfaceState.groundNormal;
   for(var i = 0; i < gameBullets.length; i++){
     var b = gameBullets[i];
+    // Curving aim: for the first few frames after launch, smoothly steer the bullet's travel direction
+    // from the ship's nose onto the crosshair-raycast direction, then it flies straight.
+    if(b.curve > 0 && b.aimDir){
+      var csp = b.vel.length() || 0.16;
+      b.vel.lerp(_skV3.copy(b.aimDir).multiplyScalar(csp), 0.35);
+      if(b.vel.lengthSq() > 1e-9) b.vel.setLength(csp);
+      b.curve--;
+    }
     if(b.orbit){
       var o = b.orbit;
       if(o.phase === 'seek'){
@@ -19454,6 +19875,9 @@ function mpOnData(data){
   else if(data.type === 'xp'){ if(mpIsGuest()) spawnXPBurst(new THREE.Vector3(data.p[0], data.p[1], data.p[2]), new THREE.Vector3(data.n[0], data.n[1], data.n[2]), data.c); } // shared kill → guest's own (client-side) orbs
   else if(data.type === 'heart'){ if(mpIsGuest()) spawnHeartDrop(new THREE.Vector3(data.p[0], data.p[1], data.p[2]), new THREE.Vector3(data.n[0], data.n[1], data.n[2])); }   // shared kill → guest's own hearts
   else if(data.type === 'map'){ if(mpIsGuest()) generateMap(data.seed); }   // host (re)generated the arena map → guest rebuilds the identical drivable geometry
+  else if(data.type === 'arena'){ if(mpIsGuest()) generateArena(data.seed); }         // host built the planet+moon+city → guest rebuilds identically (same seed → same orbit phase)
+  else if(data.type === 'arenaCity'){ if(mpIsGuest()) switchArenaCity(data.seed); }   // 5-round city switch → guest rebuilds the new cities
+  else if(data.type === 'meteor'){ if(mpIsGuest()) _addMeteor(new THREE.Vector3(data.x, data.y, data.z), new THREE.Vector3(data.nx, data.ny, data.nz), [], data.T || METEOR_FALL_FRAMES); }   // host fired a meteor → guest mirrors the visual/shake/shockwave (host owns the enemy payload)
   else if(data.type === 'heal'){ if(MP.isHost) MP.guestHp = Math.min(combat.player.maxHp, MP.guestHp + data.a); }   // guest grabbed a heart → heal its (host-owned) HP
   else if(data.type === 'xpcollect'){ if(MP.isHost) addXP(data.a); }                                  // guest collected an orb → into the shared pool
   else if(data.type === 'xppool'){ if(mpIsGuest()){ xpState.current = data.cur; xpState.level = data.lvl; updateXPHud(); } }   // sync the shared XP bar
@@ -19804,7 +20228,8 @@ function mpSerializeWorld(){
     pu.push([mpId(pd), +pd.pos.x.toFixed(4), +pd.pos.y.toFixed(4), +pd.pos.z.toFixed(4),
       +pd.normal.x.toFixed(3), +pd.normal.y.toFixed(3), +pd.normal.z.toFixed(3), +(pd.life / pd.max).toFixed(3)]); }
   return { type: 'world', e: e, b: b, eb: eb, pb: pb, fo: fo, pu: pu,
-    w: { a: combat.arenaActive ? 1 : 0, wv: combat.wave, lf: combat.enemies.length + combat.foes.length, st: Math.ceil((combat.spawnTimer || 0) / 60) },
+    w: { a: combat.arenaActive ? 1 : 0, sd: combat.arenaSeed || 0, el: Math.floor(combat.elapsed || 0), lf: combat.enemies.length + combat.foes.length + combat.balls.length, br: combat.ballRush ? 1 : 0, bo: combat.bossActive ? 1 : 0,
+      bs: combat.boss ? [ +combat.boss.mesh.position.x.toFixed(3), +combat.boss.mesh.position.y.toFixed(3), +combat.boss.mesh.position.z.toFixed(3), +(combat.boss.hp / combat.boss.maxHp).toFixed(3), combat.boss.state === 'active' ? 1 : 0 ] : 0 },
     h1: Math.round(combat.player.hp), h2: Math.round(MP.guestHp),
     // revive gauges broadcast to the guest (-1 = that player isn't downed yet): host's own + the guest's
     dn: { h: (combat.player.dead && playerDeath.downActive) ? +(playerDeath.gauge || 0).toFixed(3) : -1,
@@ -19945,7 +20370,19 @@ function mpApplyWorld(w){
   for(id in MP.mirror.pu){ if(!seenPu[id]){ scene.remove(MP.mirror.pu[id]); MP.mirror.pu[id].geometry.dispose(); MP.mirror.pu[id].material.dispose(); delete MP.mirror.pu[id]; } }
   // HUD: reflect the host's authoritative HP + wave state
   combat.player.hp = w.h2;
-  combat.arenaActive = w.w.a === 1; combat.wave = w.w.wv;
+  combat.arenaActive = w.w.a === 1; combat.elapsed = w.w.el || 0; combat.ballRush = w.w.br === 1; combat.bossActive = w.w.bo === 1;
+  combat.scaleMul = combatScaleForTime(combat.elapsed);   // keep the guest's XP-scaling in step with the host clock
+  // Resilient arena build: if the host is live but we never built the planet/moon (missed/late 'arena'
+  // message, or entered the dome after the host activated), rebuild it from the seed carried in the snapshot.
+  if(w.w.a === 1 && w.w.sd && !combat.bodies && gameMode.portal && gameMode.portal.regionB) generateArena(w.w.sd);
+  // Boss "THE CORE" mirror — build/update a local mesh from the synced position + HP fraction (the host
+  // owns the boss; the guest's host-spawned bullets already damage it, this just makes it visible).
+  var bs = w.w.bs;
+  if(bs && bs.length){
+    if(!MP.bossMirror) MP.bossMirror = makeBossMesh();
+    MP.bossMirror.userData._tp = new THREE.Vector3(bs[0], bs[1], bs[2]);
+    MP.bossHpFrac = bs[3];
+  } else if(MP.bossMirror){ if(MP.bossMirror.parent) scene.remove(MP.bossMirror); MP.bossMirror = null; MP.bossHpFrac = 0; }
   if(w.dn) MP.downGauge = w.dn;   // revive gauges (rendered on the guest's orbs)
 }
 // ── Guest: per-frame smoothing — lerp tanks/balls to target, integrate bullets by velocity ──
@@ -19972,11 +20409,14 @@ function mpInterpolateWorld(){
       else { m.userData.appBarEl.style.display = 'block'; m.userData.appBarEl.style.left = ((apg.x * 0.5 + 0.5) * window.innerWidth) + 'px'; m.userData.appBarEl.style.top = ((-apg.y * 0.5 + 0.5) * window.innerHeight) + 'px'; m.userData.appFillEl.style.width = Math.max(0, (m.userData.appFrac || 0) * 100) + '%'; }
     }
   }
+  // boss mirror: ease toward the synced position + idle spin
+  if(MP.bossMirror && MP.bossMirror.userData._tp){ MP.bossMirror.position.lerp(MP.bossMirror.userData._tp, 0.5); MP.bossMirror.rotation.y += 0.01; }
 }
 function mpClearWorld(){
   for(var eid in MP.mirror.e){ var et = MP.mirror.e[eid]; if(et.userData.hpBarEl) et.userData.hpBarEl.remove(); }
   for(var fid in MP.mirror.fo){ var ft = MP.mirror.fo[fid]; mpShedWaspMirror(ft); if(ft.userData.hpBarEl) ft.userData.hpBarEl.remove(); }
   ['e', 'b', 'eb', 'pb', 'fo', 'pu'].forEach(function(k){ for(var id in MP.mirror[k]){ var m = MP.mirror[k][id]; if(m.parent) scene.remove(m); } MP.mirror[k] = {}; });
+  if(MP.bossMirror){ if(MP.bossMirror.parent) scene.remove(MP.bossMirror); MP.bossMirror = null; } MP.bossHpFrac = 0;
   MP.world = null;
 }
 // Floating red HP bar (DOM) for a guest mirror tank — matches the host's enemy bars.
@@ -20017,8 +20457,8 @@ function mpGuestCombat(dt){
   else if(combat.player.hp > 0 && playerDeath.active) endPlayerDeath();
   if(combat.mouseFiring || combat.touchFiring || combat.enterFiring) fireBullet();   // guest held-fire: predict bullets / charge the beam locally + send intent
   updateBarrelRollFire();   // Barrel Roll Shot (guest predicts + sends wing intents)
-  updateMap();              // raise the guest's local copy of the procedural map (built from the host seed)
-  updateArena();            // raise the guest's planet/moon city + advance the moon orbit
+  updateArena();            // advance the guest's local moon orbit (built from the host seed)
+  updateMeteors();          // animate the host-synced meteors: fall, red rings, explosions, contour shockwaves, camera shake (damage/payload are host-owned)
   mpInterpolateWorld();
   mpUpdateMirrorBars();   // enemy HP bars over the mirrored tanks
   relock();               // lock-on: re-acquire the nearest mirror if the locked one died
@@ -20030,7 +20470,8 @@ function mpGuestCombat(dt){
     combat.hpFillEl.style.background = combat.player.hp / combat.player.maxHp > 0.3 ? 'linear-gradient(90deg,#48e07a,#2fae5c)' : 'linear-gradient(90deg,#ff6a4a,#cc3333)'; }
   if(combat.waveEl){
     if(combat.arenaActive){ combat.waveEl.style.display = 'block';
-      combat.waveEl.textContent = MP.world ? ('WAVE ' + combat.wave + (MP.world.w.st > 0 ? '  ·  INCOMING ' + MP.world.w.st : '  ·  ' + MP.world.w.lf + ' LEFT')) : '';
+      if(MP.world){ var _gs = Math.max(0, GAME_RUN_SECONDS - (MP.world.w.el || 0)); var _gc = ((_gs / 60) | 0) + ':' + (_gs % 60 < 10 ? '0' : '') + (_gs % 60);
+        combat.waveEl.textContent = MP.world.w.bo === 1 ? ('◈ THE CORE ◈  ·  ' + Math.max(0, Math.ceil((MP.bossHpFrac || 0) * 100)) + '%') : (MP.world.w.br === 1 ? ('BALL RUSH  ·  ' + _gc) : (_gc + '  ·  ' + MP.world.w.lf + ' ENEMIES')); }
     } else combat.waveEl.style.display = 'none';
   }
   // mirror tank HP bars
@@ -20058,7 +20499,7 @@ function mpSendFireIntent(){
     dir = gameCrosshairDir(nose, M);
   } else dir = M.clone();
   var sv = gameMode._shipVel || new THREE.Vector3();
-  mpSend({ type: 'fire', o: [nose.x, nose.y, nose.z], d: [dir.x, dir.y, dir.z], sv: [sv.x, sv.y, sv.z], up: [s.groundNormal.x, s.groundNormal.y, s.groundNormal.z], sk: mpFireSkillSummary() });
+  mpSend({ type: 'fire', o: [nose.x, nose.y, nose.z], d: [dir.x, dir.y, dir.z], m: [M.x, M.y, M.z], sv: [sv.x, sv.y, sv.z], up: [s.groundNormal.x, s.groundNormal.y, s.groundNormal.z], sk: mpFireSkillSummary() });
 }
 // Host: spawn the guest's full bullet fan with the guest's skills (owner = 1).
 function mpHostSpawnGuestVolley(d){
@@ -20066,18 +20507,24 @@ function mpHostSpawnGuestVolley(d){
   var dir = new THREE.Vector3(d.d[0], d.d[1], d.d[2]); if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.set(0, 0, 1);
   var up = new THREE.Vector3(d.up[0], d.up[1], d.up[2]); if(up.lengthSq() < 1e-9) up.set(0, 1, 0);
   var sv = new THREE.Vector3(d.sv[0], d.sv[1], d.sv[2]);
+  var M = (d.m && d.m.length === 3) ? new THREE.Vector3(d.m[0], d.m[1], d.m[2]) : null;   // guest's ship-forward → curving-aim launch dir
+  if(M && M.lengthSq() > 1e-9) M.normalize(); else M = null;
   var sk = d.sk || {};
   function spawn(orig, dr, lateral){
     dr = dr.clone(); if(dr.lengthSq() > 1e-9) dr.normalize();
     var pos = orig.clone();
     if(lateral){ var rt = new THREE.Vector3().crossVectors(dr, up); if(rt.lengthSq() > 1e-9){ rt.normalize(); pos.addScaledVector(rt, lateral); } }
-    var vel = dr.clone().multiplyScalar(0.18).add(sv);
+    // Curving aim: launch along the ship nose (M), then steer onto the crosshair dir over a few frames.
+    var launch = dr, aimD = null, cv = 0;
+    if(M && M.dot(dr) < 0.9995){ launch = M; aimD = dr.clone(); cv = GAME_AIM_CURVE_FRAMES; }
+    var vel = launch.clone().multiplyScalar(0.18).add(sv);
     var dmg = PLAYER_BULLET_DAMAGE * (sk.big ? 3.5 : 1) * (1 + 0.5 * (sk.vel || 0)) * (sk.dm || 1);
     var szb = sk.big ? 0.008 : 0.004;
     var gsb = sk.big ? 0.05 : 0.022;
     var mesh = acquireBulletMesh(sharedBulletGeo(szb), sharedBulletMat(0x66e0ff), GAME_LOW_FX ? null : sharedBulletGlow(0x9af0ff, 0.85), gsb);
     mesh.position.copy(orig);
     gameBullets.push({ mesh: mesh, vel: vel, life: 0, maxLife: sk.orbit ? 240 : 90, dmg: dmg, big: !!sk.big, homing: !!sk.track, split: sk.split || 0,
+      aimDir: aimD, curve: cv,
       fire: sk.fire || 0, ice: sk.ice || 0, electric: sk.elec || 0, bounces: sk.bounce || 0, contour: !!sk.contour,
       orbit: (sk.orbit > 0) ? { stacks: sk.orbit, phase: 'seek', target: null, angle: 0, ttl: 0 } : null, owner: 1 });
   }
@@ -20274,7 +20721,14 @@ function gameKeyDown(e) {
   if(!gameMode.active && !gameMode.entering) return;
   if(skillMenuOpen()){ handleSkillMenuKey(e); return; }   // level-up picker: 1/2/3 to choose, swallow movement
   var k = e.key ? e.key.toLowerCase() : '';
-  if(k === 'w' || k === 'arrowup') gameMode.keys.w = true;
+  if(k === 'w' || k === 'arrowup'){
+    gameMode.keys.w = true;
+    if(!e.repeat){   // double-tap W → boost (engaged while W stays held; released when W lifts)
+      var _wn = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+      if(_wn - (gameMode._lastWTap || 0) < 280) gameMode.wBoost = true;
+      gameMode._lastWTap = _wn;
+    }
+  }
   else if(k === 'a' || k === 'arrowleft') {
     gameMode.keys.a = true;
     if(!e.repeat) gameMode.lastATime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
@@ -20336,7 +20790,7 @@ function gameKeyDown(e) {
 }
 function gameKeyUp(e) {
   var k = e.key ? e.key.toLowerCase() : '';
-  if(k === 'w' || k === 'arrowup') gameMode.keys.w = false;
+  if(k === 'w' || k === 'arrowup'){ gameMode.keys.w = false; gameMode.wBoost = false; }   // releasing W ends the double-tap boost
   else if(k === 'a' || k === 'arrowleft') gameMode.keys.a = false;
   else if(k === 's' || k === 'arrowdown') { gameMode.keys.s = false; gameMode.sBrakeLock = false; }
   else if(k === 'd' || k === 'arrowright') gameMode.keys.d = false;
@@ -21188,7 +21642,7 @@ function containInChute(){
 // so the magnetic grip sticks the ship to whichever surface is nearest, letting it drive across
 // the floor, up the curved walls, and through the chute as one continuous surface (Orbicule-style).
 var _domeBest = { point: new THREE.Vector3(), normal: new THREE.Vector3(), dist: 0 };
-var _domeChP = new THREE.Vector3(), _domeChN = new THREE.Vector3(), _domeChLp = new THREE.Vector3();
+var _domeChP = new THREE.Vector3(), _domeChN = new THREE.Vector3(), _domeChLp = new THREE.Vector3(), _domeLp = new THREE.Vector3();
 function closestPointOnDome(pos){
   var P = gameMode.portal;
   var bestDist = Infinity, bx=0, by=0, bz=0, nx=0, ny=0, nz=0, found=false;
@@ -21207,22 +21661,16 @@ function closestPointOnDome(pos){
   // Flat plane floor (y = domeFloorY) — the massive ground the hallway opens onto. Huge extent so
   // you never reach an edge; no curved sphere walls anymore.
   if(combat.bodies && combat.bodies.length){
-    // Planet/moon arena: nearest point on the nearest body's sphere (analytic, radial normal) …
-    for(var _bi = 0; _bi < combat.bodies.length; _bi++){
-      var _bd = combat.bodies[_bi];
-      var ddx = pos.x - _bd.center.x, ddy = pos.y - _bd.center.y, ddz = pos.z - _bd.center.z;
-      var dl = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) || 1e-6, sdist = Math.abs(dl - _bd.radius);
-      if(sdist < bestDist){ var inv = 1 / dl; nx = ddx * inv; ny = ddy * inv; nz = ddz * inv; bx = _bd.center.x + nx * _bd.radius; by = _bd.center.y + ny * _bd.radius; bz = _bd.center.z + nz * _bd.radius; bestDist = sdist; found = true; }
-      // … and the drivable buildings on that body (cull by bounding sphere).
-      var _blds = _bd.buildings;
-      for(var _k = 0; _k < _blds.length; _k++){
-        var _bb = _blds[_k]; if(!_bb.solid) continue;
-        var _ex = pos.x - _bb.center.x, _ey = pos.y - _bb.center.y, _ez = pos.z - _bb.center.z, _rr = _bb.radius + MAP_GRIP_MARGIN;
-        if(_ex * _ex + _ey * _ey + _ez * _ez > _rr * _rr) continue;
-        var _cpt = closestPointOnTris(pos, _bb.worldTris);
-        if(_cpt && _cpt.dist < bestDist){ bestDist = _cpt.dist; bx = _cpt.point.x; by = _cpt.point.y; bz = _cpt.point.z; nx = _cpt.normal.x; ny = _cpt.normal.y; nz = _cpt.normal.z; found = true; }
-      }
-    }
+    // Planet/moon arena: nearest point on the NEAREST body's ICOSAHEDRON faces. Only the nearest body is
+    // tested (you can only grip the one you're on) → just 20 tri tests per query, cheap even with a huge
+    // swarm. Geometry is BODY-LOCAL (relative to _bd.center): probe in local space (pos − centre), run
+    // closest-point-on-tris over the 20 faces, then shift the result back to world (a pure translation
+    // leaves normals unchanged — this is what lets the moon's surface move with it). The tri normal is
+    // the flat FACE normal, so the ship sits flat on each facet and folds across ridges.
+    var _bd = combat.bodies.length === 1 ? combat.bodies[0] : nearestBody(pos);
+    _domeLp.set(pos.x - _bd.center.x, pos.y - _bd.center.y, pos.z - _bd.center.z);
+    var _cpt = closestPointOnTris(_domeLp, _bd.tris);
+    if(_cpt && _cpt.dist < bestDist){ bestDist = _cpt.dist; bx = _cpt.point.x + _bd.center.x; by = _cpt.point.y + _bd.center.y; bz = _cpt.point.z + _bd.center.z; nx = _cpt.normal.x; ny = _cpt.normal.y; nz = _cpt.normal.z; found = true; }
   } else {
     var fdx = pos.x - P.DX, fdz = pos.z - P.domeCz, fr = Math.hypot(fdx, fdz);
     if(fr <= (P.planeHalf || 40)){
@@ -21315,7 +21763,7 @@ function updatePortalInterior(){
   // speed above the walk cap (gates drift + flips). Same km/h counter, too.
   var fwdAxis = 0, yawAxis = 0, mDyaw = 0, mDriftSide = 0, aimMode = false;
   if(t.active){ fwdAxis = t.throttle; yawAxis = t.yaw; p.isBoosting = t.boost && boostAllowed(); }
-  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); var _kd = gameKbDrift(); mDyaw = _kd.dyaw; mDriftSide = _kd.side; p.isBoosting = k.shift && boostAllowed(); }
+  else { fwdAxis = (k.w?1:0)+((k.s && !gameMode.sBrakeLock)?-0.6:0); var _kd = gameKbDrift(); mDyaw = _kd.dyaw; mDriftSide = _kd.side; p.isBoosting = gameMode.wBoost && boostAllowed(); }
   if(p.isBoosting && fwdAxis < 1) fwdAxis = 1;
   if(s.airborne && fwdAxis < 0) fwdAxis = 0;   // no braking in the air (S mid-air is slam-only)
   var speedMetric = Math.max(Math.abs(s.speed), gameMode.fly.vel.length());
@@ -21410,7 +21858,9 @@ function updatePortalInterior(){
   else { if(Math.abs(s.driftExitYaw||0) > 1e-5){ s.forward.applyAxisAngle(s.groundNormal, s.driftExitYaw); s.driftExitYaw *= p.driftExitDecay; if(Math.abs(s.driftExitYaw) < 1e-5) s.driftExitYaw = 0; } if(!s.barrelRoll.active){ if(t.active){ if(Math.abs(yawAxis) > 0.01) s.forward.applyAxisAngle(s.groundNormal, -p.turnSpeed * yawAxis); } else if(!aimMode) s.forward.applyAxisAngle(s.groundNormal, mDyaw); } }   // desktop: DIRECT camera-follow steering
   s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
   if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
-  if(Math.abs(s.speed) > 0.00001) ship.position.addScaledVector(s.forward, s.speed);
+  // On a planet while airborne, motion is owned by the free-fall velocity (arenaAirVel) below — don't
+  // also apply the tangential drive here (it's already folded into the launch velocity).
+  if(Math.abs(s.speed) > 0.00001 && !(combat.bodies && combat.bodies.length && s.airborne)) ship.position.addScaledVector(s.forward, s.speed);
 
   // ── unified surface grip — drive on ANY dome surface (flat floor, curved sphere wall, or the
   //    chute) via closest-point-on-surface, the same magnetic feel as the crystal. Airborne hops
@@ -21419,7 +21869,15 @@ function updatePortalInterior(){
     // ── RADIAL ARENA (planet / moon): grip the nearest body's sphere; gravity pulls toward its centre ──
     var nb = nearestBody(ship.position);
     if(s.airborne){
-      s.vertVel -= gameJumpGravity(); ship.position.addScaledVector(s.jumpAxis, s.vertVel); s.airTime += 1;   // hop along the takeoff radial (arcs back, like the crystal)
+      // World-velocity free-fall (mirrors the crystal): launch = radial jump + tangential momentum, then
+      // accelerate toward the NEAREST body's centre each frame. As you cross the gap the nearest body
+      // flips to the moon → its gravity captures you → land on it (= jump-the-gap).
+      if(!s.arenaAirVel) s.arenaAirVel = new THREE.Vector3();
+      if(s.airTime === 0){ s.arenaAirVel.copy(s.jumpAxis).multiplyScalar(s.vertVel).addScaledVector(s.forward, s.speed); }
+      var gdir = _arenaTmp.copy(nb.center).sub(ship.position); var gl = gdir.length(); if(gl > 1e-6) gdir.multiplyScalar(1 / gl); else gdir.set(0, -1, 0);
+      s.arenaAirVel.addScaledVector(gdir, gameJumpGravity()).multiplyScalar(0.992);
+      var maxAV = p.jumpImpulse * 1.7; if(s.arenaAirVel.length() > maxAV) s.arenaAirVel.setLength(maxAV);
+      ship.position.add(s.arenaAirVel); s.airTime += 1;
       if(s.barrelRoll.active){ s.barrelRoll.progress = Math.min(1, s.barrelRoll.progress + 1/s.barrelRoll.duration); var brP = s.barrelRoll.progress; var lat = s.barrelRoll.lateralPeak*(1-brP)*(1-brP); ship.position.addScaledVector(s.barrelRoll.lateralDir, lat); if(brP >= 1){ s.barrelRoll.active = false; s.barrelRoll.progress = 0; } }
     }
     // Buildings first (eject + stick to the contacted face → run up walls / land on roofs).
@@ -21429,7 +21887,7 @@ function updatePortalInterior(){
         var lp = closestPointOnDome(ship.position);
         if(lp){
           var sd = ship.position.clone().sub(lp.point).dot(lp.normal);
-          if(sd <= s.hoverHeight + 0.02 && (s.vertVel < 0 || s.airTime > p.jumpMaxAirTime)){
+          if(sd <= s.hoverHeight + 0.02 && (s.arenaAirVel.dot(lp.normal) < 0 || s.airTime > p.jumpMaxAirTime)){
             s.groundNormal.lerp(lp.normal, 0.5).normalize();
             ship.position.copy(lp.point).addScaledVector(s.groundNormal, s.hoverHeight);
             s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal))); if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
@@ -21446,8 +21904,10 @@ function updatePortalInterior(){
         }
       }
     }
-    // radial hard-floor: never sink below the nearest body's surface (and re-stick if a frame missed)
-    var rv = _arenaTmp.copy(ship.position).sub(nb.center); var rl = rv.length(), minR = nb.radius + s.hoverHeight;
+    // radial hard-floor backstop: never sink below the nearest body's INRADIUS (the flat face-centre
+    // depth). Uses innerR (not the circumradius) so it only catches a ship that tunnelled through a
+    // facet — it must NOT lift the ship off the flat faces up onto the circumsphere.
+    var rv = _arenaTmp.copy(ship.position).sub(nb.center); var rl = rv.length(), minR = nb.innerR + s.hoverHeight;
     if(rl < minR){
       rv.multiplyScalar(minR / Math.max(rl, 1e-6)); ship.position.copy(nb.center).add(rv); s.groundNormal.copy(rv).normalize();
       if(s.airborne){ s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.barrelRoll.active = false; s.barrelRoll.progress = 0; }
@@ -21535,7 +21995,7 @@ function flatDrive(cx, cz, floorY, roomR){
   s.groundNormal.set(0,1,0);
   var fwdAxis=0, yawAxis=0;
   if(t.active){ fwdAxis=t.throttle; yawAxis=t.yaw; p.isBoosting=t.boost && boostAllowed(); }
-  else { fwdAxis=(k.w?1:0)+(k.s?-0.6:0); yawAxis=(k.a?-1:0)+(k.d?1:0); p.isBoosting=k.shift&&k.w&&boostAllowed(); }
+  else { fwdAxis=(k.w?1:0)+(k.s?-0.6:0); yawAxis=(k.a?-1:0)+(k.d?1:0); p.isBoosting=gameMode.wBoost&&boostAllowed(); }
   if(gameMode.wantJump){
     gameMode.wantJump=false;
     if(!s.airborne){ s.airborne=true; s.freeFalling=false; s.vertVel=p.jumpImpulse; s.airTime=0; s.jumpAxis.set(0,1,0);
