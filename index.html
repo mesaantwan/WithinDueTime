@@ -14670,13 +14670,25 @@ function spawnGameDriftParticles(ctx) {
     var roll = Math.random();
     var isPixel  = roll < 0.45;
     var isString = roll > 0.85;  // 15% chance of a long trailing string
-    var particle, geo;
-
+    // Pooled sparks on SHARED unit geometry: the random per-spark dimensions are baked into a base
+    // scale instead of a fresh randomized geometry (byte-identical shape — a unit cube/tapered
+    // cylinder scaled to (w, w, len) equals the old per-spark geometry, without the constant
+    // geometry build + upload + dispose while drifting).
+    var particle = _dpPool.pop();
+    if(!particle){
+      particle = new THREE.Mesh(fxShared('dpCube', function(){ return new THREE.BoxGeometry(1, 1, 1); }), gameMode.driftFx.material.clone());
+      particle.userData = { velocity: new THREE.Vector3(), life: 1, decay: 0, isPixel: false, bx: 1, by: 1, bz: 1 };
+      particle._pool = _dpPool;
+      scene.add(particle);
+    } else { particle.material.opacity = 1.0; particle.visible = true; }
+    particle.quaternion.identity();   // pixels stay axis-aligned; streaks lookAt below
+    var u = particle.userData;
+    u.isPixel = isPixel;
     if(isPixel) {
       // Tiny glowing pixel cube — these read as the bright sparks closest to the ship (~½ size now)
       var pixSize = 0.0008 + Math.random() * 0.0007;  // 0.0008 .. 0.0015
-      geo = new THREE.BoxGeometry(pixSize, pixSize, pixSize);
-      particle = new THREE.Mesh(geo, gameMode.driftFx.material.clone());
+      particle.geometry = fxShared('dpCube', function(){ return new THREE.BoxGeometry(1, 1, 1); });
+      u.bx = u.by = u.bz = pixSize;
     } else {
       // Tapered streak — wider at the head, tapering to a point at the tail (~½ size now)
       var streakLength = isString
@@ -14686,11 +14698,15 @@ function spawnGameDriftParticles(ctx) {
         ? 0.0004 + Math.random() * 0.0003      // thin strings
         : 0.0006 + Math.random() * 0.0006;     // chunkier normal streaks
       // Wide end (radius streakWidth) at the head, narrow tip (radius * 0.2) at the tail.
-      geo = new THREE.CylinderGeometry(streakWidth, streakWidth * 0.2, streakLength, 5, 1);
-      geo.translate(0, streakLength / 2, 0);
-      geo.rotateX(Math.PI / 2);
-      particle = new THREE.Mesh(geo, gameMode.driftFx.material.clone());
+      particle.geometry = fxShared('dpStreak', function(){
+        var g = new THREE.CylinderGeometry(1, 0.2, 1, 5, 1);
+        g.translate(0, 0.5, 0);
+        g.rotateX(Math.PI / 2);
+        return g;
+      });
+      u.bx = u.by = streakWidth; u.bz = streakLength;
     }
+    particle.scale.set(u.bx, u.by, u.bz);   // full-life size (the fade loop scales this down)
 
     // Spawn ON the drift-streak gouge (inner wing↔ground contact) with a tiny jitter, so the sparks
     // contour to that exact line; fall back to the ship-rear when no contact (e.g. the MP partner).
@@ -14720,49 +14736,45 @@ function spawnGameDriftParticles(ctx) {
     else if(isString) pSpeed = 0.0020 + Math.random() * 0.0015;
     else             pSpeed = 0.0011 + Math.random() * 0.0014;
 
-    particle.userData = {
-      velocity: sprayDir.clone().multiplyScalar(pSpeed),
-      life: 1.0,
-      // Strings linger longer; pixels fade fast
-      decay: isString ? 0.012 + Math.random() * 0.010
-           : isPixel  ? 0.030 + Math.random() * 0.025
-                      : 0.022 + Math.random() * 0.020,
-      isPixel: isPixel
-    };
+    u.velocity.copy(sprayDir).multiplyScalar(pSpeed);
+    u.life = 1.0;
+    // Strings linger longer; pixels fade fast
+    u.decay = isString ? 0.012 + Math.random() * 0.010
+            : isPixel  ? 0.030 + Math.random() * 0.025
+                       : 0.022 + Math.random() * 0.020;
     // Orient streaks along their velocity vector. Pixels stay axis-aligned (cube has no "head").
-    if(!isPixel) particle.lookAt(particle.position.clone().add(particle.userData.velocity));
-    scene.add(particle);
+    if(!isPixel) particle.lookAt(_dpLook.copy(particle.position).add(u.velocity));
     gameMode.driftFx.particles.push(particle);
   }
 }
+var _dpPool = [], _dpLook = new THREE.Vector3();
 
 function updateGameDriftParticles() {
   var arr = gameMode.driftFx.particles;
   if(arr.length === 0) return;
   for(var i = arr.length - 1; i >= 0; i--) {
     var p = arr[i];
-    p.position.add(p.userData.velocity);
+    var u = p.userData;
+    p.position.add(u.velocity);
     // Light gravity scaled for the tiny world
-    p.userData.velocity.y -= 0.00006;
+    u.velocity.y -= 0.00006;
     // Keep streaks oriented along velocity so they always look like they're trailing
-    if(!p.userData.isPixel && p.userData.velocity.length() > 0.0001) {
-      p.lookAt(p.position.clone().add(p.userData.velocity));
+    if(!u.isPixel && u.velocity.length() > 0.0001) {
+      p.lookAt(_dpLook.copy(p.position).add(u.velocity));
     }
-    p.userData.life -= p.userData.decay;
-    var lifeScale = Math.max(0, p.userData.life);
-    if(p.userData.isPixel) {
-      // Pixels shrink uniformly as they fade
-      p.scale.set(lifeScale, lifeScale, lifeScale);
+    u.life -= u.decay;
+    var lifeScale = Math.max(0, u.life);
+    if(u.isPixel) {
+      // Pixels shrink uniformly as they fade (base size × life — same pixels as the old sized geometry)
+      p.scale.set(u.bx * lifeScale, u.by * lifeScale, u.bz * lifeScale);
     } else {
       // Streaks keep their length but slim down as they fade — looks like the trail
       // is being "drawn" out and dissolving rather than the whole thing shrinking.
-      p.scale.set(lifeScale, lifeScale, 1);
+      p.scale.set(u.bx * lifeScale, u.by * lifeScale, u.bz);
     }
     p.material.opacity = lifeScale;
-    if(p.userData.life <= 0) {
-      scene.remove(p);
-      p.geometry.dispose();
-      p.material.dispose();
+    if(u.life <= 0) {
+      p.visible = false; p._pool.push(p);   // pooled → recycled (kept in scene, hidden)
       arr.splice(i, 1);
     }
   }
@@ -14770,11 +14782,7 @@ function updateGameDriftParticles() {
 
 function clearGameDriftParticles() {
   var arr = gameMode.driftFx.particles;
-  for(var i = 0; i < arr.length; i++) {
-    scene.remove(arr[i]);
-    if(arr[i].geometry) arr[i].geometry.dispose();
-    if(arr[i].material) arr[i].material.dispose();
-  }
+  for(var i = 0; i < arr.length; i++) { arr[i].visible = false; arr[i]._pool.push(arr[i]); }
   arr.length = 0;
 }
 
@@ -14985,12 +14993,15 @@ function updateBoostFuel(dt){
     B.fuel += dt / B.recharge;
     if(B.fuel >= 1){ B.fuel = 1; B.lockout = false; }
   }
-  B.fillEl.style.width = (B.fuel * 100) + '%';
+  // Change-gated writes: at full fuel + idle (most of the time) this now touches no DOM at all.
+  var _bw = (B.fuel * 100) + '%';
+  if(B._wCache !== _bw){ B._wCache = _bw; B.fillEl.style.width = _bw; }
   // purple while usable, red-orange while locked out (empty + recharging)
-  B.fillEl.style.background = B.lockout ? 'linear-gradient(90deg,#ff7a4a,#cc3a3a)'
-                                        : 'linear-gradient(90deg,#c9a3ff,#8f6fff)';
+  var _bbg = B.lockout ? 'linear-gradient(90deg,#ff7a4a,#cc3a3a)' : 'linear-gradient(90deg,#c9a3ff,#8f6fff)';
+  if(B._bgCache !== _bbg){ B._bgCache = _bbg; B.fillEl.style.background = _bbg; }
   // Visible only while boosting (or while locked out, so the recharge is visible)
-  B.barEl.style.opacity = (boosting || B.lockout) ? '1' : '0';
+  var _bop = (boosting || B.lockout) ? '1' : '0';
+  if(B._opCache !== _bop){ B._opCache = _bop; B.barEl.style.opacity = _bop; }
 }
 
 // ── Crosshair (screen-centre reticle = firing direction) ─────────────────────────────
@@ -15345,20 +15356,24 @@ var TANK_BASE_R = 0.032;   // pre-scale hull radius (used to derive collision ra
 // Each cannon is its own pivot; per-frame the cannon nearest the player's direction swivels to
 // track + fire while the other three rest at their axis. Built at base size, then scaled ×3. ──
 function buildTank(){
+  // NOTE: geometries are shared across every tank via fxShared (they're never mutated — spawning a
+  // tank no longer builds + uploads ~12 fresh geometries). Materials stay PER-TANK because the death
+  // glow / status tint / build fade mutate them. The dispose paths skip `_shared` geometries.
   var g = new THREE.Group();
   var bodyMat = new THREE.MeshStandardMaterial({ color: 0x7a3b3b, roughness: 0.5, metalness: 0.35, emissive: 0x3a1414, emissiveIntensity: 0.5 });
   var darkMat = new THREE.MeshStandardMaterial({ color: 0x4a2424, roughness: 0.6, metalness: 0.4 });
   // Tracked hull — short hexagonal cylinder, local +Y is up (surface normal)
-  var body = new THREE.Mesh(new THREE.CylinderGeometry(0.026, TANK_BASE_R, 0.014, 6), bodyMat);
+  var bodyGeo = fxShared('tkBody', function(){ return new THREE.CylinderGeometry(0.026, TANK_BASE_R, 0.014, 6); });
+  var body = new THREE.Mesh(bodyGeo, bodyMat);
   body.position.y = 0.007;
   g.add(body);
-  var bodyEdge = new THREE.LineSegments(new THREE.EdgesGeometry(body.geometry), new THREE.LineBasicMaterial({ color: 0xcc6a6a, transparent: true, opacity: 0.8 }));
+  var bodyEdge = new THREE.LineSegments(fxShared('tkBodyEdge', function(){ return new THREE.EdgesGeometry(bodyGeo); }), new THREE.LineBasicMaterial({ color: 0xcc6a6a, transparent: true, opacity: 0.8 }));
   bodyEdge.position.copy(body.position); g.add(bodyEdge);
   // Turret dome the four cannons mount on
   var turret = new THREE.Group();
   turret.position.y = 0.016;
   g.add(turret);
-  var dome = new THREE.Mesh(new THREE.SphereGeometry(0.016, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2), bodyMat);
+  var dome = new THREE.Mesh(fxShared('tkDome', function(){ return new THREE.SphereGeometry(0.016, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2); }), bodyMat);
   turret.add(dome);
   // Four cannons, one per axis direction. Each is a pivot whose local +Z is the barrel; the
   // pivot's rest yaw points it along its axis. The active (nearest) one re-orients to the player.
@@ -15368,18 +15383,18 @@ function buildTank(){
     var pivot = new THREE.Group();
     pivot.rotation.y = baseAngle;
     turret.add(pivot);
-    var barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.005, 0.032, 8), darkMat);
+    var barrel = new THREE.Mesh(fxShared('tkBarrel', function(){ return new THREE.CylinderGeometry(0.004, 0.005, 0.032, 8); }), darkMat);
     barrel.rotation.x = Math.PI / 2;        // cylinder axis → +Z (barrel forward)
     barrel.position.z = 0.02;
     pivot.add(barrel);
     var ringMat = new THREE.MeshBasicMaterial({ color: 0xff3311, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending });
-    var ring = new THREE.Mesh(new THREE.RingGeometry(0.012, 0.05, 16), ringMat);
+    var ring = new THREE.Mesh(fxShared('tkRing', function(){ return new THREE.RingGeometry(0.012, 0.05, 16); }), ringMat);
     ring.position.z = 0.045;
     pivot.add(ring);
     cannons.push({ pivot: pivot, barrel: barrel, ring: ring, baseAngle: baseAngle });
   }
   // Rear engine glow
-  var engine = new THREE.Mesh(new THREE.SphereGeometry(0.006, 6, 6), new THREE.MeshBasicMaterial({ color: 0xff5522, transparent: true, opacity: 0.8 }));
+  var engine = new THREE.Mesh(fxShared('tkEngine', function(){ return new THREE.SphereGeometry(0.006, 6, 6); }), new THREE.MeshBasicMaterial({ color: 0xff5522, transparent: true, opacity: 0.8 }));
   engine.position.set(0, 0.008, -0.026);
   g.add(engine);
   g.userData.turret = turret;
@@ -15396,7 +15411,7 @@ function addTank(pos, normal, attackRadius, build){
   // Lift the (scaled) hull so it rests ON the surface rather than half-buried.
   tank.position.copy(pos).addScaledVector(normal, 0.004 * TANK_SCALE);
   tank.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
-  var maxHp = 250 * (combat.scaleMul || 1);   // enemies get tankier every 5 waves
+  var maxHp = 120 * (combat.scaleMul || 1);   // weaker base tank (was 250); scaleMul ramps it gently over the run
   tank.userData.hp = maxHp;
   tank.userData.maxHp = maxHp;
   tank.userData.normal = normal;
@@ -15413,9 +15428,10 @@ function addTank(pos, normal, attackRadius, build){
   tank.userData.spiralPhase = 'none'; tank.userData.spiralT = 0; tank.userData.spiralAngle = 0; tank.userData.spiralSpin = 0;
   scene.add(tank);
   combat.enemies.push(tank);
-  // Floating DOM health bar (projected above the tank, like the damage numbers)
+  // Floating DOM health bar (projected above the tank, like the damage numbers).
+  // Positioned per-frame via transform (compositor-only) instead of left/top (layout) — same pixels.
   var bar = document.createElement('div');
-  bar.style.cssText = 'position:fixed;z-index:55;width:70px;height:7px;margin-left:-35px;'
+  bar.style.cssText = 'position:fixed;left:0;top:0;z-index:55;width:70px;height:7px;margin-left:-35px;'
     + 'background:rgba(40,12,12,0.85);border:1px solid rgba(0,0,0,0.5);border-radius:3px;'
     + 'pointer-events:none;display:none;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.6);';
   var fill = document.createElement('div');
@@ -15490,7 +15506,7 @@ function combatScaleForWave(w){ return w >= 1 ? Math.pow(2.5, Math.floor((w - 1)
 // boss lands. Kept on roughly the same scale as the old wave end-game (×2.5 every ~3:20 ≈ old +5 waves).
 var GAME_RUN_SECONDS = 600;        // 10:00 → boss phase
 var BALL_RUSH_START = 300, BALL_RUSH_END = 360;   // 5:00–6:00 ball-only rush
-function combatScaleForTime(t){ return Math.pow(2.5, t / 200); }   // ×1 @0s, ×2.5 @3:20, ×6.25 @6:40, ×15.6 @10:00
+function combatScaleForTime(t){ return Math.pow(2.0, t / 300); }   // gentler HP ramp: ×1 @0s, ×2 @5:00, ×4 @10:00 (was ×15.6) — enemies stay much weaker; density drives difficulty
 function gameRampNow(){ return Math.min(1, (combat.elapsed || 0) / GAME_RUN_SECONDS); }
 // Weighted random enemy for a wave slot. Balls are the most common; wasps + mortars(cannons) tie for
 // second; tanks are the rarest (they're big — a swarm of them is too much).
@@ -15503,25 +15519,49 @@ function pickWaveEnemy(){
 }
 // A glowing red circle on the ground (filled glow disc + bright ring outline) marking an incoming
 // spawn. Stays clearly lit the whole countdown and intensifies as the spawn approaches.
+// ── Pooled combat FX ──────────────────────────────────────────────────────────────────
+// High-churn effect objects (telegraph rings, meteors, shockwaves, booms, puddles, XP orbs,
+// lightning bolts) are RECYCLED through per-kind pools instead of being allocated + disposed
+// per spawn. The exact same mesh/material values are re-applied on acquire, so visuals are
+// byte-identical — this only kills the constant geometry re-uploads, shader-material churn
+// and GC pressure that tanked mobile. Pooled objects carry `_pool`; disposeRing() returns
+// them to their pool (hidden, kept in the scene — no add/remove churn) instead of disposing.
+// Shared geometries/materials are tagged `_shared` and must NEVER be disposed.
+var _fxShared = {};
+function fxShared(key, build){ var r = _fxShared[key]; if(!r){ r = build(); r._shared = true; _fxShared[key] = r; } return r; }
+var _fxUP = new THREE.Vector3(0, 1, 0), _fxFWD = new THREE.Vector3(0, 0, 1), _fxN = new THREE.Vector3();
+var _spawnRingPool = [];
 function makeSpawnRing(pos, normal){
-  var grp = new THREE.Group();
-  var disc = new THREE.Mesh(new THREE.CircleGeometry(0.26, 40),
-    new THREE.MeshBasicMaterial({ color: 0xff2222, transparent: true, opacity: 0.5, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
-  var ring = new THREE.Mesh(new THREE.RingGeometry(0.235, 0.275, 40),
-    new THREE.MeshBasicMaterial({ color: 0xff6666, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
-  ring.position.z = 0.0005;
-  grp.add(disc); grp.add(ring);
-  grp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize());
+  var grp = _spawnRingPool.pop();
+  if(!grp){
+    grp = new THREE.Group();
+    var disc = new THREE.Mesh(fxShared('srDisc', function(){ return new THREE.CircleGeometry(0.26, 40); }),
+      new THREE.MeshBasicMaterial({ color: 0xff2222, transparent: true, opacity: 0.5, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    var ring = new THREE.Mesh(fxShared('srRing', function(){ return new THREE.RingGeometry(0.235, 0.275, 40); }),
+      new THREE.MeshBasicMaterial({ color: 0xff6666, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    ring.position.z = 0.0005;
+    grp.add(disc); grp.add(ring);
+    grp.renderOrder = 4;
+    grp.userData = { disc: disc, ring: ring };
+    grp._pool = _spawnRingPool;
+    scene.add(grp);
+  } else {
+    // reset to the exact fresh-built state (a recycled mortar marker was recolored orange; the
+    // telegraph pulse mutates opacity/scale) — identical values to the constructor above.
+    grp.userData.disc.material.color.setHex(0xff2222); grp.userData.disc.material.opacity = 0.5;
+    grp.userData.ring.material.color.setHex(0xff6666); grp.userData.ring.material.opacity = 0.85;
+    grp.scale.setScalar(1);
+    grp.visible = true;
+  }
+  grp.quaternion.setFromUnitVectors(_fxFWD, _fxN.copy(normal).normalize());
   grp.position.copy(pos).addScaledVector(normal, 0.004);
-  grp.renderOrder = 4;
-  grp.userData = { disc: disc, ring: ring };
-  scene.add(grp);
   return grp;
 }
 function disposeRing(ring){
   if(!ring) return;
+  if(ring._pool){ ring.visible = false; ring._pool.push(ring); return; }   // pooled FX: hide + recycle (resources shared — never dispose)
   scene.remove(ring);
-  ring.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); });
+  ring.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material && !c.material._shared) c.material.dispose(); });
 }
 // Pick `n` spawn points NEAR the player, drop a telegraph circle at each, and arm the spawn timer.
 // Each slot rolls a random enemy (pickWaveEnemy); the spawn ring widens with the wave's enemy count.
@@ -15631,10 +15671,10 @@ function buildCluster(ramp){
 // A surface impact point: biased near the player (keeps the fight close) but never ON the player, and
 // spaced away from other pending impacts. Projects a random direction onto the icosahedron via
 // closestPointOnDome so the point + normal sit on a real facet.
+var _mt1 = new THREE.Vector3(), _mt2 = new THREE.Vector3();
 function sampleMeteorImpact(){
   var bd = combat.bodies && combat.bodies[0]; if(!bd) return null;
   var ship = gameMode.ship.position, fallback = null;
-  var _mt1 = new THREE.Vector3(), _mt2 = new THREE.Vector3();
   for(var a = 0; a < 20; a++){
     var dir;
     if(Math.random() < 0.7){
@@ -15658,30 +15698,53 @@ function sampleMeteorImpact(){
   return fallback;
 }
 // A glowing on-fire rock; local +Y oriented to the outward normal so the fire trail streams spaceward.
+// Pooled: the storm keeps up to ~hundreds of these alive + spawns nonstop for 10 minutes — recycling
+// the groups (shared geometry, shared static aura/trail materials, per-instance rock material so the
+// random per-meteor flicker stays independent) removes all of that churn with identical visuals.
+var _meteorPool = [];
 function makeMeteorMesh(normal){
-  var grp = new THREE.Group();
-  var rock = new THREE.Mesh(new THREE.IcosahedronGeometry(0.085, 0), new THREE.MeshStandardMaterial({ color: 0x2a1206, emissive: 0xff5a1e, emissiveIntensity: 1.5, roughness: 1, metalness: 0, flatShading: true }));
-  grp.add(rock);
-  var aura = new THREE.Mesh(new THREE.SphereGeometry(0.15, 12, 10), new THREE.MeshBasicMaterial({ color: 0xff6a2a, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending, depthWrite: false }));
-  grp.add(aura);
-  var trail = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.95, 12, 1, true), new THREE.MeshBasicMaterial({ color: 0xffb24a, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
-  trail.position.y = 0.46; grp.add(trail);
-  grp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal.clone().normalize());
-  grp.userData = { rock: rock, aura: aura, trail: trail };
-  scene.add(grp);
+  var grp = _meteorPool.pop();
+  if(!grp){
+    grp = new THREE.Group();
+    var rock = new THREE.Mesh(fxShared('mtRock', function(){ return new THREE.IcosahedronGeometry(0.085, 0); }),
+      new THREE.MeshStandardMaterial({ color: 0x2a1206, emissive: 0xff5a1e, emissiveIntensity: 1.5, roughness: 1, metalness: 0, flatShading: true }));
+    grp.add(rock);
+    var aura = new THREE.Mesh(fxShared('mtAuraGeo', function(){ return new THREE.SphereGeometry(0.15, 12, 10); }),
+      fxShared('mtAuraMat', function(){ return new THREE.MeshBasicMaterial({ color: 0xff6a2a, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending, depthWrite: false }); }));
+    grp.add(aura);
+    var trail = new THREE.Mesh(fxShared('mtTrailGeo', function(){ return new THREE.ConeGeometry(0.11, 0.95, 12, 1, true); }),
+      fxShared('mtTrailMat', function(){ return new THREE.MeshBasicMaterial({ color: 0xffb24a, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }); }));
+    trail.position.y = 0.46; grp.add(trail);
+    grp.userData = { rock: rock, aura: aura, trail: trail };
+    grp._pool = _meteorPool;
+    scene.add(grp);
+  } else grp.visible = true;
+  grp.quaternion.setFromUnitVectors(_fxUP, _fxN.copy(normal).normalize());
   return grp;
 }
 // Red impact telegraph: a disc+ring on the surface, scaled 0 → METEOR_MAX_RING over the fall so it
-// reaches full size right as the meteor lands. Built at unit radius; updateMeteors scales it.
+// reaches full size right as the meteor lands. Built at unit radius; updateMeteors scales it. Pooled.
+var _meteorRingPool = [];
 function makeMeteorRing(pos, normal){
-  var grp = new THREE.Group();
-  var disc = new THREE.Mesh(new THREE.CircleGeometry(1, 40), new THREE.MeshBasicMaterial({ color: 0xff1a1a, transparent: true, opacity: 0.2, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
-  var ring = new THREE.Mesh(new THREE.RingGeometry(0.9, 1.0, 44), new THREE.MeshBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
-  ring.position.z = 0.0006; grp.add(disc); grp.add(ring);
-  grp.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize());
-  grp.position.copy(pos).addScaledVector(normal, 0.006); grp.renderOrder = 4;
-  grp.userData = { disc: disc, ring: ring };
-  scene.add(grp);
+  var grp = _meteorRingPool.pop();
+  if(!grp){
+    grp = new THREE.Group();
+    var disc = new THREE.Mesh(fxShared('mrDisc', function(){ return new THREE.CircleGeometry(1, 40); }),
+      new THREE.MeshBasicMaterial({ color: 0xff1a1a, transparent: true, opacity: 0.2, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    var ring = new THREE.Mesh(fxShared('mrRing', function(){ return new THREE.RingGeometry(0.9, 1.0, 44); }),
+      new THREE.MeshBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    ring.position.z = 0.0006; grp.add(disc); grp.add(ring);
+    grp.renderOrder = 4;
+    grp.userData = { disc: disc, ring: ring };
+    grp._pool = _meteorRingPool;
+    scene.add(grp);
+  } else {
+    grp.userData.disc.material.opacity = 0.2; grp.userData.ring.material.opacity = 0.8;   // fresh-built values (updateMeteors re-drives them)
+    grp.scale.setScalar(1);
+    grp.visible = true;
+  }
+  grp.quaternion.setFromUnitVectors(_fxFWD, _fxN.copy(normal).normalize());
+  grp.position.copy(pos).addScaledVector(normal, 0.006);
   return grp;
 }
 // Host: pick an impact + fire a meteor; mirror it to a co-op guest (guest runs the visual/shake/damage
@@ -15699,17 +15762,29 @@ function _addMeteor(pos, normal, cluster, T){
   combat.meteors.push({ impact: pos.clone(), normal: normal.clone(), start: start, T: T, t: 0, cluster: cluster || [], mesh: mesh, ring: makeMeteorRing(pos, normal), impacted: false });
 }
 // Contour shockwave ring (lies flat on the impact facet → rolls across the surface) + a quick boom flash.
+// Both pooled — one fires per meteor impact, which is constant during the storm.
+var _shockPool = [], _boomPool = [];
 function spawnShockwave(pos, normal){
   if(!combat.shockwaves) combat.shockwaves = [];
-  var ring = new THREE.Mesh(new THREE.RingGeometry(0.86, 1.0, 48), new THREE.MeshBasicMaterial({ color: 0xffa347, transparent: true, opacity: 0.75, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
-  ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize());
-  ring.position.copy(pos).addScaledVector(normal, 0.012); ring.renderOrder = 4; scene.add(ring);
+  var ring = _shockPool.pop();
+  if(!ring){
+    ring = new THREE.Mesh(fxShared('swRing', function(){ return new THREE.RingGeometry(0.86, 1.0, 48); }),
+      new THREE.MeshBasicMaterial({ color: 0xffa347, transparent: true, opacity: 0.75, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    ring.renderOrder = 4; ring._pool = _shockPool; scene.add(ring);
+  } else { ring.material.opacity = 0.75; ring.scale.setScalar(1); ring.visible = true; }
+  ring.quaternion.setFromUnitVectors(_fxFWD, _fxN.copy(normal).normalize());
+  ring.position.copy(pos).addScaledVector(normal, 0.012);
   combat.shockwaves.push({ mesh: ring, kind: 'wave', pos: pos.clone(), t: 0, hitPlayer: false });
 }
 function spawnExplosion(pos, normal){
   if(!combat.shockwaves) combat.shockwaves = [];
-  var boom = new THREE.Mesh(new THREE.SphereGeometry(0.12, 14, 12), new THREE.MeshBasicMaterial({ color: 0xffb24a, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
-  boom.position.copy(pos).addScaledVector(normal, 0.04); boom.renderOrder = 5; scene.add(boom);
+  var boom = _boomPool.pop();
+  if(!boom){
+    boom = new THREE.Mesh(fxShared('boomGeo', function(){ return new THREE.SphereGeometry(0.12, 14, 12); }),
+      new THREE.MeshBasicMaterial({ color: 0xffb24a, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+    boom.renderOrder = 5; boom._pool = _boomPool; scene.add(boom);
+  } else { boom.material.opacity = 0.85; boom.scale.setScalar(1); boom.visible = true; }
+  boom.position.copy(pos).addScaledVector(normal, 0.04);
   combat.shockwaves.push({ mesh: boom, kind: 'boom', t: 0 });
 }
 // The moment a meteor lands: explosion + contour shockwave + proximity shake spike + direct hit if you
@@ -15740,15 +15815,15 @@ function spawnMeteorPayload(m){
 // Per-frame: fall the meteors, grow their rings, roll shockwaves, and drive the proximity camera shake.
 function updateMeteors(){
   if(!combat.shockwaves) combat.shockwaves = [];
-  var ship = gameMode.ship.position;
+  var ship = gameMode.ship.position, pnow = performance.now();
   var shake = (combat._impactShake = (combat._impactShake || 0) * 0.88);
+  var pulse = 0.5 + 0.5 * Math.sin(pnow * 0.02);   // same for every ring this frame (was recomputed per meteor)
   for(var i = combat.meteors.length - 1; i >= 0; i--){
     var m = combat.meteors[i]; m.t++;
     var pr = Math.min(1, m.t / m.T), fall = pr * pr;   // accelerating fall
     m.mesh.position.lerpVectors(m.start, m.impact, fall);
     if(m.mesh.userData.rock) m.mesh.userData.rock.material.emissiveIntensity = 1.3 + Math.random() * 0.6;
     m.ring.scale.setScalar(Math.max(0.001, METEOR_MAX_RING * pr));
-    var pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.02);
     m.ring.userData.ring.material.opacity = 0.5 + 0.4 * pulse + 0.3 * pr;
     m.ring.userData.disc.material.opacity = 0.12 + 0.2 * pr;
     if(pr > 0.35){ var d = ship.distanceTo(m.impact), prox = Math.max(0, 1 - d / METEOR_SHAKE_RANGE); shake = Math.max(shake, prox * pr * 0.13); }
@@ -15766,7 +15841,7 @@ function updateMeteors(){
   }
   if(typeof postQuad !== 'undefined' && postQuad && postQuad.material && postQuad.material.uniforms && postQuad.material.uniforms.shakeAmount){
     postQuad.material.uniforms.shakeAmount.value = Math.min(0.22, shake);
-    if(postQuad.material.uniforms.shakeTime) postQuad.material.uniforms.shakeTime.value = performance.now() * 0.06;
+    if(postQuad.material.uniforms.shakeTime) postQuad.material.uniforms.shakeTime.value = pnow * 0.06;
   }
 }
 // Boss phase entry: wipe the whole arena of regular enemies (+ their bullets + in-flight meteors) so
@@ -15833,12 +15908,13 @@ function bossAttack(bs){
     }
   }
 }
+var _bossV3 = new THREE.Vector3();
 function updateBoss(){
   var bs = combat.boss; if(!bs) return;
   if(bs.state === 'falling'){
     bs.t++;
     var pr = Math.min(1, bs.t / bs.T), fall = pr * pr;
-    bs.mesh.position.lerpVectors(bs.start, bs.pos.clone().addScaledVector(bs.normal, 0.35), fall);
+    bs.mesh.position.lerpVectors(bs.start, _bossV3.copy(bs.pos).addScaledVector(bs.normal, 0.35), fall);
     if(bs.ring){ bs.ring.scale.setScalar(Math.max(0.001, METEOR_MAX_RING * 2.4 * pr)); bs.ring.userData.ring.material.opacity = 0.6 + 0.4 * pr; }
     var d0 = gameMode.ship.position.distanceTo(bs.pos), prox0 = Math.max(0, 1 - d0 / (METEOR_SHAKE_RANGE * 1.6));
     combat._impactShake = Math.max(combat._impactShake || 0, prox0 * pr * 0.16);
@@ -16317,7 +16393,7 @@ function clearMap(){
 
 function disposeTank(tank){
   scene.remove(tank);
-  tank.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); });
+  tank.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material) c.material.dispose(); });
   if(tank.userData.hpBarEl) tank.userData.hpBarEl.remove();
   // Rolling balls are INDEPENDENT now — a tank dying no longer takes its balls with it. Region
   // clears (switchArena / clearCombat / resetDomeArena) wipe the balls separately via clearBalls().
@@ -16328,14 +16404,14 @@ function disposeTank(tank){
 var BALL_RADIUS = 0.06;          // bigger than the ship (~0.04)
 var BALL_SPEED = 0.0048;         // roll speed — slower than the ship so you can outrun/juke it
 var BALL_ACCEL = 0.00045;        // how fast it builds toward the player
-var BALL_HP = 70;
+var BALL_HP = 35;   // weaker base ball (was 70)
 var BALL_DMG = 10;
 var BALL_HIT_COOLDOWN = 650;     // ms between contact-damage ticks
 var BALLS_PER_TANK = 3;
 // Splitter: a full-size sphere bursts into BALL_SPLIT smaller spheres on death (the children chase
 // independently and die normally — no further split). BALL_MAX caps the live ball count so splits
 // can't run away across waves now that balls outlive their tanks.
-var BALL_SPLIT = 3, BALL_CHILD_SCALE = 0.55, BALL_CHILD_HP = 26, BALL_CHILD_SPEEDMUL = 1.5, BALL_MAX = 48;
+var BALL_SPLIT = 3, BALL_CHILD_SCALE = 0.55, BALL_CHILD_HP = 13, BALL_CHILD_SPEEDMUL = 1.5, BALL_MAX = 48;
 var BALL_HIT_MUL = 2.8;   // bullets vs balls: much bigger hit radius than the visual orb (easier to shoot both sizes)
 function buildBall(){
   if(!combat._ballGeo){
@@ -16359,9 +16435,9 @@ function addBall(pos, normal, gen, build, vel){
   if(child) mesh.scale.setScalar(r / BALL_RADIUS);     // shrink the shared-geo mesh to child size
   mesh.position.copy(pos).addScaledVector(n, r);
   if(build){ mesh.scale.setScalar(0.001); mesh.material.transparent = true; mesh.material.opacity = 0; }
-  // Floating health bar (same as tanks)
+  // Floating health bar (same as tanks; transform-positioned)
   var bar = document.createElement('div');
-  bar.style.cssText = 'position:fixed;z-index:55;width:54px;height:6px;margin-left:-27px;'
+  bar.style.cssText = 'position:fixed;left:0;top:0;z-index:55;width:54px;height:6px;margin-left:-27px;'
     + 'background:rgba(40,12,12,0.85);border:1px solid rgba(0,0,0,0.5);border-radius:3px;'
     + 'pointer-events:none;display:none;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.6);';
   var fill = document.createElement('div');
@@ -16402,14 +16478,15 @@ function disposeBall(b){
 // back within range. Simulation is host-only, so this is automatically co-op-correct (the guest just
 // mirrors the frozen positions) and keeps a big off-screen swarm from tanking the frame rate.
 var ENEMY_SIM_RANGE = 8.0, _ENEMY_SIM_R2 = ENEMY_SIM_RANGE * ENEMY_SIM_RANGE;
+var _ballAct = [];   // reused active-ball list (see updateBalls pass 1)
 function updateBalls(){
   if(!combat.balls.length || !gameMode.ship) return;
   var ship = gameMode.ship, now = performance.now(), balls = combat.balls;
   var inDome = gameMode.portal && gameMode.portal.inside;
   // ── Pass 1: build-up materialize OR steer toward the player + integrate ──
   // `act` = the near/active balls; the far ones freeze (LOD) and are skipped by all three passes —
-  // this also drops the O(n²) pass-2 collisions to O(active²).
-  var act = [];
+  // this also drops the O(n²) pass-2 collisions to O(active²). (Reused array — no per-frame alloc.)
+  var act = _ballAct; act.length = 0;
   for(var i = 0; i < balls.length; i++){
     var b = balls[i];
     if(b.building > 0){
@@ -16489,9 +16566,9 @@ function updateBalls(){
       if(bp.z > 1){ bk.hpBarEl.style.display = 'none'; }
       else {
         bk.hpBarEl.style.display = 'block';
-        bk.hpBarEl.style.left = ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
-        bk.hpBarEl.style.top = ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
-        bk.hpFillEl.style.width = Math.max(0, bk.hp / bk.maxHp * 100) + '%';
+        bk.hpBarEl.style.transform = 'translate(' + ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px,' + ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px)';
+        var bkw = Math.max(0, bk.hp / bk.maxHp * 100);
+        if(bk._wPct !== bkw){ bk._wPct = bkw; bk.hpFillEl.style.width = bkw + '%'; }   // width only changes on damage
       }
     }
   }
@@ -16557,18 +16634,23 @@ function spawnXPBurst(pos, normal, count){
   var xpVal = XP_ORB_VALUE * Math.sqrt(combatScaleForTime(combat.elapsed || 0));
   for(var i = 0; i < count; i++){
     if(combat.xpOrbs.length >= XP_MAX) break;
-    var mesh = new THREE.Mesh(combat._xpGeo, combat._xpMat);
+    // Recycle orb meshes (up to XP_MAX=700 can be live; a 30-orb burst per kill was scene-graph churn).
+    var mesh = _xpOrbPool.pop();
+    if(!mesh){
+      mesh = new THREE.Mesh(combat._xpGeo, combat._xpMat);
+      mesh.add(new THREE.Mesh(combat._xpGlowGeo, combat._xpGlowMat));
+      mesh.frustumCulled = false; mesh.renderOrder = 5;
+      mesh._pool = _xpOrbPool;
+      scene.add(mesh);
+    } else { mesh.scale.set(1, 1, 1); mesh.quaternion.identity(); mesh.visible = true; }   // clear any magnet stretch from its last life
     mesh.position.copy(pos);
-    var glow = new THREE.Mesh(combat._xpGlowGeo, combat._xpGlowMat);
-    mesh.add(glow);
-    mesh.frustumCulled = false; mesh.renderOrder = 5;
-    scene.add(mesh);
     var ang = Math.random() * Math.PI * 2, spd = 0.005 + Math.random() * 0.016;
     var vel = right.clone().multiplyScalar(Math.cos(ang) * spd).addScaledVector(fwd, Math.sin(ang) * spd).addScaledVector(n, 0.008 + Math.random() * 0.016);
     combat.xpOrbs.push({ mesh: mesh, vel: vel, normal: n.clone(), grounded: false, life: 0, maxLife: 1400, value: xpVal });
   }
 }
-function disposeXPOrb(o){ scene.remove(o.mesh); }   // all geo/mats are shared — nothing per-orb to free
+var _xpOrbPool = [], _heartMeshPool = [];
+function disposeXPOrb(o){ var m = o.mesh; if(m._pool){ m.visible = false; m._pool.push(m); } else scene.remove(m); }   // recycle (all geo/mats shared)
 // Shared heart-shaped geometry (a 2D heart Shape, extruded thin, centred + scaled to world size).
 function getHeartGeo(){
   if(combat._heartGeo) return combat._heartGeo;
@@ -16602,17 +16684,21 @@ function spawnHeartDrop(pos, normal){
   var right = new THREE.Vector3().crossVectors(n, t1).normalize();
   var fwd = new THREE.Vector3().crossVectors(right, n).normalize();
   for(var i = 0; i < 2; i++){
-    var mesh = new THREE.Mesh(geo, combat._heartMat);
+    var mesh = _heartMeshPool.pop();
+    if(!mesh){
+      mesh = new THREE.Mesh(geo, combat._heartMat);
+      var glow = new THREE.Mesh(geo, combat._heartGlowMat); glow.scale.setScalar(1.8); mesh.add(glow);
+      mesh.frustumCulled = false; mesh.renderOrder = 6;
+      mesh._pool = _heartMeshPool;
+      scene.add(mesh);
+    } else { mesh.quaternion.identity(); mesh.visible = true; }   // reset the twirl from its last life
     mesh.position.copy(pos);
-    var glow = new THREE.Mesh(geo, combat._heartGlowMat); glow.scale.setScalar(1.8); mesh.add(glow);
-    mesh.frustumCulled = false; mesh.renderOrder = 6;
-    scene.add(mesh);
     var ang = (i === 0 ? -0.5 : 0.5) + (Math.random() - 0.5) * 0.4, spd = 0.006 + Math.random() * 0.012;
     var vel = right.clone().multiplyScalar(Math.cos(ang) * spd).addScaledVector(fwd, Math.sin(ang) * spd).addScaledVector(n, 0.012 + Math.random() * 0.014);
     combat.xpOrbs.push({ mesh: mesh, vel: vel, normal: n.clone(), grounded: false, life: 0, maxLife: 2400, heart: true, r: HEART_R });
   }
 }
-var _xpLook = new THREE.Vector3();
+var _xpLook = new THREE.Vector3(), _xpTmp = new THREE.Vector3();
 // Fly out → fall to the floor → settle (bob) → magnet to the player (stretching toward them) → collect.
 function updateXPOrbs(){
   if(!combat.xpOrbs.length || !gameMode.ship) return;
@@ -16632,7 +16718,7 @@ function updateXPOrbs(){
     var magnet = (o.heart ? HEART_MAGNET : XP_MAGNET) * (1 + skillFx.xpRange);   // XP Magnet: +1× pickup range per stack
     if(d < magnet){
       // Smoothly suck toward the player. XP orbs STRETCH into a comet streak; hearts keep their shape.
-      var dir = ship.position.clone().sub(o.mesh.position); if(dir.lengthSq() > 1e-9) dir.normalize();
+      var dir = _xpTmp.copy(ship.position).sub(o.mesh.position); if(dir.lengthSq() > 1e-9) dir.normalize();
       var str = 1 - d / magnet;                          // 0 at the edge → 1 at the player
       o.mesh.position.addScaledVector(dir, XP_MAGNET_SPEED * (0.4 + str));
       o.grounded = false;
@@ -16648,7 +16734,7 @@ function updateXPOrbs(){
         o.mesh.position.add(o.vel);
         var cp = inDome ? closestPointOnDome(o.mesh.position) : closestPointOnCrystal(o.mesh.position);
         if(cp){
-          var h = o.mesh.position.clone().sub(cp.point).dot(cp.normal);
+          var h = _xpTmp.copy(o.mesh.position).sub(cp.point).dot(cp.normal);
           if(h <= orbR + 0.003){ o.normal.copy(cp.normal).normalize(); o.mesh.position.copy(cp.point).addScaledVector(o.normal, orbR); o.vel.set(0, 0, 0); o.grounded = true; }
         }
       } else {
@@ -16666,6 +16752,7 @@ function disposeDeadMesh(mesh, isBall){
   mesh.traverse(function(c){
     if(c.material) c.material.dispose();
     if(c.geometry){
+      if(c.geometry._shared) return;  // shared across all instances (fxShared) — never dispose
       if(isBall && (c.geometry === combat._ballGeo || c.geometry === combat._ballEdgeGeo)) return;  // shared
       c.geometry.dispose();
     }
@@ -16675,6 +16762,13 @@ function startDeath(mesh, normal, xpCount, isBall, hpBarEl){
   if(hpBarEl) hpBarEl.remove();
   combat.dying.push({ mesh: mesh, normal: normal.clone(), t: 0, max: DEATH_FRAMES, xp: xpCount, isBall: isBall,
     basePos: mesh.position.clone(), baseScale: mesh.scale.clone() });
+}
+var _dyingF = 0;   // hoisted traverse callback (was a fresh closure per dying enemy per frame)
+function _dyingGlowCb(c){
+  if(c.material){
+    if(c.material.emissive){ c.material.emissive.copy(_xpYellow); c.material.emissiveIntensity = 0.5 + _dyingF * 5; }
+    if(c.material.color){ c.material.color.lerp(_xpYellow, 0.25); }
+  }
 }
 function updateDying(){
   for(var i = combat.dying.length - 1; i >= 0; i--){
@@ -16686,12 +16780,8 @@ function updateDying(){
     dn.mesh.position.x += (Math.random() - 0.5) * amp;
     dn.mesh.position.y += (Math.random() - 0.5) * amp;
     dn.mesh.position.z += (Math.random() - 0.5) * amp;
-    dn.mesh.traverse(function(c){                                        // glow bright yellow
-      if(c.material){
-        if(c.material.emissive){ c.material.emissive.copy(_xpYellow); c.material.emissiveIntensity = 0.5 + f * 5; }
-        if(c.material.color){ c.material.color.lerp(_xpYellow, 0.25); }
-      }
-    });
+    _dyingF = f;
+    dn.mesh.traverse(_dyingGlowCb);                                      // glow bright yellow
     dn.mesh.scale.copy(dn.baseScale).multiplyScalar(1 + f * 0.5);        // swell
     if(dn.t >= dn.max){                                                  // EXPLODE → XP shards
       spawnXPBurst(dn.basePos, dn.normal, dn.xp);
@@ -16831,10 +16921,10 @@ function disposeEnemyBullet(b){
 // bars, are lockable + shootable, and shatter into XP on death. Region-agnostic (crystal/dome/sandbox).
 // NOTE: host-authoritative — in co-op these currently render on the host's screen only (no MP mirror yet).
 // ══════════════════════════════════════════════
-var WASP_HP = 90, WASP_R = 0.05, WASP_ALT = 0.28, WASP_ORBIT_R = 0.7, WASP_SPEED = 0.012,
+var WASP_HP = 45, WASP_R = 0.05, WASP_ALT = 0.28, WASP_ORBIT_R = 0.7, WASP_SPEED = 0.012,
     WASP_FIRE = 26, WASP_SHOT_SPD = 0.045, WASP_SHOT_DMG = 6, WASP_DIVE_EVERY = 300, WASP_DIVE_FRAMES = 40;
 var MORTAR_RANGE = 4.2, _MORTAR_RANGE2 = MORTAR_RANGE * MORTAR_RANGE;   // lobber only fires within this range (was effectively unlimited)
-var MORTAR_HP = 180, MORTAR_R = 0.08, MORTAR_FIRE = 140, MORTAR_GRAV = 0.0006, MORTAR_FLIGHT = 70,
+var MORTAR_HP = 90, MORTAR_R = 0.08, MORTAR_FIRE = 140, MORTAR_GRAV = 0.0006, MORTAR_FLIGHT = 70,
     MORTAR_PUDDLE_R = 0.16, MORTAR_PUDDLE_FRAMES = 160, MORTAR_PUDDLE_DMG = 5;
 var FOE_BUILD_FRAMES = 48;
 // Wasp two-phase: phase 1 it FLIES tethered by an energy beam to a ground apparatus (the shootable
@@ -16844,23 +16934,28 @@ var WASP_NODE_HP = 60, WASP_NODE_R = 0.06, WASP_TETHER_MAX = 1.35, WASP_GROUND_S
 var WASP_HIT_R = 0.11;   // bullet hitbox for the wasp BODY — generous vs its small visual (WASP_R), so the fast skittering phase-2 wasp is hittable
 var WASP_ZAP_R = 0.5, WASP_ZAP_INTERVAL = 16, WASP_ZAP_DMG = 2, WASP_ZAP_DMG_MAX = 9;   // apparatus arcs to a nearby player → progressive damage-over-time
 var _foeV3 = new THREE.Vector3();
+// Scratch objects for the per-frame foe AI (wasps used to allocate ~6 vectors + a Matrix4 each frame).
+var _foeN = new THREE.Vector3(), _foeFlat = new THREE.Vector3(), _foeVel = new THREE.Vector3(),
+    _foeTan = new THREE.Vector3(), _foeTmp = new THREE.Vector3(), _foeM4 = new THREE.Matrix4();
 
 // Shared "energy" material for the wasp's tether beam + wings — additive glow, flickered per frame.
 function waspEnergyMat(){
   return new THREE.MeshBasicMaterial({ color: WASP_ENERGY_COLOR, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
 }
 function buildWasp(){
+  // Geometry shared across all wasps (never mutated); materials per-wasp (death glow / tint / fade).
   var g = new THREE.Group();
   var bodyMat = new THREE.MeshStandardMaterial({ color: 0x7a3b6b, roughness: 0.45, metalness: 0.4, emissive: 0x3a1430, emissiveIntensity: 0.6 });
-  var body = new THREE.Mesh(new THREE.OctahedronGeometry(WASP_R, 0), bodyMat);
+  var bodyGeo = fxShared('wsBody', function(){ return new THREE.OctahedronGeometry(WASP_R, 0); });
+  var body = new THREE.Mesh(bodyGeo, bodyMat);
   body.scale.set(1, 0.7, 1.5); g.add(body);
-  var edge = new THREE.LineSegments(new THREE.EdgesGeometry(body.geometry), new THREE.LineBasicMaterial({ color: 0xff7ad0, transparent: true, opacity: 0.85 }));
+  var edge = new THREE.LineSegments(fxShared('wsEdge', function(){ return new THREE.EdgesGeometry(bodyGeo); }), new THREE.LineBasicMaterial({ color: 0xff7ad0, transparent: true, opacity: 0.85 }));
   edge.scale.copy(body.scale); g.add(edge);
   // Energy wings (same material as the beam), each hinged at the body root so they can FLAP violently.
   var wings = [];
   for(var sgn = -1; sgn <= 1; sgn += 2){
     var pivot = new THREE.Group();
-    var w = new THREE.Mesh(new THREE.PlaneGeometry(WASP_R * 2.0, WASP_R * 1.1), waspEnergyMat());
+    var w = new THREE.Mesh(fxShared('wsWing', function(){ return new THREE.PlaneGeometry(WASP_R * 2.0, WASP_R * 1.1); }), waspEnergyMat());
     w.position.set(sgn * WASP_R * 1.0, 0, 0);   // wing extends outward from the hinge
     pivot.add(w); pivot.userData.sgn = sgn;
     g.add(pivot); wings.push(pivot);
@@ -16874,9 +16969,10 @@ function buildWasp(){
 function buildWaspNode(){
   var g = new THREE.Group();
   var baseMat = new THREE.MeshStandardMaterial({ color: 0x4a2a44, roughness: 0.5, metalness: 0.5, emissive: 0x2a1024, emissiveIntensity: 0.6 });
-  var base = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.06, 0.05, 6), baseMat); base.position.y = 0.025; g.add(base);
-  var edge = new THREE.LineSegments(new THREE.EdgesGeometry(base.geometry), new THREE.LineBasicMaterial({ color: 0xff7ad0, transparent: true, opacity: 0.8 })); edge.position.copy(base.position); g.add(edge);
-  var core = new THREE.Mesh(new THREE.OctahedronGeometry(0.03, 0), waspEnergyMat()); core.position.y = 0.07; g.add(core);
+  var baseGeo = fxShared('wnBase', function(){ return new THREE.CylinderGeometry(0.035, 0.06, 0.05, 6); });
+  var base = new THREE.Mesh(baseGeo, baseMat); base.position.y = 0.025; g.add(base);
+  var edge = new THREE.LineSegments(fxShared('wnEdge', function(){ return new THREE.EdgesGeometry(baseGeo); }), new THREE.LineBasicMaterial({ color: 0xff7ad0, transparent: true, opacity: 0.8 })); edge.position.copy(base.position); g.add(edge);
+  var core = new THREE.Mesh(fxShared('wnCore', function(){ return new THREE.OctahedronGeometry(0.03, 0); }), waspEnergyMat()); core.position.y = 0.07; g.add(core);
   var glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: WASP_ENERGY_COLOR, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
   glow.scale.set(0.16, 0.16, 1); glow.position.y = 0.07; g.add(glow);
   g.userData.core = core;
@@ -16885,11 +16981,20 @@ function buildWaspNode(){
 // ── Lightning-bolt primitives (shared by the tether + all of the apparatus's arc effects) ──
 // One bolt = a Line whose points get re-jittered into a fresh jagged path each frame. Hidden until
 // first filled (so it never flashes a stray dot at the origin) and can be flickered on/off.
+var _boltPools = {};   // pooled per point-count: wasps spawn/die constantly in the storm, each with ~15 bolts
 function buildBolt(n){
+  var pool = _boltPools[n] || (_boltPools[n] = []);
+  var line = pool.pop();
+  if(line){   // reset to fresh-built state (electric FX recolor recycled bolts)
+    line.material.color.setHex(WASP_ENERGY_COLOR); line.material.opacity = 0.9;
+    line.visible = false;   // stays hidden until first filled, exactly like a fresh bolt
+    return line;
+  }
   var geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
-  var line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: WASP_ENERGY_COLOR, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
+  line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: WASP_ENERGY_COLOR, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
   line.frustumCulled = false; line.renderOrder = 5; line.userData.N = n; line.visible = false;
+  line._pool = pool;
   scene.add(line);
   return line;
 }
@@ -16927,7 +17032,7 @@ function buildWaspNodeFx(){
   function set(c){ var arr = []; for(var i = 0; i < c; i++) arr.push(buildBolt(13)); return arr; }
   return { tether: set(lf ? 3 : 6), up: set(lf ? 1 : 3), ground: set(lf ? 1 : 3), zap: set(lf ? 2 : 3) };
 }
-function disposeBoltSet(arr){ if(!arr) return; for(var i = 0; i < arr.length; i++){ var l = arr[i]; scene.remove(l); l.geometry.dispose(); l.material.dispose(); } }
+function disposeBoltSet(arr){ if(!arr) return; for(var i = 0; i < arr.length; i++){ var l = arr[i]; l.visible = false; l._pool.push(l); } }   // recycle (kept in scene, hidden)
 function disposeWaspNodeFx(fx){ if(!fx) return; disposeBoltSet(fx.tether); disposeBoltSet(fx.up); disposeBoltSet(fx.ground); disposeBoltSet(fx.zap); }
 var _fxCore = new THREE.Vector3(), _fxTan = new THREE.Vector3(), _fxA = new THREE.Vector3(), _fxB = new THREE.Vector3();
 // Drive every apparatus arc each frame — all randomized + surface-adaptive (visuals only; the host
@@ -16979,18 +17084,19 @@ function buildMortar(){
   var g = new THREE.Group();
   var baseMat = new THREE.MeshStandardMaterial({ color: 0x6a4a2a, roughness: 0.6, metalness: 0.35, emissive: 0x2a1808, emissiveIntensity: 0.5 });
   var darkMat = new THREE.MeshStandardMaterial({ color: 0x3a2a18, roughness: 0.7, metalness: 0.4 });
-  var base = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.085, 0.045, 8), baseMat); base.position.y = 0.022; g.add(base);
-  var edge = new THREE.LineSegments(new THREE.EdgesGeometry(base.geometry), new THREE.LineBasicMaterial({ color: 0xffaa55, transparent: true, opacity: 0.7 })); edge.position.copy(base.position); g.add(edge);
-  var barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.044, 0.1, 10), darkMat);
+  var baseGeo = fxShared('moBase', function(){ return new THREE.CylinderGeometry(0.06, 0.085, 0.045, 8); });
+  var base = new THREE.Mesh(baseGeo, baseMat); base.position.y = 0.022; g.add(base);
+  var edge = new THREE.LineSegments(fxShared('moEdge', function(){ return new THREE.EdgesGeometry(baseGeo); }), new THREE.LineBasicMaterial({ color: 0xffaa55, transparent: true, opacity: 0.7 })); edge.position.copy(base.position); g.add(edge);
+  var barrel = new THREE.Mesh(fxShared('moBarrel', function(){ return new THREE.CylinderGeometry(0.032, 0.044, 0.1, 10); }), darkMat);
   barrel.position.set(0, 0.07, 0.01); barrel.rotation.x = 0.5; g.add(barrel);
-  var muzzle = new THREE.Mesh(new THREE.RingGeometry(0.02, 0.05, 14), new THREE.MeshBasicMaterial({ color: 0xff6622, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  var muzzle = new THREE.Mesh(fxShared('moMuzzle', function(){ return new THREE.RingGeometry(0.02, 0.05, 14); }), new THREE.MeshBasicMaterial({ color: 0xff6622, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
   muzzle.position.set(0, 0.108, 0.052); muzzle.rotation.x = 0.5; g.add(muzzle);
   g.userData.muzzle = muzzle;
   return g;
 }
 function _foeBar(){
   var bar = document.createElement('div');
-  bar.style.cssText = 'position:fixed;z-index:55;width:60px;height:6px;margin-left:-30px;'
+  bar.style.cssText = 'position:fixed;left:0;top:0;z-index:55;width:60px;height:6px;margin-left:-30px;'
     + 'background:rgba(40,12,12,0.85);border:1px solid rgba(0,0,0,0.5);border-radius:3px;'
     + 'pointer-events:none;display:none;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.6);';
   var fill = document.createElement('div');
@@ -17038,15 +17144,15 @@ function addFoe(kind, pos, normal, build){
 }
 // Tear down a wasp's phase-1 extras (apparatus mesh + its bar, the tether beam, the energy wings).
 function disposeWaspExtras(f){
-  if(f.appMesh){ scene.remove(f.appMesh); f.appMesh.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); }); f.appMesh = null; }
+  if(f.appMesh){ scene.remove(f.appMesh); f.appMesh.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material) c.material.dispose(); }); f.appMesh = null; }
   if(f.appBarEl){ f.appBarEl.remove(); f.appBarEl = null; }
   if(f.appFx){ disposeWaspNodeFx(f.appFx); f.appFx = null; }
-  if(f.wings){ for(var i = 0; i < f.wings.length; i++){ var wp = f.wings[i]; if(wp.parent) wp.parent.remove(wp); wp.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); }); } f.wings = null; }
+  if(f.wings){ for(var i = 0; i < f.wings.length; i++){ var wp = f.wings[i]; if(wp.parent) wp.parent.remove(wp); wp.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material) c.material.dispose(); }); } f.wings = null; }
 }
 function disposeFoe(f){
   disposeWaspExtras(f);
   scene.remove(f.mesh);
-  f.mesh.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); });
+  f.mesh.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material) c.material.dispose(); });
   if(f.hpBarEl) f.hpBarEl.remove();
 }
 function clearFoes(){ for(var i = 0; i < combat.foes.length; i++) disposeFoe(combat.foes[i]); combat.foes.length = 0; }
@@ -17089,14 +17195,19 @@ function spawnMortarShell(pos, vel, normal, floorH, target){
     grav: MORTAR_GRAV, gravAxis: normal.clone(), floorH: floorH, puddleOnLand: true, marker: marker });
 }
 // Burning ground puddle (mortar area-denial): ticks damage to any player standing in it, then fades.
+var _puddlePool = [];
 function spawnPuddle(pos, normal){
   var n = normal.clone(); if(n.lengthSq() < 1e-6) n.set(0, 1, 0); n.normalize();
-  var mat = new THREE.MeshBasicMaterial({ map: getCombatGlowTex(), color: 0xff5522, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
-  var mesh = new THREE.Mesh(new THREE.PlaneGeometry(MORTAR_PUDDLE_R * 2, MORTAR_PUDDLE_R * 2), mat);
-  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+  var mesh = _puddlePool.pop();
+  if(!mesh){
+    var mat = new THREE.MeshBasicMaterial({ map: getCombatGlowTex(), color: 0xff5522, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+    mesh = new THREE.Mesh(fxShared('puddleGeo', function(){ return new THREE.PlaneGeometry(MORTAR_PUDDLE_R * 2, MORTAR_PUDDLE_R * 2); }), mat);
+    mesh.frustumCulled = false; mesh.renderOrder = 4;
+    mesh._pool = _puddlePool;
+    scene.add(mesh);
+  } else { mesh.material.opacity = 0.7; mesh.scale.setScalar(1); mesh.visible = true; }
+  mesh.quaternion.setFromUnitVectors(_fxFWD, n);
   mesh.position.copy(pos).addScaledVector(n, 0.004);
-  mesh.frustumCulled = false; mesh.renderOrder = 4;
-  scene.add(mesh);
   combat.puddles.push({ mesh: mesh, pos: pos.clone(), normal: n, life: 0, max: MORTAR_PUDDLE_FRAMES, r: MORTAR_PUDDLE_R });
 }
 function updatePuddles(){
@@ -17109,11 +17220,16 @@ function updatePuddles(){
       if(gameMode.ship.position.distanceToSquared(pu.pos) < pu.r * pu.r) hurtPlayer(MORTAR_PUDDLE_DMG, pu.pos);
       if(MP.isHost && MP.connected && MP.remote.ship && MP.remote.ship.visible && MP.remote.ship.position.distanceToSquared(pu.pos) < pu.r * pu.r) mpHurtGuest(MORTAR_PUDDLE_DMG);
     }
-    if(pu.life >= pu.max){ scene.remove(pu.mesh); pu.mesh.geometry.dispose(); pu.mesh.material.dispose(); combat.puddles.splice(i, 1); }
+    if(pu.life >= pu.max){ disposeRing(pu.mesh); combat.puddles.splice(i, 1); }   // pooled → hidden + recycled
   }
 }
-function clearPuddles(){ for(var i = 0; i < combat.puddles.length; i++){ scene.remove(combat.puddles[i].mesh); combat.puddles[i].mesh.geometry.dispose(); combat.puddles[i].mesh.material.dispose(); } combat.puddles.length = 0; }
+function clearPuddles(){ for(var i = 0; i < combat.puddles.length; i++) disposeRing(combat.puddles[i].mesh); combat.puddles.length = 0; }
 
+// Hoisted build-fade traverse callbacks (shared by the tank + foe materialize loops — they used to
+// allocate a fresh closure per building enemy per frame).
+var _fadeOp = 1;
+function _fadeCb(c){ if(c.isMesh && c.material) c.material.opacity = _fadeOp; }
+function _fadeDoneCb(c){ if(c.isMesh && c.material){ c.material.opacity = 1; c.material.transparent = false; } }
 // Per-frame foe AI + floating HP bars + puddle aging. Tanks/balls are untouched by this.
 function updateFoes(){
   if(!combat.foes.length){ updatePuddles(); return; }
@@ -17124,11 +17240,11 @@ function updateFoes(){
     if(f.building > 0){
       f.building--; var be = 1 - f.building / f.buildMax; be = be * be * (3 - 2 * be);
       f.mesh.scale.setScalar(Math.max(0.001, be));
-      f.mesh.traverse(function(c){ if(c.isMesh && c.material) c.material.opacity = be; });
+      _fadeOp = be; f.mesh.traverse(_fadeCb);
       if(f.appMesh) f.appMesh.scale.setScalar(Math.max(0.001, be));
       if(f.hpBarEl) f.hpBarEl.style.display = 'none';
       if(f.appBarEl) f.appBarEl.style.display = 'none';
-      if(f.building === 0){ f.mesh.scale.setScalar(1); f.mesh.traverse(function(c){ if(c.isMesh && c.material){ c.material.opacity = 1; c.material.transparent = false; } }); if(f.appMesh) f.appMesh.scale.setScalar(1); f.lastShot = now; }
+      if(f.building === 0){ f.mesh.scale.setScalar(1); f.mesh.traverse(_fadeDoneCb); if(f.appMesh) f.appMesh.scale.setScalar(1); f.lastShot = now; }
       continue;
     }
     var np = mpNearestPlayer(f.position);
@@ -17144,9 +17260,9 @@ function updateFoes(){
         if(bp.z > 1){ f.hpBarEl.style.display = 'none'; }
         else {
           f.hpBarEl.style.display = 'block';
-          f.hpBarEl.style.left = ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
-          f.hpBarEl.style.top = ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
-          f.hpFillEl.style.width = Math.max(0, f.hp / f.maxHp * 100) + '%';
+          f.hpBarEl.style.transform = 'translate(' + ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px,' + ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px)';
+          var fw = Math.max(0, f.hp / f.maxHp * 100);
+          if(f._wPct !== fw){ f._wPct = fw; f.hpFillEl.style.width = fw + '%'; }
         }
       }
     }
@@ -17167,33 +17283,33 @@ function updateWasp(f, np, now, inDome){
 // tether beam + apparatus core pulse + the apparatus HP bar (the only thing you can damage now).
 function updateWaspFlying(f, np, now, inDome){
   var cp = inDome ? closestPointOnDome(f.position) : closestPointOnCrystal(f.position);
-  var n = cp ? cp.normal.clone().normalize() : f.normal.clone();
+  var n = cp ? _foeN.copy(cp.normal).normalize() : _foeN.copy(f.normal);
   f.normal.copy(n);
-  var surf = cp ? cp.point : f.position.clone().addScaledVector(n, -WASP_ALT);
+  var surf = cp ? cp.point : _foeFlat.copy(f.position).addScaledVector(n, -WASP_ALT);   // consumed at curAlt below, before _foeFlat is reused
   f.diveCd--; if(f.diveCd <= 0 && f.diveT <= 0){ f.diveT = WASP_DIVE_FRAMES; f.diveCd = WASP_DIVE_EVERY * (0.6 + Math.random() * 0.8); }
   var diving = f.diveT > 0; if(diving) f.diveT--;
   var toShip = _foeV3.copy(np.pos).sub(f.position);
-  var flat = toShip.clone().addScaledVector(n, -toShip.dot(n));
-  var dist = flat.length();
-  var vel = new THREE.Vector3();
+  var vel = _foeVel.set(0, 0, 0);
   var spd = (diving ? WASP_SPEED * 1.8 : WASP_SPEED) * (f.slowMul || 1);   // Ice slow
+  f.bob += 0.12;
+  var curAlt = _foeTmp.copy(f.position).sub(surf).dot(n);
+  var flat = _foeFlat.copy(toShip).addScaledVector(n, -toShip.dot(n));
+  var dist = flat.length();
   if(dist > 1e-4){
     var dirH = flat.multiplyScalar(1 / dist);
-    var tangent = new THREE.Vector3().crossVectors(n, dirH).multiplyScalar(f.orbitDir);
+    var tangent = _foeTan.crossVectors(n, dirH).multiplyScalar(f.orbitDir);
     vel.addScaledVector(tangent, spd);
     var radialErr = dist - (diving ? WASP_ORBIT_R * 0.4 : WASP_ORBIT_R);
     vel.addScaledVector(dirH, Math.max(-spd, Math.min(spd, radialErr * 0.08)));
   }
-  f.bob += 0.12;
-  var curAlt = f.position.clone().sub(surf).dot(n);
   var altErr = (diving ? WASP_ALT * 0.35 : WASP_ALT) + Math.sin(f.bob) * 0.02 - curAlt;
   f.position.add(vel).addScaledVector(n, Math.max(-0.025, Math.min(0.025, altErr * 0.15)));
   // Tether leash — the wasp can't stray past WASP_TETHER_MAX from its apparatus.
   if(f.appPos){
-    var toApp = f.position.clone().sub(f.appPos); var dA = toApp.length();
+    var toApp = _foeTmp.copy(f.position).sub(f.appPos); var dA = toApp.length();
     if(dA > WASP_TETHER_MAX) f.position.copy(f.appPos).addScaledVector(toApp.multiplyScalar(1 / dA), WASP_TETHER_MAX);
   }
-  f.mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().lookAt(f.position, np.pos, n));
+  f.mesh.quaternion.setFromRotationMatrix(_foeM4.lookAt(f.position, np.pos, n));
   // Apparatus core spin + tether beam (lightning) + apparatus HP bar (the phase-1 target).
   if(f.appMesh){
     if(f.appMesh.userData.core) f.appMesh.userData.core.rotation.y += 0.15;
@@ -17215,9 +17331,9 @@ function updateWaspFlying(f, np, now, inDome){
       if(ap.z > 1){ f.appBarEl.style.display = 'none'; }
       else {
         f.appBarEl.style.display = 'block';
-        f.appBarEl.style.left = ((ap.x * 0.5 + 0.5) * window.innerWidth) + 'px';
-        f.appBarEl.style.top = ((-ap.y * 0.5 + 0.5) * window.innerHeight) + 'px';
-        f.appFillEl.style.width = Math.max(0, f.appHp / f.appMaxHp * 100) + '%';
+        f.appBarEl.style.transform = 'translate(' + ((ap.x * 0.5 + 0.5) * window.innerWidth) + 'px,' + ((-ap.y * 0.5 + 0.5) * window.innerHeight) + 'px)';
+        var aw = Math.max(0, f.appHp / f.appMaxHp * 100);
+        if(f._appWPct !== aw){ f._appWPct = aw; f.appFillEl.style.width = aw + '%'; }
       }
     }
   }
@@ -17245,7 +17361,7 @@ function waspHopDir(f, np, n){
 // the pre-move closest point was cancelling the motion, which is why it used to just sit there.)
 function updateWaspGrounded(f, np, now, inDome){
   var cp0 = inDome ? closestPointOnDome(f.position) : closestPointOnCrystal(f.position);
-  var n = cp0 ? cp0.normal.clone().normalize() : f.normal.clone();
+  var n = cp0 ? _foeN.copy(cp0.normal).normalize() : _foeN.copy(f.normal);
   f.normal.copy(n);
   // ── multi-hop burst → long rest skitter ──
   if(f.skitterT === undefined){ f.skitterT = 0; f.skittering = false; f.hopsLeft = 0; }
@@ -17255,18 +17371,18 @@ function updateWaspGrounded(f, np, now, inDome){
     } else if(f.skittering){                        // burst finished → long freeze
       f.skittering = false; f.skitterT = 30 + Math.floor(Math.random() * 36);   // ~0.5–1.1s rest
     } else {                                        // rested → start a new burst
-      var toShipD = new THREE.Vector3().subVectors(np.pos, f.position);
+      var toShipD = _foeTmp.subVectors(np.pos, f.position);
       var farD = toShipD.addScaledVector(n, -toShipD.dot(n)).length() > WASP_ORBIT_R * 1.4;
       f.skittering = true; f.hopsLeft = (farD ? 3 : 2) - 1;   // first hop now + 1 (or 2 when far) queued
       f.skitterDir = waspHopDir(f, np, n); f.skitterT = 9 + Math.floor(Math.random() * 9);
     }
   }
   if(f.skittering && f.skitterDir){
-    var d = f.skitterDir.clone().addScaledVector(n, -f.skitterDir.dot(n));   // re-project onto the live tangent
+    var d = _foeTan.copy(f.skitterDir).addScaledVector(n, -f.skitterDir.dot(n));   // re-project onto the live tangent
     if(d.lengthSq() > 1e-9){
       d.normalize(); f.skitterDir.copy(d);
       f.position.addScaledVector(d, WASP_GROUND_SPEED * (f.slowMul || 1));   // Ice slow
-      f.mesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().lookAt(f.position, f.position.clone().add(d), n));
+      f.mesh.quaternion.setFromRotationMatrix(_foeM4.lookAt(f.position, _foeTmp.copy(f.position).add(d), n));
     }
   }
   // grip to the surface UNDER THE NEW position (recompute post-move — this is the actual fix)
@@ -17377,12 +17493,15 @@ function updateSpiralAttack(tank, d){
 // (hits scale with bullets × enemies, so the old churn was a layout-thrash source). Visuals
 // are identical — the same text/colour/size is just re-applied to a recycled element.
 var _dmgPool = [], _dmgV3 = new THREE.Vector3(), _barV3 = new THREE.Vector3(), _ballV3 = new THREE.Vector3();
+// Tank-AI scratch objects + constant axes (the per-tank loop used to allocate vectors/quaternions each frame).
+var _tkAim = new THREE.Vector3(), _tkFlat = new THREE.Vector3(), _tkQ2 = new THREE.Quaternion(),
+    _AXIS_Z = new THREE.Vector3(0, 0, 1), _AXIS_Y = new THREE.Vector3(0, 1, 0);
 function spawnDamageNumber(worldPos, amount, isCrit){
   var rec = null;
   for(var i = 0; i < _dmgPool.length; i++){ if(!_dmgPool[i]._active){ rec = _dmgPool[i]; break; } }
   if(!rec){
     var el = document.createElement('div');
-    el.style.cssText = 'position:fixed;pointer-events:none;z-index:60;font-family:Arial,sans-serif;font-weight:bold;white-space:nowrap;';
+    el.style.cssText = 'position:fixed;left:0;top:0;pointer-events:none;z-index:60;font-family:Arial,sans-serif;font-weight:bold;white-space:nowrap;';
     document.body.appendChild(el);
     rec = { el: el, _active: false, worldPos: new THREE.Vector3(), startTime: 0, offsetY: 0 };
     _dmgPool.push(rec);
@@ -17408,8 +17527,7 @@ function updateDamageNumbers(){
     var x = (p.x * 0.5 + 0.5) * window.innerWidth;
     var y = (-p.y * 0.5 + 0.5) * window.innerHeight;
     dn.offsetY += 0.7;
-    dn.el.style.left = x + 'px';
-    dn.el.style.top = (y - dn.offsetY) + 'px';
+    dn.el.style.transform = 'translate(' + x + 'px,' + (y - dn.offsetY) + 'px)';   // compositor-only (no layout)
     dn.el.style.opacity = (p.z > 1) ? 0 : (1 - elapsed / dur);
   }
 }
@@ -17762,7 +17880,7 @@ function updateCombat(dt){
   else if(combat.arena !== arena) switchArena(arena);
 
   // Dome wave arena (touch floor → 5 → 10 → 20 → 40 → …)
-  if(arena === 'dome') updateDomeArena();
+  if(arena === 'dome' && !MP.pvp.active) updateDomeArena();   // PvP owns the arena — no meteors/enemies while brawling
 
   // If the locked target vanished (killed / arena switch), re-lock the nearest remaining target.
   relock();   // in lock-on mode, re-acquire the nearest target if the locked one died/vanished
@@ -17888,10 +18006,10 @@ function updateCombat(dt){
       d.building--;
       var bfe = 1 - d.building / d.buildMax; bfe = bfe * bfe * (3 - 2 * bfe);
       tank.scale.set(TANK_SCALE, TANK_SCALE * Math.max(0.001, bfe), TANK_SCALE);
-      tank.traverse(function(c){ if(c.isMesh && c.material){ c.material.opacity = bfe; } });
+      _fadeOp = bfe; tank.traverse(_fadeCb);
       if(d.building === 0){
         tank.scale.setScalar(TANK_SCALE);
-        tank.traverse(function(c){ if(c.isMesh && c.material){ c.material.opacity = 1; c.material.transparent = false; } });
+        tank.traverse(_fadeDoneCb);
         d.lastShot = performance.now();   // brief beat before it opens fire
       }
       if(d.hpBarEl) d.hpBarEl.style.display = 'none';
@@ -17929,7 +18047,7 @@ function updateCombat(dt){
     if(!inSpiral){
     // Player direction in the tank's LOCAL frame (cannon pivots live in this frame)
     var localAim = null;
-    var aimWorld = tnp.pos.clone().sub(tank.position);
+    var aimWorld = _tkAim.copy(tnp.pos).sub(tank.position);
     if(aimWorld.lengthSq() > 1e-9){
       localAim = aimWorld.normalize().applyQuaternion(tank.getWorldQuaternion(_q).invert());
       if(localAim.lengthSq() > 1e-9) localAim.normalize(); else localAim = null;
@@ -17937,7 +18055,7 @@ function updateCombat(dt){
     // Pick the cannon whose axis (its rest +Z) best faces the player, by the yaw-plane direction
     var cannons = d.cannons, active = cannons[0];
     if(localAim){
-      var flat = new THREE.Vector3(localAim.x, 0, localAim.z);
+      var flat = _tkFlat.set(localAim.x, 0, localAim.z);
       if(flat.lengthSq() > 1e-9){
         flat.normalize();
         var bestDot = -Infinity;
@@ -17959,12 +18077,12 @@ function updateCombat(dt){
         // so the barrel visually points where the shell will actually go.
         var aimL = localAim, leadW = enemyLeadDir(tank.position, tnp);
         if(leadW){
-          var lw = leadW.applyQuaternion(tank.getWorldQuaternion(new THREE.Quaternion()).invert());
+          var lw = leadW.applyQuaternion(tank.getWorldQuaternion(_tkQ2).invert());
           if(lw.lengthSq() > 1e-9) aimL = lw.normalize();
         }
-        cn.pivot.quaternion.slerp(_q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), aimL), 0.3);
+        cn.pivot.quaternion.slerp(_q.setFromUnitVectors(_AXIS_Z, aimL), 0.3);
       } else {
-        cn.pivot.quaternion.slerp(_q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), cn.baseAngle), 0.2);
+        cn.pivot.quaternion.slerp(_q.setFromAxisAngle(_AXIS_Y, cn.baseAngle), 0.2);
       }
       if(cn !== active){ cn.ring.material.opacity = 0; cn.ring.scale.setScalar(1); }   // only active ring glows
     }
@@ -17991,9 +18109,9 @@ function updateCombat(dt){
       if(bp.z > 1){ d.hpBarEl.style.display = 'none'; }
       else {
         d.hpBarEl.style.display = 'block';
-        d.hpBarEl.style.left = ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
-        d.hpBarEl.style.top = ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
-        d.hpFillEl.style.width = Math.max(0, d.hp / d.maxHp * 100) + '%';
+        d.hpBarEl.style.transform = 'translate(' + ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px,' + ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px)';
+        var tw = Math.max(0, d.hp / d.maxHp * 100);
+        if(d._wPct !== tw){ d._wPct = tw; d.hpFillEl.style.width = tw + '%'; }
       }
     }
   }
@@ -18042,8 +18160,14 @@ function updateCombat(dt){
     if(p.life >= p.maxLife){ disposeEnemyBullet(p); combat.enemyBullets.splice(pj, 1); }
   }
 
+  // Co-op: BOTH players dead → don't wait for a revive; drop straight into the 3-round PvP arena.
+  if(MP.connected && MP.isHost && !MP.pvp.active && combat.player.dead && MP.guestHp <= 0) mpStartPvp();
+  // PvP arena: run the rounds + player-vs-player bullet damage (host authoritative).
+  if(MP.pvp.active){
+    mpPvpTick(now, dt);
+  }
   // Player death → co-op downed/revive-orb (MP) OR quick auto-revive (single-player)
-  if(combat.player.dead){
+  else if(combat.player.dead){
     if(mpReviveActive()){
       mpUpdateOwnDowned(now, dt);   // 30s downed window; partner standing in the orb revives you
     } else if(now - combat.player.deadT > 1900){
@@ -18065,28 +18189,37 @@ function updateCombat(dt){
       }
     }
   }
-  mpHostGuestDeathCheck(now, dt);   // co-op: the host revives the downed guest from its revive orb
+  if(!MP.pvp.active) mpHostGuestDeathCheck(now, dt);   // co-op: the host revives the downed guest from its revive orb (skipped during PvP)
 
-  // HUD
+  // HUD — every write is change-gated so an unchanged frame costs a string compare, not a DOM
+  // mutation (textContent/width writes were re-laying-out the page every frame).
   showCombatHUD(true);
-  combat.hpFillEl.style.width = Math.max(0, combat.player.hp / combat.player.maxHp * 100) + '%';
-  combat.hpFillEl.style.background = combat.player.hp / combat.player.maxHp > 0.3
+  var _hpW = Math.max(0, combat.player.hp / combat.player.maxHp * 100) + '%';
+  if(combat._hpWCache !== _hpW){ combat._hpWCache = _hpW; combat.hpFillEl.style.width = _hpW; }
+  var _hpBg = combat.player.hp / combat.player.maxHp > 0.3
     ? 'linear-gradient(90deg,#48e07a,#2fae5c)' : 'linear-gradient(90deg,#ff6a4a,#cc3333)';
+  if(combat._hpBgCache !== _hpBg){ combat._hpBgCache = _hpBg; combat.hpFillEl.style.background = _hpBg; }
   if(combat.waveEl){
-    if(combat.arenaActive){
-      combat.waveEl.style.display = 'block';
+    var _wtxt = null;
+    if(MP.pvp.active){
+      _wtxt = 'PVP · ROUND ' + MP.pvp.round + '/' + MP.pvp.maxRounds + '  ·  YOU ' + MP.pvp.myScore + ' : ' + MP.pvp.theirScore + ' RIVAL' + (MP.pvp.roundOver ? '  —  ROUND OVER' : '');
+    } else if(combat.arenaActive){
       var _sec = Math.max(0, Math.floor(GAME_RUN_SECONDS - combat.elapsed));
       var _clock = ((_sec / 60) | 0) + ':' + (_sec % 60 < 10 ? '0' : '') + (_sec % 60);
       var _cnt = combat.enemies.length + combat.foes.length + combat.balls.length;
-      if(combat._victory) combat.waveEl.textContent = '★ THE CORE DESTROYED ★';
-      else if(combat.bossActive) combat.waveEl.textContent = combat.boss ? ('◈ THE CORE ◈  ·  ' + Math.max(0, Math.ceil(combat.boss.hp / combat.boss.maxHp * 100)) + '%') : '◈ THE CORE ◈';
-      else if(combat.ballRush) combat.waveEl.textContent = 'BALL RUSH  ·  ' + _clock;
-      else combat.waveEl.textContent = _clock + '  ·  ' + _cnt + ' ENEMIES';
+      if(combat._victory) _wtxt = '★ THE CORE DESTROYED ★';
+      else if(combat.bossActive) _wtxt = combat.boss ? ('◈ THE CORE ◈  ·  ' + Math.max(0, Math.ceil(combat.boss.hp / combat.boss.maxHp * 100)) + '%') : '◈ THE CORE ◈';
+      else if(combat.ballRush) _wtxt = 'BALL RUSH  ·  ' + _clock;
+      else _wtxt = _clock + '  ·  ' + _cnt + ' ENEMIES';
       // TEMP DIAGNOSTIC — remove once the arena/meteors are confirmed working.
-      combat.waveEl.textContent += combat._arenaErr ? (' | ERR: ' + combat._arenaErr)
+      _wtxt += combat._arenaErr ? (' | ERR: ' + combat._arenaErr)
         : (' | b:' + (combat.bodies ? combat.bodies.length : 0) + ' m:' + (combat.meteors ? combat.meteors.length : 0) + ' t:' + combat.meteorTimer);
+    }
+    if(_wtxt === null){
+      combat.waveEl.style.display = 'none'; combat._waveTxtCache = null;
     } else {
-      combat.waveEl.style.display = 'none';
+      combat.waveEl.style.display = 'block';
+      if(combat._waveTxtCache !== _wtxt){ combat._waveTxtCache = _wtxt; combat.waveEl.textContent = _wtxt; }   // textContent (relayout) only when the string changes
     }
   }
 
@@ -18757,7 +18890,7 @@ function checkGameLanded(){
   gameMode._wasAir = air;
 }
 // Ground Stomp shockwave — AoE damage to tanks + balls, scaled by air time, plus an expanding ring.
-var gameStompRings = [];
+var gameStompRings = [], _stompRingPool = [], _daisyRingPool = [], _dfirePool = [];
 function gameStompExplosion(pos, normal, airTime){
   var t = Math.min(airTime / 120, 1);
   var radius = 0.16 + t * 0.34;
@@ -18779,13 +18912,17 @@ function gameStompExplosion(pos, normal, airTime){
       if(bk.hp <= 0){ killBall(bk); relock(); }
     }
   }
-  // expanding additive ring billboarded to the surface normal
-  var ring = new THREE.Mesh(new THREE.RingGeometry(0.7, 1.0, 28),
-    new THREE.MeshBasicMaterial({ color: 0xffd27a, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  // expanding additive ring billboarded to the surface normal (pooled)
+  var ring = _stompRingPool.pop();
+  if(!ring){
+    ring = new THREE.Mesh(fxShared('stompRing', function(){ return new THREE.RingGeometry(0.7, 1.0, 28); }),
+      new THREE.MeshBasicMaterial({ color: 0xffd27a, transparent: true, opacity: 0.9, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    ring.frustumCulled = false; ring.renderOrder = 6;
+    ring._pool = _stompRingPool;
+    scene.add(ring);
+  } else { ring.material.opacity = 0.9; ring.scale.setScalar(1); ring.visible = true; }
   ring.position.copy(pos).addScaledVector(normal, 0.01);
-  ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
-  ring.frustumCulled = false; ring.renderOrder = 6;
-  scene.add(ring);
+  ring.quaternion.setFromUnitVectors(_fxFWD, normal);
   gameStompRings.push({ mesh: ring, t: 0, max: 22, radius: radius });
   if(combat.flashEl){ combat.hurtFlash = Math.min(0.5, combat.hurtFlash + 0.0); }   // no hurt flash; placeholder
   sfxEnemyDies(pos);
@@ -18796,10 +18933,10 @@ function updateStompRings(){
     var f = r.t / r.max;
     r.mesh.scale.setScalar(r.radius * (0.3 + f * 1.5) / 1.0);
     r.mesh.material.opacity = (1 - f) * 0.9;
-    if(r.t >= r.max){ scene.remove(r.mesh); r.mesh.geometry.dispose(); r.mesh.material.dispose(); gameStompRings.splice(i, 1); }
+    if(r.t >= r.max){ disposeRing(r.mesh); gameStompRings.splice(i, 1); }   // pooled → recycled
   }
 }
-function clearStompRings(){ for(var i = 0; i < gameStompRings.length; i++){ scene.remove(gameStompRings[i].mesh); gameStompRings[i].mesh.geometry.dispose(); gameStompRings[i].mesh.material.dispose(); } gameStompRings.length = 0; }
+function clearStompRings(){ for(var i = 0; i < gameStompRings.length; i++) disposeRing(gameStompRings[i].mesh); gameStompRings.length = 0; }   // pooled (both stomp + daisy rings)
 
 // ── Level-up skill picker (card UI) + pause ──────────────────────────────────────────
 var skillMenu = { open: false, choices: [], el: null, _built: false };
@@ -19243,16 +19380,53 @@ function createTaperedTubeGeometry(curve, segments, startRadius, endRadius, radi
   g.setIndex(indices);
   return g;
 }
+// In-place tube update: each beam keeps ONE preallocated max-size geometry per tube (fixed index
+// layout, drawRange trimmed to the live segment count) and the tapered-tube vertices are written
+// straight into its buffers each frame. Exactly the same vertex math as createTaperedTubeGeometry —
+// just without the per-frame geometry dispose + rebuild + GPU re-upload the old version did.
+var BEAM_TUBE_MAX_SEGS = 96, BEAM_TUBE_RADIAL = 8, _btPt = new THREE.Vector3();
+function _beamMakeTubeMesh(mat, order){
+  var g = new THREE.BufferGeometry();
+  var vcount = (BEAM_TUBE_MAX_SEGS + 1) * (BEAM_TUBE_RADIAL + 1);
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vcount * 3), 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(vcount * 3), 3));
+  var indices = [];
+  for(var s = 0; s < BEAM_TUBE_MAX_SEGS; s++){ for(var k = 0; k < BEAM_TUBE_RADIAL; k++){
+    var a = s * (BEAM_TUBE_RADIAL + 1) + k, b = (s + 1) * (BEAM_TUBE_RADIAL + 1) + k, c = (s + 1) * (BEAM_TUBE_RADIAL + 1) + k + 1, e = s * (BEAM_TUBE_RADIAL + 1) + k + 1;
+    indices.push(a, b, e); indices.push(b, c, e); } }
+  g.setIndex(indices);
+  var m = new THREE.Mesh(g, mat);
+  m.frustumCulled = false; m.renderOrder = order;
+  scene.add(m);
+  return m;
+}
+function _beamWriteTube(mesh, curve, segments, startRadius, endRadius){
+  var frames = curve.computeFrenetFrames(segments, false);
+  var posA = mesh.geometry.attributes.position, norA = mesh.geometry.attributes.normal;
+  var pa = posA.array, na = norA.array, w = 0;
+  for(var i = 0; i <= segments; i++){
+    var t = i / segments, point = curve.getPointAt(t, _btPt), N = frames.normals[i], B = frames.binormals[i];
+    var radius = startRadius + (endRadius - startRadius) * Math.min(t * 4, 1);
+    for(var j = 0; j <= BEAM_TUBE_RADIAL; j++){
+      var v = j / BEAM_TUBE_RADIAL * Math.PI * 2, sin = Math.sin(v), cos = Math.cos(v);
+      var nx = cos * N.x + sin * B.x, ny = cos * N.y + sin * B.y, nz = cos * N.z + sin * B.z;
+      var nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+      pa[w] = point.x + radius * nx; na[w] = nx; w++;
+      pa[w] = point.y + radius * ny; na[w] = ny; w++;
+      pa[w] = point.z + radius * nz; na[w] = nz; w++;
+    }
+  }
+  posA.needsUpdate = true; norA.needsUpdate = true;
+  mesh.geometry.setDrawRange(0, segments * BEAM_TUBE_RADIAL * 6);
+}
 function updateBeamTube(bm){
   if(bm.hist.length < 2) return;
-  if(bm.tube){ scene.remove(bm.tube); bm.tube.geometry.dispose(); }
-  if(bm.glow){ scene.remove(bm.glow); bm.glow.geometry.dispose(); }
   var curve = new THREE.CatmullRomCurve3(bm.hist, false, 'catmullrom', 0.5);
-  var segs = Math.min(bm.hist.length * 4, 96), sc = bm.scale;
-  bm.tube = new THREE.Mesh(createTaperedTubeGeometry(curve, segs, 0.006 * sc, 0.02 * sc, 8), bm.coreMat);
-  bm.tube.frustumCulled = false; bm.tube.renderOrder = 5; scene.add(bm.tube);
-  bm.glow = new THREE.Mesh(createTaperedTubeGeometry(curve, segs, 0.018 * sc, 0.055 * sc, 8), bm.glowMat);
-  bm.glow.frustumCulled = false; bm.glow.renderOrder = 4; scene.add(bm.glow);
+  var segs = Math.min(bm.hist.length * 4, BEAM_TUBE_MAX_SEGS), sc = bm.scale;
+  if(!bm.tube) bm.tube = _beamMakeTubeMesh(bm.coreMat, 5);
+  if(!bm.glow) bm.glow = _beamMakeTubeMesh(bm.glowMat, 4);
+  _beamWriteTube(bm.tube, curve, segs, 0.006 * sc, 0.02 * sc);
+  _beamWriteTube(bm.glow, curve, segs, 0.018 * sc, 0.055 * sc);
 }
 // Point→segment squared distance (swept collision along the beam head's per-frame travel a→b).
 function _distSqToSeg(p, a, b){
@@ -19288,6 +19462,7 @@ function beamApplyHits(bm, a, b){
   }
 }
 function beamSplit(bm, atPos){ if(bm.split > 0) spawnSplitChildren({ dmg: bm.dmg * 0.6, big: false, homing: false, split: bm.split, vel: bm.vel }, atPos.clone()); }
+var _beamPrev = new THREE.Vector3();
 function updateBeams(){
   // charge glow off unless actively charging this frame
   if(!skillFx.beam || performance.now() - (combat._beamLast || 0) > 60) hideBeamChargeFx();
@@ -19298,7 +19473,7 @@ function updateBeams(){
     var bm = combatBeams[i];
     if(bm.phase === 'travel'){
       // travel STRAIGHT (no auto-tracking), grow the trail, pierce via swept collision
-      var prev = bm.head.position.clone();
+      var prev = _beamPrev.copy(bm.head.position);
       bm.head.position.add(bm.vel); bm.traveled += bm.speed;
       bm.hist.push(bm.head.position.clone()); if(bm.hist.length > BEAM_MAX_HIST) bm.hist.shift();
       if(!guest) beamApplyHits(bm, prev, bm.head.position);   // swept: a fast beam won't tunnel past enemies
@@ -19440,7 +19615,7 @@ function updateSkillBullets(){
       if(o.phase === 'seek'){
         var tg = nearestGameEnemy(b.mesh.position, 0.32);
         if(tg){ o.target = tg.ref; o.kind = tg.kind; o.center = tg.pos; o.phase = 'orbit'; o.ttl = 36 + o.stacks * 8;
-          var rel = b.mesh.position.clone().sub(o.center); o.angle = Math.atan2(rel.dot(new THREE.Vector3().crossVectors(up, gameMode.surfaceState.forward)), rel.dot(gameMode.surfaceState.forward)); }
+          var rel = _skRel.copy(b.mesh.position).sub(o.center); o.angle = Math.atan2(rel.dot(_skCross.crossVectors(up, gameMode.surfaceState.forward)), rel.dot(gameMode.surfaceState.forward)); }
       } else if(o.phase === 'orbit'){
         var alive = (o.kind === 'tank') ? combat.enemies.indexOf(o.target) >= 0 : combat.balls.indexOf(o.target) >= 0;
         if(!alive){ o.phase = 'seek'; o.target = null; }
@@ -19448,8 +19623,8 @@ function updateSkillBullets(){
           o.center = (o.kind === 'tank') ? o.target.position : o.target.mesh.position;
           var rad = 0.05 * (1 + 0.5 * o.stacks);
           o.angle += 0.22 * (1 + 0.4 * o.stacks);
-          var tA = gameMode.surfaceState.forward.clone(); tA.sub(up.clone().multiplyScalar(tA.dot(up))); if(tA.lengthSq() < 1e-9) tA.set(1, 0, 0); tA.normalize();
-          var tB = new THREE.Vector3().crossVectors(up, tA).normalize();
+          var tA = _skRel.copy(gameMode.surfaceState.forward); tA.addScaledVector(up, -tA.dot(up)); if(tA.lengthSq() < 1e-9) tA.set(1, 0, 0); tA.normalize();
+          var tB = _skCross.crossVectors(up, tA).normalize();
           b.mesh.position.copy(o.center).addScaledVector(tA, Math.cos(o.angle) * rad).addScaledVector(tB, Math.sin(o.angle) * rad).addScaledVector(up, 0.01);
           if(--o.ttl <= 0){ o.phase = 'strike'; b.vel.copy(o.center).sub(b.mesh.position); if(b.vel.lengthSq() > 1e-9) b.vel.setLength(0.16); }
           continue;   // orbiting → skip straight-line move this frame
@@ -19469,6 +19644,7 @@ function updateSkillBullets(){
 
 // ── Orbiting companions: drones (auto-fire) + spinning orbs (ram), with the Electric Net link ──
 var companions = { drones: [], orbs: [], net: null, netGeo: null, _frame: 0 };
+var _cmpA = new THREE.Vector3(), _cmpB = new THREE.Vector3(), _skRel = new THREE.Vector3(), _skCross = new THREE.Vector3();
 function makeCompanionMesh(color, r){
   var g = new THREE.Group();
   var core = new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8), new THREE.MeshBasicMaterial({ color: color }));
@@ -19505,8 +19681,8 @@ function updateCompanions(){
   if(!gameMode.ship || (companions.drones.length === 0 && companions.orbs.length === 0)) return;
   companions._frame++;
   var ship = gameMode.ship, up = gameMode.surfaceState.groundNormal;
-  var tA = gameMode.surfaceState.forward.clone(); tA.sub(up.clone().multiplyScalar(tA.dot(up))); if(tA.lengthSq() < 1e-9) tA.set(1, 0, 0); tA.normalize();
-  var tB = new THREE.Vector3().crossVectors(up, tA).normalize();
+  var tA = _cmpA.copy(gameMode.surfaceState.forward); tA.addScaledVector(up, -tA.dot(up)); if(tA.lengthSq() < 1e-9) tA.set(1, 0, 0); tA.normalize();
+  var tB = _cmpB.crossVectors(up, tA).normalize();
   var ts = skillFx.timeScale;
   // drones: orbit one way, auto-fire at the nearest enemy
   var dN = companions.drones.length;
@@ -19609,11 +19785,16 @@ function gameDaisyExplosion(pos){
     var bk = combat.balls[b]; if(bk.building > 0) continue;
     if(bk.mesh.position.distanceTo(pos) < radius + bk.r){ bk.hp -= dmg; combat.totalDamage += dmg; if(bk.hp <= 0){ killBall(bk); relock(); } }
   }
-  var ring = new THREE.Mesh(new THREE.RingGeometry(0.6, 1.0, 24),
-    new THREE.MeshBasicMaterial({ color: 0xffaa33, transparent: true, opacity: 0.95, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  var ring = _daisyRingPool.pop();
+  if(!ring){
+    ring = new THREE.Mesh(fxShared('daisyRing', function(){ return new THREE.RingGeometry(0.6, 1.0, 24); }),
+      new THREE.MeshBasicMaterial({ color: 0xffaa33, transparent: true, opacity: 0.95, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    ring.frustumCulled = false; ring.renderOrder = 6;
+    ring._pool = _daisyRingPool;
+    scene.add(ring);
+  } else { ring.material.opacity = 0.95; ring.scale.setScalar(1); ring.visible = true; }
   ring.position.copy(pos).addScaledVector(gameMode.surfaceState.groundNormal, 0.01);
-  ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), gameMode.surfaceState.groundNormal);
-  ring.frustumCulled = false; ring.renderOrder = 6; scene.add(ring);
+  ring.quaternion.setFromUnitVectors(_fxFWD, gameMode.surfaceState.groundNormal);
   gameStompRings.push({ mesh: ring, t: 0, max: 18, radius: radius });
   sfxEnemyDies(pos);
 }
@@ -19637,11 +19818,16 @@ function updateDriftFire(){
   var s = gameMode.surfaceState;
   if(skillFx.driftFire && s.isDrifting && gameMode.ship){
     if(driftFire.segs.length < 220 && companions._frame % 2 === 0){
-      var mat = new THREE.MeshBasicMaterial({ map: getCombatGlowTex(), color: 0xff7722, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
-      var q = new THREE.Mesh(new THREE.PlaneGeometry(0.05, 0.05), mat);
+      var q = _dfirePool.pop();   // pooled — up to 220 live, spawned every other frame while drifting
+      if(!q){
+        var mat = new THREE.MeshBasicMaterial({ map: getCombatGlowTex(), color: 0xff7722, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+        q = new THREE.Mesh(fxShared('dfireGeo', function(){ return new THREE.PlaneGeometry(0.05, 0.05); }), mat);
+        q.frustumCulled = false; q.renderOrder = 4;
+        q._pool = _dfirePool;
+        scene.add(q);
+      } else { q.material.opacity = 0.85; q.scale.setScalar(1); q.visible = true; }
       q.position.copy(gameMode.ship.position).addScaledVector(s.groundNormal, 0.004);
-      q.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), s.groundNormal);
-      q.frustumCulled = false; q.renderOrder = 4; scene.add(q);
+      q.quaternion.setFromUnitVectors(_fxFWD, s.groundNormal);
       driftFire.segs.push({ mesh: q, pos: q.position.clone(), life: 0, max: 420 });   // ~7s at 60fps
     }
   }
@@ -19661,10 +19847,10 @@ function updateDriftFire(){
         if(bk.mesh.position.distanceTo(fseg.pos) < 0.05 + bk.r){ bk.hp -= 5; combat.totalDamage += 5; if(bk.hp <= 0){ killBall(bk); relock(); } }
       }
     }
-    if(fseg.life >= fseg.max){ scene.remove(fseg.mesh); fseg.mesh.geometry.dispose(); fseg.mesh.material.dispose(); driftFire.segs.splice(i, 1); }
+    if(fseg.life >= fseg.max){ disposeRing(fseg.mesh); driftFire.segs.splice(i, 1); }   // pooled → recycled
   }
 }
-function clearDriftFire(){ for(var i = 0; i < driftFire.segs.length; i++){ scene.remove(driftFire.segs[i].mesh); driftFire.segs[i].mesh.geometry.dispose(); driftFire.segs[i].mesh.material.dispose(); } driftFire.segs.length = 0; }
+function clearDriftFire(){ for(var i = 0; i < driftFire.segs.length; i++) disposeRing(driftFire.segs[i].mesh); driftFire.segs.length = 0; }
 
 // Drift Focus slow-mo: ease combat timeScale toward 0.5^stacks while drifting, 1 otherwise.
 function updateDriftFocus(){
@@ -19882,6 +20068,9 @@ function mpOnData(data){
   else if(data.type === 'xpcollect'){ if(MP.isHost) addXP(data.a); }                                  // guest collected an orb → into the shared pool
   else if(data.type === 'xppool'){ if(mpIsGuest()){ xpState.current = data.cur; xpState.level = data.lvl; updateXPHud(); } }   // sync the shared XP bar
   else if(data.type === 'levelup'){ if(mpIsGuest()) gameSkills.pending += data.n; }                    // shared pool leveled → guest picks at the same time
+  else if(data.type === 'pvprespawn'){ if(mpIsGuest()) mpGuestPvpRespawn(data); }   // enter/advance the PvP arena → revive + reposition
+  else if(data.type === 'pvpstate'){ if(mpIsGuest()){ MP.pvp.round = data.r; MP.pvp.myScore = data.b; MP.pvp.theirScore = data.a; MP.pvp.roundOver = !!data.o; } }   // HUD sync (scores swapped to guest perspective)
+  else if(data.type === 'pvpend'){ if(mpIsGuest()) mpGuestPvpEnd(data); }           // PvP over → back to the co-op run
 }
 function mpApplyRespawn(d){
   var ship = gameMode.ship; if(!ship) return;
@@ -20194,6 +20383,11 @@ function mpShowCode(code){ if(mpLobby.codeEl){ mpLobby.codeEl.textContent = code
 // host applies enemy damage to the guest too. So every enemy + bullet is identical on both screens.
 // ══════════════════════════════════════════════
 MP.world = null; MP.lastWorldSend = 0; MP.worldRate = 50;   // ~20Hz world snapshots
+// Co-op PvP arena: when BOTH players die, instead of waiting for a revive they drop into a
+// best-of-3 player-vs-player brawl (skill loadouts kept). Host-authoritative: host owns rounds,
+// scores + bullet-vs-player damage; the guest mirrors and is told when to (re)spawn.
+// myScore/theirScore are HOST-perspective (my = host, their = guest); the guest swaps them for its HUD.
+MP.pvp = { active: false, round: 0, myScore: 0, theirScore: 0, roundOver: false, roundEndT: 0, maxRounds: 3 };
 MP.mirror = { e: {}, b: {}, eb: {}, pb: {}, fo: {}, pu: {} };   // netId → mesh (guest): tanks, balls, enemy/player bullets, foes (wasp/mortar), puddles
 MP.guestHp = 100;                                           // host's authoritative copy of the guest's HP
 function mpIsGuest(){ return MP.connected && !MP.isHost; }
@@ -20269,7 +20463,7 @@ function mpMirrorFoe(kind){
 function mpMirrorPuddle(normal){
   var n = normal.clone(); if(n.lengthSq() < 1e-6) n.set(0, 1, 0); n.normalize();
   var mat = new THREE.MeshBasicMaterial({ map: getCombatGlowTex(), color: 0xff5522, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
-  var mesh = new THREE.Mesh(new THREE.PlaneGeometry(MORTAR_PUDDLE_R * 2, MORTAR_PUDDLE_R * 2), mat);
+  var mesh = new THREE.Mesh(fxShared('puddleGeo', function(){ return new THREE.PlaneGeometry(MORTAR_PUDDLE_R * 2, MORTAR_PUDDLE_R * 2); }), mat);
   mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
   mesh.frustumCulled = false; mesh.renderOrder = 4;
   scene.add(mesh); return mesh;
@@ -20278,10 +20472,10 @@ function mpMirrorPuddle(normal){
 // on phase 2, or when the mirror is removed.
 function mpShedWaspMirror(m){
   var u = m.userData;
-  if(u.appMesh){ scene.remove(u.appMesh); u.appMesh.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); }); u.appMesh = null; }
+  if(u.appMesh){ scene.remove(u.appMesh); u.appMesh.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material) c.material.dispose(); }); u.appMesh = null; }
   if(u.appFx){ disposeWaspNodeFx(u.appFx); u.appFx = null; }
   if(u.appBarEl){ u.appBarEl.remove(); u.appBarEl = null; }
-  if(u.wings){ for(var i = 0; i < u.wings.length; i++){ var wp = u.wings[i]; if(wp.parent) wp.parent.remove(wp); wp.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); }); } u.wings = null; }
+  if(u.wings){ for(var i = 0; i < u.wings.length; i++){ var wp = u.wings[i]; if(wp.parent) wp.parent.remove(wp); wp.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material) c.material.dispose(); }); } u.wings = null; }
 }
 // ── Guest: reconcile mirrors from a snapshot (create / update-target / remove) ──
 function mpApplyWorld(w){
@@ -20297,7 +20491,7 @@ function mpApplyWorld(w){
     m.userData.normal = new THREE.Vector3(row[11], row[12], row[13]);
     m.scale.setScalar(TANK_SCALE * (row[10] > 0 ? 0.4 : 1));   // shrunk while building
   }
-  for(id in MP.mirror.e){ if(!seenE[id]){ var tk = MP.mirror.e[id]; if(tk.userData.hpBarEl) tk.userData.hpBarEl.remove(); scene.remove(tk); tk.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); }); delete MP.mirror.e[id]; } }
+  for(id in MP.mirror.e){ if(!seenE[id]){ var tk = MP.mirror.e[id]; if(tk.userData.hpBarEl) tk.userData.hpBarEl.remove(); scene.remove(tk); tk.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material) c.material.dispose(); }); delete MP.mirror.e[id]; } }
   // balls
   for(i = 0; i < w.b.length; i++){ row = w.b[i]; id = row[0]; seenB[id] = 1;
     m = MP.mirror.b[id];
@@ -20356,7 +20550,7 @@ function mpApplyWorld(w){
       }
     }
   }
-  for(id in MP.mirror.fo){ if(!seenFo[id]){ var fm = MP.mirror.fo[id]; mpShedWaspMirror(fm); if(fm.userData.hpBarEl) fm.userData.hpBarEl.remove(); scene.remove(fm); fm.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material) c.material.dispose(); }); delete MP.mirror.fo[id]; } }
+  for(id in MP.mirror.fo){ if(!seenFo[id]){ var fm = MP.mirror.fo[id]; mpShedWaspMirror(fm); if(fm.userData.hpBarEl) fm.userData.hpBarEl.remove(); scene.remove(fm); fm.traverse(function(c){ if(c.geometry && !c.geometry._shared) c.geometry.dispose(); if(c.material) c.material.dispose(); }); delete MP.mirror.fo[id]; } }
   // burning puddles (visual; host owns the damage)
   var seenPu = {}, wpu = w.pu || [];
   for(i = 0; i < wpu.length; i++){ row = wpu[i]; id = row[0]; seenPu[id] = 1;
@@ -20367,7 +20561,7 @@ function mpApplyWorld(w){
     m.material.opacity = (1 - pf) * 0.7;
     m.scale.setScalar(1 + pf * 0.3);
   }
-  for(id in MP.mirror.pu){ if(!seenPu[id]){ scene.remove(MP.mirror.pu[id]); MP.mirror.pu[id].geometry.dispose(); MP.mirror.pu[id].material.dispose(); delete MP.mirror.pu[id]; } }
+  for(id in MP.mirror.pu){ if(!seenPu[id]){ scene.remove(MP.mirror.pu[id]); MP.mirror.pu[id].material.dispose(); delete MP.mirror.pu[id]; } }   // geometry is shared (fxShared) — never dispose
   // HUD: reflect the host's authoritative HP + wave state
   combat.player.hp = w.h2;
   combat.arenaActive = w.w.a === 1; combat.elapsed = w.w.el || 0; combat.ballRush = w.w.br === 1; combat.bossActive = w.w.bo === 1;
@@ -20422,7 +20616,7 @@ function mpClearWorld(){
 // Floating red HP bar (DOM) for a guest mirror tank — matches the host's enemy bars.
 function mpMakeBar(){
   var bar = document.createElement('div');
-  bar.style.cssText = 'position:fixed;z-index:55;width:70px;height:7px;margin-left:-35px;'
+  bar.style.cssText = 'position:fixed;left:0;top:0;z-index:55;width:70px;height:7px;margin-left:-35px;'
     + 'background:rgba(40,12,12,0.85);border:1px solid rgba(0,0,0,0.5);border-radius:3px;'
     + 'pointer-events:none;display:none;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.6);';
   var fill = document.createElement('div');
@@ -20435,13 +20629,13 @@ function mpUpdateMirrorBars(){
     for(var id in map){
       var t = map[id], u = t.userData; if(!u.hpBarEl) continue;
       if(u.phase === 1 && u.appMesh){ u.hpBarEl.style.display = 'none'; continue; }   // phase-1 wasp shows its apparatus bar instead
-      var n = u.normal || new THREE.Vector3(0, 1, 0);
+      var n = u.normal || _AXIS_Y;
       var bp = _barV3.copy(t.position).addScaledVector(n, u.topOffset || defOff).project(camera);
       if(bp.z > 1){ u.hpBarEl.style.display = 'none'; continue; }
       u.hpBarEl.style.display = 'block';
-      u.hpBarEl.style.left = ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px';
-      u.hpBarEl.style.top = ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px';
-      u.hpFillEl.style.width = Math.max(0, u.hp / u.maxHp * 100) + '%';
+      u.hpBarEl.style.transform = 'translate(' + ((bp.x * 0.5 + 0.5) * window.innerWidth) + 'px,' + ((-bp.y * 0.5 + 0.5) * window.innerHeight) + 'px)';
+      var uw = Math.max(0, u.hp / u.maxHp * 100);
+      if(u._wPct !== uw){ u._wPct = uw; u.hpFillEl.style.width = uw + '%'; }
     }
   }
   bars(MP.mirror.e, 0.16);    // mirror tanks
@@ -20466,10 +20660,16 @@ function mpGuestCombat(dt){
   updateXPOrbs();         // the guest's own (client-side) XP orbs magnet + collect → forwarded to the shared pool
   updateDamageNumbers();
   // reflect HP bar + damage counter + wave banner from the latest snapshot
-  if(combat.hpFillEl){ combat.hpFillEl.style.width = Math.max(0, combat.player.hp / combat.player.maxHp * 100) + '%';
-    combat.hpFillEl.style.background = combat.player.hp / combat.player.maxHp > 0.3 ? 'linear-gradient(90deg,#48e07a,#2fae5c)' : 'linear-gradient(90deg,#ff6a4a,#cc3333)'; }
+  if(combat.hpFillEl){
+    var _ghw = Math.max(0, combat.player.hp / combat.player.maxHp * 100) + '%';
+    if(combat._hpWCache !== _ghw){ combat._hpWCache = _ghw; combat.hpFillEl.style.width = _ghw; }
+    var _ghbg = combat.player.hp / combat.player.maxHp > 0.3 ? 'linear-gradient(90deg,#48e07a,#2fae5c)' : 'linear-gradient(90deg,#ff6a4a,#cc3333)';
+    if(combat._hpBgCache !== _ghbg){ combat._hpBgCache = _ghbg; combat.hpFillEl.style.background = _ghbg; }
+  }
   if(combat.waveEl){
-    if(combat.arenaActive){ combat.waveEl.style.display = 'block';
+    if(MP.pvp.active){ combat.waveEl.style.display = 'block';
+      combat.waveEl.textContent = 'PVP · ROUND ' + MP.pvp.round + '/' + MP.pvp.maxRounds + '  ·  YOU ' + MP.pvp.myScore + ' : ' + MP.pvp.theirScore + ' RIVAL' + (MP.pvp.roundOver ? '  —  ROUND OVER' : '');
+    } else if(combat.arenaActive){ combat.waveEl.style.display = 'block';
       if(MP.world){ var _gs = Math.max(0, GAME_RUN_SECONDS - (MP.world.w.el || 0)); var _gc = ((_gs / 60) | 0) + ':' + (_gs % 60 < 10 ? '0' : '') + (_gs % 60);
         combat.waveEl.textContent = MP.world.w.bo === 1 ? ('◈ THE CORE ◈  ·  ' + Math.max(0, Math.ceil((MP.bossHpFrac || 0) * 100)) + '%') : (MP.world.w.br === 1 ? ('BALL RUSH  ·  ' + _gc) : (_gc + '  ·  ' + MP.world.w.lf + ' ENEMIES')); }
     } else combat.waveEl.style.display = 'none';
@@ -20554,14 +20754,18 @@ function mpHurtGuest(amount){
 // guest ship}; single-player (not connected) always returns the host ship → zero behaviour change.
 MP.remoteVel = new THREE.Vector3(); MP._remotePrev = null;
 var _mpZeroVec = new THREE.Vector3();
+// Reused result singletons — this is called for EVERY tank/ball/foe every frame, so the old per-call
+// object literal was steady GC pressure. Safe to share: the host/guest results always carry the same
+// live references (ship position + velocity vectors), so nested calls can't corrupt an earlier result.
+var _mpNPHost = { pos: null, vel: null, isGuest: false }, _mpNPGuest = { pos: null, vel: null, isGuest: true };
 function mpNearestPlayer(pos){
   var hp = gameMode.ship.position;
-  if(!MP.isHost || !MP.connected || !MP.remote.ship || !MP.remote.ship.visible){
-    return { pos: hp, vel: gameMode._shipVel || _mpZeroVec, isGuest: false };
-  }
+  _mpNPHost.pos = hp; _mpNPHost.vel = gameMode._shipVel || _mpZeroVec;
+  if(!MP.isHost || !MP.connected || !MP.remote.ship || !MP.remote.ship.visible) return _mpNPHost;
   var gp = MP.remote.ship.position;
-  if(pos.distanceToSquared(hp) <= pos.distanceToSquared(gp)) return { pos: hp, vel: gameMode._shipVel || _mpZeroVec, isGuest: false };
-  return { pos: gp, vel: MP.remoteVel, isGuest: true };
+  if(pos.distanceToSquared(hp) <= pos.distanceToSquared(gp)) return _mpNPHost;
+  _mpNPGuest.pos = gp; _mpNPGuest.vel = MP.remoteVel;
+  return _mpNPGuest;
 }
 // ══════════════════════════════════════════════
 // CO-OP DOWNED / REVIVE-ORB — when a player dies in MP, a transparent RANGE ORB extends from the
@@ -20605,6 +20809,118 @@ function mpHostGuestDeathCheck(now, dt){
     }
   } else if(MP.guestHp > 0){ MP.guestRevT = 0; MP.guestGauge = 0; }   // alive again
 }
+
+// ══════════════════════════════════════════════
+// CO-OP PvP ARENA — both players dead → a best-of-3 player-vs-player brawl (skill loadouts kept).
+// Host-authoritative: host clears the co-op world, respawns both at opposite spots, and each frame
+// runs bullet-vs-player damage + round scoring; the guest mirrors and (re)spawns on host messages.
+// ══════════════════════════════════════════════
+var PVP_HIT_R = 0.14;         // player-bullet ↔ rival-ship hit radius
+var PVP_INTERMISSION = 2500;  // ms between rounds (show ROUND OVER)
+// Two opposite spawn points on the current surface (planet/floor), gripped so both stand on the ground.
+function mpPvpSpawnPoints(){
+  var base = combat.domeSpawn ? combat.domeSpawn.clone() : gameMode.ship.position.clone();
+  var n = new THREE.Vector3(0, 1, 0);
+  var cp0 = closestPointOnDome(base); if(cp0) n.copy(cp0.normal).normalize();
+  var t1 = new THREE.Vector3(1, 0, 0); if(Math.abs(n.dot(t1)) > 0.9) t1.set(0, 0, 1);
+  var tang = new THREE.Vector3().crossVectors(n, t1).normalize();
+  var hov = gameMode.surfaceState.hoverHeight || 0.008;
+  function grip(p){ var c = closestPointOnDome(p); if(c) p.copy(c.point).addScaledVector(c.normal, hov); return p; }
+  return [ grip(base.clone().addScaledVector(tang, 1.2)), grip(base.clone().addScaledVector(tang, -1.2)) ];
+}
+// Host: wipe the co-op world (enemies/meteors/bullets/orbs) so the arena is player-vs-player only.
+function mpPvpClearWorld(){
+  despawnAllEnemies();          // tanks/balls/foes/meteors/enemy bullets + dying FX
+  clearGameBullets();
+  clearXPOrbs(); clearDying();
+  mpClearReviveOrbs();
+  for(var i = 0; i < combat.enemyBullets.length; i++) disposeEnemyBullet(combat.enemyBullets[i]);
+  combat.enemyBullets.length = 0;
+}
+// Reset the local (host) player to a fresh alive state, cleared of any death animation.
+function mpPvpReviveLocal(pos){
+  var s = gameMode.surfaceState;
+  combat.player.dead = false; combat.player.hp = combat.player.maxHp;
+  endPlayerDeath();
+  if(pos && gameMode.ship){ gameMode.ship.position.copy(pos); }
+  s.speed = 0; s.airborne = false; s.freeFalling = false; s.isDrifting = false;
+  s.driftAngle = 0; s.driftTargetAngle = 0; gameMode.fly.vel.set(0, 0, 0);
+}
+// Host: revive both players at opposite spots + tell the guest to do the same.
+function mpPvpRespawnBoth(){
+  var pts = mpPvpSpawnPoints();
+  mpPvpReviveLocal(pts[0]);
+  MP.guestHp = combat.player.maxHp;
+  mpSend({ type: 'pvprespawn', p: [pts[1].x, pts[1].y, pts[1].z], r: MP.pvp.round, a: MP.pvp.myScore, b: MP.pvp.theirScore });
+}
+// Host: begin the PvP arena (called the frame BOTH players are dead).
+function mpStartPvp(){
+  MP.pvp.active = true; MP.pvp.round = 1; MP.pvp.myScore = 0; MP.pvp.theirScore = 0;
+  MP.pvp.roundOver = false; MP.pvp.roundEndT = 0;
+  combat.arenaActive = false; combat.bossActive = false; combat.bossDone = false;
+  combat.scaleMul = 1;   // PvP damage must ignore the co-op difficulty multiplier
+  mpPvpClearWorld();
+  mpPvpRespawnBoth();
+}
+// Host: end the PvP arena → back to a fresh co-op run (re-arms on the next floor touch).
+function mpEndPvp(){
+  MP.pvp.active = false; MP.pvp.roundOver = false;
+  mpPvpReviveLocal(combat.domeSpawn ? combat.domeSpawn.clone() : null);
+  MP.guestHp = combat.player.maxHp;
+  resetDomeArena();
+  mpSend({ type: 'pvpend', p: combat.domeSpawn ? [combat.domeSpawn.x, combat.domeSpawn.y, combat.domeSpawn.z] : null });
+}
+// Host per-frame: intermission handling, player-vs-player bullet damage, round-death scoring.
+function mpPvpTick(now, dt){
+  if(!MP.isHost) return;   // guest mirrors PvP via messages, no local sim
+  if(MP.pvp.roundOver){
+    if(now - MP.pvp.roundEndT > PVP_INTERMISSION){
+      if(MP.pvp.round >= MP.pvp.maxRounds){ mpEndPvp(); return; }
+      MP.pvp.round++; MP.pvp.roundOver = false;
+      mpPvpRespawnBoth();
+    }
+    return;
+  }
+  // Bullet-vs-rival damage. owner 1 = guest's bullets (can hit the host); else host's (can hit the guest).
+  var guest = MP.remote.ship;
+  for(var bi = gameBullets.length - 1; bi >= 0; bi--){
+    var b = gameBullets[bi], bp = b.mesh.position, hit = false;
+    if(b.owner === 1){
+      if(!combat.player.dead && bp.distanceToSquared(gameMode.ship.position) < PVP_HIT_R * PVP_HIT_R){
+        hurtPlayer(b.dmg || PLAYER_BULLET_DAMAGE, bp); hit = true;
+      }
+    } else if(guest && guest.visible && MP.guestHp > 0 && bp.distanceToSquared(guest.position) < PVP_HIT_R * PVP_HIT_R){
+      mpHurtGuest(b.dmg || PLAYER_BULLET_DAMAGE); hit = true;
+    }
+    if(hit){ disposeGameBullet(b); gameBullets.splice(bi, 1); }
+  }
+  // Round death → the SURVIVOR scores (double-KO scores nobody), then intermission.
+  var hostDead = combat.player.dead || combat.player.hp <= 0;
+  var guestDead = MP.guestHp <= 0;
+  if(hostDead || guestDead){
+    if(guestDead && !hostDead) MP.pvp.myScore++;
+    else if(hostDead && !guestDead) MP.pvp.theirScore++;
+    MP.pvp.roundOver = true; MP.pvp.roundEndT = now;
+    mpSend({ type: 'pvpstate', r: MP.pvp.round, a: MP.pvp.myScore, b: MP.pvp.theirScore, o: 1 });
+  }
+}
+// Guest: enter/advance the PvP arena — clear mirrors, revive, and jump to the host-chosen spot.
+function mpGuestPvpRespawn(d){
+  MP.pvp.active = true; MP.pvp.round = d.r || 1;
+  MP.pvp.myScore = d.b || 0; MP.pvp.theirScore = d.a || 0;   // swap to guest perspective
+  MP.pvp.roundOver = false;
+  mpClearWorld(); clearGameBullets(); clearXPOrbs();
+  var pos = (d.p && gameMode.ship) ? new THREE.Vector3(d.p[0], d.p[1], d.p[2]) : null;
+  mpPvpReviveLocal(pos);
+}
+// Guest: PvP over → back to the co-op run at the shared spawn.
+function mpGuestPvpEnd(d){
+  MP.pvp.active = false; MP.pvp.roundOver = false;
+  mpClearWorld();
+  var pos = (d.p && gameMode.ship) ? new THREE.Vector3(d.p[0], d.p[1], d.p[2]) : null;
+  mpPvpReviveLocal(pos);
+}
+
 // Transparent revive RANGE ORB (a translucent sphere + an inner gauge sphere that grows 0→1).
 function mpMakeReviveOrb(){
   var orb = new THREE.Mesh(new THREE.SphereGeometry(REVIVE_RADIUS, 20, 16),
@@ -20621,7 +20937,7 @@ function mpMakeReviveOrb(){
 function updateReviveOrbs(){
   if(!MP.reviveOrbs) MP.reviveOrbs = [];
   var list = [];
-  if(MP.connected && gameMode.active && !gameMode.exiting){
+  if(MP.connected && gameMode.active && !gameMode.exiting && !MP.pvp.active){   // no revive orbs during a PvP brawl
     if(MP.isHost){
       if(combat.player.dead && playerDeath.downActive && playerDeath.spot) list.push({ p: playerDeath.spot, g: playerDeath.gauge || 0 });
       if(MP.guestHp <= 0 && MP.remote.downActive) list.push({ p: MP.remote.downSpot, g: MP.guestGauge || 0 });
