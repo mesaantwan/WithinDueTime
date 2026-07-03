@@ -27,6 +27,45 @@ body { font-family: Arial, sans-serif; background:#0a0a0a; overflow-x: hidden; h
 <body>
 <div id="canvas-container"></div>
 <video id="faceVideo" autoplay playsinline style="display:none;"></video>
+<script>
+// ══ TEMP BOOT DIAGNOSTIC ══ shows a red box with the real error when the page fails to start
+// (the body is near-black, so any startup crash otherwise reads as a silent black screen on
+// phones, where there's no console). Remove once the mobile issue is identified.
+(function(){
+  function box(msg){
+    var d = document.getElementById('boot-err');
+    if(!d){
+      d = document.createElement('div'); d.id = 'boot-err';
+      d.style.cssText = 'position:fixed;left:8px;right:8px;top:8px;z-index:2147483647;'
+        + 'background:rgba(130,10,10,0.93);color:#fff;font:12px/1.45 monospace;padding:10px 12px;'
+        + 'border-radius:8px;white-space:pre-wrap;word-break:break-word;max-height:45vh;overflow:auto;';
+      (document.body || document.documentElement).appendChild(d);
+    }
+    if(d.textContent.indexOf(msg) === -1) d.textContent += msg + '\n';
+  }
+  window.addEventListener('error', function(e){
+    var m = e.message || 'script error';
+    if(e.filename) m += '  @' + e.filename.split('/').pop() + ':' + e.lineno;
+    else if(e.target && e.target.src) m += '  [failed to load: ' + e.target.src + ']';
+    box(m);
+  }, true);
+  window.addEventListener('unhandledrejection', function(e){
+    box('promise: ' + ((e.reason && (e.reason.message || e.reason.stack)) || e.reason));
+  });
+  // startup watchdog: if the 3D scene never appears, say why instead of staying black
+  window.addEventListener('load', function(){
+    setTimeout(function(){
+      if(document.getElementById('boot-err')) return;   // already showing a real error
+      if(typeof THREE === 'undefined'){ box('three.js did not load (CDN blocked or offline?)'); return; }
+      try {
+        var c = document.createElement('canvas');
+        if(!(c.getContext('webgl') || c.getContext('experimental-webgl'))){ box('WebGL is not available on this device/browser'); return; }
+      } catch(err){ box('WebGL check failed: ' + err.message); return; }
+      if(!window.scene || !document.querySelector('#canvas-container canvas')) box('page loaded but the 3D scene never started (no error thrown)');
+    }, 7000);
+  });
+})();
+</script>
 <script defer src="https://sdks.shopifycdn.com/buy-button/latest/buy-button-storefront.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/objects/Lensflare.js"></script>
