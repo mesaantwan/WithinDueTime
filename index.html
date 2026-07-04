@@ -1924,7 +1924,7 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
   var beamHeight=(TOTAL_FLOORS-1)*FLOOR_SPACING;
   var numSections=(TOTAL_FLOORS-1)*3; // 3 sections per floor gap
   var sectionH=beamHeight/numSections;
-  var MAX_PARTICLES=15000;
+  var MAX_PARTICLES=GAME_LOW_FX?5000:15000;   // MOBILE GFX: thinner energy beam (the per-frame loops walk this whole array)
   
   // Pre-allocate max particle arrays
   var bpPos=new Float32Array(MAX_PARTICLES*3);
@@ -2048,7 +2048,7 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
   };
   
   // Bond system — lines connecting nearby particles into chains
-  var MAX_BONDS=6000;
+  var MAX_BONDS=GAME_LOW_FX?2000:6000;   // MOBILE GFX: sparser molten-strand web
   var bondData=[]; // {a:particleIdx, b:particleIdx}
   var bondPositions=new Float32Array(MAX_BONDS*2*3); // 2 vertices per bond, xyz each
   var bondAlphas=new Float32Array(MAX_BONDS*2);
@@ -2700,8 +2700,9 @@ var smoothedRpmForPlanets = 0;
 
 function createGodRays(){
   var pr = Math.min(window.devicePixelRatio, 1.5);
-  var w = Math.floor(window.innerWidth * pr * 0.5);
-  var h = Math.floor(window.innerHeight * pr * 0.5);
+  var grsc = GAME_LOW_FX ? 0.35 : 0.5;   // MOBILE GFX: softer god rays at lower res
+  var w = Math.floor(window.innerWidth * pr * grsc);
+  var h = Math.floor(window.innerHeight * pr * grsc);
   godrayFBO = new THREE.WebGLRenderTarget(w, h, {minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter, format:THREE.RGBFormat});
   godrayBlurFBO = new THREE.WebGLRenderTarget(w, h, {minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter, format:THREE.RGBFormat});
   occlusionMat = new THREE.MeshBasicMaterial({color:0x000000});
@@ -2731,8 +2732,9 @@ function createGodRays(){
 
 function resizeGodRays(){
   if(godrayFBO){
-    var pr=Math.min(window.devicePixelRatio,2.0);
-    var w=Math.floor(window.innerWidth*pr*0.5), h=Math.floor(window.innerHeight*pr*0.5);
+    var pr=Math.min(window.devicePixelRatio,GAME_LOW_FX?1.5:2.0);
+    var grsc=GAME_LOW_FX?0.35:0.5;
+    var w=Math.floor(window.innerWidth*pr*grsc), h=Math.floor(window.innerHeight*pr*grsc);
     godrayFBO.setSize(w,h); godrayBlurFBO.setSize(w,h);
   }
 }
@@ -3135,8 +3137,8 @@ function updateOrbs(dt){
       // water from a hose: launched UP with a spread, gravity arcs them back down, and they
       // recycle. Power (count), speed (launch velocity) and reach all grow with RPM, so the
       // jet climbs from a small base bubble at rest to a full column-height blast at max spin.
-      var BASE_PARTICLES=300;     // resting jet is a small bubble at the base
-      var MAX_EXTRA=13000;        // full spin → a powerful, tall stream
+      var BASE_PARTICLES=GAME_LOW_FX?150:300;     // resting jet is a small bubble at the base (MOBILE GFX: halved)
+      var MAX_EXTRA=GAME_LOW_FX?4200:13000;       // full spin → a powerful, tall stream (MOBILE GFX: thinner)
       var targetCount=Math.min(B.maxP, Math.floor(BASE_PARTICLES+rpmNorm*MAX_EXTRA));
       // ── Stage 1: the beam TIP climbs with the spin ── its height tracks beamClimb (rpm /
       // BEAM_TOP_RPM), so it grows from a base bubble to the full column at HALF the old rate,
@@ -3242,7 +3244,7 @@ function updateOrbs(dt){
           if(bddx*bddx+bddy*bddy>BOND_BREAK_DIST2){BO.data.splice(bi3,1);}
         }
         if(BO.data.length<BO.maxBonds){
-          var formsPerFrame=Math.min(90, BO.maxBonds-BO.data.length);
+          var formsPerFrame=Math.min(GAME_LOW_FX?40:90, BO.maxBonds-BO.data.length);
           for(var fi2=0;fi2<formsPerFrame;fi2++){
             var pa2=Math.floor(Math.random()*B.maxP);
             if(!B.alive[pa2]||BO.particleBondCount[pa2]>=BOND_MAX_PER) continue;
@@ -7310,9 +7312,10 @@ var glassFBO = null;
 
 function createGlassFBO() {
   var pr = Math.min(window.devicePixelRatio, 1.5);
+  var sc = GAME_LOW_FX ? 0.35 : 0.5;   // MOBILE GFX: blurrier glass refraction, far fewer pixels
   glassFBO = new THREE.WebGLRenderTarget(
-    Math.floor(window.innerWidth * pr * 0.5),
-    Math.floor(window.innerHeight * pr * 0.5),
+    Math.floor(window.innerWidth * pr * sc),
+    Math.floor(window.innerHeight * pr * sc),
     { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBFormat }
   );
 }
@@ -7320,9 +7323,10 @@ function createGlassFBO() {
 function resizeGlassFBO() {
   if(glassFBO) {
     var pr = Math.min(window.devicePixelRatio, 1.5);
+    var sc = GAME_LOW_FX ? 0.35 : 0.5;
     glassFBO.setSize(
-      Math.floor(window.innerWidth * pr * 0.5),
-      Math.floor(window.innerHeight * pr * 0.5)
+      Math.floor(window.innerWidth * pr * sc),
+      Math.floor(window.innerHeight * pr * sc)
     );
   }
 }
@@ -11809,7 +11813,7 @@ var starField = null;
 var shootingStars = [];
 
 function createStarField() {
-  var count = 800;
+  var count = GAME_LOW_FX ? 400 : 800;   // MOBILE GFX: half the stars
   var positions = new Float32Array(count * 3);
   var sizes = new Float32Array(count);
   var phases = new Float32Array(count);
@@ -11930,7 +11934,7 @@ function createStarField() {
 // shell above the dome floor (shares starField.material so it twinkles off the same time uniform).
 function createDomeStars(P, gB){
   if(typeof starField === 'undefined' || !starField || !starField.material) return null;
-  var count = 700;
+  var count = GAME_LOW_FX ? 320 : 700;   // MOBILE GFX: sparser dome sky
   var positions = new Float32Array(count*3), sizes = new Float32Array(count), phases = new Float32Array(count),
       speeds = new Float32Array(count), brightness = new Float32Array(count), spikeLen = new Float32Array(count);
   for(var i=0;i<count;i++){
@@ -12480,10 +12484,13 @@ function enterGameMode() {
   // Warm up the boost-trail meshes NOW (under the entry animation) so the first boost press
   // doesn't hitch building geometry + compiling shaders. renderer.compile pre-links the new
   // shader programs; cached ones are skipped.
-  if(!gameMode.boostTrail.mesh){
-    ensureBoostTrailMesh();
-    if(renderer) renderer.compile(scene, camera);
-  }
+  var _firstEntryBuild = !gameMode.boostTrail.mesh;
+  if(_firstEntryBuild) ensureBoostTrailMesh();
+  // MOBILE: also build the portal world (Region B dome, render targets, carved crystal) right
+  // now, under the entry dive, instead of on the first gameplay frame — that build was the big
+  // "loading in" freeze the moment the game started. One-time (buildPortal guards on P.built).
+  if(GAME_LOW_FX) buildPortal();
+  if(_firstEntryBuild && renderer) renderer.compile(scene, camera);
   // Two-stage entry: first the wheel rapidly decelerates from its current burst velocity,
   // THEN the camera dives in. Without this pre-decel, the wheel would either snap to a
   // halt (jarring) or continue spinning while the camera zooms in (distracting).
@@ -15134,7 +15141,7 @@ function _shotFrom(pool, idxField){
 }
 function sfxShoot(){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=_shotFrom('_shootPool','_shootIdx'); s.volume = s._baseVol * sfx.sfxVol; s.play().catch(function(){}); }
 function sfxPlayerDamage(){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=_shotFrom('_pdmgPool','_pdmgIdx'); s.volume = s._baseVol * sfx.sfxVol; s.play().catch(function(){}); }
-function sfxEnemyDamage(pos){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=sfx._ehitPool[Math.floor(Math.random()*sfx._ehitN)]; var v=sfxPosVol(pos,s._baseVol)*sfx.sfxVol; if(v<0.01) return; s.volume=v; s.pause(); s.currentTime=0; s.play().catch(function(){}); }
+function sfxEnemyDamage(pos){ if(!sfx._loaded || sfx.sfxVol<=0) return; if(GAME_LOW_FX){ var tE=performance.now(); if(tE-(sfx._lastEhit||0)<120) return; sfx._lastEhit=tE; } var s=sfx._ehitPool[Math.floor(Math.random()*sfx._ehitN)]; var v=sfxPosVol(pos,s._baseVol)*sfx.sfxVol; if(v<0.01) return; s.volume=v; s.pause(); s.currentTime=0; s.play().catch(function(){}); }   // MOBILE: throttle hit sounds (audio restarts jank phone browsers)
 function sfxEnemyCrit(pos){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=_shotFrom('_ecritPool','_ecritIdx'); var v=sfxPosVol(pos,s._baseVol)*sfx.sfxVol; if(v<0.01) return; s.volume=v; s.play().catch(function(){}); }
 function sfxEnemyDies(pos){ if(!sfx._loaded || sfx.sfxVol<=0) return; var s=_shotFrom('_ediesPool','_ediesIdx'); var v=sfxPosVol(pos,s._baseVol)*sfx.sfxVol; if(v<0.01) return; s.volume=v; s.play().catch(function(){}); }
 var _lastBounce = 0;
@@ -17536,6 +17543,9 @@ var _dmgPool = [], _dmgV3 = new THREE.Vector3(), _barV3 = new THREE.Vector3(), _
 var _tkAim = new THREE.Vector3(), _tkFlat = new THREE.Vector3(), _tkQ2 = new THREE.Quaternion(),
     _AXIS_Z = new THREE.Vector3(0, 0, 1), _AXIS_Y = new THREE.Vector3(0, 1, 0);
 function spawnDamageNumber(worldPos, amount, isCrit){
+  // MOBILE GFX: cap concurrent floating numbers — past ~2 dozen they're unreadable anyway,
+  // and each one is a per-frame DOM transform write.
+  if(GAME_LOW_FX && combat.damageNumbers.length >= 24 && !isCrit) return;
   var rec = null;
   for(var i = 0; i < _dmgPool.length; i++){ if(!_dmgPool[i]._active){ rec = _dmgPool[i]; break; } }
   if(!rec){
@@ -18250,9 +18260,6 @@ function updateCombat(dt){
       else if(combat.bossActive) _wtxt = combat.boss ? ('◈ THE CORE ◈  ·  ' + Math.max(0, Math.ceil(combat.boss.hp / combat.boss.maxHp * 100)) + '%') : '◈ THE CORE ◈';
       else if(combat.ballRush) _wtxt = 'BALL RUSH  ·  ' + _clock;
       else _wtxt = _clock + '  ·  ' + _cnt + ' ENEMIES';
-      // TEMP DIAGNOSTIC — remove once the arena/meteors are confirmed working.
-      _wtxt += combat._arenaErr ? (' | ERR: ' + combat._arenaErr)
-        : (' | b:' + (combat.bodies ? combat.bodies.length : 0) + ' m:' + (combat.meteors ? combat.meteors.length : 0) + ' t:' + combat.meteorTimer);
     }
     if(_wtxt === null){
       combat.waveEl.style.display = 'none'; combat._waveTxtCache = null;
@@ -18310,6 +18317,9 @@ function buildBoostLineSystem(maxN, T){
 function ensureBoostTrailMesh(){
   var DT = gameMode.boostTrail;
   if(DT.mesh) return;
+  // MOBILE GFX: slimmer boost trail — shorter/coarser tube, fewer orbiting sparks + welding
+  // sparks (all buffer sizes derive from these, so set them before the build below).
+  if(GAME_LOW_FX){ DT.maxPoints = 30; DT.sides = 5; DT.maxOrb = 70; DT.orbTrail = 5; DT.maxSparks = 56; DT.sparkTrail = 4; }
   // ── Central purple beam: a tapered tube around the spine (point at the nozzle → cylinder). ──
   var maxP = DT.maxPoints, K = DT.sides;
   var geo = new THREE.BufferGeometry();
@@ -18339,10 +18349,15 @@ function ensureBoostTrailMesh(){
   DT.geo = geo; DT.posAttr = geo.getAttribute('position'); DT.alphaAttr = geo.getAttribute('alpha'); DT.mesh = mesh;
 
   // ── Beam light: a purple point light the beam emits onto the ship + nearby surface. ──
-  var light = new THREE.PointLight(0x9a5cff, 0, 1.4, 2.0);
-  light.visible = false;
-  scene.add(light);
-  DT.light = light;
+  // MOBILE GFX: skipped on phones — toggling a light's visibility changes the scene's light
+  // count, which forces THREE to recompile every lit material's shader the first time boost
+  // fires (a multi-hundred-ms freeze on mobile GPUs). The additive beam itself still glows.
+  if(!GAME_LOW_FX){
+    var light = new THREE.PointLight(0x9a5cff, 0, 1.4, 2.0);
+    light.visible = false;
+    scene.add(light);
+    DT.light = light;
+  }
 
   // ── Ignition shockwave: a one-shot bright flash + an expanding ring. ──
   var flash = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12),
@@ -18426,8 +18441,8 @@ function spawnBoostTrail(){
   if(!DT.boosting){
     DT.boosting = true;
     DT.startT = 0;
-    spawnBoostSparks(82, enginePos, back);
-    spawnBoostOrbiter(64, enginePos, back, true);
+    spawnBoostSparks(GAME_LOW_FX ? 26 : 82, enginePos, back);   // MOBILE GFX: smaller ignition burst
+    spawnBoostOrbiter(GAME_LOW_FX ? 20 : 64, enginePos, back, true);
     if(!DT.shockPos) DT.shockPos = new THREE.Vector3();
     DT.shockPos.copy(enginePos);
     DT.shockT = 0;
@@ -18445,8 +18460,14 @@ function spawnBoostTrail(){
   DT.intensity = I;
 
   // Per-frame emission scales with intensity (storm at startup → steady stream while held).
-  spawnBoostSparks(Math.round(1 + I * I * 10), enginePos, back);
-  spawnBoostOrbiter(Math.round(2 + I * I * 14), enginePos, back);
+  // MOBILE GFX: about a third of the desktop emission rate.
+  if(GAME_LOW_FX){
+    spawnBoostSparks(Math.round(1 + I * I * 3), enginePos, back);
+    spawnBoostOrbiter(Math.round(1 + I * I * 5), enginePos, back);
+  } else {
+    spawnBoostSparks(Math.round(1 + I * I * 10), enginePos, back);
+    spawnBoostOrbiter(Math.round(2 + I * I * 14), enginePos, back);
+  }
 
   // Spine sample (spacing-gated) — the beam centerline. Each point snapshots its radius from the
   // current intensity (fat at ignition → base while held), and the beam fades by alpha as it trails.
@@ -19167,7 +19188,7 @@ function nearestGameEnemy(pos, maxDist){
 // unchanged. They're shared + never disposed → disposeGameBullet/disposeEnemyBullet must
 // only detach from the scene, never call .dispose() on the geometry/material.
 var _bulletGeoCache = {}, _bulletMatCache = {}, _bulletGlowCache = {};
-function sharedBulletGeo(sz, ws, hs){ ws = ws || 8; hs = hs || 6; var k = sz + '_' + ws + '_' + hs; return _bulletGeoCache[k] || (_bulletGeoCache[k] = new THREE.SphereGeometry(sz, ws, hs)); }
+function sharedBulletGeo(sz, ws, hs){ ws = ws || (GAME_LOW_FX ? 6 : 8); hs = hs || (GAME_LOW_FX ? 4 : 6); var k = sz + '_' + ws + '_' + hs; return _bulletGeoCache[k] || (_bulletGeoCache[k] = new THREE.SphereGeometry(sz, ws, hs)); }   // MOBILE GFX: lower-poly bullets
 function sharedBulletMat(col){ return _bulletMatCache[col] || (_bulletMatCache[col] = new THREE.MeshBasicMaterial({ color: col })); }
 function sharedBulletGlow(col, op){ var k = col + '_' + op; return _bulletGlowCache[k] || (_bulletGlowCache[k] = new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: col, transparent: true, opacity: op, blending: THREE.AdditiveBlending, depthWrite: false })); }
 // Mobile/touch = LOW-FX: drop the additive glow sprites (the #1 fillrate cost once the screen fills
@@ -21482,7 +21503,9 @@ function buildPortal(){
   scene.add(gB); P.regionB = gB;
 
   // ── Render targets + virtual camera ──
-  var pr = Math.min(window.devicePixelRatio, 2.0);
+  // MOBILE GFX: the portal seam view renders the whole scene an extra time — on phones use a
+  // lower-res target (softer through-the-portal image, big fillrate win).
+  var pr = Math.min(window.devicePixelRatio, GAME_LOW_FX ? 1.0 : 2.0);
   var rw = Math.max(2, Math.floor(window.innerWidth * pr)), rh = Math.max(2, Math.floor(window.innerHeight * pr));
   var rtOpts = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBFormat };
   P.rt1 = new THREE.WebGLRenderTarget(rw, rh, rtOpts);   // Region B (seen through P1)
@@ -22546,7 +22569,7 @@ function init(){
   updateCamRadius();
   camera.position.set(0,0,CAM_ORBIT_RADIUS);camera.lookAt(0,0,0);
   renderer=new THREE.WebGLRenderer({antialias:true,alpha:true,powerPreference:'high-performance'});
-  renderer.setSize(window.innerWidth,window.innerHeight);renderer.setPixelRatio(Math.min(window.devicePixelRatio,2.0));renderer.sortObjects=true;
+  renderer.setSize(window.innerWidth,window.innerHeight);renderer.setPixelRatio(Math.min(window.devicePixelRatio,GAME_LOW_FX?1.5:2.0));renderer.sortObjects=true;   // MOBILE GFX: lower pixel ratio (~44% fewer pixels)
   document.getElementById('canvas-container').appendChild(renderer.domElement);
   createEnv();scene.environment=envMap;
   cubeRenderTarget=new THREE.WebGLCubeRenderTarget(256,{format:THREE.RGBAFormat,generateMipmaps:true,minFilter:THREE.LinearMipmapLinearFilter});
@@ -22798,7 +22821,7 @@ function animate(){
   
   cubeCamera.position.set(0,camera.position.y,0);
   if(!window._ccFrame)window._ccFrame=0;window._ccFrame++;
-  if(window._ccFrame%3===0){
+  if(window._ccFrame%(GAME_LOW_FX?10:3)===0){   // MOBILE GFX: crystal reflections refresh at ~6Hz instead of 20Hz
     floors.forEach(function(f){if(f.hasRings){f.rings.top.forEach(function(r){r.visible=false;});f.rings.bottom.forEach(function(r){r.visible=false;});}});
     cubeCamera.update(renderer,scene);
     floors.forEach(function(f){if(f.hasRings){f.rings.top.forEach(function(r){r.visible=true;});f.rings.bottom.forEach(function(r){r.visible=true;});}});
@@ -23335,7 +23358,9 @@ function animate(){
   for(var prb2=0;prb2<pendingReverses.length;prb2++) _updBd(pendingReverses[prb2].backdrop);
 
   // Render background to FBO for glass refraction
-  renderGlassFBO();
+  // MOBILE GFX: this is a full extra scene render — refresh it every 2nd frame on phones
+  // (glass refraction updates at ~30Hz; the held frame is imperceptible behind the blur).
+  if(!GAME_LOW_FX || window._ccFrame % 2 === 0) renderGlassFBO();
 
   // God rays occlusion + blur pass
   renderGodRays();
@@ -23462,7 +23487,7 @@ function animate(){
 // ── Post-processing (chromatic aberration + vignette + god rays + whiteout + shake) ──
 var postFBO,postScene,postCamera,postQuad;
 function createPostProcessing(){
-  var pr=Math.min(window.devicePixelRatio,2.0);
+  var pr=Math.min(window.devicePixelRatio,GAME_LOW_FX?1.5:2.0);   // MOBILE GFX: match the lower renderer pixel ratio
   postFBO=new THREE.WebGLRenderTarget(Math.floor(window.innerWidth*pr),Math.floor(window.innerHeight*pr),{minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBFormat});
   postScene=new THREE.Scene();
   postCamera=new THREE.OrthographicCamera(-1,1,1,-1,0,1);
@@ -23547,7 +23572,7 @@ function createPostProcessing(){
 }
 function resizePostFBO(){
   if(postFBO){
-    var pr=Math.min(window.devicePixelRatio,2.0);
+    var pr=Math.min(window.devicePixelRatio,GAME_LOW_FX?1.5:2.0);
     postFBO.setSize(Math.floor(window.innerWidth*pr),Math.floor(window.innerHeight*pr));
   }
 }
