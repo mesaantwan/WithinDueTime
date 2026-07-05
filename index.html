@@ -12489,7 +12489,17 @@ function enterGameMode() {
   // MOBILE: also build the portal world (Region B dome, render targets, carved crystal) right
   // now, under the entry dive, instead of on the first gameplay frame — that build was the big
   // "loading in" freeze the moment the game started. One-time (buildPortal guards on P.built).
-  if(GAME_LOW_FX) buildPortal();
+  if(GAME_LOW_FX){
+    buildPortal();
+    // Pre-touch the shared bullet billboard + enemy-shell materials (acquire BOTH, then release
+    // back to the pool — freeing in between would recycle one mesh and drop the first material)
+    // so renderer.compile below links their shaders during the entry dive instead of hitching on
+    // the very first shot fired / first enemy volley.
+    var _pw1 = acquireBulletMesh(sharedBulletGeo(0.004), sharedBulletMat(0xc9a3ff), null, 0);
+    if(!combat._ebGeo){ combat._ebGeo = new THREE.SphereGeometry(0.012, 8, 8); combat._ebMat = new THREE.MeshBasicMaterial({ color: 0xff9980 }); }
+    var _pw2 = acquireBulletMesh(combat._ebGeo, combat._ebMat, null, 0);
+    freeBulletMesh(_pw1); freeBulletMesh(_pw2);
+  }
   if(_firstEntryBuild && renderer) renderer.compile(scene, camera);
   // Two-stage entry: first the wheel rapidly decelerates from its current burst velocity,
   // THEN the camera dives in. Without this pre-decel, the wheel would either snap to a
@@ -15326,13 +15336,16 @@ function updateGameBullets(){
     if(!(b.orbit && b.orbit.phase === 'orbit')){
       b.mesh.position.add(b.vel);   // orbiting bullets are positioned by updateSkillBullets
       if(b.contour || b.bounces > 0) bulletSurfaceInteract(b);   // Contour ride-the-wall / Bouncy reflect
-      var bsp = b.vel.length();     // STREAK: orient along travel + stretch into a fast-moving line
-      if(bsp > 1e-6){
-        b.mesh.lookAt(_bulletAim.copy(b.mesh.position).add(b.vel));
-        var bsz = b.big ? 0.008 : 0.004;
-        b.mesh.scale.set(1, 1, Math.min(BULLET_STREAK_MAX, bsp / bsz * BULLET_STREAK_K));
+      if(!GAME_LOW_FX){
+        var bsp = b.vel.length();     // STREAK: orient along travel + stretch into a fast-moving line
+        if(bsp > 1e-6){
+          b.mesh.lookAt(_bulletAim.copy(b.mesh.position).add(b.vel));
+          var bsz = b.big ? 0.008 : 0.004;
+          b.mesh.scale.set(1, 1, Math.min(BULLET_STREAK_MAX, bsp / bsz * BULLET_STREAK_K));
+        }
       }
     }
+    if(GAME_LOW_FX) b.mesh.quaternion.copy(camera.quaternion);   // MOBILE GFX: billboard plane faces the camera (no lookAt/stretch)
     if(b.life >= b.maxLife){ disposeGameBullet(b); gameBullets.splice(i, 1); }
   }
 }
@@ -18188,11 +18201,15 @@ function updateCombat(dt){
         p.grav = 0;                                            // landed → stop pulling it down
       }
     }
-    var sp = p.vel.length();
-    if(sp > 1e-6 && !p.noStretch){
-      p.mesh.lookAt(_dmgV3.copy(p.mesh.position).add(p.vel));
-      var stretch = 1 + Math.min(p.life * 0.2, 1) * 1.4;
-      p.mesh.scale.set(1, 1, stretch);
+    if(GAME_LOW_FX){
+      p.mesh.quaternion.copy(camera.quaternion);   // MOBILE GFX: billboard plane faces the camera
+    } else {
+      var sp = p.vel.length();
+      if(sp > 1e-6 && !p.noStretch){
+        p.mesh.lookAt(_dmgV3.copy(p.mesh.position).add(p.vel));
+        var stretch = 1 + Math.min(p.life * 0.2, 1) * 1.4;
+        p.mesh.scale.set(1, 1, stretch);
+      }
     }
     var hr2 = (p.hitR || 0.03) * (p.hitR || 0.03);
     if(p.mesh.position.distanceToSquared(shipPos) < hr2){   // squared → no sqrt
@@ -19191,6 +19208,13 @@ var _bulletGeoCache = {}, _bulletMatCache = {}, _bulletGlowCache = {};
 function sharedBulletGeo(sz, ws, hs){ ws = ws || (GAME_LOW_FX ? 6 : 8); hs = hs || (GAME_LOW_FX ? 4 : 6); var k = sz + '_' + ws + '_' + hs; return _bulletGeoCache[k] || (_bulletGeoCache[k] = new THREE.SphereGeometry(sz, ws, hs)); }   // MOBILE GFX: lower-poly bullets
 function sharedBulletMat(col){ return _bulletMatCache[col] || (_bulletMatCache[col] = new THREE.MeshBasicMaterial({ color: col })); }
 function sharedBulletGlow(col, op){ var k = col + '_' + op; return _bulletGlowCache[k] || (_bulletGlowCache[k] = new THREE.SpriteMaterial({ map: getCombatGlowTex(), color: col, transparent: true, opacity: op, blending: THREE.AdditiveBlending, depthWrite: false })); }
+// MOBILE GFX: on phones every bullet renders as ONE camera-facing glow plane (a straight-up
+// billboard) instead of a sphere mesh — a single quad per bullet, no per-frame lookAt/stretch.
+// One shared unit geometry + one shared material per color.
+var _bbBulletGeo = null, _bbBulletMats = {};
+function billboardBulletMat(col){
+  return _bbBulletMats[col] || (_bbBulletMats[col] = new THREE.MeshBasicMaterial({ map: getCombatGlowTex(), color: col, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }));
+}
 // Mobile/touch = LOW-FX: drop the additive glow sprites (the #1 fillrate cost once the screen fills
 // with bullets — additive transparent overdraw murders mobile GPUs) AND recycle bullet meshes through
 // a shared pool so firing allocates nothing and never churns the scene graph (the hitch on each shot).
@@ -19201,6 +19225,20 @@ var _bulletPool = [];   // recycled bullet meshes (shared by player + enemy bull
 function acquireBulletMesh(geo, mat, glowMat, glowScale){
   var m = _bulletPool.pop();
   if(!m){ m = new THREE.Mesh(geo, mat); m.frustumCulled = false; m.renderOrder = 5; scene.add(m); }
+  if(GAME_LOW_FX){
+    // MOBILE GFX: billboard-plane bullet — sized from the sphere geo it replaces, colored from
+    // the passed material, facing the camera (re-billboarded each frame by the update loops).
+    if(!_bbBulletGeo) _bbBulletGeo = new THREE.PlaneGeometry(1, 1);
+    var bbR = (geo && geo.parameters && geo.parameters.radius) || 0.004;
+    m.geometry = _bbBulletGeo;
+    m.material = billboardBulletMat(mat && mat.color ? mat.color.getHex() : 0xc9a3ff);
+    m.visible = true;
+    m.scale.set(bbR * 5, bbR * 5, 1);
+    if(camera) m.quaternion.copy(camera.quaternion);
+    if(m._glow) m._glow.visible = false;
+    if(m._streak) m._streak.visible = false;
+    return m;
+  }
   m.geometry = geo; m.material = mat; m.visible = true;
   m.scale.set(1, 1, 1); m.quaternion.identity();   // reset any prior stretch/aim (bullets lookAt + stretch on reuse)
   // Round sprite glow (enemy / mortar / etc.). Robust to recycling: hidden when no glow is requested.
@@ -21763,27 +21801,38 @@ function updatePortalWindow(){
   var _mouth = P.inB ? P.dstAnchor : P.srcAnchor;
   if(_portalMouthW.setFromMatrixPosition(_mouth.matrixWorld).distanceTo(camera.position) > 4.0) return;
   P.vCam.fov = camera.fov; P.vCam.aspect = camera.aspect; P.vCam.updateProjectionMatrix();
+  // MOBILE GFX: the seam view is a FULL extra scene render every frame — near the crystal hole
+  // (where the game starts) that doubled the frame cost the whole early game. On phones refresh
+  // the seam texture every 2nd frame and hold the previous one in between; the ship clone still
+  // updates every frame so motion through the portal stays smooth. Never skip an unwarmed side.
+  var _seamSkip = GAME_LOW_FX && (window._ccFrame % 2 === 1) && (P.inB ? P._seamWarm2 : P._seamWarm1);
   if(!P.inB){
-    // From the crystal, looking THROUGH the source mouth into Region B (the dome, layer 2).
-    setVCamThroughPortal(P.srcAnchor.matrixWorld, P.dstAnchor.matrixWorld);
-    // clip at the destination doorway: keep the dome interior (dst +Z), cull anything behind it
-    _ocN.set(0,0,1).applyQuaternion(P.dstAnchor.getWorldQuaternion(_portalQ)).normalize();
-    _portalMouthW.setFromMatrixPosition(P.dstAnchor.matrixWorld);
-    applyObliqueNearClip(P.vCam, _portalMouthW, _ocN);
     updateShipClone(P.srcAnchor.matrixWorld, P.dstAnchor.matrixWorld, PORTAL_LAYER);  // ship seen through the seam
-    P.vCam.layers.set(PORTAL_LAYER);
-    renderPortalRT(P.rt1, true);
+    if(!_seamSkip){
+      // From the crystal, looking THROUGH the source mouth into Region B (the dome, layer 2).
+      setVCamThroughPortal(P.srcAnchor.matrixWorld, P.dstAnchor.matrixWorld);
+      // clip at the destination doorway: keep the dome interior (dst +Z), cull anything behind it
+      _ocN.set(0,0,1).applyQuaternion(P.dstAnchor.getWorldQuaternion(_portalQ)).normalize();
+      _portalMouthW.setFromMatrixPosition(P.dstAnchor.matrixWorld);
+      applyObliqueNearClip(P.vCam, _portalMouthW, _ocN);
+      P.vCam.layers.set(PORTAL_LAYER);
+      renderPortalRT(P.rt1, true);
+      P._seamWarm1 = true;
+    }
     P.p1.visible = true;
   } else {
-    // Inside Region B, looking back through the dest mouth into the crystal world (layers 0/1).
-    setVCamThroughPortal(P.dstAnchor.matrixWorld, P.srcAnchor.matrixWorld);
-    // clip at the source mouth: keep the outward (crystal-exterior) side the camera emerges into
-    _ocN.set(0,0,1).applyQuaternion(P.srcAnchor.getWorldQuaternion(_portalQ)).normalize();
-    _portalMouthW.setFromMatrixPosition(P.srcAnchor.matrixWorld);
-    applyObliqueNearClip(P.vCam, _portalMouthW, _ocN);
     updateShipClone(P.dstAnchor.matrixWorld, P.srcAnchor.matrixWorld, 0);  // ship seen back through the seam
-    P.vCam.layers.set(0); P.vCam.layers.enable(1);
-    renderPortalRT(P.rt2, false);
+    if(!_seamSkip){
+      // Inside Region B, looking back through the dest mouth into the crystal world (layers 0/1).
+      setVCamThroughPortal(P.dstAnchor.matrixWorld, P.srcAnchor.matrixWorld);
+      // clip at the source mouth: keep the outward (crystal-exterior) side the camera emerges into
+      _ocN.set(0,0,1).applyQuaternion(P.srcAnchor.getWorldQuaternion(_portalQ)).normalize();
+      _portalMouthW.setFromMatrixPosition(P.srcAnchor.matrixWorld);
+      applyObliqueNearClip(P.vCam, _portalMouthW, _ocN);
+      P.vCam.layers.set(0); P.vCam.layers.enable(1);
+      renderPortalRT(P.rt2, false);
+      P._seamWarm2 = true;
+    }
     P.p2.visible = true;
   }
 }
