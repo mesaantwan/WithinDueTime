@@ -525,10 +525,12 @@ var gameMode = {
     // Extra per-frame damping ON TOP of the wheel's natural 0.98 friction (which is what
     // gives "same rate, more time" scaling — a constant per-frame factor means higher
     // starting RPM takes proportionally more frames to bleed down to the threshold).
-    rampStartDamp: 0.995,           // brake engages immediately, no soft-start coast
-    rampEndDamp: 0.99,              // small ongoing brake — held indefinitely after the ramp
+    rampStartDamp: 0.995,           // brake eases in (no jarring instant stop)…
+    rampEndDamp: 0.9,               // …then firms up to a steady exponential spindown (a real cooldown)
     rampFrames: 15,                 // ~0.25s ramp from start→end damp
-    diveRpmThreshold: 165,          // raw rpmSmooth — dive kicks in while wheel still feels fast
+    diveRpmThreshold: 4,            // spin ALL the way down to a stop (+ the light fully fades) before the morph
+    morphCamFrames: 45,             // ease the camera to a framing that shows the platform forming
+    morphHold: 24,                  // extra beat after the morph completes so you can see the finished platform
     diveDuration: 150,              // ~2.5s for the camera to arc into the chase pose
     diveProg: 0,
     diveDamp: 0.85,                 // strong damp DURING dive — quickly kills residual rotation
@@ -781,6 +783,11 @@ var gameMode = {
   // Chase camera offsets — in tangent frame, scaled for planet
   camBackDist: 0.15,
   camUpDist: 0.06,
+  // DRIFT CAM SWING (options, 0–1): how much the drift camera physically SWINGS AROUND the ship
+  // to sit behind its facing ("stick on a motor"), vs holding position and only rotating in
+  // place (ship pushed to the drift side). 0 = pure rotate-in-place, 1 = pure swing-behind;
+  // values between mix the two. Screen centre stays on the firing line at any setting.
+  driftCamSwing: 0.5,
   // Camera zoom (scroll wheel / two-finger pinch). 1 = default chase; larger pulls the camera
   // back, and past CAM_ZOOM_TOPDOWN_START it tilts toward a straight-overhead survey view.
   // Reset to 1 on game entry.
@@ -2029,8 +2036,9 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
   // sphere was computed once at the base — so frustum culling would drop the whole beam the moment
   // the emission point scrolled off-screen. Disable culling so the climbing beam stays visible.
   beamPoints.frustumCulled=false;
+  beamPoints.visible=false;   // rising particle beam removed (kept for beamHeight → spin-to-enter trigger)
   scene.add(beamPoints);
-  
+
   // Section energy — tracks RPM propagation up the beam
   var sectionEnergy=new Float32Array(numSections);
   var sectionSpawnTimer=new Float32Array(numSections);
@@ -2093,6 +2101,7 @@ function createOrbFloor(y, radius, label, numOrbs, fi) {
   var bondLines=new THREE.LineSegments(bondGeo,bondMat);
   bondLines.position.y=y;
   bondLines.frustumCulled=false;   // same reason as beamPoints — dynamic, climbs off the base
+  bondLines.visible=false;   // rising particle beam removed
   scene.add(bondLines);
   
   // Track how many bonds each particle has (for chain limit of 5)
@@ -3107,6 +3116,13 @@ function updateOrbs(dt){
     tR2 += (0.78 - tR2) * cb;
     tG2 += (0.82 - tG2) * cb;
     tB2 += (1.00 - tB2) * cb;
+    // Once the game owns the gallery (entry + play on the platform AND after crossing the portal into
+    // the dome), HOLD the crescendo black instead of snapping back to light gray — the dark backdrop is
+    // maintained the whole time, including through the portal. Full-dark stage-2 value so it matches the
+    // "goes black" spin peak (and the dome's own dark P.bg used for the seam render).
+    if((gameMode.active || gameMode.entering || gameMode.decelerating) && fl === gameMode.galleryFloor){
+      tR2 = bgR2 * 0.04; tG2 = bgG2 * 0.03; tB2 = bgB2 * 0.05;
+    }
     scene.background.setRGB(tR2, tG2, tB2);
     scene.fog.color.setRGB(tR2, tG2, tB2);
 
@@ -3335,6 +3351,10 @@ function updateOrbs(dt){
     fl.orbs.forEach(function(orb){
       // Skip orbs that have been knocked loose — physics owns them now
       if(orb.mesh.userData._fallen) return;
+      // The game-entry morph owns the gallery orbs (they become the platform) — don't orbit them.
+      // Only once the morph has actually STARTED (after the wheel spins down); during the spin-down
+      // the orbs keep orbiting (slowing with the wheel) so you see the momentum stop.
+      if(fl === gameMode.galleryFloor && gameMode.entry && gameMode.entry.active && gameMode.entry.morph && gameMode.entry.morph.started) return;
       var prevX = orb.mesh.position.x;
       var prevY = orb.mesh.position.y;
       var prevZ = orb.mesh.position.z;
@@ -7843,7 +7863,7 @@ function makeGameWindow(kind, title, W, H){
 }
 
 function ensureGameWindows(){
-  if(!gameUI.options)   gameUI.options   = makeGameWindow('options', 'OPTIONS', 4.4, 6.2);
+  if(!gameUI.options)   gameUI.options   = makeGameWindow('options', 'OPTIONS', 4.4, 6.8);   // taller: fits the DRIFT SWING row
   if(!gameUI.inventory) gameUI.inventory = makeGameWindow('inventory', 'INVENTORY', 4.2, 3.8);
 }
 
@@ -7861,6 +7881,7 @@ function buildOptionsContent(win){
     {label:'MOUSE SENS',  val:Math.round(gameMode.shipAimSens * 1000) + '', dec:'opt-sens-dec', inc:'opt-sens-inc'},
     {label:'CAMERA ZOOM', val:gameMode.camBackDist.toFixed(2), dec:'opt-zoom-dec', inc:'opt-zoom-inc'},
     {label:'FOV',         val:Math.round(gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + '', dec:'opt-fov-dec',  inc:'opt-fov-inc'},
+    {label:'DRIFT SWING', val:Math.round((gameMode.driftCamSwing != null ? gameMode.driftCamSwing : 0) * 100) + '%', dec:'opt-swing-dec', inc:'opt-swing-inc'},
     {label:'MUSIC',       val:Math.round(sfx.musicVol * 100) + '%', dec:'opt-music-dec', inc:'opt-music-inc'},
     {label:'SFX',         val:Math.round(sfx.sfxVol   * 100) + '%', dec:'opt-sfx-dec',   inc:'opt-sfx-inc'}
   ];
@@ -7940,6 +7961,8 @@ function handleGameOption(actionId){
   else if(actionId === 'opt-zoom-inc') gameMode.camBackDist = Math.min(0.50, gameMode.camBackDist + 0.02); // farther
   else if(actionId === 'opt-fov-dec'){ gameMode.fovBase = Math.max(40, (gameMode.fovBase != null ? gameMode.fovBase : camera.fov) - 5); }
   else if(actionId === 'opt-fov-inc'){ gameMode.fovBase = Math.min(120, (gameMode.fovBase != null ? gameMode.fovBase : camera.fov) + 5); }
+  else if(actionId === 'opt-swing-dec') gameMode.driftCamSwing = Math.max(0, Math.round((gameMode.driftCamSwing - 0.05) * 100) / 100);  // drift-cam swing-around mix, 5% steps
+  else if(actionId === 'opt-swing-inc') gameMode.driftCamSwing = Math.min(1, Math.round((gameMode.driftCamSwing + 0.05) * 100) / 100);
   else if(actionId === 'opt-music-dec') sfx.musicVol = Math.max(0, Math.round((sfx.musicVol - 0.1) * 10) / 10);
   else if(actionId === 'opt-music-inc') sfx.musicVol = Math.min(1, Math.round((sfx.musicVol + 0.1) * 10) / 10);
   else if(actionId === 'opt-sfx-dec')   sfx.sfxVol   = Math.max(0, Math.round((sfx.sfxVol   - 0.1) * 10) / 10);
@@ -12490,7 +12513,6 @@ function enterGameMode() {
   // now, under the entry dive, instead of on the first gameplay frame — that build was the big
   // "loading in" freeze the moment the game started. One-time (buildPortal guards on P.built).
   if(GAME_LOW_FX){
-    buildPortal();
     // Pre-touch the shared bullet billboard + enemy-shell materials (acquire BOTH, then release
     // back to the pool — freeing in between would recycle one mesh and drop the first material)
     // so renderer.compile below links their shaders during the entry dive instead of hitching on
@@ -12530,11 +12552,17 @@ function enterGameMode() {
   // Use the crystal mesh's ACTUAL world position (the centerStar sits ~1.5 below the floor
   // origin), not the floor Y — otherwise the radial ray + grip fallback aim at the wrong point.
   if(gameMode.surface.crystal){
-    // Lock the crystal so the carved hole faces STRAIGHT UP (+Y) for the whole game, regardless of
-    // how the wheel was spun before entry. holeUpQuat is the crystal's fixed world orientation; the
-    // per-frame floor loop re-applies it (countering the floor's Y spin) so it never drifts.
+    // Lock the crystal so the carved hole faces HORIZONTALLY toward the camera (world +Z) for the
+    // whole game — the platform + bridge staging area sits in front of it. holeUpQuat is the crystal's
+    // fixed world orientation; the per-frame floor loop re-applies it (countering the floor's Y spin).
     var holeDirLocal = new THREE.Vector3(-1, 1, 1).normalize();
-    gameMode.portal.holeUpQuat = new THREE.Quaternion().setFromUnitVectors(holeDirLocal, new THREE.Vector3(0, 1, 0));
+    var _Ftarget = new THREE.Vector3(0, 0, 1);
+    var _Q0 = new THREE.Quaternion().setFromUnitVectors(holeDirLocal, _Ftarget);
+    // Roll the crystal around the hole axis so the triangular doorway sits flat-edge-down (apex up).
+    // The three edges are ~equilateral; ENTRY_HOLE_ROLL_STEPS (0/1/2 → 0°/120°/240°) picks WHICH edge
+    // becomes the base so the hallway FLOOR (not a wall) lands at the bottom. Flip the step if it's off.
+    var _roll = holeRollForFlatBottom(holeDirLocal, _Ftarget, _Q0) + ENTRY_HOLE_ROLL_STEPS * (Math.PI * 2 / 3);
+    gameMode.portal.holeUpQuat = new THREE.Quaternion().setFromAxisAngle(_Ftarget, _roll).multiply(_Q0);
     gf.group.updateMatrixWorld(true);
     gameMode.surface.crystal.quaternion.copy(
       new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), -gf.group.rotation.y).multiply(gameMode.portal.holeUpQuat)
@@ -12544,15 +12572,21 @@ function enterGameMode() {
   } else {
     gameMode.surface.center.set(0, gf ? gf.group.position.y : 0, 0);
   }
-  // Spawn the ship above the FRONT face of the crystal (the +Z side facing the orbit
-  // camera) with its forward direction pointing along world +Y. After the raycast snap
-  // the ship sits on whichever facet that probe hits, oriented so pressing W flies it
-  // up through the website. groundNormal points outward from the crystal along +Z so
-  // the chase camera ends up below + slightly behind the ship, looking up.
-  gameMode.ship.position.copy(gameMode.surface.center).add(new THREE.Vector3(0, 0, 1.5));
-  gameMode.surfaceState.forward.set(0, 1, 0);
+  // Build the portal (from the now hole-forward crystal) then the octagon platform + bridge staging
+  // area in front of the mouth. buildPortal is idempotent; doing it here (not on the first game frame)
+  // means the mouth/tube dimensions are known so the platform lines up with the hole.
+  buildPortal();
+  var _estage = buildEntryStage();
+  // Spawn the ship at the CENTRE of the platform, sitting on top (normal +Y), facing the crystal hole
+  // (−Z) so pressing W drives it across the bridge into the portal.
+  if(_estage){
+    gameMode.ship.position.copy(_estage.spawn);
+  } else {
+    gameMode.ship.position.copy(gameMode.surface.center).add(new THREE.Vector3(0, 0, 1.5));
+  }
+  gameMode.surfaceState.forward.set(0, 0, -1);
   gameMode.surfaceState.speed = 0;
-  gameMode.surfaceState.groundNormal.set(0, 0, 1);
+  gameMode.surfaceState.groundNormal.set(0, 1, 0);
   gameMode.surfaceState.isDrifting = false;
   gameMode.surfaceState.driftDirection = 0;
   gameMode.surfaceState.driftAngle = 0;
@@ -12577,10 +12611,15 @@ function enterGameMode() {
   // momentum for the first 1s (lighting stays at full brightness) and then progressively
   // ramps up the decay over the next 2s. The lighting fades naturally with the velocity
   // because the RPM override is no longer applied during the decelerating phase.
-  // Place ship at the right world location immediately so it's ready when camera arrives.
-  // Keep ship hidden during decel — it's a tiny dot from orbital camera distance and
-  // would just be visual noise. Becomes visible at the start of the entering phase.
-  positionShipOnSurface();
+  // Snap the ship onto the platform (entry-surface grip, not the crystal raycast) + orient it.
+  var _sh = closestPointOnEntrySurface(gameMode.ship.position);
+  if(_sh){
+    gameMode.surfaceState.groundNormal.copy(_sh.normal).normalize();
+    gameMode.ship.position.copy(_sh.point).addScaledVector(gameMode.surfaceState.groundNormal, gameMode.surfaceState.hoverHeight);
+  }
+  var _sm = new THREE.Matrix4();
+  _sm.lookAt(new THREE.Vector3(0,0,0), gameMode.surfaceState.forward.clone().multiplyScalar(-1), gameMode.surfaceState.groundNormal);
+  gameMode.ship.quaternion.setFromRotationMatrix(_sm);
   // Release any dragging state to avoid stuck inputs
   isDragging = false;
   selectedFloor = null;
@@ -12609,7 +12648,9 @@ function animateGameDecel() {
   // counter-rotates fl.group.rotation.y at line ~12683, so the crystal stays world-Y
   // fixed. What actually moves the surface during decel is the X-axis tumble at
   // centerStar.rotation.x += vel*0.5, which a Y-only tracker can't follow.)
-  if(d.stage !== 'dive') trackCrystalRotation();
+  // Skip crystal-spin tracking during the platform entry — the ship sits on the fixed platform,
+  // not the crystal, so dragging it around the (still-braking) crystal centre would fling it off.
+  if(d.stage !== 'dive' && !(gameMode.entry && gameMode.entry.active)) trackCrystalRotation();
   d.stageFrames += 1;
 
   // ── HOLD ── velocity (and therefore RPM + lighting) ride at peak for ~1s
@@ -12621,11 +12662,8 @@ function animateGameDecel() {
     return;
   }
 
-  // ── DAMP ── apply per-frame damping (curve lerps start→end and then HOLDS at end
-  // damp indefinitely). Stay here until rpmSmooth drops below the dive threshold, OR a
-  // hard frame cap fires as a safety net. The constant-rate decay means a higher
-  // starting RPM naturally takes more frames to reach the threshold — same braking,
-  // longer total time.
+  // ── DAMP ── spin the wheel DOWN to a stop (the crescendo light fades with the RPM). Stay here
+  // until rpmSmooth drops to a near-halt, then FULL-STOP and start the morph you can watch.
   if(d.stage === 'damp') {
     if(gf) {
       var rampT = Math.min(1, d.stageFrames / d.rampFrames);
@@ -12634,24 +12672,21 @@ function animateGameDecel() {
       if(Math.abs(gf.group.userData.velocity) < 0.0005) gf.group.userData.velocity = 0;
     }
     var rpmNow = gf ? (gf.group.userData.rpmSmooth || 0) : 0;
-    var rampDone = d.stageFrames >= d.rampFrames; // can't dive until ramp damp is mature
+    var rampDone = d.stageFrames >= d.rampFrames; // can't proceed until ramp damp is mature
     if((rampDone && rpmNow < d.diveRpmThreshold) || d.stageFrames > d.maxDampFrames) {
-      d.stage = 'dive';
-      d.stageFrames = 0;
-      d.diveProg = 0;
-      if(!gameMode.group.visible) gameMode.group.visible = true;
+      if(gf){ gf.group.userData.velocity = 0; gf.group.userData.rpmSmooth = 0; }   // full stop
+      startEntryMorphNow();                             // begin the morph — it plays DURING the straight dive, on black
+      d.stage = 'dive'; d.stageFrames = 0; d.diveProg = 0;
+      if(!gameMode.group.visible) gameMode.group.visible = true;   // ship appears for the dive
     }
     return;
   }
 
-  // ── DIVE ── camera animates from saved orbit pose to chase pose over diveDuration
+  // ── DIVE ── camera moves STRAIGHT IN from the orbit pose to the chase pose over diveDuration
   // frames. Wheel keeps damping at the (already mature) end rate so any remaining
   // momentum dies during the dive rather than after.
   if(d.stage === 'dive') {
-    if(gf) {
-      gf.group.userData.velocity *= d.diveDamp;
-      if(Math.abs(gf.group.userData.velocity) < 0.0005) gf.group.userData.velocity = 0;
-    }
+    if(gf){ gf.group.userData.velocity = 0; gf.group.userData.rpmSmooth = 0; }   // stay fully stopped + dark through the dive
     // Anchor the ship to the actual crystal surface this frame — the crystal is still
     // tumbling around its X axis from residual velocity (centerStar.rotation.x += vel*0.5),
     // so the facet under the ship moves each frame. Raycasting + smoothed-normal snap is
@@ -12659,7 +12694,8 @@ function animateGameDecel() {
     // pose throughout the dive, so the chase target stays valid and there's nothing for
     // the first active frame to "fix" (which is the clip-and-reset jitter at the tail end).
     var sst = gameMode.surfaceState;
-    var diveHit = raycastShipToSurface(gameMode.ship.position);
+    var diveHit = (gameMode.entry && gameMode.entry.active) ? closestPointOnEntrySurface(gameMode.ship.position)
+                                                            : raycastShipToSurface(gameMode.ship.position);
     if(diveHit) {
       sst.groundNormal.lerp(diveHit.normal, 0.25).normalize();
       gameMode.ship.position.copy(diveHit.point).addScaledVector(sst.groundNormal, sst.hoverHeight);
@@ -12677,8 +12713,8 @@ function animateGameDecel() {
     // Cubic-out — fast initial swoop, settles gently on the chase pose
     var ease = 1 - (1 - p) * (1 - p) * (1 - p);
     var chase = computeChaseCamPose();
-    var center = gameMode.surface.center;
-    // Arc-lerp around the crystal (avoids cutting through it) + radial bump that lifts
+    var center = (gameMode.entry && gameMode.entry.active) ? gameMode.entry.center : gameMode.surface.center;
+    // Arc-lerp around the platform (avoids cutting through the crystal) + radial bump that lifts
     // the camera outward in the middle of the path so even a near-collinear start/end
     // bows away from the surface.
     var arcPos = arcLerpAroundCenter(center, gameMode.savedCamPos, chase.pos, ease);
@@ -12712,6 +12748,28 @@ function animateGameDecel() {
       gameMode.group.visible = true;
     }
   }
+}
+
+// Camera framing for the "watch the platform form" stage — an elevated 3/4 view of the platform
+// (with the crystal beyond it), so you can see the orbs morph into the octagon + the bridge shoot out.
+function computeMorphCamPose(){
+  var e = gameMode.entry;
+  var pc = (e && e.center) ? e.center.clone() : gameMode.surface.center.clone();
+  return {
+    pos: pc.clone().add(new THREE.Vector3(0, 4.0, 6.0)),
+    lookAt: pc.clone().add(new THREE.Vector3(0, 0.2, -1.2)),
+    up: new THREE.Vector3(0, 1, 0)
+  };
+}
+// Begin the orb→platform morph NOW (called once the wheel has fully stopped) — snapshot the orbs'
+// current world positions as the morph start so they flow from where they stopped into the platform.
+function startEntryMorphNow(){
+  var e = gameMode.entry; if(!e || !e.morph) return;
+  var gf = gameMode.galleryFloor, orbs = (gf && gf.orbs) ? gf.orbs : [];
+  var orbStart = [];
+  for(var i = 0; i < orbs.length; i++){ var wp = new THREE.Vector3(); orbs[i].mesh.getWorldPosition(wp); orbStart.push(wp); }
+  e.morph.orbStart = orbStart;
+  e.morph.t = 0; e.morph.done = false; e.morph.started = true;
 }
 
 // Apply the crystal's per-frame rotation around Y to the ship so the ship stays locked
@@ -12973,6 +13031,368 @@ function closestPointOnTris(p, arr){
   return _ctRet;
 }
 
+// ══════════════════════════════════════════════
+// ENTRY STAGE — the octagon platform + bridge the ship spawns on. The gallery wheel's clear-blue
+// orbs morph into a flat regular octagon lying horizontally in front of the crystal (facing the
+// camera), a flat bridge shoots out to the crystal's (now horizontal) portal hole, and invisible
+// barriers keep the ship from driving off the sides. You drive across the bridge, into the hole,
+// and portal into the dome arena exactly as before. Region-A staging surface only — combat lives
+// in the dome. Built in enterGameMode (after the crystal is locked hole-forward + buildPortal).
+// ══════════════════════════════════════════════
+var _entryRet = { point: new THREE.Vector3(), normal: new THREE.Vector3(), dist: 0, kind: '' };
+var _entryTmp = new THREE.Vector3(), _entryTmp2 = new THREE.Vector3();
+function entryOrbMaterial(){
+  // Same clear-blue glass as the gallery orbs (createOrbFloor).
+  return new THREE.MeshStandardMaterial({
+    color: 0x8899bb, transparent: true, opacity: 0.7,
+    roughness: 0.05, metalness: 0.6, emissive: 0x334466, emissiveIntensity: 0.15,
+    envMap: (typeof cubeRenderTarget !== 'undefined' && cubeRenderTarget) ? cubeRenderTarget.texture : null,
+    envMapIntensity: 1.2, side: THREE.DoubleSide
+  });
+}
+// Which of the triangular doorway's 3 edges is the FLOOR (put at the bottom): 0/1/2 = 0°/120°/240°.
+var ENTRY_HOLE_ROLL_STEPS = 1;
+// The crystal lock (holeDir → world F) leaves a free ROLL around the hole axis. The carved hole is a
+// triangle; we want it sitting flat-edge-DOWN (apex up), like a doorway on the ground. Compute that
+// roll from the raw geometry (CRYSTAL_PORTAL_POS) — the same mouth-triangle buildPortal derives — so
+// it can be baked into the lock BEFORE buildPortal bakes the seam + chute (keeping them aligned).
+function holeRollForFlatBottom(holeDirLocal, F, Q0){
+  var pos = (typeof CRYSTAL_PORTAL_POS !== 'undefined') ? CRYSTAL_PORTAL_POS : null;
+  if(!pos) return 0;
+  var hd = holeDirLocal.clone().normalize();
+  var qH = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), hd);
+  var lX = new THREE.Vector3(1, 0, 0).applyQuaternion(qH), lY = new THREE.Vector3(0, 1, 0).applyQuaternion(qH);
+  var hall = [], v = new THREE.Vector3();
+  for(var i = 0; i + 2 < pos.length; i += 3){
+    v.set(pos[i], pos[i + 1], pos[i + 2]);
+    var ax = v.dot(hd), pp = v.clone().addScaledVector(hd, -ax).length();
+    if(pp < 0.35) hall.push({ v: v.clone(), ax: ax });
+  }
+  var mAx = hall.reduce(function(m, o){ return Math.max(m, o.ax); }, -1e9);
+  var tri = [], seen = {};
+  for(var k = 0; k < hall.length && tri.length < 3; k++){
+    if(hall[k].ax > mAx - 0.12){
+      var pv = hall[k].v.clone().addScaledVector(hd, -hall[k].v.dot(hd));
+      var tx = pv.dot(lX), ty = pv.dot(lY), key = tx.toFixed(3) + ',' + ty.toFixed(3);
+      if(!seen[key]){ seen[key] = 1; tri.push([tx, ty]); }
+    }
+  }
+  if(tri.length < 3) return 0;
+  // Corners in the WORLD seam plane under the base lock Q0 (⟂ F).
+  var w = [];
+  for(var t = 0; t < 3; t++){
+    var p = lX.clone().multiplyScalar(tri[t][0]).addScaledVector(lY, tri[t][1]).applyQuaternion(Q0);
+    w.push({ x: p.x, y: p.y });
+  }
+  var a = w[0], b = w[1], c = w[2];
+  var theta = -Math.atan2(b.y - a.y, b.x - a.x);   // roll edge ab horizontal
+  function rot(pt, th){ var cs = Math.cos(th), sn = Math.sin(th); return { x: pt.x * cs - pt.y * sn, y: pt.x * sn + pt.y * cs }; }
+  var rm = rot({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, theta), rc = rot(c, theta);
+  if(rc.y < rm.y) theta += Math.PI;                 // apex must sit ABOVE the base edge
+  return theta;
+}
+function buildEntryStage(){
+  clearEntryStage();
+  var P = gameMode.portal, gf = gameMode.galleryFloor;
+  if(!gf) return null;
+  var C = gameMode.surface.center.clone();       // crystal world centre
+  var F = new THREE.Vector3(0, 0, 1);            // hole faces +Z (toward the orbit camera) — matches the lock target
+  var U = new THREE.Vector3(0, 1, 0);
+  var hallMouth = (P && P.hallMouth != null) ? P.hallMouth : 0.72;
+  var tubeR = (P && P.tubeR) ? P.tubeR : 0.14;
+  var platR = 2.70, bridgeHW = 0.16;             // large platform + a bridge
+  var inR = platR * Math.cos(Math.PI / 8);       // octagon inradius — barrier radius + where the bridge attaches
+  var hover = gameMode.surfaceState.hoverHeight;
+  // Driving plane = the doorway's flat base (bottom of the triangular hole, now rolled flat-edge-down),
+  // so the bridge feeds in level. Derived from the portal's seam triangle; falls back to the tube lip.
+  var floorY = C.y - tubeR;
+  if(P && P.seamTri && P.seamTri.length === 3 && P.holeDir){
+    var _qH = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), P.holeDir.clone().normalize());
+    var _lX = new THREE.Vector3(1, 0, 0).applyQuaternion(_qH), _lY = new THREE.Vector3(0, 1, 0).applyQuaternion(_qH);
+    var _Q = gameMode.portal.holeUpQuat || new THREE.Quaternion();
+    var _minY = Infinity;
+    for(var _k = 0; _k < 3; _k++){
+      var _wp = _lX.clone().multiplyScalar(P.seamTri[_k][0]).addScaledVector(_lY, P.seamTri[_k][1]).applyQuaternion(_Q);
+      if(_wp.y < _minY) _minY = _wp.y;
+    }
+    if(isFinite(_minY)) floorY = C.y + _minY;     // base-edge world height (mouth axis is at C.y)
+  }
+  var mouthZ = C.z + hallMouth;                   // hole mouth (F = +Z, C.z = 0)
+  var bridgeLen = 0.80;                            // longer bridge
+  var platZ = mouthZ + bridgeLen + inR;           // octagon centre
+  var Pc = new THREE.Vector3(C.x, floorY, platZ);
+  // Regular octagon, edge midpoints on the axes (so a flat edge faces the bridge). Built as a
+  // triangle fan so the visual mesh and the collision triangles are identical.
+  var A0 = Math.PI / 8;
+  var vwx = [], vwz = [];
+  for(var i = 0; i < 8; i++){ var a = A0 + i * (Math.PI / 4); vwx.push(Math.cos(a) * platR); vwz.push(Math.sin(a) * platR); }
+  var fanPos = [], platformTris = [];
+  for(var t = 0; t < 8; t++){
+    var j = (t + 1) % 8;
+    fanPos.push(0, 0, 0, vwx[t], 0, vwz[t], vwx[j], 0, vwz[j]);
+    platformTris.push(Pc.x, floorY, Pc.z, Pc.x + vwx[t], floorY, Pc.z + vwz[t], Pc.x + vwx[j], floorY, Pc.z + vwz[j]);
+  }
+  var octaGeo = new THREE.BufferGeometry();
+  octaGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(fanPos), 3));
+  octaGeo.computeVertexNormals();
+  var mat = entryOrbMaterial();
+  var platform = new THREE.Mesh(octaGeo, mat);
+  platform.position.copy(Pc); platform.renderOrder = 1;
+  scene.add(platform);
+  // Edge outline (like the orbs' glass rims).
+  var octEdge = [];
+  for(var e = 0; e <= 8; e++){ var ae = A0 + e * (Math.PI / 4); octEdge.push(Math.cos(ae) * platR, 0, Math.sin(ae) * platR); }
+  var octEdgeGeo = new THREE.BufferGeometry();
+  octEdgeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(octEdge), 3));
+  var platEdge = new THREE.Line(octEdgeGeo, new THREE.LineBasicMaterial({ color: 0x667788, transparent: true, opacity: 0.35 }));
+  platEdge.position.copy(Pc); scene.add(platEdge);
+  // Bridge — a flat strip from the platform's near edge to the hole mouth.
+  var bridgeZ1 = platZ - inR + 0.006;             // platform end (fixed anchor for the telescope)
+  var bridgeZ0 = mouthZ - 0.01;                    // crystal end (at the mouth)
+  var bLen = Math.max(0.001, bridgeZ1 - bridgeZ0);
+  var bridgeGeo = new THREE.PlaneGeometry(2 * bridgeHW, bLen);
+  bridgeGeo.rotateX(-Math.PI / 2);                 // lie flat (normal +Y)
+  var bMat = entryOrbMaterial();
+  var bridge = new THREE.Mesh(bridgeGeo, bMat);
+  bridge.position.set(C.x, floorY, (bridgeZ0 + bridgeZ1) * 0.5); bridge.renderOrder = 1;
+  scene.add(bridge);
+  var bx0 = C.x - bridgeHW, bx1 = C.x + bridgeHW;
+  var bridgeTris = new Float32Array([
+    bx0, floorY, bridgeZ0, bx1, floorY, bridgeZ0, bx1, floorY, bridgeZ1,
+    bx0, floorY, bridgeZ0, bx1, floorY, bridgeZ1, bx0, floorY, bridgeZ1
+  ]);
+  // Snapshot orb world positions for the morph.
+  var orbStart = [], orbs = gf.orbs || [];
+  for(var oi = 0; oi < orbs.length; oi++){ var wp = new THREE.Vector3(); orbs[oi].mesh.getWorldPosition(wp); orbStart.push(wp); }
+  gameMode.entry = {
+    built: true, active: true,
+    platform: platform, platformEdge: platEdge, bridge: bridge, mat: mat, bMat: bMat,
+    platformTris: new Float32Array(platformTris), bridgeTris: bridgeTris,
+    center: Pc, floorY: floorY, platR: platR, inR: inR, bridgeHW: bridgeHW,
+    mouthZ: mouthZ, platZ: platZ, bridgeZ0: bridgeZ0, bridgeZ1: bridgeZ1, bLen: bLen,
+    forward: F, up: U,
+    spawn: new THREE.Vector3(Pc.x, floorY + hover, platZ),
+    morph: { t: 0, done: false, started: false, orbStart: orbStart, TA: 58, TB: 34 }
+  };
+  // Start un-formed: platform is a point that grows out of the pooling orbs; bridge hidden.
+  mat.opacity = 0.0; bMat.opacity = 0.0; platEdge.material.opacity = 0.0; bridge.scale.z = 0.001;
+  platform.scale.setScalar(0.0001); platEdge.scale.setScalar(0.0001);
+  // Glowing blue light-wall barrier: octagon perimeter (minus the −Z bridge opening) + the bridge rails.
+  var wallEdges = [];
+  for(var wi = 0; wi < 8; wi++){
+    if(wi === 5) continue;                        // −Z edge = the bridge opening (leave it open)
+    var wj = (wi + 1) % 8;
+    wallEdges.push({ ax: Pc.x + vwx[wi], az: Pc.z + vwz[wi], bx: Pc.x + vwx[wj], bz: Pc.z + vwz[wj] });
+  }
+  wallEdges.push({ ax: C.x - bridgeHW, az: bridgeZ0, bx: C.x - bridgeHW, bz: bridgeZ1 });
+  wallEdges.push({ ax: C.x + bridgeHW, az: bridgeZ0, bx: C.x + bridgeHW, bz: bridgeZ1 });
+  buildEntryBarrier(gameMode.entry, wallEdges, floorY);
+  return gameMode.entry;
+}
+// The glowing barrier wall — a short plane of blue light rising from the platform/bridge edges,
+// nearly opaque at the base and fading to clear as it rises, with particles streaming up from the
+// bottom. Purely visual (collision is the lateral clamp in resolveEntryBarriers).
+function buildEntryBarrier(e, edges, floorY){
+  var wallH = 0.35;                                // "not that tall"
+  var wpos = [], wuv = [];
+  for(var k = 0; k < edges.length; k++){
+    var ed = edges[k], y0 = floorY, y1 = floorY + wallH;
+    wpos.push(ed.ax, y0, ed.az, ed.bx, y0, ed.bz, ed.bx, y1, ed.bz,
+              ed.ax, y0, ed.az, ed.bx, y1, ed.bz, ed.ax, y1, ed.az);
+    wuv.push(0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1);
+  }
+  var wgeo = new THREE.BufferGeometry();
+  wgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(wpos), 3));
+  wgeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(wuv), 2));
+  var wmat = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color(0x35a2ff) }, uTime: { value: 0 }, uOpacity: { value: 0 } },
+    vertexShader: [
+      'varying float vH; varying vec2 vUv;',
+      'void main(){ vH = uv.y; vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 uColor; uniform float uTime, uOpacity; varying float vH; varying vec2 vUv;',
+      'void main(){',
+      '  float a = pow(1.0 - vH, 2.0) * 0.82;',                 // nearly opaque at the base → clear at the top
+      '  a *= 0.78 + 0.22 * sin(uTime * 3.0 + vUv.x * 20.0 + vH * 7.0);',   // energy shimmer
+      '  a *= uOpacity;',
+      '  if(a < 0.003) discard;',
+      '  vec3 col = mix(uColor, vec3(0.82, 0.95, 1.0), (1.0 - vH) * 0.4);',  // hot near-white core at the base',
+      '  gl_FragColor = vec4(col, a);',
+      '}'
+    ].join('\n'),
+    transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.NormalBlending
+  });
+  var wall = new THREE.Mesh(wgeo, wmat); wall.renderOrder = 2;
+  var N = 200;
+  var parts = [], pbase = new Float32Array(N * 3), ppos = new Float32Array(N * 3), palpha = new Float32Array(N);
+  for(var n = 0; n < N; n++){
+    var ed2 = edges[(Math.random() * edges.length) | 0], tt = Math.random();
+    var bx = ed2.ax + (ed2.bx - ed2.ax) * tt, bz = ed2.az + (ed2.bz - ed2.az) * tt;
+    pbase[n * 3] = bx; pbase[n * 3 + 1] = floorY; pbase[n * 3 + 2] = bz;
+    ppos[n * 3] = bx; ppos[n * 3 + 1] = floorY; ppos[n * 3 + 2] = bz; palpha[n] = 0;
+    parts.push({ speed: 0.35 + Math.random() * 0.85, phase: Math.random() });
+  }
+  var pgeo = new THREE.BufferGeometry();
+  pgeo.setAttribute('position', new THREE.BufferAttribute(ppos, 3));
+  pgeo.setAttribute('alpha', new THREE.BufferAttribute(palpha, 1));
+  var pmat = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color(0x9bd6ff) }, uOpacity: { value: 0 }, pixelRatio: { value: Math.min(window.devicePixelRatio, 2) } },
+    vertexShader: [
+      'attribute float alpha; varying float vA; uniform float pixelRatio;',
+      'void main(){ vA = alpha; vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_PointSize = clamp(pixelRatio * 34.0 / max(0.05, -mv.z), 1.0, 9.0); gl_Position = projectionMatrix * mv; }'
+    ].join('\n'),
+    fragmentShader: [
+      'varying float vA; uniform vec3 uColor; uniform float uOpacity;',
+      'void main(){ float d = length(gl_PointCoord - 0.5) * 2.0; if(d > 1.0) discard; float g = 1.0 - d; gl_FragColor = vec4(uColor, g * vA * uOpacity); }'
+    ].join('\n'),
+    transparent: true, depthWrite: false, blending: THREE.NormalBlending
+  });
+  var points = new THREE.Points(pgeo, pmat); points.renderOrder = 3; points.frustumCulled = false;
+  var grp = new THREE.Group(); grp.add(wall); grp.add(points); scene.add(grp);
+  e.barrier = { group: grp, wall: wall, wmat: wmat, points: points, pmat: pmat, pgeo: pgeo,
+    parts: parts, pbase: pbase, ppos: ppos, palpha: palpha, wallH: wallH, floorY: floorY, op: 0 };
+}
+// Per-frame: shimmer the wall, rise the particles, and fade the barrier in as the platform forms.
+function updateEntryBarrier(){
+  var e = gameMode.entry; if(!e || !e.active || !e.barrier) return;
+  var b = e.barrier, m = e.morph;
+  var wantOp = m ? Math.max(0, Math.min(1, (m.t - m.TA * 0.55) / (m.TA * 0.6))) : 1;
+  b.op += (wantOp - b.op) * 0.12;
+  var t = performance.now() * 0.001;
+  b.wmat.uniforms.uTime.value = t;
+  b.wmat.uniforms.uOpacity.value = b.op;
+  b.pmat.uniforms.uOpacity.value = b.op;
+  var N = b.parts.length;
+  for(var n = 0; n < N; n++){
+    var frac = (b.parts[n].phase + t * b.parts[n].speed) % 1;
+    b.ppos[n * 3] = b.pbase[n * 3];
+    b.ppos[n * 3 + 1] = b.floorY + b.wallH * 1.25 * frac;
+    b.ppos[n * 3 + 2] = b.pbase[n * 3 + 2];
+    b.palpha[n] = (1 - frac) * (1 - frac);
+  }
+  b.pgeo.attributes.position.needsUpdate = true;
+  b.pgeo.attributes.alpha.needsUpdate = true;
+}
+function clearEntryStage(){
+  var e = gameMode.entry;
+  if(e){
+    if(e.platform){ scene.remove(e.platform); e.platform.geometry.dispose(); e.mat.dispose(); }
+    if(e.platformEdge){ scene.remove(e.platformEdge); e.platformEdge.geometry.dispose(); e.platformEdge.material.dispose(); }
+    if(e.bridge){ scene.remove(e.bridge); e.bridge.geometry.dispose(); e.bMat.dispose(); }
+    if(e.barrier){ scene.remove(e.barrier.group); e.barrier.wall.geometry.dispose(); e.barrier.wmat.dispose(); e.barrier.pgeo.dispose(); e.barrier.pmat.dispose(); }
+  }
+  gameMode.entry = null;
+  // Restore the gallery orbs the morph consumed (re-show + reset opacity; updateOrbs resumes orbiting).
+  var gf = gameMode.galleryFloor;
+  if(gf && gf.orbs){
+    for(var i = 0; i < gf.orbs.length; i++){
+      var orb = gf.orbs[i];
+      if(orb.mesh && orb.mesh.material){ orb.mesh.material.opacity = 0.7; orb.mesh.material.transparent = true; }
+      if(orb.mesh){ orb.mesh.visible = true; orb.mesh.scale.set(1, 1, 1); }
+      if(orb.edges) orb.edges.visible = true;
+    }
+  }
+}
+// Nearest of {crystal, platform, bridge} to `pos`; sets `.kind` so callers can tell them apart.
+// Returns the shared `_entryRet` (copy out if you need to hold it across another call).
+function closestPointOnEntrySurface(pos){
+  var e = gameMode.entry, have = false;
+  var cc = closestPointOnCrystal(pos);
+  if(cc){ _entryRet.point.copy(cc.point); _entryRet.normal.copy(cc.normal); _entryRet.dist = cc.dist; _entryRet.kind = 'crystal'; have = true; }
+  if(e && e.active){
+    var b = closestPointOnTris(pos, e.bridgeTris);
+    if(b && (!have || b.dist < _entryRet.dist)){ _entryRet.point.copy(b.point); _entryRet.normal.copy(b.normal); _entryRet.dist = b.dist; _entryRet.kind = 'bridge'; have = true; }
+    var pp = closestPointOnTris(pos, e.platformTris);
+    if(pp && (!have || pp.dist < _entryRet.dist)){ _entryRet.point.copy(pp.point); _entryRet.normal.copy(pp.normal); _entryRet.dist = pp.dist; _entryRet.kind = 'platform'; have = true; }
+  }
+  return have ? _entryRet : null;
+}
+// Invisible barriers — keep the ship laterally inside the platform (circle of radius inR) + bridge
+// corridor. Only clamps on the platform/bridge side of the mouth; past the mouth (into the hole) it
+// lets go so you can enter the portal.
+function resolveEntryBarriers(ship, s){
+  var e = gameMode.entry;
+  if(!e || !e.active) return;
+  var x = ship.position.x - e.center.x;          // platform is centred on x = C.x
+  var z = ship.position.z;
+  if(z < e.mouthZ) return;                        // at/inside the hole → no barrier
+  var inBridge = (z <= e.bridgeZ1 + 0.02) && Math.abs(x) <= e.bridgeHW + 1e-4;
+  var dxP = ship.position.x - e.center.x, dzP = z - e.center.z;
+  var rP = Math.sqrt(dxP * dxP + dzP * dzP);
+  var inPlat = rP <= e.inR;
+  if(inBridge || inPlat) return;
+  // Outside both → push back to whichever boundary is nearer, and kill the outward drive.
+  var toBridge = (z <= e.bridgeZ1 + 0.02);
+  if(toBridge && (!inPlat)){
+    // clamp x into the bridge corridor
+    var nx = x > 0 ? 1 : -1;
+    ship.position.x = e.center.x + nx * e.bridgeHW;
+    if(s.speed * (s.forward.x * nx) > 0) s.speed *= 0.35;
+  } else if(rP > 1e-5){
+    // clamp onto the platform circle (inradius)
+    ship.position.x = e.center.x + (dxP / rP) * e.inR;
+    ship.position.z = e.center.z + (dzP / rP) * e.inR;
+    s.speed *= 0.35;
+  }
+}
+// Orb → platform morph (Phase A: orbs spiral into the octagon + fade, platform fades in) then the
+// bridge telescopes out toward the crystal (Phase B). Runs through the entry decel + camera dive.
+function updateEntryMorph(){
+  var e = gameMode.entry; if(!e || !e.active) return;
+  var m = e.morph; if(!m.started || m.done) return;   // only runs after the wheel has fully stopped
+  m.t++;
+  var gf = gameMode.galleryFloor, orbs = (gf && gf.orbs) ? gf.orbs : [];
+  var pA = Math.min(1, m.t / m.TA), eA = pA * pA * (3 - 2 * pA);
+  var N = Math.max(1, orbs.length);
+  // ── Orbs directly become the octagon — NO opacity crossfade ── they fly in, flatten into discs,
+  // pool near the centre, then the SOLID octagon platform (full opacity) grows out of the pool while
+  // the discs are ABSORBED by shrinking into it. Same material, so it reads as the orb material
+  // literally reshaping into the octagonal plane rather than one fading in over the other.
+  var flyT = Math.min(1, eA / 0.55);                          // fly in + pool
+  var flatT = Math.max(0, Math.min(1, (eA - 0.2) / 0.4));     // flatten to discs
+  var absorbT = Math.max(0, Math.min(1, (eA - 0.6) / 0.4));   // shrink into the growing platform
+  var spread = (1 + flatT * 1.6) * (1 - absorbT);
+  var flatY = Math.max(0.05, 1 - flatT * 0.95) * (1 - absorbT * 0.6);
+  for(var i = 0; i < orbs.length; i++){
+    var orb = orbs[i]; if(orb.mesh.userData._fallen) continue;
+    var start = m.orbStart[i] || orb.mesh.getWorldPosition(_entryTmp2);
+    var a = Math.PI / 8 + (i / N) * Math.PI * 2;
+    var rr = e.platR * 0.28;                                  // pool in a small ring near the centre
+    _entryTmp.set(e.center.x + Math.cos(a) * rr, e.floorY + 0.006, e.center.z + Math.sin(a) * rr);
+    _entryTmp.lerpVectors(start, _entryTmp, flyT);
+    if(orb.mesh.parent) orb.mesh.parent.worldToLocal(_entryTmp);
+    orb.mesh.position.copy(_entryTmp);
+    // Kill the orb's carried spin + streak geometry so the flatten lies FLAT on the horizontal plane.
+    orb.mesh.rotation.set(0, 0, 0);
+    orb.mesh.matrixAutoUpdate = true;
+    if(orb.isCurved && orb.sphereGeo){ orb.mesh.geometry = orb.sphereGeo; orb.isCurved = false; }
+    orb.mesh.scale.set(Math.max(0.0001, spread), flatY, Math.max(0.0001, spread));
+    if(orb.mesh.material){ orb.mesh.material.transparent = true; orb.mesh.material.opacity = 0.7; }   // no fade — absorbed by shrinking
+    if(orb.edges) orb.edges.visible = false;
+    orb.mesh.visible = spread > 0.003;
+  }
+  // Platform grows out of the pool as SOLID material at full opacity (no crossfade).
+  var platT = Math.max(0, Math.min(1, (eA - 0.4) / 0.6)); platT = platT * platT * (3 - 2 * platT);
+  e.platform.scale.setScalar(Math.max(0.0001, platT));
+  if(e.platformEdge) e.platformEdge.scale.setScalar(Math.max(0.0001, platT));
+  e.mat.opacity = 0.7;
+  if(e.platformEdge) e.platformEdge.material.opacity = 0.35 * Math.min(1, platT * 2);
+  if(m.t > m.TA){
+    var pB = Math.min(1, (m.t - m.TA) / m.TB), eB = pB * pB * (3 - 2 * pB);
+    e.bMat.opacity = 0.7 * eB;
+    e.bridge.scale.z = Math.max(0.001, eB);
+    e.bridge.position.z = e.bridgeZ1 - e.bLen * eB * 0.5;   // fixed at the platform end, grows toward the mouth
+  }
+  if(m.t >= m.TA + m.TB){
+    m.done = true;
+    e.mat.opacity = 0.7; e.bMat.opacity = 0.7;
+    e.platform.scale.setScalar(1); if(e.platformEdge) e.platformEdge.scale.setScalar(1);
+    e.bridge.scale.z = 1; e.bridge.position.z = (e.bridgeZ0 + e.bridgeZ1) * 0.5;
+    for(var j = 0; j < orbs.length; j++){ if(orbs[j].mesh){ orbs[j].mesh.visible = false; orbs[j].mesh.scale.set(1, 1, 1); } }
+  }
+}
+
 function raycastGroundBelow(probePos, downDir, fwdDir, speed) {
   var crystalGroup = gameMode.surface.crystal ||
     (gameMode.galleryFloor && gameMode.galleryFloor.group.userData.centerStar);
@@ -13076,6 +13496,7 @@ function exitGameMode() {
     if(gameMode.portal.p1) gameMode.portal.p1.visible = false;
     if(gameMode.portal.p2) gameMode.portal.p2.visible = false;
   }
+  resetPortalSeal();   // re-open the return doorway so the next run starts fresh
   gameMode.exiting = true;
   gameMode.exitProg = 0;
   // Skills: tear down transient meshes (companions, drift fire, stomp rings) + hide the HUD.
@@ -13234,7 +13655,8 @@ function computeChaseCamPose() {
   // pose mid-hop, so the camera must keep the drift framing instead of easing back to focus the ship.
   var target = (s.isDrifting || s.driftJump) ? 1 : 0;
   var b = gameMode._driftCamBlend || 0;
-  b += (target - b) * 0.06;   // slower = smoother, damped swing into/out of the drift cam (was 0.09)
+  // DRIFT SWING stiffens the enter/exit ramp too: 0.06 (loose, the old feel) → 0.2 (rigid stick).
+  b += (target - b) * (0.06 + 0.14 * (gameMode.driftCamSwing || 0));
   if(b < 0.0008) b = 0;
   gameMode._driftCamBlend = b;
   if(b <= 0.0008){
@@ -13250,22 +13672,32 @@ function computeChaseCamPose() {
   var halfV = fovRadCam / 2;
   var halfH = Math.atan(Math.tan(halfV) * camera.aspect);
   var sxMax = halfH * 0.5;
-  var sx = Math.max(-sxMax, Math.min(sxMax, driftA));
+  // ── DRIFT CAM SWING (options row, gameMode.driftCamSwing 0–1) ── how far the camera physically
+  // swings around to sit directly behind the ship's FACING M while drifting. The ship's on-screen
+  // offset is exactly the angle between M and the camera's behind-line, so it IS the dial:
+  //   w=0 → offset = the full drift angle (capped at the screen edge below) = the camera holds its
+  //         spot behind TRAVEL and only rotates in place, ship pushed off to the drift side;
+  //   w=1 → offset = 0 = a rigid stick behind the ship's facing at all times ("stick on a motor"),
+  //         ship dead-centre on screen, at the plain non-drift chase distance.
+  // Screen centre stays on the firing line M at every setting, so the crosshair never moves.
+  var w = (gameMode.driftCamSwing != null ? gameMode.driftCamSwing : 0);
+  var sx = Math.max(-sxMax, Math.min(sxMax, driftA * (1 - w)));
   var sy = -Math.min(0.13, halfV * 0.3);
   // How far into the drift we are across the FULL drift range → drives the camera pull-in + roll.
   var driftFrac = Math.min(1, Math.abs(driftA) / GAME_DRIFT_MAX_ANGLE);
-  // At hard drift, ease the ship's on-screen offset back toward centre so it can't hug/leave the edge.
-  var sxEff = sx * (1 - 0.45 * driftFrac);
+  // At hard drift, ease the ship's on-screen offset back toward centre so it can't hug/leave the
+  // edge (faded out with w — at full swing the offset is already 0).
+  var sxEff = sx * (1 - 0.45 * driftFrac * (1 - w));
   var right = new THREE.Vector3().crossVectors(M, up).normalize();
   var shipDir = M.clone().addScaledVector(right, Math.tan(sxEff)).addScaledVector(up, Math.tan(sy));
   if(shipDir.lengthSq() > 1e-9) shipDir.normalize();
   // Camera-to-ship distance. The non-drift pose sits back d AND up h, so its radius is √(d²+h²).
-  // The drift pose starts a touch wider (DRIFT_CAM_ZOOM) but is pulled IN as the view rotates — the
-  // camera physically moves closer + swings behind the rotated aim M — so however far left/right you
-  // look, the ship stays framed and the crosshair (screen centre = M) stays put.
+  // The rotate-in-place rig (w=0) starts a touch wider (DRIFT_CAM_ZOOM) and is pulled IN as the
+  // view rotates so the offset ship stays framed; the full-swing rig (w=1) is just the chase cam
+  // rotated with the ship, so it keeps the plain chase radius. Blend the two radii by w.
   var DRIFT_CAM_ZOOM = 1.4;
   var camRadiusBase = Math.sqrt(d * d + h * h);
-  var camRadius = camRadiusBase * (DRIFT_CAM_ZOOM - 0.6 * driftFrac);
+  var camRadius = camRadiusBase * ((DRIFT_CAM_ZOOM - 0.6 * driftFrac) * (1 - w) + w);
   var posD = S.clone().addScaledVector(shipDir, -camRadius);
   var lookD = posD.clone().addScaledVector(M, 1.0);
   var upD = up.clone();
@@ -13326,7 +13758,10 @@ function computeLockCamPose(target){
 var GAME_CAM_JUMP_DAMP = 0.1;   // per-frame catch-up of the camera to the ship's jump height (lower = steadier)
 function updateCamAnchor(inDome){
   var ship = gameMode.ship;
-  var foot = inDome ? closestPointOnDome(ship.position) : closestPointOnCrystal(ship.position);
+  // On the entry platform, anchor to the platform/bridge (flat, +Y) — same as the dome uses
+  // closestPointOnDome — so the jump-damp altitude is stable instead of measuring against the far crystal.
+  var foot = inDome ? closestPointOnDome(ship.position)
+    : ((gameMode.entry && gameMode.entry.active) ? closestPointOnEntrySurface(ship.position) : closestPointOnCrystal(ship.position));
   if(!foot){ gameMode._camAlt = null; gameMode._camExcess = 0; return; }
   var alt = ship.position.clone().sub(foot.point).dot(foot.normal);
   if(gameMode._camAlt == null || gameMode.portal.snapCam) gameMode._camAlt = alt;   // init / portal-cross → snap (no lag)
@@ -13445,6 +13880,7 @@ function animateGameTransition() {
       gameMode.active = false;
       gameMode.group.visible = false;
       restoreGalleryWheel();
+      clearEntryStage();   // remove the platform/bridge + restore the gallery orbs to their orbit
       targetCameraY = gameMode.savedTargetCameraY;
       // Restore the original near plane now that the camera is back in orbit-cam range
       camera.near = gameMode.savedCamNear;
@@ -13831,8 +14267,9 @@ function updateGamePhysicsAndCamera() {
 
     if(s.isDrifting) {
       // Zero Friction Drift: always hold the entry momentum (never decay) → drift forever.
-      if(p.hasZeroFriction || s.driftTime <= p.driftSustainTime) {
+      if(p.hasZeroFriction || s._slipActive || s.driftTime <= p.driftSustainTime) {
         // Hold the entry momentum — a fresh drift must NEVER bleed speed, even coming in at
+        // (s._slipActive = riding a Slipstream ribbon → drag is killed the same as Zero Friction)
         // top speed. (Previously entering a drift fast could settle you into a slower glide.)
         var driftSign = s.speed < 0 ? -1 : 1;
         if(Math.abs(s.speed) < s.driftEntrySpeed) s.speed = driftSign * s.driftEntrySpeed;
@@ -13849,23 +14286,27 @@ function updateGamePhysicsAndCamera() {
       s.speed = Math.max(0, s.speed - (p.brakeMin + (p.brakeMax - p.brakeMin) * bramp));
       s.coastFrames = 0;
     } else if(p.isBoosting){
-      // RUNNING (boost): double-accel forward with NO max speed — keep building over and over.
-      s.speed += thrust * fwdAxis;                          // no drag, no cap → speed climbs unbounded
+      // BOOST: strong LINEAR acceleration (+60 km/h per second — faster than W's +35) up to a hard 100 km/h
+      // ceiling. Boost raises ACCELERATION, not an unbounded top speed: from a standstill you hit 60 km/h in
+      // ~1s and keep climbing to the 100 km/h cap (~1.7s), always out-accelerating W.
       s.coastFrames = 0;
-      var BOOST_SAFETY = p.maxSpeed * 12 * (p.maxBoostMul || 1);                   // ~180 km/h sanity guard (effectively uncapped)
-      if(s.speed > BOOST_SAFETY) s.speed = BOOST_SAFETY;
+      var A_BOOST = p.maxSpeed * (60/15) / 60;              // +60 km/h per second
+      var TOTAL_MAX = p.maxSpeed * (100/15) * (p.maxBoostMul || 1);   // total max speed = 100 km/h
+      s.speed += A_BOOST * (fwdAxis > 0 ? fwdAxis : 1);
+      if(s.speed > TOTAL_MAX) s.speed = TOTAL_MAX;
       var maxRb = p.maxSpeed * 0.6;
       if(s.speed < -maxRb) s.speed = -maxRb;
     } else if(fwdAxis > 0.01){
-      // Holding W (not boosting): snap up to the 35 km/h cruise cap in ~1s, then hold it. Above the
-      // cap (carried in from a boost) bleed slowly back down to it.
+      // Holding W (not boosting): LINEAR +35 km/h per second up to the 35 km/h cruise cap, then hold it.
+      // Above the cap (carried in from a boost) bleed slowly back down to it.
       s.coastFrames = 0;
       var CRUISE_CAP = p.maxSpeed * (35/15);                // 35 km/h
+      var A_W = p.maxSpeed * (35/15) / 60;                  // +35 km/h per second → reach cruise in ~1s
       if(s.speed > CRUISE_CAP){
         s.speed -= 0.00015;                                 // slow momentum loss down to 35
         if(s.speed < CRUISE_CAP) s.speed = CRUISE_CAP;
       } else {
-        s.speed += (CRUISE_CAP * Math.min(1, fwdAxis) - s.speed) * GAME_W_ACCEL;   // fast ease to cruise
+        s.speed = Math.min(CRUISE_CAP, s.speed + A_W * Math.min(1, fwdAxis));   // steady climb to cruise
       }
     } else if(hasFwd){
       // Reverse (no W) — the original gentle ramp.
@@ -13936,7 +14377,9 @@ function updateGamePhysicsAndCamera() {
       // has carried us off the planet's edge. Rather than fall forever along the
       // locked axis, hand control to gravity-well free-fall so we get pulled back
       // toward the nearest planet/crystal.
-      var hopLandHit = raycastShipToSurface(ship.position);
+      // Use the entry surface (platform/bridge + crystal) so hops + S-slams land on the platform,
+      // not just the crystal — raycastShipToSurface only casts at the crystal and misses the platform.
+      var hopLandHit = closestPointOnEntrySurface(ship.position);
       var hopAlt = hopLandHit ? ship.position.clone().sub(hopLandHit.point).dot(hopLandHit.normal) : Infinity;
       var FALL_OFF_ALT = 0.5;   // safely above a normal hop apex — tune if jumps feel cut short
       if(hopAlt > FALL_OFF_ALT){
@@ -13981,7 +14424,8 @@ function updateGamePhysicsAndCamera() {
     // you're out there, the triangular HALLWAY walls/floor once you've gone in. Robust for the
     // carved shape: the nearest surface is whatever's directly under the ship, so it can never grab
     // the far inner side and flip you, and you walk straight off the face down into the hallway.
-    var cp = closestPointOnCrystal(ship.position);
+    var cp = closestPointOnEntrySurface(ship.position);
+    var cpCrystal = !cp || cp.kind === 'crystal';   // false while gripping the flat platform/bridge
     if(cp) {
       var normalSmooth = 0.18 + Math.min(0.20, Math.abs(s.speed) * 30);
       s.groundNormal.lerp(cp.normal, normalSmooth).normalize();
@@ -13999,7 +14443,7 @@ function updateGamePhysicsAndCamera() {
       // only ever reached by FLYING in, which runs the airborne path, not this grip), HARD-pop it
       // back onto the outer side of the nearest face. Iterated a few times so a sharp multi-face
       // corner can't trap it. Pure-math bore test + radial push — no raycast can miss it.
-      for(var _eg = 0; _eg < 3; _eg++){
+      if(cpCrystal) for(var _eg = 0; _eg < 3; _eg++){   // only on the crystal — the flat platform has no "inside"
         var rOut = ship.position.clone().sub(gameMode.surface.center);
         if(rOut.lengthSq() < 1e-9) break;
         rOut.normalize();
@@ -14008,13 +14452,15 @@ function updateGamePhysicsAndCamera() {
         s.groundNormal.copy(rOut);                                            // hard outward normal
         ship.position.copy(skin.point).addScaledVector(rOut, s.hoverHeight);  // shove out to the skin
       }
+      // Invisible barriers keep the ship on the platform/bridge (skipped near the mouth so you can enter the hole).
+      resolveEntryBarriers(ship, s);
       s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
       if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
       var vN = fly.vel.dot(s.groundNormal);
       if(vN < 0) fly.vel.sub(s.groundNormal.clone().multiplyScalar(vN));
       fly.vel.multiplyScalar(0.85);
       // Wings ride the facets/ridges (anti-clip). Skipped while drifting so the inner wing scrapes.
-      if(!s.isDrifting) contourWingsToSurface();
+      if(!s.isDrifting && cpCrystal) contourWingsToSurface();
     } else {
       // Crystal missing (shouldn't happen) → detach into free-fall (carry walking momentum).
       s.airborne = true; s.freeFalling = true; s.airTime = 0;
@@ -14232,7 +14678,11 @@ function updateGamePhysicsAndCamera() {
     camera.position.copy(chase.pos); camera.up.copy(chase.up).normalize();
     gameMode.portal.snapCam = false;
   } else {
-    var camLerp = gameMode.surfaceState.isDrifting ? 0.13 : 0.18;   // damped: ease into the drift swing instead of snapping
+    // Damped chase. DRIFT SWING also stiffens the drift position-tracking: at w=0 the camera eases
+    // loosely (0.13, the old feel), at w=1 it tracks near-rigidly (0.9) — a real stick behind the
+    // ship. Without this the follow-lag (~40° of azimuth at drift speed) swamped the pose change.
+    var swW = gameMode.surfaceState.isDrifting ? (gameMode.driftCamSwing || 0) : 0;
+    var camLerp = gameMode.surfaceState.isDrifting ? (0.13 + 0.77 * swW) : 0.18;
     camera.position.lerp(chase.pos, camLerp);
     camera.up.lerp(chase.up, 0.12); camera.up.normalize();
   }
@@ -15215,16 +15665,14 @@ function gameCrosshairDir(nose, M){
   var up = gameMode.surfaceState.groundNormal;
   var camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
   if(camFwd.lengthSq() <= 1e-9) return M.clone();
-  camFwd.normalize();
-  var distToShip = camera.position.distanceTo(gameMode.ship.position);
-  var dir = camera.position.clone().addScaledVector(camFwd, distToShip + GAME_AIM_AHEAD).sub(nose);
-  // Flatten into the surface tangent plane. The drift cam sits ABOVE the ship, so its centre ray
-  // passes above it — aiming at any point on that ray tilts bullets UP by an amount that grows with
-  // zoom (the residual "upward curve"). Stripping the normal component keeps the horizontal crosshair
-  // convergence but fires dead-flat along the ground at every zoom.
-  dir.addScaledVector(up, -dir.dot(up));
-  if(dir.lengthSq() > 1e-9) dir.normalize(); else dir.copy(M);
-  return dir;
+  // The crosshair's aim LINE = the screen-centre ray flattened onto the ground. We return its horizontal
+  // DIRECTION only — deliberately independent of where the ship sits or which enemy is under the crosshair.
+  // Every bullet curves onto this one heading and travels dead-flat straight down the crosshair, so aim is
+  // consistent at any range/zoom and never shifts based on the target's depth. (A bit unrealistic — the
+  // bullet visibly bends out of the ship — but it makes long-distance fire reliable, which is the point.)
+  camFwd.addScaledVector(up, -camFwd.dot(up));
+  if(camFwd.lengthSq() > 1e-9){ camFwd.normalize(); return camFwd; }
+  return M.clone();
 }
 // EXACT crosshair aim: cast a ray from the camera straight through the centre crosshair and find the
 // nearest enemy it passes through, returning that enemy's world position so bullets fired from the
@@ -15276,7 +15724,7 @@ function fireBullet(){
   if(!gameMode.active || gameMode.exiting || playerDeath.active) return;   // no firing while dead
   if(skillFx.beam){ updateBeamCharge(); return; }   // Beam skill: hold to charge → release a piercing beam (replaces rapid fire)
   var now = performance.now();
-  var cap = (skillFx.bigBullet ? 660 : 220) / (1 + 0.25 * (skillFx.overclock || 0));   // half base rate; Overclock +25%/stack
+  var cap = (skillFx.bigBullet ? 660 : 220) / ((1 + 0.25 * (skillFx.overclock || 0)) * gameFireRateMul());   // Overclock +25%/stack, ×Kill Streak / Adrenaline
   if(now - lastFireTime < cap) return;
   lastFireTime = now;
   fireOneVolley();   // the full bullet fan (Front Bullet + Diagonal + Big/Velocity/Split/Orbit/Tracking)
@@ -15308,6 +15756,41 @@ function bulletSurfaceInteract(b){
   if(b.bounces > 0 && signed <= SKIN){
     var vn = b.vel.dot(n);
     if(vn < 0){ b.vel.addScaledVector(n, -2 * vn); b.mesh.position.copy(cp.point).addScaledVector(n, SKIN + 0.001); b.bounces--; }
+  }
+}
+// ── Rubber Bullet: ricochet a player bullet off an ENEMY hull (reflect velocity + pop clear of the
+// radius) instead of consuming it. Damage is already dealt by the caller. Returns true if it bounced
+// (keep the bullet), false if it has no bounces left (caller disposes it as normal). ──
+var _rubberN = new THREE.Vector3(), SHIELD_BULLET_R = 0.05;
+function bulletBounce(b, targetPos, targetR){
+  if(!(b.rubber > 0)) return false;
+  var n = _rubberN.copy(b.mesh.position).sub(targetPos);
+  if(n.lengthSq() < 1e-9) n.copy(b.vel).multiplyScalar(-1);
+  if(n.lengthSq() < 1e-9) n.set(0, 1, 0);
+  n.normalize();
+  var vn = b.vel.dot(n);
+  if(vn < 0) b.vel.addScaledVector(n, -2 * vn);                          // reflect away from the hull
+  b.mesh.position.copy(targetPos).addScaledVector(n, (targetR || 0.1) + 0.006);   // clear the radius (no instant re-hit)
+  b.rubber--; b.life = 0;                                                // refresh life so the ricochet keeps flying
+  return true;
+}
+// ── Shield Bullet: player bullets shoot down incoming enemy bullets with a big interception hitbox.
+// Both pop on contact (mutual annihilation). Called each combat frame. ──
+function updateBulletShield(){
+  if(!skillFx.shieldBullet || !gameBullets.length || !combat.enemyBullets.length) return;
+  for(var sbi = gameBullets.length - 1; sbi >= 0; sbi--){
+    var sb = gameBullets[sbi];
+    var sr = (sb.hitR || BULLET_HIT_R) + SHIELD_BULLET_R;
+    for(var ebi = combat.enemyBullets.length - 1; ebi >= 0; ebi--){
+      var eb = combat.enemyBullets[ebi];
+      var rr = sr + (eb.hitR || 0.03);
+      if(sb.mesh.position.distanceToSquared(eb.mesh.position) < rr * rr){
+        sklBurst(eb.mesh.position.clone(), 0x9fe0ff, 0.045, 8);          // interception spark
+        disposeEnemyBullet(eb); combat.enemyBullets.splice(ebi, 1);
+        disposeGameBullet(sb); gameBullets.splice(sbi, 1);
+        break;   // this player bullet is spent → next
+      }
+    }
   }
 }
 function updateGameBullets(){
@@ -15731,28 +16214,30 @@ function buildCluster(ramp){
 // spaced away from other pending impacts. Projects a random direction onto the icosahedron via
 // closestPointOnDome so the point + normal sit on a real facet.
 var _mt1 = new THREE.Vector3(), _mt2 = new THREE.Vector3();
+// FLAT ARENA: pick an impact point ON THE FLAT PLANE (y = domeFloorY). 70% biased near the player, 30%
+// anywhere on the plane; clamped just inside the plane edge so meteors always land within the floor's
+// confines. Never drops straight on the player and stays spaced from other pending impacts.
 function sampleMeteorImpact(){
-  var bd = combat.bodies && combat.bodies[0]; if(!bd) return null;
+  var P = gameMode.portal; if(!P) return null;
   var ship = gameMode.ship.position, fallback = null;
+  var half = (P.planeHalf || 20) * 0.94;   // keep impacts just inside the plane border
   for(var a = 0; a < 20; a++){
-    var dir;
+    var px, pz;
     if(Math.random() < 0.7){
-      var up = ship.clone().sub(bd.center); if(up.lengthSq() < 1e-6) up.set(0, 1, 0); up.normalize();
-      tangentBasis(up, _mt1, _mt2);
-      var ang = Math.random() * Math.PI * 2, rad = 0.6 + Math.random() * 2.2;
-      dir = up.clone().addScaledVector(_mt1, Math.cos(ang) * rad / bd.radius).addScaledVector(_mt2, Math.sin(ang) * rad / bd.radius).normalize();
+      var ang = Math.random() * Math.PI * 2, rad = 0.6 + Math.random() * 2.6;   // ring around the player
+      px = ship.x + Math.cos(ang) * rad; pz = ship.z + Math.sin(ang) * rad;
     } else {
-      var uu = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2, rxy = Math.sqrt(Math.max(0, 1 - uu * uu));
-      dir = new THREE.Vector3(rxy * Math.cos(th), uu, rxy * Math.sin(th));
+      px = P.DX + (Math.random() * 2 - 1) * half; pz = P.domeCz + (Math.random() * 2 - 1) * half;   // anywhere on the plane
     }
-    var cp = closestPointOnDome(bd.center.clone().addScaledVector(dir, bd.radius * 1.05));
-    if(!cp) continue;
-    var p = cp.point;
-    if(p.distanceTo(ship) < 0.7) continue;                         // never drop straight on the player
+    px = Math.max(P.DX - half, Math.min(P.DX + half, px));      // clamp inside the plane
+    pz = Math.max(P.domeCz - half, Math.min(P.domeCz + half, pz));
+    var p = new THREE.Vector3(px, P.domeFloorY, pz);
+    if(p.distanceTo(ship) < 0.7) continue;                     // never drop straight on the player
     var ok = true;
     for(var e = 0; e < combat.meteors.length; e++){ if(combat.meteors[e].impact.distanceTo(p) < 0.8){ ok = false; break; } }
-    if(ok) return { pos: p.clone(), normal: cp.normal.clone() };
-    fallback = { pos: p.clone(), normal: cp.normal.clone() };
+    var res = { pos: p, normal: new THREE.Vector3(0, 1, 0) };
+    if(ok) return res;
+    fallback = res;
   }
   return fallback;
 }
@@ -15812,6 +16297,18 @@ function spawnMeteor(cluster){
   var s = sampleMeteorImpact(); if(!s) return;
   _addMeteor(s.pos, s.normal, cluster, METEOR_FALL_FRAMES);
   if(MP.isHost && MP.connected) mpSend({ type: 'meteor', x: s.pos.x, y: s.pos.y, z: s.pos.z, nx: s.normal.x, ny: s.normal.y, nz: s.normal.z, T: METEOR_FALL_FRAMES });
+}
+// Drop a meteor at a CHOSEN ground point on the flat plane (clamped inside the border), with a custom
+// fall time. THE CORE uses this to bombard the player directly. An empty cluster ⇒ a PURE-DAMAGE meteor
+// (no enemy payload emerges), so the boss threatens you without spawning any adds.
+function spawnMeteorAt(x, z, cluster, T){
+  var P = gameMode.portal; if(!P) return;
+  var half = (P.planeHalf || 20) * 0.98;
+  var px = Math.max(P.DX - half, Math.min(P.DX + half, x));
+  var pz = Math.max(P.domeCz - half, Math.min(P.domeCz + half, z));
+  var T2 = T || METEOR_FALL_FRAMES;
+  _addMeteor(new THREE.Vector3(px, P.domeFloorY, pz), new THREE.Vector3(0, 1, 0), cluster || [], T2);
+  if(MP.isHost && MP.connected) mpSend({ type: 'meteor', x: px, y: P.domeFloorY, z: pz, nx: 0, ny: 1, nz: 0, T: T2 });
 }
 function _addMeteor(pos, normal, cluster, T){
   var jitter = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5);
@@ -15945,26 +16442,35 @@ function spawnBoss(){
   var start = s.pos.clone().addScaledVector(s.normal, METEOR_START_DIST * 1.6);
   mesh.position.copy(start);
   combat.boss = { mesh: mesh, hp: maxHp, maxHp: maxHp, pos: s.pos.clone(), normal: s.normal.clone(), start: start,
-    state: 'falling', t: 0, T: BOSS_FALL_FRAMES, hitR: 0.42, phase: 1, atkTimer: 120, atkIdx: -1, ring: makeMeteorRing(s.pos, s.normal) };
+    state: 'falling', t: 0, T: BOSS_FALL_FRAMES, hitR: 0.42, phase: 1, atkTimer: 70, atkIdx: -1, ring: makeMeteorRing(s.pos, s.normal) };
 }
-// One boss attack, cycling rain → slam → adds; counts/cadence escalate with the phase.
+// One boss attack, cycling barrage → cage → bombardment. All PURE-DAMAGE meteors aimed at the player —
+// THE CORE fights you alone and NEVER spawns adds. Counts/cadence escalate with the HP-gated phase.
 function bossAttack(bs){
   bs.atkIdx = (bs.atkIdx + 1) % 3;
-  if(bs.atkIdx === 0){                                    // meteor rain
-    var c = bs.phase >= 3 ? 5 : bs.phase >= 2 ? 3 : 2;
-    for(var i = 0; i < c; i++) spawnMeteor(buildCluster(0.4));
-  } else if(bs.atkIdx === 1){                             // contour shockwave slam(s)
-    spawnShockwave(bs.pos, bs.normal);
-    if(bs.phase >= 3) spawnShockwave(bs.pos, bs.normal);
-  } else {                                                // adds
-    var na = bs.phase >= 3 ? 4 : bs.phase >= 2 ? 3 : 2, tb1 = new THREE.Vector3(), tb2 = new THREE.Vector3();
-    tangentBasis(bs.normal, tb1, tb2);
-    for(var a = 0; a < na; a++){
-      var ang = Math.random() * Math.PI * 2, rad = 0.25 + Math.random() * 0.22;
-      var p = bs.pos.clone().addScaledVector(tb1, Math.cos(ang) * rad).addScaledVector(tb2, Math.sin(ang) * rad);
-      var cp = closestPointOnDome(p), pos = cp ? cp.point.clone().addScaledVector(cp.normal, 0.01) : p, nrm = cp ? cp.normal.clone() : bs.normal.clone();
-      if(Math.random() < 0.6) addBall(pos, nrm, 0, true, null); else addFoe('wasp', pos, nrm, true);
+  var ship = gameMode.ship.position;
+  if(bs.atkIdx === 0){
+    // BARRAGE — a volley raining right onto the player (aimed at them + a tight spread so standing still
+    // gets you cored). Faster fall in later phases so you have less time to clear the impact zone.
+    var c = bs.phase >= 3 ? 6 : bs.phase >= 2 ? 4 : 3, fall = bs.phase >= 3 ? 78 : 100;
+    for(var i = 0; i < c; i++){
+      var ang = Math.random() * Math.PI * 2, rad = Math.random() * (bs.phase >= 3 ? 1.5 : 1.0);
+      spawnMeteorAt(ship.x + Math.cos(ang) * rad, ship.z + Math.sin(ang) * rad, [], fall);
     }
+  } else if(bs.atkIdx === 1){
+    // CAGE — a shockwave telegraph erupts at the core while a ring of meteors drops AROUND the player,
+    // squeezing their safe space so they have to dodge through a gap.
+    spawnShockwave(bs.pos, bs.normal);
+    var na = bs.phase >= 3 ? 12 : bs.phase >= 2 ? 9 : 7, r = 1.25;
+    for(var a = 0; a < na; a++){
+      var th = (a / na) * Math.PI * 2 + Math.random() * 0.35;
+      spawnMeteorAt(ship.x + Math.cos(th) * r, ship.z + Math.sin(th) * r, [], 110);
+    }
+  } else {
+    // BOMBARDMENT — a wide scatter across the player's neighbourhood (area denial).
+    var nb = bs.phase >= 3 ? 8 : bs.phase >= 2 ? 6 : 4;
+    for(var b = 0; b < nb; b++)
+      spawnMeteorAt(ship.x + (Math.random()*2-1)*2.6, ship.z + (Math.random()*2-1)*2.6, [], bs.phase >= 3 ? 90 : 120);
   }
 }
 var _bossV3 = new THREE.Vector3();
@@ -16020,6 +16526,7 @@ function updateDomeArena(){
     var nearFloor = ship.position.y < P.domeFloorY + 0.5;   // actually down on the dome floor, not the chute
     if(grounded && nearFloor){
       combat.arenaActive = true;
+      startPortalSeal();   // committed to the dome → collapse the return doorway shut (one-way, crystal seal)
       combat.startMs = performance.now(); combat.elapsed = 0; combat.scaleMul = combatScaleForTime(0);
       combat.domeSpawn = ship.position.clone();   // where to send the player back to on death
       combat.meteorTimer = WAVE1_DELAY;           // brief grace before the first meteor falls
@@ -16159,6 +16666,7 @@ function clearArena(){
     for(var i = 0; i < combat.bodies.length; i++){ var g = combat.bodies[i].group; if(g){ if(g.parent) g.parent.remove(g); g.traverse(function(c){ if(c.geometry) c.geometry.dispose(); if(c.material && c.material.dispose) c.material.dispose(); }); } }
     combat.bodies = null;
   }
+  combat.arenaBuilt = false;
   var P = gameMode.portal; if(P){ if(P.floorMesh) P.floorMesh.visible = true; if(P.gridMesh) P.gridMesh.visible = true; }
 }
 // Two orthonormal tangents for a radial up-vector (a building's local ground frame on the sphere).
@@ -16282,18 +16790,19 @@ function makeBody(center, radius, kind){
   P.regionB.add(grp);
   return { center: center.clone(), radius: radius, innerR: radius * ICOSA_IN, kind: kind, group: grp, buildings: [], tris: new Float32Array(geo.attributes.position.array) };
 }
-// Build the planet + its city (top at the drop-in height so you land on the pole) + an orbiting moon.
+// FLAT ARENA: the hallway opens onto the massive flat grid plane — exactly what you see through the
+// portal. No planet/moon; the flat floor + grid stay visible and grip/gravity fall through to the flat
+// physics path (combat.bodies === null). The old icosahedron builder (_generateArenaInner/makeBody) is
+// left defined but unused.
 function generateArena(seed){
   clearArena();
   var P = gameMode.portal; if(!P || !P.regionB) return;
-  try{ _generateArenaInner(P, seed); }
-  catch(e){
-    combat._arenaErr = (e && e.message) || String(e);
-    // build failed → don't strand the player on a hidden floor
-    if(P.floorMesh) P.floorMesh.visible = true;
-    if(P.gridMesh) P.gridMesh.visible = true;
-    combat.bodies = null;
-  }
+  if(P.floorMesh) P.floorMesh.visible = true;
+  if(P.gridMesh) P.gridMesh.visible = true;
+  combat.bodies = null;
+  combat.arenaBuilt = true;
+  combat.arenaSeed = (seed >>> 0) || 1;
+  if(MP.isHost && MP.connected) mpSend({ type: 'arena', seed: combat.arenaSeed });   // co-op: keep the seed handshake
 }
 function _generateArenaInner(P, seed){
   if(P.floorMesh) P.floorMesh.visible = false;
@@ -16655,6 +17164,8 @@ function addXP(amount){
     mpSend({ type: 'xpcollect', a: amount });
     return;
   }
+  if(skillFx.greed) amount *= 1.5;        // Greed: +50% XP from kills
+  if(skillFx.scavenger) amount *= 0.8;    // Scavenger: level up 20% slower
   var before = xpState.level;
   xpState.current += amount;
   while(xpState.current >= xpRequired()){ xpState.current -= xpRequired(); xpState.level++; }  // overflow → multi-level
@@ -16683,6 +17194,7 @@ function spawnXPBurst(pos, normal, count){
     combat._xpGlowGeo = new THREE.SphereGeometry(XP_ORB_R * 2.0, 7, 6);
     combat._xpMat = new THREE.MeshBasicMaterial({ color: 0xfff070 });
     combat._xpGlowMat = new THREE.MeshBasicMaterial({ color: 0xffd844, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false });
+    applyXpOrbTint();   // Greed/Scavenger recolor from the first burst
   }
   var n = normal.clone(); if(n.lengthSq() < 1e-6) n.set(0, 1, 0); n.normalize();
   var t1 = new THREE.Vector3(1, 0, 0); if(Math.abs(n.dot(t1)) > 0.9) t1.set(0, 0, 1);
@@ -16766,12 +17278,14 @@ function updateXPOrbs(){
     var o = combat.xpOrbs[i];
     o.life++;
     if(o.heart) o.mesh.rotateOnWorldAxis(o.normal, 0.07);   // gentle twirl so the heart is noticeable
-    if(o.life > o.maxLife){ disposeXPOrb(o); combat.xpOrbs.splice(i, 1); continue; }
+    var effMaxLife = (skillFx.greed && !o.heart) ? o.maxLife * 0.5 : o.maxLife;   // Greed: orbs expire 2× faster
+    if(o.life > effMaxLife){ disposeXPOrb(o); combat.xpOrbs.splice(i, 1); continue; }
     var orbR = o.r || XP_ORB_R;
     var d = o.mesh.position.distanceTo(ship.position);
     var pickup = o.heart ? HEART_PICKUP : XP_PICKUP;
     if(d < pickup){
-      if(o.heart) healPlayer(combat.player.maxHp * HEART_HEAL_FRAC); else addXP(o.value);
+      if(o.heart) healPlayer(combat.player.maxHp * HEART_HEAL_FRAC);
+      else { addXP(o.value); if(skillFx.scavenger) healPlayer(combat.player.maxHp * 0.01); }   // Scavenger: +1% HP per XP orb
       disposeXPOrb(o); combat.xpOrbs.splice(i, 1); continue;
     }
     var magnet = (o.heart ? HEART_MAGNET : XP_MAGNET) * (1 + skillFx.xpRange);   // XP Magnet: +1× pickup range per stack
@@ -16856,12 +17370,14 @@ function clearDying(){ for(var i = 0; i < combat.dying.length; i++) disposeDeadM
 // player-bullet kills; the instant disposeTank/disposeBall path (region clears) skips the animation.
 function killTank(tank){
   var idx = combat.enemies.indexOf(tank); if(idx >= 0) combat.enemies.splice(idx, 1);
+  onEnemyKilled(tank.position, tank.userData.normal || _statUp, tank.userData, 'tank');
   sfxEnemyDies(tank.position);
   startDeath(tank, tank.userData.normal, TANK_XP_ORBS, false, tank.userData.hpBarEl);
   // The tank's rolling balls are NOT killed here — they keep chasing on their own (independent).
 }
 function killBall(ball){
   var bi = combat.balls.indexOf(ball); if(bi >= 0) combat.balls.splice(bi, 1);
+  onEnemyKilled(ball.mesh.position, ball.normal || _statUp, ball, 'ball');
   sfxEnemyDies(ball.mesh.position);
   // Splitter: a full-size sphere bursts into BALL_SPLIT smaller spheres that scatter out across the
   // surface, then the parent shatters into XP. Children chase independently and die normally (no
@@ -17217,6 +17733,7 @@ function disposeFoe(f){
 function clearFoes(){ for(var i = 0; i < combat.foes.length; i++) disposeFoe(combat.foes[i]); combat.foes.length = 0; }
 function killFoe(f){
   var i = combat.foes.indexOf(f); if(i >= 0) combat.foes.splice(i, 1);
+  onEnemyKilled(f.position, f.normal || _statUp, f, 'foe');
   disposeWaspExtras(f);   // safety: phase-2 wasps already shed these; no-op for mortars
   sfxEnemyDies(f.position);
   startDeath(f.mesh, f.normal, f.kind === 'wasp' ? BALL_XP_ORBS : TANK_XP_ORBS, false, f.hpBarEl);
@@ -17784,6 +18301,14 @@ function updateLockReticle(){
 function hurtPlayer(amount, srcPos){
   if(combat.player.dead) return;
   if(combat.godMode) return;   // Immortality toggle (I key)
+  var S = sklState();
+  // Overshield: a banked shield bubble eats the whole hit (and pops), no damage taken.
+  if(skillFx.overshield && S.shieldUp){
+    S.shieldUp = false; S.killsNoHit = 0;
+    combat.hurtFlash = 0.4;
+    sklBurst(gameMode.ship.position.clone(), 0x8fd4ff, 0.12, 18);
+    return;
+  }
   amount *= (combat.scaleMul || 1);   // enemies hit harder every 5 waves
   // Melee Shield: reduce close-range damage by 25% per stack (capped 90%). In this tiny world
   // shells land at the ship and rams are point-blank, so a missing srcPos counts as close.
@@ -17791,10 +18316,14 @@ function hurtPlayer(amount, srcPos){
     var close = !srcPos || srcPos.distanceTo(gameMode.ship.position) < 0.2;
     if(close) amount *= (1 - Math.min(0.9, 0.25 * skillFx.meleeShield));
   }
+  if(skillFx.leechField && S.leeching) amount *= LEECH_DMG_MUL;   // +20% damage taken while regenerating
   combat.player.hp -= amount;
   combat.hurtFlash = 1;
   sfxPlayerDamage();
+  if(skillFx.adrenaline) triggerAdrenaline();   // taking a hit fuels the surge
+  S.killsNoHit = 0;                              // Overshield streak resets on any hit taken
   if(combat.player.hp <= 0){
+    if(trySecondWind()) return;                  // Second Wind: revive at 30% HP once per run (wipes loose XP)
     combat.player.hp = 0;
     combat.player.dead = true;
     combat.player.deadT = performance.now();
@@ -17808,6 +18337,8 @@ function initCombat(arena){
   combat.player.hp = combat.player.maxHp;
   combat.player.dead = false;
   combat.totalDamage = 0;
+  resetSkillRunState();   // fresh Second Wind / kill-streak / shield state for the run
+  applyXpOrbTint();
   combat.arena = arena;
   combat.spawned = true;
   // No auto-spawn — the player spawns every tank manually with T.
@@ -17977,7 +18508,7 @@ function updateCombat(dt){
         _bs.hp -= _bdmg; combat.totalDamage += _bdmg;
         spawnDamageNumber(_bs.mesh.position.clone().addScaledVector(_bs.normal, 0.12), _bdmg, false);
         sfxEnemyDamage(_bs.mesh.position);
-        disposeGameBullet(b); gameBullets.splice(bi, 1);
+        if(!bulletBounce(b, _bs.mesh.position, _bs.hitR)){ disposeGameBullet(b); gameBullets.splice(bi, 1); }
         if(_bs.hp <= 0) killBoss();
         continue;
       }
@@ -17992,7 +18523,7 @@ function updateCombat(dt){
       dealDamageToTank(hitTank, b.dmg || PLAYER_BULLET_DAMAGE);
       applyBulletElements(b, hitTank, 'tank');   // Fire/Ice/Electric on-hit
       spawnSplitChildren(b, hitTank.position.clone());   // Split Shot: spawn child bullets on hit
-      disposeGameBullet(b); gameBullets.splice(bi, 1);
+      if(!bulletBounce(b, hitTank.position, (hitTank.userData.collideR || 0.1))){ disposeGameBullet(b); gameBullets.splice(bi, 1); }   // Rubber: ricochet instead of vanish
       if(hitTank.userData.hp <= 0){
         killTank(hitTank);   // shake → glow yellow → shatter into XP (also kills its balls the same way)
         // Killed the locked target (the tank OR one of its balls) → jump to the next-nearest target
@@ -18017,7 +18548,7 @@ function updateCombat(dt){
             sfxEnemyDamage(fo.appPos);
             applyBulletElements(b, fo, 'foe');
             spawnSplitChildren(b, fo.appPos.clone());
-            disposeGameBullet(b); gameBullets.splice(bi, 1);
+            if(!bulletBounce(b, fo.appPos, fo.appR)){ disposeGameBullet(b); gameBullets.splice(bi, 1); }
             if(fo.appHp <= 0){ waspBreakTether(fo); relock(); }
             hitFoe = true; break;
           }
@@ -18032,7 +18563,7 @@ function updateCombat(dt){
         sfxEnemyDamage(fo.position);
         applyBulletElements(b, fo, 'foe');
         spawnSplitChildren(b, fo.position.clone());   // Split Shot: spawn child bullets on hit
-        disposeGameBullet(b); gameBullets.splice(bi, 1);
+        if(!bulletBounce(b, fo.position, (fo.hitR || fo.r))){ disposeGameBullet(b); gameBullets.splice(bi, 1); }
         if(fo.hp <= 0){ killFoe(fo); relock(); }
         hitFoe = true; break;
       }
@@ -18050,12 +18581,15 @@ function updateCombat(dt){
         sfxEnemyDamage(bk.mesh.position);
         applyBulletElements(b, bk, 'ball');
         spawnSplitChildren(b, bk.mesh.position.clone());   // Split Shot: spawn child bullets on hit
-        disposeGameBullet(b); gameBullets.splice(bi, 1);
+        if(!bulletBounce(b, bk.mesh.position, bk.r * BALL_HIT_MUL)){ disposeGameBullet(b); gameBullets.splice(bi, 1); }
         if(bk.hp <= 0){ killBall(bk); relock(); }
         break;
       }
     }
   }
+
+  updateBulletShield();   // Shield Bullet: shoot down incoming enemy bullets before they reach you
+  flushKillFx();   // apply queued Deep Freeze / Wildfire AoE now — safely OUTSIDE every enemy-array loop
 
   // Tank AI: nearest cannon tracks + fires at the player, the other three rest at their axis
   for(var ti = 0; ti < combat.enemies.length; ti++){
@@ -18775,7 +19309,34 @@ var gameUpgradeDefs = {
   xpMagnet:     { name:'XP Magnet',      rarity:'common', stackable:true, maxStack:5, icon:'🧲',
     desc:'Doubles XP pickup range. Stacks.' },
   driftFire:    { name:'Drift Fire',     rarity:'rare', stackable:false, maxStack:1, icon:'🔥',
-    desc:'Leaves a fire trail while drifting that burns enemies for 7s.' }
+    desc:'Leaves a fire trail while drifting that burns enemies for 7s.' },
+  // ── New batch ──
+  killStreak:   { name:'Kill Streak',    rarity:'rare', stackable:false, maxStack:1, icon:'📈',
+    desc:'Every kill stacks +4% fire rate (decays if you stop killing). A hot aura grows with the streak.' },
+  adrenaline:   { name:'Adrenaline',     rarity:'rare', stackable:false, maxStack:1, icon:'💢',
+    desc:'Taking a hit grants a 2s surge: +30% speed & fire rate. Red speed-lines flare while active.' },
+  leechField:   { name:'Leech Field',    rarity:'rare', stackable:false, maxStack:1, icon:'💚',
+    desc:'Stand still to regenerate HP fast (green glow), but you take +20% damage while regenerating.' },
+  overshield:   { name:'Overshield',     rarity:'rare', stackable:false, maxStack:1, icon:'🫧',
+    desc:'5 kills without taking a hit grants a one-hit shield bubble around the ship.' },
+  secondWind:   { name:'Second Wind',    rarity:'legendary', stackable:false, maxStack:1, icon:'💫',
+    desc:'Once per run, a lethal hit instead revives you at 30% HP — but wipes all loose XP orbs.' },
+  slipstream:   { name:'Slipstream',     rarity:'rare', stackable:false, maxStack:1, icon:'➰',
+    desc:'Drifting lays a glowing speed-ribbon. Riding it (loop around!) boosts speed + kills friction.' },
+  afterburn:    { name:'Afterburn Trail',rarity:'rare', stackable:false, maxStack:1, icon:'♨',
+    desc:'Your boost trail becomes a burning red wake that sets enemies on fire.' },
+  deepFreeze:   { name:'Deep Freeze',    rarity:'rare', stackable:false, maxStack:1, icon:'🧊',
+    desc:'Killing a slowed/frozen enemy shatters it in an icy AoE blast that damages nearby foes.' },
+  wildfire:     { name:'Wildfire',       rarity:'rare', stackable:false, maxStack:1, icon:'🌋',
+    desc:'A burning enemy that dies spreads its fire to nearby enemies.' },
+  greed:        { name:'Greed',          rarity:'common', stackable:false, maxStack:1, icon:'🪙',
+    desc:'+50% XP from kills, but XP orbs (turned gold) expire twice as fast — grab them quick.' },
+  scavenger:    { name:'Scavenger',      rarity:'common', stackable:false, maxStack:1, icon:'🩹',
+    desc:'XP orbs (tinted green) also heal 1% HP each, but you level up 20% slower.' },
+  shieldBullet: { name:'Shield Bullet',  rarity:'rare', stackable:false, maxStack:1, icon:'🔰',
+    desc:'Your bullets shoot down incoming enemy bullets (large interception hitbox). Both pop on contact.' },
+  rubberBullet: { name:'Rubber Bullet',  rarity:'common', stackable:true, maxStack:5, icon:'🎾',
+    desc:'Bullets ricochet off enemies (still dealing damage) instead of vanishing. +1 bounce per stack.' }
 };
 var SKILL_SYNERGY = { drone:['orbitDrone','droneSpeed','electricNet'], orb:['spinOrb','orbSpeed','electricNet'] };
 
@@ -18783,10 +19344,12 @@ var SKILL_SYNERGY = { drone:['orbitDrone','droneSpeed','electricNet'], orb:['spi
 // everything else lives here. applyGameUpgrades() recomputes both from gameSkills.equipped.
 var skillFx = {
   frontBullet:0, multiShot:0, diagonal:0, bigBullet:false, splitShot:0, orbitingShot:0, velocity:0, tracking:false, overclock:0, beam:false, dmgMult:1,
-  fireBullet:0, iceBullet:0, electric:0, bounce:0, contour:false, barrelRollShot:0,
+  fireBullet:0, iceBullet:0, electric:0, bounce:0, contour:false, barrelRollShot:0, rubber:0, shieldBullet:false,
   drone:0, droneSpeed:0, orb:0, orbSpeed:0, electricNet:false,
   meleeShield:0, ram:0, crazyDaisy:false,
   xpRange:0, driftFire:false, driftFocus:0,
+  killStreak:false, adrenaline:false, leechField:false, overshield:false, secondWind:false,
+  slipstream:false, afterburn:false, deepFreeze:false, wildfire:false, greed:false, scavenger:false,
   timeScale:1, volleys:[]   // live: enemy slow-mo factor + queued multishot volley countdowns
 };
 var GAUGE_DRIFT_RATE = (Math.PI * 0.5) / 45;   // gauge drift ramps to full 90° over ~0.75s of hold
@@ -18843,6 +19406,8 @@ function applyGameUpgrades(){
   skillFx.electric     = g.getCount('electricBullet');   // Phase C skill (0 until added)
   skillFx.bounce       = g.getCount('bouncyBullet');     // Phase D
   skillFx.contour      = g.getCount('contourArrow') > 0; // Phase D
+  skillFx.rubber       = g.getCount('rubberBullet');     // bounce off ENEMIES (still damaging)
+  skillFx.shieldBullet = g.getCount('shieldBullet') > 0; // intercept incoming enemy bullets
   skillFx.barrelRollShot = g.getCount('barrelRollShot'); // Phase E
   // companions
   skillFx.drone        = g.getCount('orbitDrone');
@@ -18857,6 +19422,20 @@ function applyGameUpgrades(){
   skillFx.xpRange      = g.getCount('xpMagnet');
   skillFx.driftFire    = g.getCount('driftFire') > 0;
   skillFx.driftFocus   = p.driftFocusStacks;
+  // ── new batch flags ──
+  skillFx.killStreak   = g.getCount('killStreak') > 0;
+  skillFx.adrenaline   = g.getCount('adrenaline') > 0;
+  skillFx.leechField   = g.getCount('leechField') > 0;
+  skillFx.overshield   = g.getCount('overshield') > 0;
+  skillFx.secondWind   = g.getCount('secondWind') > 0;
+  skillFx.slipstream   = g.getCount('slipstream') > 0;
+  skillFx.afterburn    = g.getCount('afterburn') > 0;
+  skillFx.deepFreeze   = g.getCount('deepFreeze') > 0;
+  skillFx.wildfire     = g.getCount('wildfire') > 0;
+  skillFx.greed        = g.getCount('greed') > 0;
+  skillFx.scavenger    = g.getCount('scavenger') > 0;
+  applyXpOrbTint();   // Greed/Scavenger recolor the shared XP-orb material as a visual tell
+  syncSkillVisuals();   // attach/detach persistent ship auras (kill-streak / overshield / second-wind)
   // ── new: max boost / max health / Giant ──
   p.maxBoostMul = 1 + 0.3 * g.getCount('maxBoost');              // Overdrive Boost: higher boost ceiling
   var giantN = g.getCount('giant');
@@ -19295,6 +19874,7 @@ function spawnSkillBullet(origin, dir, lateral){
   if(skillFx.electric){ col = 0x66ccff; glowC = 0x88ddff; }            // element tint — priority: electric > fire > ice
   else if(skillFx.fireBullet){ col = 0xff5a2a; glowC = 0xff8a3a; }
   else if(skillFx.iceBullet){ col = 0xbfeaff; glowC = 0xdaf4ff; }
+  else if(skillFx.rubber > 0){ col = 0x8cff5a; glowC = 0xb6ff8a; }      // Rubber Bullet tell — lime (only when no element tint)
   var gs = skillFx.bigBullet ? 0.05 : 0.022;
   var mesh = acquireBulletMesh(sharedBulletGeo(sz), sharedBulletMat(col), null, 0);   // no round sprite — use a stretched halo
   attachStreakGlow(mesh, glowC, sz);
@@ -19306,6 +19886,7 @@ function spawnSkillBullet(origin, dir, lateral){
     big: skillFx.bigBullet, homing: skillFx.tracking, split: skillFx.splitShot,
     fire: skillFx.fireBullet, ice: skillFx.iceBullet, electric: skillFx.electric,
     bounces: skillFx.bounce, contour: skillFx.contour,
+    rubber: skillFx.rubber > 0 ? (skillFx.rubber + 1) : 0,   // Rubber Bullet: ricochet off enemies this many times
     orbit: skillFx.orbitingShot > 0 ? { stacks: skillFx.orbitingShot, phase: 'seek', target: null, angle: 0, ttl: 0 } : null
   });
 }
@@ -19320,11 +19901,9 @@ function gameVolleyAim(){
   } else {
     var M = gameFiringDir();
     nose = gameMode.ship.position.clone().addScaledVector(M, 0.02);
-    if(crosshairActive()){
-      var aim = gameAimEnemyPoint();
-      if(aim){ dir = aim.sub(nose); if(dir.lengthSq() > 1e-9) dir.normalize(); else dir = gameCrosshairDir(nose, M); }
-      else dir = gameCrosshairDir(nose, M);
-    } else dir = M.clone();
+    // Always aim straight down the crosshair's flat ground line (no per-enemy raycast — that was what made
+    // aim jump around based on what you were looking at). Bullets launch from the ship and curve onto it.
+    dir = crosshairActive() ? gameCrosshairDir(nose, M) : M.clone();
   }
   return { nose: nose, dir: dir, up: s.groundNormal };
 }
@@ -19963,11 +20542,304 @@ function updateSkillSystems(){
   updateDriftFire();
   updateCrazyDaisy();
   updateStompRings();
+  // ── new batch ──
+  updateKillStreak();
+  updateAdrenaline();
+  updateLeechField();
+  updateOvershield();
+  updateSlipstream();
+  updateAfterburn();
+  updateSklFx();
+  updateSkillVisuals();
 }
 // Free every transient skill mesh (called on game exit / combat clear). Equipped skills persist.
 function clearSkillSystems(){
   clearCompanions(); clearDriftFire(); clearStompRings();
   skillFx.volleys.length = 0; skillFx.timeScale = 1;
+  clearSlipstream(); clearSklFx();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════
+// NEW SKILL BATCH — Kill Streak / Adrenaline / Leech Field / Overshield / Second Wind /
+// Slipstream / Afterburn / Deep Freeze / Wildfire / Greed / Scavenger. Live state hangs off
+// combat.skl; per-frame updaters run from updateSkillSystems; on-kill effects route through
+// onEnemyKilled (called by killTank/killBall/killFoe).
+// ══════════════════════════════════════════════════════════════════════════════════════
+var SKILL_STREAK_STEP = 0.04, SKILL_STREAK_MAX = 1.5, SKILL_STREAK_DECAY = 0.02/60;   // +4%/kill, cap +150%, −2%/s
+var ADREN_FRAMES = 120, ADREN_FIRE = 1.30, ADREN_SPD = 1.30;                          // 2s surge, +30% fire & speed
+var LEECH_DELAY = 40, LEECH_RATE = 0.004, LEECH_DMG_MUL = 1.20;                       // idle → regen 0.4%/frame, +20% dmg taken
+var OVERSHIELD_KILLS = 5;
+var SLIP_MAX_LIFE = 540, SLIP_DROP_CD = 3, SLIP_SEG_R = 0.16;                         // 9s ribbon, drop every 3f
+var _sklTmp = new THREE.Vector3();
+function sklState(){
+  if(!combat.skl) resetSkillRunState();
+  return combat.skl;
+}
+function resetSkillRunState(){
+  combat._killFx = null;   // drop any queued on-kill AoE from a prior run
+  if(combat.skl && combat.skl.slip) clearSlipstream();   // recycle any live ribbon discs before wiping state
+  combat.skl = { streakBonus:0, killsNoHit:0, shieldUp:false, adrenT:0, leechT:0, leeching:false,
+    secondWindUsed:false, slip:[], slipCd:0, onSlip:false, _chain:false,
+    reviveFlash:0, shieldPop:0 };
+}
+// Combined fire-rate multiplier from the new skills (read by fireBullet).
+function gameFireRateMul(){
+  var S = combat.skl, m = 1;
+  if(!S) return 1;
+  if(skillFx.killStreak) m += S.streakBonus;
+  if(skillFx.adrenaline && S.adrenT > 0) m *= ADREN_FIRE;
+  return m;
+}
+
+// ── Central on-kill hook (every enemy death) ──
+function onEnemyKilled(pos, normal, bag, kind){
+  var S = sklState();
+  if(skillFx.killStreak) S.streakBonus = Math.min(SKILL_STREAK_MAX, S.streakBonus + SKILL_STREAK_STEP);
+  if(skillFx.overshield && !S.shieldUp){
+    S.killsNoHit++;
+    if(S.killsNoHit >= OVERSHIELD_KILLS){ S.shieldUp = true; S.killsNoHit = 0; sklBurst(gameMode.ship.position.clone(), 0x66ccff, 0.09, 16); }
+  }
+  if(!S._chain && bag){
+    // QUEUE the AoE effects instead of running them inline — a kill can happen deep inside another
+    // array iteration (bullet loop, burn-DoT sweep, another AoE), and mutating combat.enemies/balls/foes
+    // re-entrantly would leave a stale index → "reading 'building' of undefined". flushKillFx() drains
+    // this at a safe point (end of updateCombat), outside every enemy-array loop.
+    if(!combat._killFx) combat._killFx = [];
+    if(skillFx.deepFreeze && bag.slowMul != null && bag.slowMul < 0.75) combat._killFx.push({ t:'freeze', p: pos.clone(), n: (normal ? normal.clone() : _statUp.clone()), s: bag.slowMul });
+    if(skillFx.wildfire && bag.burnT > 0) combat._killFx.push({ t:'fire', p: pos.clone(), n: (normal ? normal.clone() : _statUp.clone()), d: bag.burnDPS || FIRE_DPS });
+  }
+}
+// Drain queued on-kill AoE (Deep Freeze shatter / Wildfire spread) at a SAFE point — never inside an
+// enemy-array iteration. Bursts set skl._chain so their own kills don't re-queue; bounded drain anyway.
+function flushKillFx(){
+  var guard = 0;
+  while(combat._killFx && combat._killFx.length && guard++ < 8){
+    var q = combat._killFx; combat._killFx = [];
+    for(var i = 0; i < q.length; i++){
+      var e = q[i];
+      if(e.t === 'freeze') deepFreezeBurst(e.p, e.n, e.s);
+      else wildfireSpread(e.p, e.d);
+    }
+  }
+}
+// Damage every enemy/ball/foe within `R` of `pos` (backwards-safe; kills route through the kill fns).
+function damageEnemiesInRadius(pos, R, dmg){
+  var i, R2 = R;
+  for(i = combat.enemies.length - 1; i >= 0; i--){ var en = combat.enemies[i]; if(en.userData.building > 0) continue;
+    if(en.position.distanceTo(pos) < R2 + (en.userData.collideR || 0.1)){ dealDamageToTank(en, dmg); if(en.userData.hp <= 0){ killTank(en); relock(); } } }
+  for(i = combat.balls.length - 1; i >= 0; i--){ var bk = combat.balls[i]; if(bk.building > 0) continue;
+    if(bk.mesh.position.distanceTo(pos) < R2 + bk.r){ bk.hp -= dmg; combat.totalDamage += dmg; spawnDamageNumber(bk.mesh.position.clone().addScaledVector(bk.normal, 0.04), dmg, true); if(bk.hp <= 0){ killBall(bk); relock(); } } }
+  for(i = combat.foes.length - 1; i >= 0; i--){ var f = combat.foes[i]; if(f.building > 0) continue;
+    if(f.position.distanceTo(pos) < R2 + 0.12){ f.hp -= dmg; combat.totalDamage += dmg; spawnDamageNumber(f.position.clone().addScaledVector(f.normal || _statUp, 0.04), dmg, false); if(f.hp <= 0){ killFoe(f); relock(); } } }
+}
+function deepFreezeBurst(pos, normal, slowMul){
+  var S = sklState(); S._chain = true;
+  var power = Math.min(1, 1 - slowMul);                    // 0.25 (light slow) → 1 (fully frozen)
+  var R = 0.4 + power * 0.5, dmg = (55 + 120 * power) * (combat.scaleMul || 1);
+  damageEnemiesInRadius(pos, R, dmg);
+  sklBurst(pos.clone(), 0x8fdcff, R, 20);                  // icy shatter ring
+  S._chain = false;
+}
+function wildfireSpread(pos, dps){
+  var S = sklState(); S._chain = true;
+  var R = 0.55, i, bag;
+  for(i = 0; i < combat.enemies.length; i++){ var en = combat.enemies[i]; if(en.userData.building > 0) continue; if(en.position.distanceTo(pos) < R){ bag = en.userData; bag.burnT = FIRE_FRAMES; bag.burnDPS = dps; } }
+  for(i = 0; i < combat.balls.length; i++){ var bk = combat.balls[i]; if(bk.building > 0) continue; if(bk.mesh.position.distanceTo(pos) < R){ bk.burnT = FIRE_FRAMES; bk.burnDPS = dps; } }
+  for(i = 0; i < combat.foes.length; i++){ var f = combat.foes[i]; if(f.building > 0) continue; if(f.position.distanceTo(pos) < R){ f.burnT = FIRE_FRAMES; f.burnDPS = dps; } }
+  sklBurst(pos.clone(), 0xff5a1e, R, 18);                  // fire flare
+  S._chain = false;
+}
+
+// ── Per-frame updaters ──
+function updateKillStreak(){
+  var S = sklState();
+  if(!skillFx.killStreak){ S.streakBonus = 0; return; }
+  if(S.streakBonus > 0) S.streakBonus = Math.max(0, S.streakBonus - SKILL_STREAK_DECAY);
+}
+function triggerAdrenaline(){   // called from hurtPlayer when a hit lands
+  var S = sklState();
+  if(!skillFx.adrenaline) return;
+  S.adrenT = ADREN_FRAMES;
+  sklBurst(gameMode.ship.position.clone(), 0xff3a2a, 0.09, 14);
+}
+function updateAdrenaline(){
+  var S = sklState();
+  if(!skillFx.adrenaline || S.adrenT <= 0){ if(S) S.adrenT = 0; return; }
+  S.adrenT--;
+  // +30% speed surge: floor the drive speed while moving forward (doesn't fight the cruise/boost caps).
+  var s = gameMode.surfaceState, p = gameMode.physics;
+  if(s && s.speed > 0){ var floorV = p.maxSpeed * (35/15) * ADREN_SPD; if(s.speed < floorV) s.speed = floorV; }
+}
+function updateLeechField(){
+  var S = sklState();
+  S.leeching = false;
+  if(!skillFx.leechField){ S.leechT = 0; return; }
+  var s = gameMode.surfaceState;
+  var still = s && !s.airborne && Math.abs(s.speed) < gameMode.physics.maxSpeed * 0.12;
+  if(still){
+    S.leechT++;
+    if(S.leechT > LEECH_DELAY && combat.player.hp < combat.player.maxHp && !combat.player.dead){
+      S.leeching = true;
+      healPlayer(combat.player.maxHp * LEECH_RATE);
+    }
+  } else S.leechT = 0;
+}
+function updateOvershield(){
+  var S = sklState();
+  if(!skillFx.overshield){ S.shieldUp = false; S.killsNoHit = 0; }
+}
+// ── Slipstream — a glowing ground ribbon dropped while drifting; riding it boosts speed + kills drag ──
+var _slipPool = [];
+function makeSlipDisc(){
+  var m = _slipPool.pop();
+  if(!m){
+    m = new THREE.Mesh(fxShared('slipDisc', function(){ return new THREE.CircleGeometry(SLIP_SEG_R, 20); }),
+      new THREE.MeshBasicMaterial({ color: 0x39d6ff, transparent: true, opacity: 0.6, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    m.frustumCulled = false; m.renderOrder = 4; m._pool = _slipPool;
+    scene.add(m);
+  } else { m.visible = true; m.material.opacity = 0.6; }
+  return m;
+}
+function updateSlipstream(){
+  var S = sklState(), s = gameMode.surfaceState, p = gameMode.physics;
+  S.onSlip = false; if(s) s._slipActive = false;
+  if(!skillFx.slipstream){ if(S.slip.length) clearSlipstream(); return; }
+  if(!gameMode.ship) return;
+  // Lay ribbon while drifting with real speed.
+  if(s && s.isDrifting && Math.abs(s.speed) > p.maxSpeed * 0.3){
+    S.slipCd--;
+    if(S.slipCd <= 0){
+      S.slipCd = SLIP_DROP_CD;
+      var disc = makeSlipDisc();
+      disc.position.copy(gameMode.ship.position).addScaledVector(s.groundNormal, 0.006);
+      disc.quaternion.setFromUnitVectors(_fxFWD, s.groundNormal);
+      disc.scale.setScalar(1);
+      S.slip.push({ mesh: disc, pos: gameMode.ship.position.clone(), life: 0 });
+    }
+  }
+  // Age ribbon + detect the ship riding it.
+  var shipP = gameMode.ship.position;
+  for(var i = S.slip.length - 1; i >= 0; i--){
+    var seg = S.slip[i]; seg.life++;
+    var f = seg.life / SLIP_MAX_LIFE;
+    if(f >= 1){ if(seg.mesh._pool){ seg.mesh.visible = false; seg.mesh._pool.push(seg.mesh); } else scene.remove(seg.mesh); S.slip.splice(i, 1); continue; }
+    seg.mesh.material.opacity = 0.55 * (1 - f) + 0.1;
+    if(seg.life > 4 && shipP.distanceTo(seg.pos) < SLIP_SEG_R * 1.35){ S.onSlip = true; seg.mesh.material.opacity = 0.85; }
+  }
+  // Ride effect: speed floor + kill friction (read by the drift branches via s._slipActive).
+  if(S.onSlip && s){
+    s._slipActive = true;
+    var target = p.maxSpeed * (50/15);
+    if(s.speed >= 0 && s.speed < target) s.speed = target;
+  }
+}
+function clearSlipstream(){
+  var S = combat.skl; if(!S || !S.slip) return;
+  for(var i = 0; i < S.slip.length; i++){ var m = S.slip[i].mesh; if(m._pool){ m.visible = false; m._pool.push(m); } else scene.remove(m); }
+  S.slip.length = 0; S.onSlip = false;
+}
+// ── Afterburn — while boosting, a red burning wake that ignites enemies behind you ──
+function updateAfterburn(){
+  if(!skillFx.afterburn || !gameMode.ship) return;
+  if(!gameMode.physics.isBoosting) return;
+  var s = gameMode.surfaceState;
+  var back = _sklTmp.copy(s.forward); if(back.lengthSq() < 1e-6) back.set(0,0,1); back.normalize();
+  var wake = gameMode.ship.position.clone().addScaledVector(back, -0.03);
+  // red embers so the trail reads as burning
+  if((window._ccFrame || 0) % 2 === 0) sklBurst(wake.clone(), 0xff2a12, 0.05, 12, true);
+  // ignite nearby enemies in the wake
+  var R = 0.14, i;
+  for(i = 0; i < combat.enemies.length; i++){ var en = combat.enemies[i]; if(en.userData.building > 0) continue; if(en.position.distanceTo(wake) < R + (en.userData.collideR||0.1)){ en.userData.burnT = FIRE_FRAMES; en.userData.burnDPS = FIRE_DPS; } }
+  for(i = 0; i < combat.balls.length; i++){ var bk = combat.balls[i]; if(bk.building > 0) continue; if(bk.mesh.position.distanceTo(wake) < R + bk.r){ bk.burnT = FIRE_FRAMES; bk.burnDPS = FIRE_DPS; } }
+  for(i = 0; i < combat.foes.length; i++){ var f = combat.foes[i]; if(f.building > 0) continue; if(f.position.distanceTo(wake) < R + 0.12){ f.burnT = FIRE_FRAMES; f.burnDPS = FIRE_DPS; } }
+}
+// ── Second Wind — called from hurtPlayer instead of dying (returns true if it saved you) ──
+function trySecondWind(){
+  var S = sklState();
+  if(!skillFx.secondWind || S.secondWindUsed) return false;
+  S.secondWindUsed = true;
+  combat.player.hp = Math.round(combat.player.maxHp * 0.30);
+  combat.player.dead = false;
+  // wipe all loose XP orbs (the cost)
+  for(var i = combat.xpOrbs.length - 1; i >= 0; i--){ if(!combat.xpOrbs[i].heart){ disposeXPOrb(combat.xpOrbs[i]); combat.xpOrbs.splice(i, 1); } }
+  S.reviveFlash = 1;
+  sklBurst(gameMode.ship.position.clone(), 0x66f0ff, 0.16, 30);
+  return true;
+}
+
+// ── XP-orb tint (Greed = gold, Scavenger = green; both = gold-green) — a shared-material visual tell ──
+function applyXpOrbTint(){
+  if(!combat._xpMat) return;
+  var core = 0xfff070, glow = 0xffd844;
+  if(skillFx.greed && skillFx.scavenger){ core = 0xd6d21e; glow = 0xbcd028; }
+  else if(skillFx.greed){ core = 0xffb300; glow = 0xff9500; }
+  else if(skillFx.scavenger){ core = 0x9fe86a; glow = 0x63d838; }
+  combat._xpMat.color.setHex(core);
+  if(combat._xpGlowMat) combat._xpGlowMat.color.setHex(glow);
+}
+
+// ── Persistent ship auras (scene-child meshes repositioned onto the ship each frame) ──
+function ensureAuraMeshes(){
+  if(gameMode._sklAuras) return;
+  if(typeof scene === 'undefined' || !scene || typeof THREE === 'undefined') return;
+  var A = {};
+  A.streak = new THREE.Mesh(new THREE.RingGeometry(0.06, 0.088, 28), new THREE.MeshBasicMaterial({ color: 0xff7a1e, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  A.adren  = new THREE.Mesh(new THREE.RingGeometry(0.07, 0.11, 28),  new THREE.MeshBasicMaterial({ color: 0xff2a2a, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  A.sw     = new THREE.Mesh(new THREE.RingGeometry(0.092, 0.104, 32),new THREE.MeshBasicMaterial({ color: 0x8ff0ff, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+  A.bubble = new THREE.Mesh(new THREE.SphereGeometry(0.078, 18, 14), new THREE.MeshBasicMaterial({ color: 0x66ccff, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
+  A.leech  = new THREE.Mesh(new THREE.SphereGeometry(0.072, 16, 12), new THREE.MeshBasicMaterial({ color: 0x4dff8a, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
+  for(var k in A){ A[k].frustumCulled = false; A[k].renderOrder = 5; A[k].visible = false; scene.add(A[k]); }
+  gameMode._sklAuras = A;
+}
+function syncSkillVisuals(){ ensureAuraMeshes(); }
+function updateSkillVisuals(){
+  ensureAuraMeshes();
+  var A = gameMode._sklAuras, S = sklState();
+  var show = !!(gameMode.active && !gameMode.exiting && gameMode.ship && gameMode.ship.visible);
+  if(!show){ for(var k in A){ A[k].visible = false; } return; }
+  var p = gameMode.ship.position, camQ = camera.quaternion;
+  function place(m){ m.position.copy(p); m.quaternion.copy(camQ); }
+  // Kill Streak — hot ring that grows/brightens with the streak
+  if(skillFx.killStreak && S.streakBonus > 0.01){ place(A.streak); var t = Math.min(1, S.streakBonus / SKILL_STREAK_MAX); A.streak.visible = true; A.streak.material.opacity = 0.25 + 0.55 * t; A.streak.material.color.setHex(t > 0.6 ? 0xff2e12 : 0xff8a1e); A.streak.scale.setScalar(0.85 + 0.5 * t + 0.05 * Math.sin(performance.now() * 0.02)); A.streak.rotation.z += 0.03 + 0.05 * t; } else A.streak.visible = false;
+  // Adrenaline — red flare while the surge is live
+  if(skillFx.adrenaline && S.adrenT > 0){ place(A.adren); var af = S.adrenT / ADREN_FRAMES; A.adren.visible = true; A.adren.material.opacity = 0.15 + 0.5 * af; A.adren.scale.setScalar(1 + (1 - af) * 0.6); } else A.adren.visible = false;
+  // Second Wind — soft halo while the free revive is still available
+  if(skillFx.secondWind && !S.secondWindUsed){ place(A.sw); A.sw.visible = true; A.sw.material.opacity = 0.25 + 0.15 * Math.sin(performance.now() * 0.005); A.sw.rotation.z += 0.008; } else A.sw.visible = false;
+  // Overshield — bubble while a shield charge is banked
+  if(skillFx.overshield && S.shieldUp){ place(A.bubble); A.bubble.quaternion.identity(); A.bubble.visible = true; A.bubble.material.opacity = 0.22 + 0.1 * Math.sin(performance.now() * 0.008); A.bubble.scale.setScalar(1 + 0.04 * Math.sin(performance.now() * 0.01)); } else A.bubble.visible = false;
+  // Leech Field — green glow while regenerating
+  if(skillFx.leechField && S.leeching){ place(A.leech); A.leech.quaternion.identity(); A.leech.visible = true; A.leech.material.opacity = 0.28 + 0.12 * Math.sin(performance.now() * 0.02); A.leech.scale.setScalar(1 + 0.06 * Math.sin(performance.now() * 0.015)); } else A.leech.visible = false;
+}
+
+// ── Small transient skill FX (bursts/rings) ──
+var _sklFxPool = [];
+function sklBurst(pos, color, maxR, frames, sphere){
+  if(!combat.sklFx) combat.sklFx = [];
+  var m = _sklFxPool.pop();
+  if(!m){
+    m = new THREE.Mesh(fxShared('sklFxRing', function(){ return new THREE.RingGeometry(0.72, 1.0, 28); }),
+      new THREE.MeshBasicMaterial({ transparent: true, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending }));
+    m.frustumCulled = false; m.renderOrder = 6; m._pool = _sklFxPool;
+    scene.add(m);
+  }
+  m.material.color.setHex(color); m.material.opacity = 0.85; m.visible = true; m.scale.setScalar(0.001);
+  m.position.copy(pos); m.quaternion.copy(camera.quaternion);
+  combat.sklFx.push({ mesh: m, t: 0, max: frames || 16, r: maxR || 0.1 });
+}
+function updateSklFx(){
+  if(!combat.sklFx || !combat.sklFx.length) return;
+  for(var i = combat.sklFx.length - 1; i >= 0; i--){
+    var e = combat.sklFx[i]; e.t++;
+    var f = e.t / e.max;
+    e.mesh.scale.setScalar(Math.max(0.001, e.r * (0.2 + f * 1.2)));
+    e.mesh.material.opacity = (1 - f) * 0.85;
+    if(f >= 1){ if(e.mesh._pool){ e.mesh.visible = false; e.mesh._pool.push(e.mesh); } else scene.remove(e.mesh); combat.sklFx.splice(i, 1); }
+  }
+}
+function clearSklFx(){
+  if(!combat.sklFx) return;
+  for(var i = 0; i < combat.sklFx.length; i++){ var m = combat.sklFx[i].mesh; if(m._pool){ m.visible = false; m._pool.push(m); } else scene.remove(m); }
+  combat.sklFx.length = 0;
 }
 
 // ── Immortality toggle (I key) ───────────────────────────────────────────────────────
@@ -20666,7 +21538,7 @@ function mpApplyWorld(w){
   combat.scaleMul = combatScaleForTime(combat.elapsed);   // keep the guest's XP-scaling in step with the host clock
   // Resilient arena build: if the host is live but we never built the planet/moon (missed/late 'arena'
   // message, or entered the dome after the host activated), rebuild it from the seed carried in the snapshot.
-  if(w.w.a === 1 && w.w.sd && !combat.bodies && gameMode.portal && gameMode.portal.regionB) generateArena(w.w.sd);
+  if(w.w.a === 1 && w.w.sd && !combat.arenaBuilt && gameMode.portal && gameMode.portal.regionB) generateArena(w.w.sd);
   // Boss "THE CORE" mirror — build/update a local mesh from the synced position + HP fraction (the host
   // owns the boss; the guest's host-spawned bullets already damage it, this just makes it visible).
   var bs = w.w.bs;
@@ -21401,6 +22273,87 @@ function makeCrystalTextures(){
   return { rough: mk(rc), color: mk(cc) };
 }
 
+// Glowing blue "plane of light" barrier around the flat combat arena — same look as the entry-platform
+// wall (nearly opaque at the base, clearing as it rises, with particles drifting up). Built as a SQUARE
+// on the arena perimeter, on PORTAL_LAYER (part of Region B), and always on. The ship is hard-clamped
+// inside it in updatePortalInterior; this is the visual tell for that invisible wall.
+function buildDomeBarrier(P, gB, half, floorY, cx, cz){
+  var wallH = 0.4;                                          // "not that tall" — matches the entry platform
+  var c = [[cx - half, cz - half], [cx + half, cz - half], [cx + half, cz + half], [cx - half, cz + half]];
+  var edges = [];
+  for(var i = 0; i < 4; i++){ var a = c[i], b = c[(i + 1) % 4]; edges.push({ ax: a[0], az: a[1], bx: b[0], bz: b[1] }); }
+  var wpos = [], wuv = [];
+  for(var k = 0; k < edges.length; k++){
+    var ed = edges[k], y0 = floorY, y1 = floorY + wallH;
+    wpos.push(ed.ax, y0, ed.az, ed.bx, y0, ed.bz, ed.bx, y1, ed.bz,
+              ed.ax, y0, ed.az, ed.bx, y1, ed.bz, ed.ax, y1, ed.az);
+    wuv.push(0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1);
+  }
+  var wgeo = new THREE.BufferGeometry();
+  wgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(wpos), 3));
+  wgeo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(wuv), 2));
+  var wmat = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color(0x35a2ff) }, uTime: { value: 0 }, uOpacity: { value: 1 } },
+    vertexShader: [
+      'varying float vH; varying vec2 vUv;',
+      'void main(){ vH = uv.y; vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }'
+    ].join('\n'),
+    fragmentShader: [
+      'uniform vec3 uColor; uniform float uTime, uOpacity; varying float vH; varying vec2 vUv;',
+      'void main(){',
+      '  float a = pow(1.0 - vH, 2.0) * 0.82;',
+      '  a *= 0.78 + 0.22 * sin(uTime * 3.0 + vUv.x * 20.0 + vH * 7.0);',
+      '  a *= uOpacity;',
+      '  if(a < 0.003) discard;',
+      '  vec3 col = mix(uColor, vec3(0.82, 0.95, 1.0), (1.0 - vH) * 0.4);',
+      '  gl_FragColor = vec4(col, a);',
+      '}'
+    ].join('\n'),
+    transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.NormalBlending
+  });
+  var wall = new THREE.Mesh(wgeo, wmat); wall.renderOrder = 2; wall.frustumCulled = false;
+  var N = 420, parts = [], pbase = new Float32Array(N * 3), ppos = new Float32Array(N * 3), palpha = new Float32Array(N);
+  for(var n = 0; n < N; n++){
+    var ed2 = edges[(Math.random() * edges.length) | 0], tt = Math.random();
+    var bx = ed2.ax + (ed2.bx - ed2.ax) * tt, bz = ed2.az + (ed2.bz - ed2.az) * tt;
+    pbase[n * 3] = bx; pbase[n * 3 + 1] = floorY; pbase[n * 3 + 2] = bz;
+    ppos[n * 3] = bx; ppos[n * 3 + 1] = floorY; ppos[n * 3 + 2] = bz; palpha[n] = 0;
+    parts.push({ speed: 0.35 + Math.random() * 0.85, phase: Math.random() });
+  }
+  var pgeo = new THREE.BufferGeometry();
+  pgeo.setAttribute('position', new THREE.BufferAttribute(ppos, 3));
+  pgeo.setAttribute('alpha', new THREE.BufferAttribute(palpha, 1));
+  var pmat = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color(0x9bd6ff) }, uOpacity: { value: 1 }, pixelRatio: { value: Math.min(window.devicePixelRatio, 2) } },
+    vertexShader: [
+      'attribute float alpha; varying float vA; uniform float pixelRatio;',
+      'void main(){ vA = alpha; vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_PointSize = clamp(pixelRatio * 34.0 / max(0.05, -mv.z), 1.0, 9.0); gl_Position = projectionMatrix * mv; }'
+    ].join('\n'),
+    fragmentShader: [
+      'varying float vA; uniform vec3 uColor; uniform float uOpacity;',
+      'void main(){ float d = length(gl_PointCoord - 0.5) * 2.0; if(d > 1.0) discard; float g = 1.0 - d; gl_FragColor = vec4(uColor, g * vA * uOpacity); }'
+    ].join('\n'),
+    transparent: true, depthWrite: false, blending: THREE.NormalBlending
+  });
+  var points = new THREE.Points(pgeo, pmat); points.renderOrder = 3; points.frustumCulled = false;
+  var grp = new THREE.Group(); grp.add(wall); grp.add(points); gB.add(grp);
+  P.domeBarrier = { wmat: wmat, pmat: pmat, pgeo: pgeo, parts: parts, pbase: pbase, ppos: ppos, palpha: palpha, wallH: wallH, floorY: floorY };
+}
+// Per-frame shimmer + rising particles for the arena light wall (runs while you're in the dome).
+function updateDomeBarrier(){
+  var P = gameMode.portal, b = P && P.domeBarrier; if(!b) return;
+  var t = performance.now() * 0.001;
+  b.wmat.uniforms.uTime.value = t;
+  var N = b.parts.length;
+  for(var n = 0; n < N; n++){
+    var frac = (b.parts[n].phase + t * b.parts[n].speed) % 1;
+    b.ppos[n * 3 + 1] = b.floorY + b.wallH * 1.25 * frac;
+    b.palpha[n] = (1 - frac) * (1 - frac);
+  }
+  b.pgeo.attributes.position.needsUpdate = true;
+  b.pgeo.attributes.alpha.needsUpdate = true;
+}
+
 function buildPortal(){
   var P = gameMode.portal;
   if(P.built) return;
@@ -21446,17 +22399,9 @@ function buildPortal(){
     // winding (otherwise back-facing faces silently drop collision), and so the hallway's
     // inward-facing walls are visible from inside.
     if(octa.material){
+      // Keep the crystal's ORIGINAL website material (mirror look) — only flip to DoubleSide so the
+      // carved hallway's inner walls render + raycast. No color/roughness/scratch changes on entry.
       octa.material.side = THREE.DoubleSide;
-      // Tame the overblown mirror: dimmer reflections, blurred (higher roughness), and a
-      // scratches+grain roughness map on top. Region B clones this material below, so the
-      // dome inherits the same look.
-      var tex = makeCrystalTextures();
-      octa.material.envMapIntensity = 1.25;    // tone down the overblown brightness (was 1.8)
-      octa.material.roughness = 0.22;          // blur the reflection (was 0.03 = mirror)
-      octa.material.roughnessMap = tex.rough;  // scratches/grain frost the reflection where they are
-      octa.material.bumpMap = tex.rough;       // and visibly distort it
-      octa.material.bumpScale = 0.0016;
-      octa.material.map = tex.color;           // dark scratch tint so the wear shows on a flat env
       octa.material.needsUpdate = true;
     }
     if(PORTAL_DEBUG_WIRE) applyDebugWire(octa, 0, 0xff2255);   // crystal + hallway: bold magenta wireframe
@@ -21521,17 +22466,18 @@ function buildPortal(){
   var domeCy = P.domeFloorY + P.domeR;
   // Massive flat plane the hallway opens onto (replaces the dome sphere). A NON-reflective matte
   // ground + a grey grid so it reads as open floor; the dark fog fades the far edges.
-  var planeSize = 40;
+  var planeSize = 20;                                                            // half the old 40 — smaller arena + spawn area
   P.planeHalf = planeSize * 0.5;
   var floor = new THREE.Mesh(new THREE.PlaneGeometry(planeSize, planeSize),
     new THREE.MeshBasicMaterial({ color: 0x24242b, side: THREE.DoubleSide }));   // flat, unlit, non-reflective
   floor.rotation.x = -Math.PI/2;
   floor.position.set(P.DX, P.domeFloorY, P.domeCz);
   gB.add(floor);
-  var grid = new THREE.GridHelper(planeSize, 200, 0x8a8a93, 0x55555c);           // grey grid (0.2-unit cells)
+  var grid = new THREE.GridHelper(planeSize, 100, 0x8a8a93, 0x55555c);           // grey grid (0.2-unit cells)
   grid.position.set(P.DX, P.domeFloorY + 0.001, P.domeCz);                       // just above to avoid z-fight
   gB.add(grid);
   P.floorMesh = floor; P.gridMesh = grid;   // refs so the planet arena can hide the flat floor
+  buildDomeBarrier(P, gB, P.planeHalf, P.domeFloorY, P.DX, P.domeCz);            // glowing light wall around the arena edge
   // Fill lights — the hallway/chute still uses the crystal material, which needs lighting.
   var l1 = new THREE.PointLight(0xbcd0ff, 1.4, 90); l1.position.set(P.DX, domeCy + P.domeR*0.6, P.domeCz); gB.add(l1);
   var l2 = new THREE.PointLight(0x88aaff, 1.1, 150); l2.position.set(P.DX, P.domeFloorY + 16, P.domeCz - 18); gB.add(l2);
@@ -21622,6 +22568,21 @@ function buildPortal(){
   P.p2 = new THREE.Mesh(makeSeamGeo(true), portalSeamMat(P.rt2));   // mirrored = portal-image of the crystal hole
   P.p2.renderOrder = 3; P.p2.visible = false; P.p2.layers.set(PORTAL_LAYER);
   P.dstAnchor.add(P.p2);
+  // Return-portal SEAL — a crystal lid shaped to the return hole, wearing the SAME crystal material as
+  // the OUTER portal's doorway (P.matB is the crystal-material clone). Hidden until you commit to the
+  // dome (the arena activates); then the return doorway COLLAPSES shut: the window implodes while this
+  // lid grows to seal the hole. The exit is already one-way (checkPortalExit locks during the arena) —
+  // this just makes the closure visible, leaving a crystal-matched sealed doorway that's still "there".
+  P.sealCap = new THREE.Mesh(makeSeamGeo(true), P.matB.clone());
+  P.sealCap.material.side = THREE.DoubleSide;
+  P.sealCap.material.clippingPlanes = null;
+  P.sealCap.renderOrder = 2;
+  P.sealCap.position.z = 0.005;                 // flush just inside the seam plane
+  P.sealCap.scale.setScalar(0.0001);
+  P.sealCap.visible = false;
+  P.sealCap.layers.set(PORTAL_LAYER);
+  P.dstAnchor.add(P.sealCap);
+  P.seal = { active: false, t: 0, T: 34, sealed: false };
 
   // ── Continuation chute ── built as the EXACT portal-image of the crystal's carved tunnel walls
   // (the seam→floor segment), baked into dome space by the portal transform T = M_dst·R180·M_src⁻¹.
@@ -21820,6 +22781,8 @@ function updatePortalWindow(){
       P._seamWarm1 = true;
     }
     P.p1.visible = true;
+  } else if(P.seal && P.seal.sealed){
+    if(P.p2) P.p2.visible = false;   // return doorway has collapsed shut — no window, skip the rt2 pass
   } else {
     updateShipClone(P.dstAnchor.matrixWorld, P.srcAnchor.matrixWorld, 0);  // ship seen back through the seam
     if(!_seamSkip){
@@ -21837,6 +22800,30 @@ function updatePortalWindow(){
   }
 }
 
+// Begin the return-portal collapse (called once you commit to the dome). The crystal lid grows to seal
+// the hole while the see-through window implodes.
+function startPortalSeal(){
+  var P = gameMode.portal;
+  if(!P || !P.built || !P.sealCap || !P.seal || P.seal.sealed || P.seal.active) return;
+  P.seal.active = true; P.seal.t = 0;
+  P.sealCap.visible = true; P.sealCap.scale.setScalar(0.0001);
+}
+function updatePortalSeal(){
+  var P = gameMode.portal;
+  if(!P || !P.seal || !P.seal.active) return;
+  P.seal.t++;
+  var pr = Math.min(1, P.seal.t / P.seal.T), e = pr * pr * (3 - 2 * pr);   // smoothstep
+  if(P.sealCap) P.sealCap.scale.setScalar(Math.max(0.0001, e));            // crystal lid closes over the hole
+  if(P.p2) P.p2.scale.setScalar(Math.max(0.0001, 1 - e));                  // the window collapses inward
+  if(pr >= 1){ P.seal.active = false; P.seal.sealed = true; if(P.p2){ P.p2.visible = false; P.p2.scale.setScalar(1); } }
+}
+// Re-open the return portal (on game exit / arena reset) so a fresh run starts with an open doorway.
+function resetPortalSeal(){
+  var P = gameMode.portal; if(!P || !P.seal) return;
+  P.seal.active = false; P.seal.t = 0; P.seal.sealed = false;
+  if(P.sealCap){ P.sealCap.visible = false; P.sealCap.scale.setScalar(0.0001); }
+  if(P.p2) P.p2.scale.setScalar(1);
+}
 function portalWithinTube(cx){
   var p = gameMode.ship.position;
   return Math.abs(p.x - cx) < gameMode.portal.HW && Math.abs(p.y - gameMode.portal.gy) < gameMode.portal.HH;
@@ -21998,9 +22985,9 @@ function leaveToCrystalSeamless(){
     // the cross is seamless with nothing to snap/reset.
     gameMode.fly.active = true;
   } else {
-    // Emerge gripped onto the crystal tunnel wall — a NO-OP since the chute is its portal-image, so
-    // the folded groundNormal/position already match. Momentum preserved (s.speed unchanged).
-    var cpc = closestPointOnCrystal(ship.position);
+    // Emerge gripped onto the crystal tunnel wall (or the bridge/platform if you popped out onto it)
+    // — a NO-OP since the chute is its portal-image, so the folded groundNormal/position already match.
+    var cpc = closestPointOnEntrySurface(ship.position);
     if(cpc){
       s.groundNormal.copy(cpc.normal).normalize();
       ship.position.copy(cpc.point).addScaledVector(s.groundNormal, s.hoverHeight);
@@ -22101,8 +23088,8 @@ function closestPointOnDome(pos){
     var _cpt = closestPointOnTris(_domeLp, _bd.tris);
     if(_cpt && _cpt.dist < bestDist){ bestDist = _cpt.dist; bx = _cpt.point.x + _bd.center.x; by = _cpt.point.y + _bd.center.y; bz = _cpt.point.z + _bd.center.z; nx = _cpt.normal.x; ny = _cpt.normal.y; nz = _cpt.normal.z; found = true; }
   } else {
-    var fdx = pos.x - P.DX, fdz = pos.z - P.domeCz, fr = Math.hypot(fdx, fdz);
-    if(fr <= (P.planeHalf || 40)){
+    var fdx = pos.x - P.DX, fdz = pos.z - P.domeCz, fhalf = (P.planeHalf || 20);
+    if(Math.abs(fdx) <= fhalf && Math.abs(fdz) <= fhalf){   // square floor (matches the square light barrier)
       var fdist = Math.abs(pos.y - P.domeFloorY);
       if(fdist < bestDist){ bestDist = fdist; bx = pos.x; by = P.domeFloorY; bz = pos.z; nx=0; ny=1; nz=0; found=true; }
     }
@@ -22182,6 +23169,7 @@ function updatePortalInterior(){
   // Free-flight (P) works inside the dome just like outside — hand off to the flight controller,
   // then keep the ship contained in the chute on the way down.
   if(skillMenuOpen()) return;   // level-up skill picker pauses the game
+  updateDomeBarrier();          // shimmer + rising particles on the arena light wall
   if(playerDeath.active){ updatePlayerDeath(); return; }   // death animation owns the camera + physics
   if(gameMode.fps.active){ updateFpsPhysicsAndCamera(); return; }   // first-person POV (dome floor/walls)
   if(gameMode.fly.active){ updateFlightPhysicsAndCamera(); containInChute(); return; }
@@ -22257,7 +23245,7 @@ function updatePortalInterior(){
   var driftTight = 0; if(t.active && t.driftHold) driftTight = t.driftTight; if(k.s) driftTight = Math.max(driftTight, 1);
   if(!(fwdAxis < -0.01 && s.speed > 0.0005)) s.brakeTime = 0;       // reset brake ramp when not braking
   if(s.isDrifting){
-    if(p.hasZeroFriction || s.driftTime <= p.driftSustainTime){ var ds = s.speed < 0 ? -1 : 1; if(Math.abs(s.speed) < s.driftEntrySpeed) s.speed = ds * s.driftEntrySpeed; }   // Zero Friction Drift
+    if(p.hasZeroFriction || s._slipActive || s.driftTime <= p.driftSustainTime){ var ds = s.speed < 0 ? -1 : 1; if(Math.abs(s.speed) < s.driftEntrySpeed) s.speed = ds * s.driftEntrySpeed; }   // Zero Friction Drift / Slipstream
     else { s.speed -= Math.sign(s.speed || 1) * p.driftDecel; s.speed *= 0.998; if(driftTight > 0) s.speed *= (1 - driftTight * 0.015); }
   } else if(fwdAxis < -0.01 && s.speed > 0.0005){
     // BRAKING — ramped decel (gentle → firm); falls through to reverse once stopped.
@@ -22265,15 +23253,20 @@ function updatePortalInterior(){
     var bramp = Math.min(s.brakeTime / p.brakeRampFrames, 1); bramp *= bramp;
     s.speed = Math.max(0, s.speed - (p.brakeMin + (p.brakeMax - p.brakeMin) * bramp)); s.coastFrames = 0;
   } else if(p.isBoosting){
-    s.speed += thrust * fwdAxis; s.coastFrames = 0;                 // no drag, no cap → unbounded boost
-    var BOOST_SAFETY = p.maxSpeed * 12 * (p.maxBoostMul || 1); if(s.speed > BOOST_SAFETY) s.speed = BOOST_SAFETY;
+    // BOOST: linear +60 km/h per second (faster accel than W) up to the hard 100 km/h ceiling.
+    s.coastFrames = 0;
+    var A_BOOST = p.maxSpeed * (60/15) / 60;
+    var TOTAL_MAX = p.maxSpeed * (100/15) * (p.maxBoostMul || 1);
+    s.speed += A_BOOST * (fwdAxis > 0 ? fwdAxis : 1);
+    if(s.speed > TOTAL_MAX) s.speed = TOTAL_MAX;
     var maxRb = p.maxSpeed*0.6; if(s.speed < -maxRb) s.speed = -maxRb;
   } else if(fwdAxis > 0.01){
-    // Holding W → snap to the 35 km/h cruise cap in ~1s, then hold; above it (from a boost) bleed down.
+    // Holding W → linear +35 km/h per second up to the 35 km/h cruise cap, then hold; above it bleed down.
     s.coastFrames = 0;
     var CRUISE_CAP = p.maxSpeed * (35/15);
+    var A_W = p.maxSpeed * (35/15) / 60;
     if(s.speed > CRUISE_CAP){ s.speed -= 0.00015; if(s.speed < CRUISE_CAP) s.speed = CRUISE_CAP; }
-    else s.speed += (CRUISE_CAP * Math.min(1, fwdAxis) - s.speed) * GAME_W_ACCEL;
+    else s.speed = Math.min(CRUISE_CAP, s.speed + A_W * Math.min(1, fwdAxis));
   } else if(hasFwd){
     s.speed += thrust * fwdAxis; s.coastFrames = 0; s.speed *= p.drag;
     var maxR = p.maxSpeed*0.6; if(s.speed < -maxR) s.speed = -maxR;
@@ -22373,12 +23366,19 @@ function updatePortalInterior(){
         } else { s.airborne = true; s.freeFalling = false; s.vertVel = -0.004; s.jumpAxis.set(0,1,0); s.airTime = 0; }
       }
     }
-    if(Math.hypot(ship.position.x - P.DX, ship.position.z - P.domeCz) <= P.planeHalf){
+    if(Math.abs(ship.position.x - P.DX) <= P.planeHalf && Math.abs(ship.position.z - P.domeCz) <= P.planeHalf){
       var floorMinY = P.domeFloorY + s.hoverHeight;
       if(ship.position.y < floorMinY){ ship.position.y = floorMinY; s.groundNormal.set(0, 1, 0);
         if(s.airborne){ s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.barrelRoll.active = false; s.barrelRoll.progress = 0; s.forward.y = 0; if(s.forward.lengthSq() > 1e-6) s.forward.normalize(); }
       }
     }
+    // Invisible perimeter walls (the glowing light barrier) — hard-clamp the ship inside the square arena
+    // and bleed off any drive heading into the wall, so you can't leave the plane.
+    var bHalf = P.planeHalf - 0.04, lwx = ship.position.x - P.DX, lwz = ship.position.z - P.domeCz;
+    if(lwx > bHalf){ ship.position.x = P.DX + bHalf; if(s.forward.x * s.speed > 0) s.speed *= 0.4; }
+    else if(lwx < -bHalf){ ship.position.x = P.DX - bHalf; if(s.forward.x * s.speed < 0) s.speed *= 0.4; }
+    if(lwz > bHalf){ ship.position.z = P.domeCz + bHalf; if(s.forward.z * s.speed > 0) s.speed *= 0.4; }
+    else if(lwz < -bHalf){ ship.position.z = P.domeCz - bHalf; if(s.forward.z * s.speed < 0) s.speed *= 0.4; }
   }
 
   // ── orient + drift visuals + engine glow (same as crystal) ──
@@ -22397,7 +23397,8 @@ function updatePortalInterior(){
     camera.position.copy(chase.pos); camera.up.copy(chase.up).normalize();
     P.snapCam = false;
   } else {
-    var camLerpP = gameMode.surfaceState.isDrifting ? 0.13 : 0.18; camera.position.lerp(chase.pos, camLerpP); camera.up.lerp(chase.up, 0.12); camera.up.normalize();
+    var swWP = gameMode.surfaceState.isDrifting ? (gameMode.driftCamSwing || 0) : 0;   // DRIFT SWING stiffens drift tracking (see crystal apply site)
+    var camLerpP = gameMode.surfaceState.isDrifting ? (0.13 + 0.77 * swWP) : 0.18; camera.position.lerp(chase.pos, camLerpP); camera.up.lerp(chase.up, 0.12); camera.up.normalize();
   }
   camera.lookAt(chase.lookAt);
 
@@ -22783,6 +23784,8 @@ function init(){
 var GAME_FIXED_DT = 1 / 60;   // simulation step (matches the 60fps the game was tuned at)
 var _gameSimAccum = 0;
 function stepGameSim(dt){
+  // Orb → platform morph + bridge shoot-out + the glowing barrier wall, driven through the entry.
+  if(gameMode.entry && gameMode.entry.active && !gameMode.exiting){ updateEntryMorph(); updateEntryBarrier(); }
   // transition + physics + camera (mirrors the old per-frame order)
   if(gameMode.decelerating) animateGameDecel();
   if(gameMode.entering || gameMode.exiting) animateGameTransition();
@@ -22994,9 +23997,13 @@ function animate(){
         // regardless of current RPM — momentum builds at a steady linear pace instead of the
         // old converge model, which capped at the swipe speed (making it harder and harder to
         // add more). Friction (free state, 0.9998) preserves it between swipes.
-        var GALLERY_ACCEL = 0.05;
-        vel += inputVel * GALLERY_ACCEL;
+        // SLIPPERY SLOPE OF POWER — a swing adds little at low RPM but much more as the wheel spins
+        // faster, so the momentum snowballs and you can max it out in ~2–3 good swings.
+        var GALLERY_ACCEL = 0.14;
         var VMAX = 2.4;                                   // clamp (~rpm 1375) so it can't run away
+        var GALLERY_POWER_RAMP = 6.0;                     // how much stronger swings get at max RPM
+        var powerMul = 1 + GALLERY_POWER_RAMP * Math.min(1, Math.abs(vel) / VMAX);
+        vel += inputVel * GALLERY_ACCEL * powerMul;
         if(vel>VMAX)vel=VMAX; else if(vel<-VMAX)vel=-VMAX;
       } else {
         // PRODUCT WHEELS — converge toward swipe speed (responsive browsing).
@@ -23462,6 +24469,7 @@ function animate(){
   if(gameMode.portal.built){
     if(gameMode.active){
       updatePortalWindow();
+      updatePortalSeal();
     } else {
       if(gameMode.portal.p1) gameMode.portal.p1.visible = false;
       if(gameMode.portal.p2) gameMode.portal.p2.visible = false;
