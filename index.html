@@ -12657,6 +12657,65 @@ function updateShootingStars(dt) {
 var GAME_SHIP_POSITIONS = new Float32Array([-0.71,0.704,-1,-0.71,0.704,-1,-0.71,0.704,-1,-0.712,0.708,-0.617,-0.712,0.708,-0.617,-0.712,0.708,-0.617,-0.709,1.038,-0.812,-0.709,1.038,-0.812,-0.709,1.038,-0.812,-1.153,0.82,-0.812,-1.153,0.82,-0.812,-1.153,0.82,-0.812,-0.711,0.704,-1,-0.711,0.704,-1,-0.711,0.704,-1,-0.713,0.708,-0.617,-0.713,0.708,-0.617,-0.713,0.708,-0.617,-0.71,1.038,-0.812,-0.71,1.038,-0.812,-0.71,1.038,-0.812,-0.269,0.813,-0.808,-0.269,0.813,-0.808,-0.269,0.813,-0.808,-1.771,0.655,-0.768,-1.771,0.655,-0.768,-1.771,0.655,-0.768,-0.505,0.747,-0.348,-0.505,0.747,-0.348,-0.505,0.747,-0.348,-0.478,0.987,-0.7,-0.478,0.987,-0.7,-0.478,0.987,-0.7,-0.942,0.879,-0.551,-0.942,0.879,-0.551,-0.942,0.879,-0.551,-0.475,0.894,-0.571,-0.475,0.894,-0.571,-0.475,0.894,-0.571,-0.473,0.896,-0.572,-0.473,0.896,-0.572,-0.473,0.896,-0.572,-0.165,1.081,-0.385,-0.165,1.081,-0.385,-0.165,1.081,-0.385,-0.164,1.087,-0.39,-0.164,1.087,-0.39,-0.164,1.087,-0.39,-0.2,0.827,-0.763,-0.2,0.827,-0.763,-0.2,0.827,-0.763,-0.313,0.885,-0.697,-0.313,0.885,-0.697,-0.313,0.885,-0.697,0.281,0.992,-0.33,0.281,0.992,-0.33,0.281,0.992,-0.33,0.333,1.075,-0.237,0.333,1.075,-0.237,0.333,1.075,-0.237,-0.583,0.696,-0.501,-0.583,0.696,-0.501,-0.583,0.696,-0.501,-0.58,0.7,-0.5,-0.58,0.7,-0.5,-0.58,0.7,-0.5,-0.093,0.733,-0.086,-0.093,0.733,-0.086,-0.093,0.733,-0.086,-0.091,0.744,-0.087,-0.091,0.744,-0.087,-0.091,0.744,-0.087,-0.149,0.811,-0.802,-0.149,0.811,-0.802,-0.149,0.811,-0.802,-0.327,0.814,-0.663,-0.327,0.814,-0.663,-0.327,0.814,-0.663,0.611,0.569,-0.111,0.611,0.569,-0.111,0.611,0.569,-0.111,0.692,0.574,0.086,0.692,0.574,0.086,0.692,0.574,0.086,-0.583,0.696,-1.119,-0.583,0.696,-1.119,-0.583,0.696,-1.119,-0.58,0.7,-1.12,-0.58,0.7,-1.12,-0.58,0.7,-1.12,-0.093,0.733,-1.533,-0.093,0.733,-1.533,-0.093,0.733,-1.533,-0.091,0.744,-1.532,-0.091,0.744,-1.532,-0.091,0.744,-1.532,-0.149,0.811,-0.818,-0.149,0.811,-0.818,-0.149,0.811,-0.818,-0.327,0.814,-0.956,-0.327,0.814,-0.956,-0.327,0.814,-0.956,0.611,0.569,-1.508,0.611,0.569,-1.508,0.611,0.569,-1.508,0.692,0.574,-1.705,0.692,0.574,-1.705,0.692,0.574,-1.705,-0.475,0.894,-1.061,-0.475,0.894,-1.061,-0.475,0.894,-1.061,-0.473,0.896,-1.06,-0.473,0.896,-1.06,-0.473,0.896,-1.06,-0.165,1.081,-1.247,-0.165,1.081,-1.247,-0.165,1.081,-1.247,-0.164,1.087,-1.242,-0.164,1.087,-1.242,-0.164,1.087,-1.242,-0.2,0.827,-0.868,-0.2,0.827,-0.868,-0.2,0.827,-0.868,-0.313,0.885,-0.934,-0.313,0.885,-0.934,-0.313,0.885,-0.934,0.281,0.992,-1.302,0.281,0.992,-1.302,0.281,0.992,-1.302,0.333,1.075,-1.395,0.333,1.075,-1.395,0.333,1.075,-1.395,-0.583,0.696,-1.119,-0.583,0.696,-1.119,-0.583,0.696,-1.119,-0.58,0.7,-1.12,-0.58,0.7,-1.12,-0.58,0.7,-1.12,-0.093,0.733,-1.533,-0.093,0.733,-1.533,-0.093,0.733,-1.533,-0.091,0.744,-1.532,-0.091,0.744,-1.532,-0.091,0.744,-1.532,-0.149,0.811,-0.818,-0.149,0.811,-0.818,-0.149,0.811,-0.818,-0.327,0.814,-0.956,-0.327,0.814,-0.956,-0.327,0.814,-0.956,0.611,0.569,-1.508,0.611,0.569,-1.508,0.611,0.569,-1.508,0.692,0.574,-1.705,0.692,0.574,-1.705,0.692,0.574,-1.705,-1.771,0.655,-0.864,-1.771,0.655,-0.864,-1.771,0.655,-0.864,-0.505,0.747,-1.284,-0.505,0.747,-1.284,-0.505,0.747,-1.284,-0.478,0.987,-0.932,-0.478,0.987,-0.932,-0.478,0.987,-0.932,-0.942,0.879,-1.081,-0.942,0.879,-1.081,-0.942,0.879,-1.081]);
 var GAME_SHIP_INDICES = new Uint16Array([1,10,5,0,4,7,3,9,6,8,11,2,14,23,17,12,16,19,15,21,18,20,22,13,24,33,27,25,28,30,29,34,31,32,35,26,38,40,46,38,46,44,42,45,57,42,57,54,56,58,52,56,52,50,49,51,39,49,39,37,43,55,48,43,48,36,59,47,41,59,41,53,60,63,69,60,69,66,68,70,81,68,81,79,80,83,77,80,77,74,73,75,64,73,64,62,67,78,72,67,72,61,82,71,65,82,65,76,84,87,93,84,93,90,91,95,107,91,107,103,102,105,99,102,99,96,97,101,89,97,89,85,92,104,98,92,98,86,106,94,88,106,88,100,108,112,118,108,118,114,115,119,131,115,131,127,126,129,123,126,123,120,122,125,113,122,113,110,116,128,121,116,121,109,130,117,111,130,111,124,132,135,141,132,141,138,139,143,155,139,155,151,150,153,147,150,147,144,145,149,137,145,137,133,140,152,146,140,146,134,154,142,136,154,136,148,156,165,159,158,161,164,160,167,163,162,166,157]);
 
+// ── Ship model parts ── the merged GAME_SHIP arrays split into individually animatable
+// pieces. The parts are contiguous, self-contained slices (flat-shaded — no shared verts):
+//   cockpit = the two centre diamonds (verts 0-23 / tris 0-7); body = everything else.
+// Each part is re-centred by the SAME full-model bbox centre so they stay aligned. The
+// cockpit rides a pivot whose local Z is its tip-to-tip axis, so pivot.rotation.z twirls
+// the diamond nose-tip → tail-tip while the body stays put.
+var SHIP_CKPT_AXIS_X = -0.001, SHIP_CKPT_AXIS_Y = -0.0115;   // tip-to-tip spin axis (ship-local)
+function shipModelCenter(){
+  var p = GAME_SHIP_POSITIONS, mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+  for(var i = 0; i < p.length; i += 3){
+    for(var k = 0; k < 3; k++){ if(p[i + k] < mn[k]) mn[k] = p[i + k]; if(p[i + k] > mx[k]) mx[k] = p[i + k]; }
+  }
+  return new THREE.Vector3((mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2);
+}
+function shipPartGeometry(v0, v1, t0, t1, center){   // vertex span [v0,v1], triangle span [t0,t1]
+  var g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(GAME_SHIP_POSITIONS.slice(v0 * 3, (v1 + 1) * 3), 3));
+  var idx = new Uint16Array((t1 - t0 + 1) * 3);
+  for(var k = 0; k < idx.length; k++) idx[k] = GAME_SHIP_INDICES[t0 * 3 + k] - v0;
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  g.computeVertexNormals();
+  g.translate(-center.x, -center.y, -center.z);
+  return g;
+}
+// Build the ship visual into `sv`: rear-wing body, the cockpit on its spin pivot, and the
+// two front panels each on their own slide pivot (gun-recoil kick-back). Shared by the
+// local ship and the P2 remote ship (same rig, their colors).
+function buildShipVisualParts(sv, shipMat, edgeColor, edgeOpacity){
+  var c = shipModelCenter();
+  var rotY = Math.PI / 2;   // raw model → ship-local (+Z = nose)
+  function addPart(parent, v0, v1, t0, t1, meshPos){
+    var geo = shipPartGeometry(v0, v1, t0, t1, c);
+    var mesh = new THREE.Mesh(geo, shipMat);
+    mesh.rotation.set(0, rotY, 0);
+    if(meshPos) mesh.position.copy(meshPos);
+    parent.add(mesh);
+    var edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+      new THREE.LineBasicMaterial({ color: edgeColor, transparent: true, opacity: edgeOpacity }));
+    edges.rotation.copy(mesh.rotation);
+    if(meshPos) edges.position.copy(mesh.position);
+    parent.add(edges);
+    return mesh;
+  }
+  // body = the four rear wings (small upper + big lower pairs, incl. the dormant duplicate R wing)
+  var body = addPart(sv, 36, 155, 12, 71, null);
+  // Cockpit pivot: sits ON the tip axis; the mesh is offset back by the same amount so the
+  // geometry lands exactly where it always did — rotation.z then spins about the tip line.
+  var pivot = new THREE.Group();
+  pivot.position.set(SHIP_CKPT_AXIS_X, SHIP_CKPT_AXIS_Y, 0);
+  sv.add(pivot);
+  var ckpt = addPart(pivot, 0, 23, 0, 7, new THREE.Vector3(-SHIP_CKPT_AXIS_X, -SHIP_CKPT_AXIS_Y, 0));
+  // Front panels: one slide pivot each — position.z = -offset juts them straight back (recoil)
+  var frontL = new THREE.Group(), frontR = new THREE.Group();
+  sv.add(frontL); sv.add(frontR);
+  var fL = addPart(frontL, 24, 35, 8, 11, null);
+  var fR = addPart(frontR, 156, 167, 72, 75, null);
+  return { pivot: pivot, body: body, cockpit: ckpt, frontPivots: [frontL, frontR], frontMeshes: [fL, fR] };
+}
+
 function buildGameMode() {
   // Wrapper group lets us toggle ship visibility cleanly
   var g = new THREE.Group();
@@ -12667,31 +12726,16 @@ function buildGameMode() {
   var shipVisual = new THREE.Group();
   ship.add(shipVisual);
 
-  var shipGeo = new THREE.BufferGeometry();
-  shipGeo.setAttribute('position', new THREE.BufferAttribute(GAME_SHIP_POSITIONS, 3));
-  shipGeo.setIndex(new THREE.BufferAttribute(GAME_SHIP_INDICES, 1));
-  shipGeo.computeVertexNormals();
-  shipGeo.computeBoundingBox();
-  var shipCenter = new THREE.Vector3();
-  shipGeo.boundingBox.getCenter(shipCenter);
-  shipGeo.translate(-shipCenter.x, -shipCenter.y, -shipCenter.z);
-
   // Brighter purple — the ship needs to read against the crystal at this scale
   var shipMat = new THREE.MeshStandardMaterial({
     color: 0x9977cc, transparent: true, opacity: 0.96,
     roughness: 0.15, metalness: 0.3,
     emissive: 0x553388, emissiveIntensity: 0.55
   });
-  var shipMesh = new THREE.Mesh(shipGeo, shipMat);
-  shipMesh.rotation.set(0, Math.PI / 2, 0);
-  shipVisual.add(shipMesh);
-
-  var shipEdges = new THREE.LineSegments(
-    new THREE.EdgesGeometry(shipGeo),
-    new THREE.LineBasicMaterial({color: 0xddbbff, transparent: true, opacity: 0.8})
-  );
-  shipEdges.rotation.copy(shipMesh.rotation);
-  shipVisual.add(shipEdges);
+  var shipRig = buildShipVisualParts(shipVisual, shipMat, 0xddbbff, 0.8);
+  gameMode.cockpitPivot = shipRig.pivot;
+  gameMode.frontPivots = shipRig.frontPivots;   // recoil sliders for the two front panels
+  gameMode.shipParts = [shipRig.body, shipRig.cockpit].concat(shipRig.frontMeshes);   // hull meshes (portal avatar clones these)
 
   // Whole ship scales down so it looks like a tiny craft on the ~0.9-radius crystal (2× the old size)
   ship.scale.setScalar(GAME_BASE_SHIP_SCALE * (gameMode._giantScaleMul || 1));   // base × Giant skill
@@ -19971,17 +20015,112 @@ function updateSideThrusters(){
   _thrR.set(1, 0, 0).applyQuaternion(gameMode.ship.quaternion);
   var scl = gameMode.ship.scale.x / GAME_BASE_SHIP_SCALE;   // Giant widens the wing mounts
   if(onL){
-    _thrP.copy(gameMode.ship.position).addScaledVector(_thrR, GAME_WING_HALF_SPAN * 0.7 * scl).addScaledVector(_thrF, -0.008 * scl)
+    _thrP.copy(gameMode.ship.position).addScaledVector(_thrR, GAME_WING_HALF_SPAN * 0.64 * scl).addScaledVector(_thrF, -0.012 * scl)
       .addScaledVector(s.groundNormal, -0.006 * scl);   // drop to wing level (the wings hang below the hull centre)
     spawnThrusterTrail(gameMode.thrusters.L, _thrP, s.groundNormal);
   } else gameMode.thrusters.L.boosting = false;
   if(onR){
-    _thrP.copy(gameMode.ship.position).addScaledVector(_thrR, -GAME_WING_HALF_SPAN * 0.7 * scl).addScaledVector(_thrF, -0.008 * scl)
+    _thrP.copy(gameMode.ship.position).addScaledVector(_thrR, -GAME_WING_HALF_SPAN * 0.64 * scl).addScaledVector(_thrF, -0.012 * scl)
       .addScaledVector(s.groundNormal, -0.006 * scl);
     spawnThrusterTrail(gameMode.thrusters.R, _thrP, s.groundNormal);
   } else gameMode.thrusters.R.boosting = false;
   if(gameMode.thrusters.L.mesh) updateBoostTrailCore(gameMode.thrusters.L, onL, s.groundNormal, false);
   if(gameMode.thrusters.R.mesh) updateBoostTrailCore(gameMode.thrusters.R, onR, s.groundNormal, false);
+}
+
+// ══════════════════════════════════════════════
+// PART SPIN — reusable impulse-spin animator for individual ship parts. THE PATTERN, so it
+// can be recreated verbatim for any other part (wings, front panels…):
+//   1. state = makePartSpin(opts)                    — one state object per animated part
+//   2. partSpinKick(state, mul) on each driving EVENT (a shot fired, a hit taken, a boost…)
+//   3. pivot.rotation.<axis> = updatePartSpin(state) — every sim frame (stepGameSim, 60Hz)
+// Each kick ADDS angular velocity, so events landing faster stack more acceleration — a
+// faster fire rate spins the part up quicker AND higher, and it coasts longer afterwards
+// (velocity bleeds off slowly through `friction`). Once it drops below `settleBelow` the
+// part SETTLES HOME: it eases to the nearest rest pose that looks identical to the original
+// (`period` = the part's rotational symmetry) instead of freezing at a random angle.
+// ══════════════════════════════════════════════
+function makePartSpin(o){
+  o = o || {};
+  return {
+    angle: 0, vel: 0,
+    impulse:     o.impulse     != null ? o.impulse     : 0.02,    // rad/frame added per kick
+    maxVel:      o.maxVel      != null ? o.maxVel      : 0.45,    // spin cap (rad/frame)
+    friction:    o.friction    != null ? o.friction    : 0.99,    // per-frame decay — the slow wind-down
+    settleBelow: o.settleBelow != null ? o.settleBelow : 0.012,   // below this, stop coasting and go home
+    settleRate:  o.settleRate  != null ? o.settleRate  : 0.08,    // ease rate of the return-home
+    period:      o.period      != null ? o.period      : Math.PI * 2   // rotational symmetry of the part
+  };
+}
+function partSpinKick(st, mul){ st.vel = Math.min(st.maxVel, st.vel + st.impulse * (mul || 1)); }
+function updatePartSpin(st){
+  if(st.vel > st.settleBelow){
+    st.angle += st.vel;
+    st.vel *= st.friction;
+  } else {
+    // wound down → settle ("bottom out") to the nearest visually-identical rest pose
+    st.vel *= 0.9;
+    var home = Math.round(st.angle / st.period) * st.period;
+    st.angle += (home - st.angle) * st.settleRate;
+    if(Math.abs(home - st.angle) < 0.001 && st.vel < 0.0005){ st.angle = home % (Math.PI * 2); st.vel = 0; }
+  }
+  return st.angle;
+}
+
+// ── Cockpit: the centre diamond spins tip-to-tip, driven by FIRING — every shot kicks it
+// HARD (each bullet visibly slams it faster), so the fire rate IS the spin driver
+// (Overglock / Kill Streak / Adrenaline rev it into a full blur; Big Bullet's slow heavy
+// shots barely keep it turning). period = 2π/3 because the diamond's cross-section is an
+// equilateral triangle — every 120° is a perfect rest pose. ──
+var CKPT_SPIN_OPTS = { impulse: 0.06, maxVel: 1.1, friction: 0.99, settleBelow: 0.012, settleRate: 0.08, period: Math.PI * 2 / 3 };
+function ckptSpinKick(mul){
+  if(!gameMode.ckptSpin) gameMode.ckptSpin = makePartSpin(CKPT_SPIN_OPTS);
+  partSpinKick(gameMode.ckptSpin, mul);
+}
+function updateCockpitSpin(){
+  var pv = gameMode.cockpitPivot;
+  if(!pv) return;
+  if(!gameMode.ckptSpin) gameMode.ckptSpin = makePartSpin(CKPT_SPIN_OPTS);
+  pv.rotation.z = updatePartSpin(gameMode.ckptSpin);
+}
+
+// ══════════════════════════════════════════════
+// PART RECOIL — the sibling reusable animator to PART SPIN, for kick-back motion: each
+// kick SNAPS the part's offset OUT instantly (the quick jut), then it eases back to rest
+// slowly. Same reuse pattern as PART SPIN:
+//   1. state = makePartRecoil(opts)                     — one state per animated part
+//   2. partRecoilKick(state, mul) on each driving EVENT
+//   3. pivot.position.<axis> = ±updatePartRecoil(state) — every sim frame (stepGameSim)
+// ══════════════════════════════════════════════
+function makePartRecoil(o){
+  o = o || {};
+  return { off: 0,
+    kick:   o.kick   != null ? o.kick   : 0.10,   // offset added per kick (part-local units) — instant
+    maxOff: o.maxOff != null ? o.maxOff : 0.26,   // furthest it can sit back under sustained fire
+    ret:    o.ret    != null ? o.ret    : 0.05 }; // ease-home fraction per frame (the slow return)
+}
+function partRecoilKick(st, mul){ st.off = Math.min(st.maxOff, st.off + st.kick * (mul || 1)); }
+function updatePartRecoil(st){
+  st.off *= (1 - st.ret);
+  if(st.off < 0.0004) st.off = 0;
+  return st.off;
+}
+
+// ── Front panels: gun kick-back — both nose blades jut straight back the instant a shot
+// fires and slide home slowly, selling the recoil of the volley. Under sustained fire they
+// ride pinned near maxOff, twitching further back with each shot. ──
+var FRONT_RECOIL_OPTS = { kick: 0.10, maxOff: 0.26, ret: 0.05 };
+function frontRecoilKick(mul){
+  if(!gameMode.frontRecoil) gameMode.frontRecoil = makePartRecoil(FRONT_RECOIL_OPTS);
+  partRecoilKick(gameMode.frontRecoil, mul);
+}
+function updateFrontRecoil(){
+  var pvs = gameMode.frontPivots;
+  if(!pvs) return;
+  if(!gameMode.frontRecoil) gameMode.frontRecoil = makePartRecoil(FRONT_RECOIL_OPTS);
+  var off = updatePartRecoil(gameMode.frontRecoil);
+  pvs[0].position.z = -off;   // ship-local -Z = straight back
+  pvs[1].position.z = -off;
 }
 
 // ══════════════════════════════════════════════
@@ -20632,6 +20771,8 @@ function updateBarrelRollFire(){
 // One volley = the full bullet fan (1 forward + Front Bullets + Diagonal pairs).
 function fireOneVolley(originOverride, dirOverride, quiet){
   if(!gameMode.active || gameMode.exiting) return;
+  ckptSpinKick(1);     // every shot revs the cockpit diamond (PART SPIN — fire rate = spin driver)
+  frontRecoilKick(1);  // …and juts the front panels back (PART RECOIL — gun kick-back)
   var s = gameMode.surfaceState;
   var nose, dir;
   if(originOverride){ nose = originOverride; dir = dirOverride; }   // Barrel-Roll Shot fires from each wing
@@ -20683,6 +20824,8 @@ function updateBeamCharge(){
 }
 function fireBeam(){
   var a = gameVolleyAim();
+  ckptSpinKick(2.5);    // heavy shot — one bigger cockpit rev per beam (PART SPIN)
+  frontRecoilKick(2);   // …and a deeper front-panel kick-back (PART RECOIL)
   if(gameMode.fps.active) gameMode.fps.recoil = 1;
   var sk = { front: skillFx.frontBullet, diag: skillFx.diagonal, big: skillFx.bigBullet ? 1 : 0,
              vel: skillFx.velocity, track: skillFx.tracking ? 1 : 0, split: skillFx.splitShot, oc: skillFx.overclock, dm: skillFx.dmgMult,
@@ -22697,6 +22840,8 @@ function mpSerializeShip(){
          w: (gameMode.keys && (gameMode.keys.w || gameMode.wBoost)) ? 1 : 0,           // accelerating → partner renders my wing thrusters
          dd: s.isDrifting ? (s.driftDirection | 0) : 0 },                              // drift side (+1 left / -1 right) → which thruster
     sk: mpSkillSummary(),
+    ckv: gameMode.ckptSpin ? +gameMode.ckptSpin.vel.toFixed(3) : 0,   // cockpit spin velocity → partner's diamond revs with MY firing
+    fro: gameMode.frontRecoil ? +gameMode.frontRecoil.off.toFixed(3) : 0,   // front-panel recoil offset → partner sees my gun kick-back
     tb: (treeUI.open || treeUI.closing || towerNearby()) ? 1 : 0,   // shopping at the spire → the partner's break countdown holds
     hp: combat.player.hp, mh: combat.player.maxHp,
     // downed-revive: am I downed, and where did my revive orb extend (raw world coords)?
@@ -22717,6 +22862,8 @@ function mpApplyShip(d){
   r.flags.accel = !!(d.f && d.f.w);                       // holding W → wing thrusters
   r.flags.driftDir = (d.f && d.f.dd) | 0;                 // drift side (+1 left / -1 right, 0 = not drifting)
   r.skills = d.sk || {}; r.hp = (d.hp != null) ? d.hp : r.hp;
+  r.ckptVel = d.ckv || 0;   // their cockpit spin velocity (their fire rate drives it)
+  r.frontOff = d.fro || 0;  // their front-panel recoil offset (their gun kick-back)
   r.maxHp = d.mh || r.maxHp || 100;   // partner max HP (Reinforced Hull) → the P2 HUD bar scales right
   r.treeBusy = !!d.tb;   // partner is at the skill spire / in the tree → hold the break
   r.isFps = !!(d.f && d.f.fp);   // partner is in first-person → don't let an FPS player ride them
@@ -22758,15 +22905,11 @@ function mpBuildRemoteShip(){
   var ship = new THREE.Group();
   var sv = new THREE.Group();
   ship.add(sv);
-  var geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(GAME_SHIP_POSITIONS), 3));   // clone (local build mutates the shared array)
-  geo.setIndex(new THREE.BufferAttribute(GAME_SHIP_INDICES, 1));
-  geo.computeVertexNormals(); geo.computeBoundingBox();
-  var c = new THREE.Vector3(); geo.boundingBox.getCenter(c); geo.translate(-c.x, -c.y, -c.z);
+  // Same split rig as the local ship (body + spinnable cockpit), in the P2 teal-green.
   var mat = new THREE.MeshStandardMaterial({ color: 0x55ccaa, transparent: true, opacity: 0.96, roughness: 0.15, metalness: 0.3, emissive: 0x1e7a5e, emissiveIntensity: 0.6 });
-  var mesh = new THREE.Mesh(geo, mat); mesh.rotation.set(0, Math.PI / 2, 0); sv.add(mesh);
-  var edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: 0xbbffe6, transparent: true, opacity: 0.85 }));
-  edges.rotation.copy(mesh.rotation); sv.add(edges);
+  var rig = buildShipVisualParts(sv, mat, 0xbbffe6, 0.85);
+  MP.remote.ckptPivot = rig.pivot;
+  MP.remote.frontPivots = rig.frontPivots;
   ship.scale.setScalar(0.028);   // matches the local ship's 2× size
   ship.visible = false;
   var gunner = mpBuildGunnerAvatar();   // the FPS-mode avatar (hidden until the partner enters gunner mode)
@@ -22828,6 +22971,19 @@ function mpUpdateRemoteShip(){
     if(MP._remotePrev) MP.remoteVel.copy(r.ship.position).sub(MP._remotePrev);
     else MP._remotePrev = new THREE.Vector3();
     MP._remotePrev.copy(r.ship.position);
+    // cockpit spin parity: their diamond revs with THEIR firing — the packet carries their
+    // spin VELOCITY (ckv); the angle integrates locally with the same friction + settle-home
+    if(r.ckptPivot){
+      if(!r._ckptSpin) r._ckptSpin = makePartSpin(CKPT_SPIN_OPTS);
+      r._ckptSpin.vel += ((r.ckptVel || 0) - r._ckptSpin.vel) * 0.3;
+      r.ckptPivot.rotation.z = updatePartSpin(r._ckptSpin);
+    }
+    // front-panel recoil parity: their nose blades kick with THEIR shots (offset synced)
+    if(r.frontPivots){
+      r._fro = (r._fro || 0) + ((r.frontOff || 0) - (r._fro || 0)) * 0.5;
+      r.frontPivots[0].position.z = -r._fro;
+      r.frontPivots[1].position.z = -r._fro;
+    }
     // FPS partner → show the little gunner guy in place of the ship (so you can tell their mode).
     // Only swap to the gunner if we actually have one built — otherwise ALWAYS keep the ship visible
     // (never leave the partner invisible).
@@ -22974,12 +23130,12 @@ function mpUpdateRemoteFx(){
     _mpThrR.set(1, 0, 0).applyQuaternion(r.ship.quaternion);      // their right
     var rscl = r.ship.scale.x / GAME_BASE_SHIP_SCALE;
     if(rOnL){
-      _mpEng.copy(r.ship.position).addScaledVector(_mpThrR, GAME_WING_HALF_SPAN * 0.7 * rscl).addScaledVector(_mpBack, -0.008 * rscl)
+      _mpEng.copy(r.ship.position).addScaledVector(_mpThrR, GAME_WING_HALF_SPAN * 0.64 * rscl).addScaledVector(_mpBack, -0.012 * rscl)
         .addScaledVector(_mpUpV, -0.006 * rscl);   // wing level, matching the local mounts
       spawnThrusterTrail(MP.remoteThr.L, _mpEng, _mpUpV);
     } else MP.remoteThr.L.boosting = false;
     if(rOnR){
-      _mpEng.copy(r.ship.position).addScaledVector(_mpThrR, -GAME_WING_HALF_SPAN * 0.7 * rscl).addScaledVector(_mpBack, -0.008 * rscl)
+      _mpEng.copy(r.ship.position).addScaledVector(_mpThrR, -GAME_WING_HALF_SPAN * 0.64 * rscl).addScaledVector(_mpBack, -0.012 * rscl)
         .addScaledVector(_mpUpV, -0.006 * rscl);
       spawnThrusterTrail(MP.remoteThr.R, _mpEng, _mpUpV);
     } else MP.remoteThr.R.boosting = false;
@@ -25942,24 +26098,38 @@ function setVCamThroughPortal(Msrc, Mdst){
 // Portal avatar: a clone of the ship body, transformed through the portal onto the DESTINATION
 // layer, so as the real ship dives into the seam you see it continue OUT the other side through
 // the portal — covering the gap while the chase camera (behind the ship) catches up and crosses.
+// The ship is now split into parts (body + spinning cockpit), so the avatar clones EVERY mesh
+// under shipVisual with its own world matrix — the cockpit even keeps spinning through the seam.
 var _cloneT = new THREE.Matrix4(), _cloneInv = new THREE.Matrix4();
 function updateShipClone(Msrc, Mdst, destLayer){
   var P = gameMode.portal;
   if(!gameMode.ship) return;
-  var body = P._shipBody;
-  if(!body){ gameMode.ship.traverse(function(o){ if(!body && o.isMesh) body = o; }); P._shipBody = body; }
-  if(!body) return;
+  // hull meshes only (registered at build time) — NOT the underglow rig / wheels that also
+  // live under the ship group; the old single-mesh clone never mirrored those either
+  if(!P._shipParts){
+    if(!gameMode.shipParts || !gameMode.shipParts.length) return;
+    P._shipParts = gameMode.shipParts;
+  }
   if(!P.shipClone){
-    P.shipClone = new THREE.Mesh(body.geometry, body.material);
+    P.shipClone = new THREE.Group();   // container just for the visible toggle
     P.shipClone.matrixAutoUpdate = false;
-    P.shipClone.frustumCulled = false;
+    P.shipCloneParts = P._shipParts.map(function(src){
+      var m = new THREE.Mesh(src.geometry, src.material);
+      m.matrixAutoUpdate = false;
+      m.frustumCulled = false;
+      P.shipClone.add(m);
+      return m;
+    });
     scene.add(P.shipClone);
   }
-  body.updateMatrixWorld(true);
+  gameMode.ship.updateMatrixWorld(true);
   _cloneT.copy(Mdst).multiply(_portalFlip).multiply(_cloneInv.copy(Msrc).invert());
-  P.shipClone.matrix.multiplyMatrices(_cloneT, body.matrixWorld);
-  P.shipClone.matrixWorldNeedsUpdate = true;
-  P.shipClone.layers.set(destLayer);
+  for(var ci = 0; ci < P.shipCloneParts.length; ci++){
+    var cl = P.shipCloneParts[ci];
+    cl.matrix.multiplyMatrices(_cloneT, P._shipParts[ci].matrixWorld);
+    cl.matrixWorldNeedsUpdate = true;
+    cl.layers.set(destLayer);
+  }
   P.shipClone.visible = true;
 }
 // Seamless transform-teleport: move the ship + camera + velocities through the portal pair by
@@ -27077,6 +27247,8 @@ function stepGameSim(dt){
   updateBoostTrail();
   updateShipUnderglow();   // adaptive hover propulsion rings under the ship
   updateSideThrusters();   // wing thrusters: candle mini-trails while holding W / drifting
+  updateCockpitSpin();     // centre diamond revs with the fire rate, settles home after (PART SPIN)
+  updateFrontRecoil();     // front panels jut back per shot, slide home slowly (PART RECOIL)
   updateSkillTower();   // skill spire: carousel spin + between-rounds beam ritual
   updateGameBullets();
   updateCombat(dt);
