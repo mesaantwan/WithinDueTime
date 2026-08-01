@@ -19128,8 +19128,12 @@ function facePlanetBody(){
 // badly skewed by the face relief and can sit almost ON the surface), scale so the MEAN vertex
 // radius = FACE_PLANET_R, build the render geometry, and bake the radial physics field from the
 // same scaled tri soup. The fit centre is what the gravity well pulls toward.
-function _fpFinishGeometry(parsed){
-  var p = parsed.pos, i;
+// PURE-MATH half: least-squares sphere fit → recentre → scale to FACE_PLANET_R, IN PLACE on the tri
+// soup. Split out of _fpFinishGeometry so the OBJ worker can run the IDENTICAL code — the worker's
+// source is built by stringifying this very function (see _fpWorkerSource), so there is exactly one
+// copy of the collision-feeding math and the two paths can never drift apart numerically.
+function _fpFitScale(p){
+  var i;
   // Normal equations for A·m = b with rows [2x, 2y, 2z, 1], b = |v|² → m = [cx, cy, cz, r²−|c|²]
   var M = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]], Rv = [0,0,0,0], row = [0,0,0,1];
   for(i = 0; i < p.length; i += 3){
@@ -19153,16 +19157,125 @@ function _fpFinishGeometry(parsed){
   meanR /= (p.length / 3);
   var sc = FACE_PLANET_R / Math.max(meanR, 1e-6);
   for(i = 0; i < p.length; i += 3){ p[i] = (p[i] - cx) * sc; p[i + 1] = (p[i + 1] - cy) * sc; p[i + 2] = (p[i + 2] - cz) * sc; }
+}
+// Build the render geometry + adopt the physics source arrays from an ALREADY fit/scaled tri soup.
+// Shared by every path (sync, chunked, worker). Setting facePlanet.geo is the "planet is usable"
+// signal — buildPortal's facePlanetActivate() gates on it — so callers must run this LAST, after the
+// bake and the buckets exist, or the planet can go live with no collision index behind it.
+function _fpAdoptGeometry(parsed){
   var geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(p, 3));
+  geo.setAttribute('position', new THREE.BufferAttribute(parsed.pos, 3));
   if(parsed.uv) geo.setAttribute('uv', new THREE.BufferAttribute(parsed.uv, 2));
   if(parsed.nrm) geo.setAttribute('normal', new THREE.BufferAttribute(parsed.nrm, 3));
   else geo.computeVertexNormals();
   facePlanet.geo = geo;
-  facePlanet.pos = p;                                             // tri soup — the exact-cast source of truth
+  facePlanet.pos = parsed.pos;                                    // tri soup — the exact-cast source of truth
   facePlanet.vnrm = geo.attributes.normal ? geo.attributes.normal.array : null;   // smooth normals (file or computed)
-  _fpBake(p);
-  _fpBuildBuckets(p);
+}
+// SYNCHRONOUS full pipeline — still the path for the PvP world swap and any caller that needs the
+// planet finished before it returns. loadFacePlanet() uses the off-thread path below instead.
+function _fpFinishGeometry(parsed){
+  _fpFitScale(parsed.pos);
+  _fpBake(parsed.pos);
+  _fpBuildBuckets(parsed.pos);
+  _fpAdoptGeometry(parsed);
+}
+// ── OFF-THREAD OBJ PIPELINE ──────────────────────────────────────────────────────────────────
+// Parse + fit + bake + bucket-build is ~650ms of pure JS that used to run in ONE main-thread task
+// the moment the 5MB OBJ landed — the biggest remaining entry stall, and entirely GPU-independent.
+// It all moves to a worker now. The worker's SOURCE IS GENERATED from the live functions above
+// (Function.prototype.toString), so the collision-feeding math is literally the same code, running
+// in the same JS engine on the same IEEE-754 doubles: the buffers that come back are bit-identical
+// to what the sync path produces. That property is the whole reason this is safe — the ship's grip
+// on the terrain reads facePlanet.pos/bkOff/bkIdx directly, and none of those numbers change.
+// A Blob URL keeps the single-file rule intact (no second .js to ship).
+var _fpWorkerPath = '';   // 'worker' | 'chunked' — which route actually ran (the harnesses assert on this)
+function _fpWorkerSource(){
+  return [
+    // Stubs standing in for the page globals the baking code closes over.
+    'var facePlanet = { W: ' + facePlanet.W + ', H: ' + facePlanet.H + ' };',
+    'var FACE_PLANET_R = ' + FACE_PLANET_R + ';',
+    'var FP_BW = ' + FP_BW + ', FP_BH = ' + FP_BH + ';',
+    _fpParseObj.toString(), _fpFitScale.toString(), _fpBake.toString(),
+    _fpTriCells.toString(), _fpBuildBuckets.toString(),
+    'self.onmessage = function(e){',
+    '  try {',
+    '    var parsed = _fpParseObj(e.data);',
+    '    _fpFitScale(parsed.pos);',
+    '    _fpBake(parsed.pos);',
+    '    _fpBuildBuckets(parsed.pos);',
+    '    var xfer = [parsed.pos.buffer, facePlanet.R.buffer, facePlanet.bkOff.buffer, facePlanet.bkIdx.buffer];',
+    '    if(parsed.uv) xfer.push(parsed.uv.buffer);',
+    '    if(parsed.nrm) xfer.push(parsed.nrm.buffer);',
+    '    self.postMessage({ ok: 1, pos: parsed.pos, uv: parsed.uv, nrm: parsed.nrm,',
+    '      R: facePlanet.R, minR: facePlanet.minR, maxR: facePlanet.maxR,',
+    '      bkOff: facePlanet.bkOff, bkIdx: facePlanet.bkIdx }, xfer);',
+    '  } catch(err){ self.postMessage({ ok: 0, err: String((err && err.message) || err) }); }',
+    '};'
+  ].join('\n');
+}
+// Adopt a finished worker payload. Same assignment set (and same LAST-geometry ordering) as the
+// chunked path, so "which route ran" is invisible to everything downstream.
+function _fpAdoptWorkerResult(m){
+  facePlanet.R = m.R; facePlanet.minR = m.minR; facePlanet.maxR = m.maxR;
+  facePlanet.bkOff = m.bkOff; facePlanet.bkIdx = m.bkIdx;
+  _fpAdoptGeometry({ pos: m.pos, uv: m.uv, nrm: m.nrm });
+}
+// MAIN-THREAD FALLBACK for when a worker can't be had — a CSP without blob: in script-src, an
+// embedding context that forbids workers, or a device that refuses to spawn one. (Chrome does allow
+// blob: workers from file://, so a double-clicked local copy still takes the worker route; this is
+// insurance, not the common case.) Runs the identical functions in the identical order, just
+// yielding between phases so the browser can paint and handle input instead of freezing solid.
+// Nothing is recomputed or approximated: each phase is atomic, so the results are unchanged —
+// verified byte-for-byte against the worker route in portal-harness/objworkerfallback.js.
+function _fpProcessChunked(objText, done){
+  var parsed = null;
+  var steps = [
+    function(){ parsed = _fpParseObj(objText); },
+    function(){ _fpFitScale(parsed.pos); },
+    function(){ _fpBake(parsed.pos); },
+    function(){ _fpBuildBuckets(parsed.pos); },
+    function(){ _fpAdoptGeometry(parsed); }
+  ];
+  (function step(i){
+    if(i >= steps.length){ done(true); return; }
+    try { steps[i](); } catch(e){ done(false); return; }
+    setTimeout(function(){ step(i + 1); }, 0);
+  })(0);
+}
+// Try the worker; fall back to the chunked main-thread run on ANY failure (no Worker constructor,
+// no Blob/createObjectURL, blocked blob: origin, a throw inside the worker, or a hard error event).
+function _fpProcessAsync(objText, done){
+  var w = null, settled = false, bailed = false, guard = 0;
+  function finish(ok){ if(settled) return; settled = true; if(guard){ clearTimeout(guard); guard = 0; } done(ok); }
+  function bail(){
+    if(settled || bailed) return;
+    bailed = true;
+    if(guard){ clearTimeout(guard); guard = 0; }
+    if(w){ try { w.terminate(); } catch(e){} w = null; }
+    _fpWorkerPath = 'chunked';
+    _fpProcessChunked(objText, finish);
+  }
+  try {
+    var url = URL.createObjectURL(new Blob([_fpWorkerSource()], { type: 'text/javascript' }));
+    w = new Worker(url);
+    URL.revokeObjectURL(url);
+    // WATCHDOG. facePlanet.state stays 'loading' until this resolves, and warmup + the terra
+    // fallback both gate on that — so a worker that never answers (dead thread, exhausted memory on
+    // a weak device) would hang the arena forever with no way out. 30s is ~40× the work's real cost.
+    guard = setTimeout(bail, 30000);
+    w.onmessage = function(ev){
+      var m = ev.data;
+      try { w.terminate(); } catch(e){}
+      w = null;
+      if(!m || !m.ok){ bail(); return; }
+      try { _fpAdoptWorkerResult(m); } catch(e){ bail(); return; }
+      _fpWorkerPath = 'worker';
+      finish(true);
+    };
+    w.onerror = function(ev){ if(ev && ev.preventDefault) ev.preventDefault(); bail(); };   // blocked blob: origin lands here
+    w.postMessage(objText);
+  } catch(e){ bail(); }
 }
 // Kick off the async load (idempotent). Called from buildPortal so the ~5MB fetch runs while the
 // player is still driving to the portal.
@@ -19171,11 +19284,13 @@ function loadFacePlanet(){
   facePlanet.state = 'loading';
   _fpFetchText(FACE_PLANET_URLS.slice(), function(objText){
     if(!objText){ facePlanet.state = 'failed'; _fpTerraFallback(); return; }
-    try {
-      _fpFinishGeometry(_fpParseObj(objText));
+    // state stays 'loading' across the whole off-thread build — warmup (ensureGameWarmup) already
+    // gates on that, so nothing goes live until the bake and the buckets are actually in hand.
+    _fpProcessAsync(objText, function(ok){
+      if(!ok || !facePlanet.geo){ facePlanet.state = 'failed'; _fpTerraFallback(); return; }
       facePlanet.state = 'ready';
       facePlanetActivate();
-    } catch(e){ facePlanet.state = 'failed'; _fpTerraFallback(); }
+    });
   });
   // MTL: mined for a map_Kd texture line; then GUESSED filenames so simply uploading the image to
   // the repo root works even without re-exporting the MTL. (The current export has NO map_Kd —
