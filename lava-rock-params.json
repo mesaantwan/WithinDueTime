@@ -1,0 +1,145 @@
+{
+  "params": {
+    "seed": 20260811,
+    "res": 2048,
+    "tiers": [
+      1024,
+      512
+    ],
+    "tile_world": 0.35,
+    "height_world": 0.014,
+    "plate_period": 13,
+    "plate_joint_w": 0.09,
+    "plate_depth": 0.1,
+    "plate_dome": 0.05,
+    "rope_scale": 4,
+    "rope_warp": 0.55,
+    "rope_freq": 4.0,
+    "rope_amt": 0.24,
+    "rope_sharp": 0.55,
+    "pebble_period": 30,
+    "pebble_amt": 0.2,
+    "pebble_fill": 0.22,
+    "pebble_rad": [
+      0.2,
+      0.3
+    ],
+    "pebble2_period": 72,
+    "pebble2_amt": 0.09,
+    "pebble2_fill": 0.28,
+    "pebble2_rad": [
+      0.18,
+      0.26
+    ],
+    "grit_period": 190,
+    "grit_amt": 0.045,
+    "grain_period": 240,
+    "grain_oct": 4,
+    "grain_amt": 0.045,
+    "crack_period": 22,
+    "crack_oct": 4,
+    "crack_warp": 0.34,
+    "crack_width": 0.075,
+    "crack_width2": 0.042,
+    "crack_depth": 0.55,
+    "rough_base": 0.42,
+    "rough_plate_var": 0.34,
+    "rough_obsidian": 0.09,
+    "rough_rubble": 0.88,
+    "rough_rope": 0.26,
+    "rough_floor": 0.3,
+    "molten_hi": 0.4,
+    "molten_lo": 0.18
+  },
+  "summary": {
+    "name": "lava-rock",
+    "tileWorldSize": 0.35,
+    "heightMetres": 0.014,
+    "seed": 20260811,
+    "files": {
+      "lava-rock-alb-1024.jpg": 222266,
+      "lava-rock-nrm-1024.png": 2933170,
+      "lava-rock-mix-1024.png": 2225028,
+      "lava-rock-alb-512.jpg": 65788,
+      "lava-rock-nrm-512.png": 753602,
+      "lava-rock-mix-512.png": 634337
+    },
+    "seams": {
+      "height": {
+        "horizontal": {
+          "pctile": 67.3,
+          "wrap": 0.03726,
+          "innerMedian": 0.03468
+        },
+        "vertical": {
+          "pctile": 12.3,
+          "wrap": 0.02837,
+          "innerMedian": 0.03438
+        }
+      },
+      "albedo": {
+        "horizontal": {
+          "pctile": 74.3,
+          "wrap": 0.00802,
+          "innerMedian": 0.0074
+        },
+        "vertical": {
+          "pctile": 7.1,
+          "wrap": 0.00613,
+          "innerMedian": 0.00735
+        }
+      },
+      "normal": {
+        "horizontal": {
+          "pctile": 74.6,
+          "wrap": 0.06545,
+          "innerMedian": 0.06103
+        },
+        "vertical": {
+          "pctile": 64.5,
+          "wrap": 0.06326,
+          "innerMedian": 0.06064
+        }
+      }
+    },
+    "roundtripErr255": {
+      "1024/alb": {
+        "mean": 1.26,
+        "p999": 7.27,
+        "max": 13.93
+      },
+      "1024/nrm": {
+        "mean": 0.25,
+        "p999": 0.5,
+        "max": 0.5
+      },
+      "1024/mix": {
+        "mean": 0.19,
+        "p999": 0.5,
+        "max": 0.5
+      },
+      "512/alb": {
+        "mean": 1.68,
+        "p999": 8.03,
+        "max": 12.68
+      },
+      "512/nrm": {
+        "mean": 0.25,
+        "p999": 0.5,
+        "max": 0.5
+      },
+      "512/mix": {
+        "mean": 0.2,
+        "p999": 0.5,
+        "max": 0.5
+      }
+    },
+    "heightStats": {
+      "min": 0.0,
+      "max": 0.9473,
+      "mean": 0.5094
+    },
+    "fissureCoverage": 0.1094,
+    "moltenCoverage": 0.1278
+  }
+}
