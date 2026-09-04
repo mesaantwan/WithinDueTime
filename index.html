@@ -653,7 +653,16 @@ var CAM_FOV = 75;
 // scene.background, the FogExp2 colour distant geometry fades INTO, and `bgBase` in updateOrbs
 // — which the whole spin crescendo is derived from (it multiplies this down to black and back).
 // The clouds read it live off scene.background, so they follow for free.
-var SITE_BG = 0xe7effc;   // very pale blue — nearly white, unmistakably not grey
+var SITE_BG = 0x6fb8e0;   // open sky. Bright enough to stay a light theme, dark enough that a
+                          // white cloud deck reads as WHITE against it and not as pale grey —
+                          // the clouds sit at ~1.0 and this is 0.65 luminance, so there is a
+                          // stop and a half of separation for their shading to live in.
+// WHAT THE CRYSTALS REFLECT. Deliberately NOT SITE_BG. Every polished surface on the site takes
+// its colour from the cube map, which is a live render of the room — so making the sky blue made
+// the whole shop blue with it, and the metal stopped reading as metal. The reflections are held at
+// the pale near-white the site was designed around: the sky is scenery, the product finishes are
+// the brand. Set this to SITE_BG to go back to physically-consistent (and blue) reflections.
+var REFLECT_BG = 0xe7effc;
 var CAM_TILT_STRENGTH = 0.015;
 
 function updateCamRadius() {
@@ -62116,17 +62125,24 @@ function _perfHud(dt){   // add ?fps to the URL to show a frame-time readout (to
 // shell, the depth buffer, the weather map's own texture, and the 5-step light march (two taps
 // here). That is the whole difference between ~300 texture fetches a pixel and ~50.
 //
-// THE LIGHT IS THE SPIN. There is no sun on the storefront — there is a crystal in the middle of
-// the tower, and the crescendo (mainPower / godrayIntensity / crystalScreenBright) is what turns
-// it on. So the "sun" sits at the gallery crystal and its intensity IS the crescendo. Because the
-// composite is `bg·T + L`, the whole effect the user asked for falls out of the physics for free:
-// at rest the background is SITE_BG (a pale blue) and a cloud is the part of it the cloud absorbs —
-// soft grey shapes on white. As you spin, the site's own code darkens `scene.background` toward
-// black, `bg·T` goes to nothing, and what is left is L — clouds lit from inside the tower, getting
-// brighter as the crystal does. Nothing cross-fades; the same equation does both ends.
+// THE PAGE IS A SKY. SITE_BG is an open blue and the deck sits below the eye (`hWorld`), so the front
+// page reads as standing above a cumulus field: white tops filling the lower frame, blue over the
+// tower, and the sky whitening toward an off-frame sun (`haloStr`). The clouds are white because
+// they are LIT to ~1.0 while the sky sits at 0.65 luminance — that separation is what makes them
+// read as cloud rather than as pale haze, and it is why the background cannot be pushed brighter.
 //
-// PUBLIC BUILD: the H parameter window is deleted in this file. Tune the clouds in
-// `Chrysolin Website.html` (H → CLOUDS tab) and copy the values across.
+// THE LIGHT IS ALSO THE SPIN. There is a crystal in the middle of the tower, and the crescendo
+// (mainPower / godrayIntensity / crystalScreenBright) drives it. Because the composite is
+// `bg·T + L`, both ends fall out of one equation: at rest the sky lights the deck (`amb`, scaled
+// by the background's own luminance) and you get daylight cumulus. As you spin, the site darkens
+// `scene.background` toward black, `bg·T` goes to nothing and the sky bounce leaves with it — what
+// arrives in its place is `ambSpin`, the crystal. The deck never goes out; it changes who is
+// lighting it. Nothing cross-fades; the same equation does both ends.
+//
+// TUNING: press H for the parameter window (`?clouds` opens it on load, `?cloudsonly` also
+// pins quality so the adaptive ladder is not moving under you). It is a TEMPORARY block at the
+// end of this section, marked ▼▼▼ / ▲▲▲ — delete those lines and everything between them and the
+// build is back to shipping shape.
 // ══════════════════════════════════════════════════════════════════════════════════════════
 // ── GLSL ──────────────────────────────────────────────────────────────────────────────────
 // 32³ instead of the atmosphere's 64³: this is background cloud at a quarter of the screen's
@@ -62150,11 +62166,12 @@ function cskyFrag(){ return [
 'uniform sampler2D tBase;',
 'uniform float uTime, uD0, uD1;',
 'uniform float uCov, uDens, uScale, uWScale, uDetAmt, uDetScale;',
-'uniform float uHGrad, uHCentre, uHSpan;',
+'uniform float uHGrad, uHCentre, uHSpan, uTowerLo;',
 'uniform vec3 uWind; uniform float uEvolve;',
 'uniform vec3 uSunDir, uSunCol, uAmbCol, uTint;',
 'uniform float uSunI, uAmb, uDark, uPowder, uSilver, uG1, uG2, uAbsorb, uBright, uShadow;',
 'uniform int uSteps, uLSteps;',
+'uniform float uGrow;',
 SKY_COMMON,
 SKY_SAMPLE_LIB,
 // The Worley lattice tiles at period 1, so read straight off world axes it lays the cloud
@@ -62175,7 +62192,13 @@ SKY_SAMPLE_LIB,
 'float cShape(vec3 p, float cov, bool full){',
 '  if(cov <= 0.002) return 0.0;',
 '  float h = hFrac(p);',
-'  float grad = mix(1.0, sat(rmap(h,0.03,0.30,0.0,1.0)) * sat(rmap(h,0.58,0.98,1.0,0.0)), uHGrad);',
+// A CLOUD IS AS TALL AS ITS OWN WEATHER. With one fixed top the deck flattens into a sea:
+// every cell stops at the same height, so the silhouette is a ridge line and nothing towers.
+// Letting the top follow `cov` is what turns the same field into banks — thin flat cloud where
+// coverage is low, cumulus climbing to the ceiling where it is high. uTowerLo 0.98 collapses
+// the mix and reproduces the old fixed-top behaviour exactly.
+'  float tTop = mix(uTowerLo, 0.98, cov);',
+'  float grad = mix(1.0, sat(rmap(h,0.03,0.30,0.0,1.0)) * sat(rmap(h, tTop-0.40, tTop, 1.0,0.0)), uHGrad);',
 '  if(grad <= 0.002) return 0.0;',
 '  vec3 wp = p*uScale + uWind*uTime;',
 '  vec4 nb = tex3D(tBase, wp);',
@@ -62205,7 +62228,13 @@ SKY_SAMPLE_LIB,
 'void main(){',
 '  vec3 vr = vRay;',
 '  vec3 rd = normalize((uCamW * vec4(vr,0.0)).xyz);',
-'  float ds = (uD1 - uD0) / float(uSteps);',
+// A GEOMETRIC MARCH, not an even one. The deck sits below the eye and runs to the horizon, so a
+// uniform step spends as much of its budget on the far band — where a hundred units collapse
+// into a few pixels — as on the near billows that fill half the frame. Growing the step keeps
+// the same count and puts it where the detail is: at grow 1.12 over 18 steps the first is ~5
+// units and the last ~37, and the crosshatch the jitter leaves on near cloud faces goes away.
+'  float kk = max(uGrow, 1.0001);',
+'  float ds = (uD1 - uD0) * (kk - 1.0) / (pow(kk, float(uSteps)) - 1.0);',
 '  float jit = ign(gl_FragCoord.xy);',
 '  float mu = dot(rd, uSunDir);',
 // mu is constant down the ray, so the phase lobes are evaluated once here rather than per step.
@@ -62234,7 +62263,7 @@ SKY_SAMPLE_LIB,
 '      energy += trans * (direct + ambient) * uTint * (1.0 - ext);',
 '      trans *= ext;',
 '    }',
-'    t += ds;',
+'    t += ds; ds *= kk;',
 '  }',
 '  gl_FragColor = vec4(energy, trans);',
 '}'
@@ -62274,16 +62303,24 @@ var CSKY_COMP = [
 'precision mediump float;',
 'varying vec2 vUv;',
 'uniform sampler2D tCloud, tShaft;',
-'uniform vec3 uBg, uShaftCol;',
-'uniform float uFade, uShaftStr, uShaftOn;',
+'uniform vec3 uBg, uShaftCol, uHaloCol;',
+'uniform float uFade, uShaftStr, uShaftOn, uHaloR, uHaloStr, uHaloAsp;',
+'uniform vec2 uHaloUV;',
 'void main(){',
+// THE SKY IS NOT ONE COLOUR. scene.background is flat, and against a flat blue a white cloud
+// deck reads as a cut-out. The air forward-scatters around the sun, so the sky whitens toward
+// it — and because that happens BEFORE the cloud composite, thin cloud in front of the glow
+// lights up through `bg*T` for free. The sun sits off the top edge, so what lands in frame is
+// a soft wash down from above, never a hotspot on the crystal.
+'  vec2 hd = (vUv - uHaloUV) * vec2(uHaloAsp, 1.0);',
+'  vec3 bg = mix(uBg, uHaloCol, uHaloStr * exp(-dot(hd,hd)/max(uHaloR*uHaloR, 1e-4)));',
 '  vec4 c = texture2D(tCloud, vUv);',
-'  vec3 lit = uBg * c.a + c.rgb;',
+'  vec3 lit = bg * c.a + c.rgb;',
 '  if(uShaftOn > 0.5){',
 '    float head = clamp(1.0 - max(lit.r, max(lit.g, lit.b)), 0.0, 1.0);',
 '    lit += uShaftCol * texture2D(tShaft, vUv).r * uShaftStr * head;',
 '  }',
-'  gl_FragColor = vec4(mix(uBg, lit, uFade), 1.0);',
+'  gl_FragColor = vec4(mix(bg, lit, uFade), 1.0);',
 '}'
 ].join('\n');
 
@@ -62307,31 +62344,54 @@ var P = {
   // 2.49 ms at 0.50/14, 9.9 ms at 1.00/24. These are the hand-tuned shipping values; res 0.7 buys
   // a visibly sharper deck and costs about 2.5× the march that 0.4 did — see cost() for the live
   // number, and the adaptive ladder below for what happens on a machine that cannot hold it.
+  // `steps` went 14 → 18 when the deck became real cumulus: the billows are shapes now, and 14
+  // evenly spaced samples aliased them into a crosshatch. `grow` is what pays for that — it buys
+  // the near field a 5-unit step out of the same 18 by letting the far band coarsen to ~37.
   res: 0.70,              // cloud RT size as a fraction of CSS pixels (NOT device pixels)
   hz: 24,                 // max cloud-march updates per second (the composite still runs at 60)
-  steps: 14,              // view-ray march steps
+  steps: 18,              // view-ray march steps
+  grow: 1.13,              // per-step growth of the view march (1.0 = evenly spaced)
   lSteps: 1,              // taps toward the light per lit step
 
-  // ── where the deck sits ── a shell of distance around the camera, so it is always around you
-  // however far the page has scrolled, while the noise stays anchored in WORLD space so moving
-  // through it gives real parallax. The span is deliberately huge (5 → 305): near samples give
-  // the big foreground shapes their scale, far ones the haze behind the tower. The composite quad
-  // is drawn first with depth testing off, so nothing here can ever come in FRONT of the shop —
-  // clouds sampled a few units from the eye still sit behind every product.
-  dIn: 5, dOut: 305,
-  hGrad: 0.42,            // 0 = clouds in every direction, 1 = a flat deck with clear air above/below
-  hSpan: 400,             // world height the deck gradient is spread over
+  // ── where the deck sits ── dIn/dOut are how far ALONG THE RAY the march runs, so they are a
+  // shell of distance around the camera; everything else about the deck is fixed in world space.
+  // The span is deliberately huge (15 → 290): near samples give the big foreground billows their
+  // scale, far ones the cloud sea running out to the horizon. Starting at 15 rather than at the
+  // eye is what keeps the last floor from burying the camera in white — you descend INTO the
+  // tops and the nearest cloud is always some way off. The composite quad is drawn first
+  // with depth testing off, so nothing here can ever come in FRONT of the shop — clouds sampled a
+  // few units from the eye still sit behind every product.
+  dIn: 15, dOut: 290,
+  hGrad: 0.64,            // 0 = clouds in every direction, 1 = a flat deck with clear air above/below
+  // Deck thickness, and with a world-anchored deck this is now THE EXCHANGE RATE between the two
+  // ends of the page: the camera only travels 26 units top to bottom, so a thin deck means you
+  // pass through more of it (clean sky at the top, inside the cloud at the bottom) and a thick one
+  // means the view barely changes over the whole scroll. 55 puts the hero shot above the tops and
+  // the last floor in among them.
+  hSpan: 55,              // world height the deck gradient is spread over
+  // WHERE THE DECK SITS — IN THE WORLD, not relative to your eye. This is an absolute world Y for
+  // the middle of the deck and it does not move, ever. That is the whole point: the page scroll
+  // flies the camera DOWN THROUGH a fixed cloud layer, so the clouds hold their shapes and only
+  // your view of them changes — the same thing that happens when you fly up through the deck in
+  // the game. Pinning hCentre to camera.y instead (which is what this used to do) drags the whole
+  // height gradient along with you, so every cloud silently regrows as you scroll and the deck
+  // top is welded to the horizon line no matter where you are.
+  //
+  // The camera runs y 0 (top of the page) → about -26 (bottom), so -34 puts you above the deck at
+  // the top of the site and inside its tops by the last floor.
+  hWorld: -26,
+  towerLo: 0.20,          // height a ZERO-coverage cloud stops at (0.98 = the old flat top)
 
   // ── shape ──
-  // Coverage is deliberately LOW. On a light storefront the gaps are the effect: a cloud only
-  // exists because there is pale page either side of it. Much above ~0.45 closes the deck over
-  // and the page reads as flat overcast.
-  cov: 0.36,
-  dens: 1.50,
-  scale: 0.0100,          // noise frequency in world units (period = 1/scale)
-  wScale: 0.32,           // coverage layer frequency, relative to `scale`
-  detAmt: 0.55,           // high-frequency erosion of the edges
-  detScale: 7.0,          // erosion frequency, relative to `scale`
+  // Coverage is high, and on this deck that does NOT mean overcast: `towerLo` spends coverage on
+  // HEIGHT rather than on closing the sky over, so raising it builds taller banks with blue still
+  // showing between the tops. It is `hWorld` that decides how much sky you keep, not `cov`.
+  cov: 0.82,
+  dens: 3.85,
+  scale: 0.0070,          // noise frequency in world units (period = 1/scale)
+  wScale: 0.45,           // coverage layer frequency, relative to `scale`
+  detAmt: 0.88,           // high-frequency erosion of the edges
+  detScale: 9.6,          // erosion frequency, relative to `scale`
 
   // ── motion ── windSpd/windDir/rise/evolve are the SHAPE of the movement (which way, how far
   // per unit of cloud time, how fast the field reorganises). The two speeds below are the CLOCK
@@ -62342,7 +62402,29 @@ var P = {
   // once the wheel is turning at `spinRpm`, and everything in between is a lerp on the wheel's
   // own smoothed RPM. `hzSpin` exists because the march is rate-capped: at 14× speed the clouds
   // move ~20 screen px between two 24 Hz updates, which judders — so the cap rises with the rate.
-  speedIdle: 1.0, speedSpin: 14.0, spinRpm: 200, hzSpin: 48,
+  speedIdle: 0.2, speedSpin: 14.0, spinRpm: 200, hzSpin: 48,
+  // MOVING THE CAMERA IS THE OTHER THING THAT NEEDS A HIGHER RATE, and for a different reason.
+  // The field is static now, but the VIEW of it is not: the march is baked into a render target
+  // from one camera position and the composite then blits it every frame. Scroll, and that target
+  // is stale — the whole sky lurches to a new position `hz` times a second while the shop in front
+  // of it moves at 60. That read as the page itself stuttering.
+  //
+  // The fix is simply to march more often while the camera moves — nothing else changes.
+  //
+  // IT USED TO DROP THE STEP COUNT TOO, to pay for the rate, and that was wrong: a step count is
+  // NOT appearance-neutral in a march this coarse. Rendered side by side at the same camera
+  // position, 10 steps gives a visibly thinner, flatter deck with a dotty texture and a lower
+  // silhouette than 18 does. So the clouds thinned out the moment you touched the scroll and
+  // fattened back up when you stopped — two states, snapping between them, every single scroll.
+  // Consistency beats the ~1 ms: stepsMove defaults to the same value as `steps`. Lower it only if
+  // a machine genuinely cannot hold frame, and expect to see the change happen.
+  // 120 is not a real rate — the march can only run once per frame, so anything at or above the
+  // display refresh means "every frame while moving", which is the only setting with no repeated
+  // frames in it at all. 60 would be the honest number on a 60 Hz screen and it is the wrong one:
+  // an interval of exactly 16.67 ms is missed by any frame that lands a hair early, so a march
+  // gets skipped every few frames and the judder comes back in a slower, more irregular form.
+  hzMove: 120, stepsMove: 18,
+  moveFull: 0.05,         // camera movement PER FRAME (world units) that counts as fully moving
 
   // ── light ──
   // WHERE THE LIGHT COMES FROM. A fixed sun sitting just off the TOP of the frame, not the orb.
@@ -62353,7 +62435,7 @@ var P = {
   // frame, but close enough that shafts would still fan down INTO the frame.
   // `sunAz` is measured from straight ahead (0 = directly behind the tower, +ve to the right).
   sunLock: 0.0,           // 0 = the fixed sun below, 1 = drag the light onto the gallery crystal
-  sunAz: 20, sunEl: 38,
+  sunAz: 5, sunEl: 38,
   sunUp: 0.0,             // only used when sunLock > 0: raises the "sun" above the crystal
   // These are IRRADIANCE, and the shader multiplies by 4π, the phase function and `bright`.
   // THE ONE RULE: the composite is mix(bg, direct+ambient, 1-T), so direct+ambient is the only
@@ -62361,23 +62443,28 @@ var P = {
   // blitting the composite into a byte render target and counting texels at 255; guessing at it
   // cost three passes. `bright` 2.0 doubles the direct term, so it is the fastest way to break
   // that rule if the other light values are raised much further.
-  sunBase: 0.064,
-  sunGain: 0.24,          // how hard the crescendo drives the light (spin runs 0 → ~2.2)
+  sunBase: 0.200,
+  // 0: the crescendo no longer adds DIRECT sun. The clouds still light up as you spin — that is
+  // `ambSpin`, the crystal arriving as bounce — but the key stays put, so the deck keeps one
+  // consistent sun direction from rest all the way through the climb instead of growing a second
+  // highlight that tracks the tower. Raise it to put the forward-scatter lobe back on the spin.
+  sunGain: 0.00,          // how hard the crescendo drives the light (spin runs 0 → ~2.2)
   sunCol: [1.00, 1.00, 1.00],
   // g1 is well below the atmosphere's 0.78 on purpose: a tight forward lobe has a 27:1 range
   // across this frame, which reads as a blown-out corner rather than as a sky. 0.45 keeps the
   // gradient toward the sun and loses the glare core. `absorb` under 1 thins the deck's optical
   // depth without touching its silhouette, which is how it stays translucent at this density.
-  bright: 2.0, absorb: 0.70, powder: 0.72, silver: 0.20, g1: 0.45, g2: 0.34,
-  shadow: 3.0,            // world length of the first light tap
-  // AMBIENT IS WHAT YOU ACTUALLY SEE AT REST. The composite is bg·T + L, so on a pale page a
-  // cloud is only visible where L falls SHORT of the background it blocked.
-  amb: 0.62,              // sky bounce. Scaled by the background's own brightness (see update)
+  bright: 2.0, absorb: 1.15, powder: 0.72, silver: 0.20, g1: 0.45, g2: 0.34,
+  shadow: 3.5,            // world length of the first light tap
+  // AMBIENT IS WHAT YOU ACTUALLY SEE AT REST — direct light is under a third of a lit cloud here,
+  // and it is the part that models the billows. This is the term that has to put an opaque cloud
+  // at ~1.0 against a 0.65 sky: drop it and the deck greys out, raise it and the shading flattens.
+  amb: 0.73,              // sky bounce. Scaled by the background's own brightness (see update)
   // …and what REPLACES it once the page goes dark. During the crescendo the page stops being a
   // light source, so without this the clouds go out with it and only the few facing the sun
   // survive — the phase function's range is 530:1, so "lit by the key" means a handful of pixels.
   // Sky bounce leaves, crystal bounce arrives, and the clouds get brighter, not dimmer.
-  ambSpin: 1.84,
+  ambSpin: 1.50,
   // HOW FAST THE SPIN BRIGHTENS THE SKY. The raw signal is the site's own crescendo energy, and
   // that is built to slam: `godrayIntensity` is already at 2.2 of its 3.2 by about 86 rpm out of
   // 960, because the screen has to go black almost the moment you touch the wheel. Riding it
@@ -62386,12 +62473,18 @@ var P = {
   // climb instead — the PEAK is unchanged, only the approach to it. Higher = stays dim longer.
   lightCurve: 3.0,
   lightGain: 1.0,         // overall amount of the spin's contribution (1 = the full peak)
-  // Hand-picked, and NOT a sky colour on its own: the bounce is a green-teal and `tint` a cool
-  // blue-grey, so what the eye gets is their product. Reading either one in isolation is
-  // misleading — change one and the other has to move with it.
-  ambCol: [0.353, 0.808, 0.671],
-  dark: 0.0,              // how much darker the underside is than the top
-  tint: [0.565, 0.655, 0.757],
+  // Both are essentially white now: the sky does the colour work, so anything the bounce or the
+  // tint adds comes straight off the cloud's whiteness. `ambCol` keeps a faint blue so shadowed
+  // faces cool toward the sky instead of going neutral grey.
+  ambCol: [0.920, 0.960, 1.000],
+  dark: 0.16,             // how much darker the underside is than the top
+  tint: [1.000, 1.000, 1.000],
+
+  // ── sun halo ── the sky's own forward scatter around the sun, painted into the background
+  // BEFORE the clouds composite over it. haloStr 0 restores a flat scene.background exactly.
+  haloStr: 1.00,          // how white the sky goes at the centre of the glow
+  haloR: 0.52,            // screen radius of the glow, in half-heights
+  haloCol: [1.00, 1.00, 1.00],
 
   // ── light shafts ── a radial blur of where the light gets THROUGH the deck near the sun.
   // OFF: with the deck this thick and this close, the shafts read as a haze over the whole frame
@@ -62411,7 +62504,7 @@ var M = {
   rtCloud: null, rtShaft: null,
   w: 0, h: 0, sw: 0, sh: 0,
   t0: 0, last: -1e9, half: false,
-  tier: 0, avg: 16.7, tierT: 0, hidden: false, fade: 0,
+  tier: 0, avg: 16.7, tierT: 0, hidden: false, fade: 0, moveT: 0,
   warm: 0, base: 0,
   ct: 0, rate: 1
 };
@@ -62428,6 +62521,9 @@ var TIERS = [ {r:1.00, s:1.00}, {r:0.78, s:0.72}, {r:0.58, s:0.55}, {r:0, s:0} ]
 var CS_WARM = 1.4;
 
 var _sun = new THREE.Vector3(), _sd = new THREE.Vector3(), _tmp = new THREE.Vector3();
+// Previous-frame camera pose, for the motion metric. Seeded far away so the first frame reads as
+// a huge jump and settles, rather than reading as motion for the next third of a second.
+var _camPrev = new THREE.Vector3(1e9, 1e9, 1e9), _qPrev = new THREE.Quaternion();
 var _fwd = new THREE.Vector3();
 var _bg = new THREE.Color(), _sunUV = new THREE.Vector2(0.5, 0.5);
 
@@ -62485,14 +62581,14 @@ function _build(){
       uTime:{value:0}, uD0:{value:P.dIn}, uD1:{value:P.dOut},
       uCov:{value:P.cov}, uDens:{value:P.dens}, uScale:{value:P.scale}, uWScale:{value:P.wScale},
       uDetAmt:{value:P.detAmt}, uDetScale:{value:P.detScale},
-      uHGrad:{value:P.hGrad}, uHCentre:{value:0}, uHSpan:{value:P.hSpan},
+      uHGrad:{value:P.hGrad}, uHCentre:{value:0}, uHSpan:{value:P.hSpan}, uTowerLo:{value:P.towerLo},
       uWind:{value:new THREE.Vector3()}, uEvolve:{value:P.evolve},
       uSunDir:{value:new THREE.Vector3(0,1,0)}, uSunCol:{value:new THREE.Color(1,1,1)},
       uAmbCol:{value:new THREE.Color(0.8,0.85,0.95)}, uTint:{value:new THREE.Color(1,1,1)},
       uSunI:{value:0.3}, uAmb:{value:P.amb}, uDark:{value:P.dark}, uPowder:{value:P.powder},
       uSilver:{value:P.silver}, uG1:{value:P.g1}, uG2:{value:P.g2}, uAbsorb:{value:P.absorb},
       uBright:{value:P.bright}, uShadow:{value:P.shadow},
-      uSteps:{value:14}, uLSteps:{value:2}
+      uSteps:{value:14}, uLSteps:{value:2}, uGrow:{value:P.grow}
     });
     M.mShaft = _mat(CSKY_SHAFT, {
       tCloud:{value:null}, uSunUV:{value:new THREE.Vector2(0.5,0.5)}, uAspect:{value:1},
@@ -62503,7 +62599,9 @@ function _build(){
       uniforms: {
         tCloud:{value:null}, tShaft:{value:null},
         uBg:{value:new THREE.Color(0.94,0.94,0.96)}, uShaftCol:{value:new THREE.Color(1,1,1)},
-        uFade:{value:0}, uShaftStr:{value:P.shStr}, uShaftOn:{value:1}
+        uFade:{value:0}, uShaftStr:{value:P.shStr}, uShaftOn:{value:1},
+        uHaloCol:{value:new THREE.Color(1,1,1)}, uHaloUV:{value:new THREE.Vector2(0.5,1.2)},
+        uHaloR:{value:P.haloR}, uHaloStr:{value:P.haloStr}, uHaloAsp:{value:1}
       },
       vertexShader: CSKY_COMP_VERT, fragmentShader: CSKY_COMP,
       depthTest: false, depthWrite: false, fog: false
@@ -62585,6 +62683,13 @@ function _wantsOn(){
 // a bug, and re-testing costs frames on exactly the machine that could not spare them.
 function _adapt(dt){
   if(!P.adapt) return;
+  // JUDGE SETTLED FRAMES ONLY. Moving frames deliberately cost about twice as much (hzMove), so
+  // feeding them to the ladder makes a long scroll look like a machine that cannot cope — and a
+  // demotion changes BOTH the resolution and the step count at once, which is the most visible
+  // jump this effect can make, is one-way, and can walk all the way to off. Skipping these frames
+  // does not hide a genuinely slow machine: its resting cost is what the ladder is for, and that
+  // is still measured. It only means the step down happens after you stop rather than under you.
+  if(M.moveT > 0.15) return;
   var ms = dt * 1000;
   if(ms < 200) M.avg += (ms - M.avg) * 0.05;   // ignore tab-switch and GC spikes
   M.tierT += dt;
@@ -62645,10 +62750,33 @@ function update(dt){
   M.ct += dt * M.rate;
   M.spinT = spinT;
 
+  // ── HOW FAST THE CAMERA IS MOVING ── position plus rotation (weighted, because a radian of yaw
+  // moves the image far more than a world unit of travel does). ATTACK IS INSTANT AND RELEASE IS
+  // SLOW on purpose: scroll arrives as discrete wheel events with gaps between them, so a
+  // symmetric filter drops back to the idle rate inside the gaps and reintroduces exactly the
+  // judder this exists to remove.
+  var dpos = (_camPrev.x > 1e8) ? 0 : _camPrev.distanceTo(camera.position);
+  var dq = Math.abs(_qPrev.dot(camera.quaternion));
+  var dang = 2 * Math.acos(Math.min(1, dq));
+  _camPrev.copy(camera.position); _qPrev.copy(camera.quaternion);
+  // PER FRAME, NOT PER SECOND — deliberately no dt in this. The staleness being corrected for is
+  // how far the image moves BETWEEN TWO MARCHES, which is a per-frame quantity; and the site
+  // clamps dt to 1/30, so a rate expressed per second reads ~7x high on a machine running at
+  // 10 fps and latches the expensive path on exactly the hardware that cannot afford it.
+  var moveTgt = Math.min(1, (dpos + dang * 8) / Math.max(1e-4, P.moveFull));
+  M.moveT = (moveTgt > M.moveT) ? moveTgt : M.moveT + (moveTgt - M.moveT) * Math.min(1, dt * 3);
+
   // ── background: the site's own crescendo colour, used as the sky the clouds sit against ──
   if(scene.background && scene.background.isColor) _bg.copy(scene.background);
-  else _bg.setHex(typeof SITE_BG === 'number' ? SITE_BG : 0xe7effc);
+  else _bg.setHex(typeof SITE_BG === 'number' ? SITE_BG : 0x6fb8e0);
   var bgLum = 0.299*_bg.r + 0.587*_bg.g + 0.114*_bg.b;
+  // HOW MUCH DAYLIGHT IS LEFT. Measured against SITE_BG's own luminance, not a constant: the
+  // page is the sky, so `skyFrac` is 1 at rest and 0 at the bottom of the crescendo whatever
+  // colour the site is painted. Hard-coding the old near-white 0.94 here would read the blue
+  // storefront as three-quarters of a sunset and dim the deck for no reason.
+  var siteLum = 0.94;
+  if(typeof SITE_BG === 'number') siteLum = (0.299*((SITE_BG>>16)&0xff) + 0.587*((SITE_BG>>8)&0xff) + 0.114*(SITE_BG&0xff))/255;
+  var skyFrac = Math.min(1, bgLum / Math.max(0.05, siteLum));
 
   // ── light ──
   _sunWorld(_sun);
@@ -62667,13 +62795,16 @@ function update(dt){
   // same scale, so lightCurve 1 / lightGain 1 is exactly the old behaviour and the top end never
   // moves however hard the curve is bent.
   var spin = Math.pow(Math.min(1, _spin() / 2.2), Math.max(0.2, P.lightCurve)) * 2.2 * P.lightGain;
-  var sunI = P.sunBase + P.sunGain * spin;
+  // THE SUN IS PART OF THE SKY. Left at full strength it kept a sunlit deck under a black page
+  // during the crescendo — bright cloud with no sky to have come from. It fades with `skyFrac`
+  // down to a tenth, and `sunGain*spin` (the crystal) is what takes over the key light.
+  var sunI = P.sunBase * (0.10 + 0.90 * skyFrac) + P.sunGain * spin;
   // TWO AMBIENT SOURCES, and the handover between them is the whole effect. `sky` is the page
   // itself, which the site's own crescendo takes to black; `crys` is the crystal, which the same
   // crescendo takes to full. Their SUM is what lights the clouds, so the deck never goes out — it
   // changes who is lighting it. `w` is that handover, and it drives the colour too: white page
   // bounce at rest, the crystal's own light once the page is dark.
-  var skyAmb = 0.16 + 0.84 * Math.min(1, bgLum / 0.94);
+  var skyAmb = 0.16 + 0.84 * skyFrac;
   var crysAmb = P.ambSpin * spin;
   var amb = P.amb * (skyAmb + crysAmb);
   var w = crysAmb / Math.max(1e-4, skyAmb + crysAmb);
@@ -62694,7 +62825,8 @@ function update(dt){
   u.uScale.value = P.scale; u.uWScale.value = P.wScale;
   u.uDetAmt.value = P.detAmt; u.uDetScale.value = P.detScale;
   u.uHGrad.value = P.hGrad; u.uHSpan.value = Math.max(1, P.hSpan);
-  u.uHCentre.value = camera.position.y;   // the deck travels with the page scroll; the noise does not
+  u.uTowerLo.value = P.towerLo;
+  u.uHCentre.value = P.hWorld;   // fixed in the world — the camera moves, the deck does not
   var wr = P.windDir * Math.PI/180, ws = P.windSpd * 0.004;
   u.uWind.value.set(Math.cos(wr)*ws, P.rise*0.004, Math.sin(wr)*ws);
   u.uEvolve.value = P.evolve * 0.02;
@@ -62709,21 +62841,27 @@ function update(dt){
   u.uPowder.value = P.powder; u.uSilver.value = P.silver;
   u.uG1.value = P.g1; u.uG2.value = P.g2; u.uAbsorb.value = P.absorb;
   u.uBright.value = P.bright; u.uShadow.value = P.shadow;
-  u.uSteps.value = Math.max(4, Math.min(32, Math.round(P.steps * tier.s)));
+  // Steps fall as the rate rises — see hzMove. tier.s is the adaptive ladder and multiplies both.
+  u.uSteps.value = Math.max(4, Math.min(32, Math.round((P.steps + (P.stepsMove - P.steps) * M.moveT) * tier.s)));
   u.uLSteps.value = Math.max(1, Math.min(4, Math.round(P.lSteps)));
+  u.uGrow.value = Math.max(1.0, Math.min(1.4, P.grow));
 
   // ── the march, rate-capped ── the composite still runs every frame, so a held cloud frame is
   // invisible: the camera moves a few thousandths of a radian between them and the field itself
   // is the slowest-moving thing on the page.
-  var interval = 1000 / Math.max(4, P.hz + (P.hzSpin - P.hz) * spinT);
+  // WHERE THE SUN LANDS ON SCREEN. Projected along the LIGHT DIRECTION, not at a world object —
+  // there is nothing out there to point at. Deliberately outside the frame (uSunEl 38 puts it
+  // at ~1.2 in NDC), which is why the halo reads as sky and not as a lens flare.
+  _tmp.copy(camera.position).addScaledVector(_sd, 1e4).project(camera);
+  _sunUV.set(_tmp.x*0.5 + 0.5, _tmp.y*0.5 + 0.5);
+  var behindCam = _sd.dot(_fwd.set(0,0,-1).applyQuaternion(camera.quaternion)) <= 0.0;
+
+  var interval = 1000 / Math.max(4, Math.max(P.hz + (P.hzSpin - P.hz) * spinT,
+                                             P.hz + (P.hzMove - P.hz) * M.moveT));
   if(now - M.last >= interval){
     M.last = now;
     _blit(M.mCloud, M.rtCloud);
     if(P.shOn && M.rtShaft){
-      // Project along the LIGHT DIRECTION, not the crystal's position — with an off-frame sun
-      // there is no world object to point at, and this is correct in crystal-lock mode too.
-      _tmp.copy(camera.position).addScaledVector(_sd, 1e4).project(camera);
-      _sunUV.set(_tmp.x*0.5 + 0.5, _tmp.y*0.5 + 0.5);
       var su = M.mShaft.uniforms;
       su.uInvProj.value.copy(camera.projectionMatrixInverse);
       su.uSunUV.value.copy(_sunUV);
@@ -62737,8 +62875,7 @@ function update(dt){
       // plane, so its NDC z is ALWAYS > 1 and that test reported "behind the camera" every frame —
       // the shafts were simply never drawn. The camera's own forward vector answers it exactly, and
       // owes nothing to near/far or to how fresh matrixWorldInverse happens to be.
-      _fwd.set(0, 0, -1).applyQuaternion(camera.quaternion);
-      var behind = _sd.dot(_fwd) <= 0.0;
+      var behind = behindCam;
       // The sun is DELIBERATELY outside the frame, so this cannot fade the moment it leaves:
       // shafts fanning in from just past the top edge is the entire look. `shReach` is how far
       // beyond the edge, in half-screens, it can travel before they are gone.
@@ -62754,6 +62891,14 @@ function update(dt){
   cu.uShaftOn.value = (P.shOn && M.rtShaft) ? 1 : 0;
   cu.uShaftStr.value = P.shStr;
   cu.uShaftCol.value.setRGB(P.sunCol[0], P.sunCol[1], P.sunCol[2]);
+  // The halo is SKY, so it leaves with the sky: the crescendo takes scene.background to black,
+  // and scaling by that same luminance is what keeps a white smear from floating in the dark.
+  // Behind the camera it is simply off — there is no glow on the wall you have turned away from.
+  cu.uHaloCol.value.setRGB(P.haloCol[0], P.haloCol[1], P.haloCol[2]);
+  cu.uHaloUV.value.copy(_sunUV);
+  cu.uHaloR.value = Math.max(0.02, P.haloR);
+  cu.uHaloAsp.value = window.innerWidth / Math.max(1, window.innerHeight);
+  cu.uHaloStr.value = behindCam ? 0 : P.haloStr * skyFrac * M.fade * P.opacity;
 }
 
 return {
@@ -62790,7 +62935,9 @@ return {
     if(!M.built || M.tier >= 3) return { on:false };
     return { on:true, tier:M.tier, rt:M.w + 'x' + M.h, px:(M.w*M.h/1e6).toFixed(2) + 'MP',
              steps:M.mCloud.uniforms.uSteps.value,
-             hz:Math.round(P.hz + (P.hzSpin - P.hz) * (M.spinT || 0)),
+             hz:Math.round(Math.max(P.hz + (P.hzSpin - P.hz) * (M.spinT || 0),
+                                    P.hz + (P.hzMove - P.hz) * (M.moveT || 0))),
+             moveT:(M.moveT || 0).toFixed(2),
              avgMs:M.avg.toFixed(1), baseMs:M.base.toFixed(1),
              rate:M.rate.toFixed(2), spinT:(M.spinT || 0).toFixed(2), rpm:Math.round(_wheelRpm()),
              raw:_spin().toFixed(2), lit:(M.lit || 0).toFixed(3), sunI:(M.sunI || 0).toFixed(3),
@@ -62798,6 +62945,265 @@ return {
   }
 };
 })();
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// ▼▼▼ TEMPORARY — CLOUD PARAMETER WINDOW.  DELETE FROM HERE ▼▼▼
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Press H. Everything in this block is tuning-only: it reads and writes CSKY.P and SITE_BG, and
+// nothing else in the file touches it — so deleting the whole block (down to the matching ▲▲▲
+// marker) leaves the site exactly the build it was. No flag to unset, no call site to clean up.
+//
+// It is INERT until H is pressed: nothing is created, nothing runs per frame, and the only thing
+// alive before then is the keydown listener. `?clouds` in the URL opens it on load. Pair it with
+// `?cloudsonly`, which holds the adaptive ladder at full quality so a slider is not fighting an
+// automatic step-down halfway through a judgement.
+//
+// TO KEEP WHAT YOU TUNED: the button at the bottom prints only the params you actually moved,
+// already formatted as source lines — paste them over the matching lines in the `var P = {`
+// block above, and over `var SITE_BG` at the top of the file if you changed the sky.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+(function CSKY_PANEL(){
+  var el = null, base = null, tick = 0;
+
+  function rgbHex(a){
+    function c(v){ var x = Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16); return x.length < 2 ? '0' + x : x; }
+    return '#' + c(a[0]) + c(a[1]) + c(a[2]);
+  }
+  function hexRgb(s){
+    return [parseInt(s.substr(1, 2), 16) / 255, parseInt(s.substr(3, 2), 16) / 255, parseInt(s.substr(5, 2), 16) / 255];
+  }
+  function bgHex(){ return '#' + ('000000' + (SITE_BG >>> 0).toString(16)).slice(-6); }
+  // The readout follows the STEP, not the value: `scale` moves in thousandths and would otherwise
+  // read a flat 0.01 across a third of its travel, which makes the slider look broken.
+  function fmt(v, step){ var st = parseFloat(step); return (st >= 1) ? String(v) : v.toFixed(st < 0.005 ? 4 : (st < 0.05 ? 3 : 2)); }
+
+  function row(label, key, min, max, step){
+    var v = CSKY.P[key];
+    return '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font:600 10px Arial;color:#9ec9ae">' +
+      '<span style="flex:0 0 104px">' + label + '</span>' +
+      '<input data-ck="' + key + '" type="range" min="' + min + '" max="' + max +
+      '" step="' + step + '" value="' + v + '" style="flex:1;accent-color:#3ddc84;min-width:0">' +
+      '<span data-v="' + key + '" style="flex:0 0 44px;text-align:right;color:#8fffc0;font-weight:700">' + fmt(v, step) + '</span></div>';
+  }
+  function chk(label, key){
+    return '<label style="display:flex;align-items:center;gap:6px;margin:5px 0;font:600 10px Arial;color:#9ec9ae;cursor:pointer">' +
+      '<input data-cb="' + key + '" type="checkbox"' + (CSKY.P[key] ? ' checked' : '') + ' style="accent-color:#3ddc84"> ' + label + '</label>';
+  }
+  // Params hold [r,g,b] on 0..1 — the site is Linear / NoToneMapping, so they reach the shader
+  // untouched — while the picker speaks hex.
+  function col(label, key){
+    return '<div style="display:flex;align-items:center;gap:6px;margin:5px 0;font:600 10px Arial;color:#9ec9ae">' +
+      '<span style="flex:0 0 104px">' + label + '</span>' +
+      '<input data-cc="' + key + '" type="color" value="' + rgbHex(CSKY.P[key]) +
+      '" style="flex:1;min-width:0;height:22px;padding:0;border:1px solid rgba(61,220,132,0.35);' +
+      'border-radius:4px;background:transparent;cursor:pointer"></div>';
+  }
+  // SITE_BG is not a CSKY param — it is the page's own sky, which the clouds read live off
+  // scene.background. It gets a row anyway because the deck cannot be judged apart from what it
+  // sits against: a cloud is only white relative to the blue behind it.
+  function bgRow(){
+    return '<div style="display:flex;align-items:center;gap:6px;margin:5px 0;font:600 10px Arial;color:#8fd6ff">' +
+      '<span style="flex:0 0 104px">Sky (SITE_BG)</span>' +
+      '<input id="csky-bg" type="color" value="' + bgHex() + '" style="flex:1;min-width:0;height:22px;padding:0;' +
+      'border:1px solid rgba(90,190,255,0.45);border-radius:4px;background:transparent;cursor:pointer">' +
+      '<span id="csky-bgv" style="flex:0 0 58px;text-align:right;color:#8fd6ff;font-weight:700;font-size:9px">' + bgHex() + '</span></div>';
+  }
+  function hd(t){ return '<div style="font:800 9px Arial;letter-spacing:.12em;color:#3ddc84;margin:11px 0 2px">' + t + '</div>'; }
+  function note(t){ return '<div style="font:600 9px Arial;color:#6f9a80;margin:1px 0 5px;line-height:1.4">' + t + '</div>'; }
+
+  function build(){
+    return '<div style="font:800 11px Arial;letter-spacing:.15em;color:#3ddc84;margin-bottom:2px">CLOUD PARAMS</div>' +
+      '<div style="font:600 9px Arial;color:#6f9a80;margin-bottom:6px">temporary — press H to hide</div>' +
+
+      hd('SHOW · COST') +
+      chk('Clouds on', 'on') + chk('Adaptive quality (auto step-down)', 'adapt') + chk('Run on mobile', 'mobile') +
+      row('Strength', 'opacity', 0, 1, 0.02) +
+      row('RT scale', 'res', 0.15, 1, 0.05) +
+      row('Update Hz', 'hz', 5, 60, 1) +
+      row('March steps', 'steps', 4, 32, 1) +
+      row('Step growth', 'grow', 1, 1.35, 0.01) +
+      note('Growth spends the same steps unevenly — fine near, coarse at the horizon. 1.00 is an even march.') +
+      row('Light taps', 'lSteps', 1, 4, 1) +
+
+      hd('WHERE THE DECK SITS') +
+      row('Near dist', 'dIn', 5, 200, 1) +
+      row('Far dist', 'dOut', 20, 400, 5) +
+      row('Deck centre Y', 'hWorld', -140, 40, 1) +
+      note('A fixed height IN THE WORLD — the deck never moves. The camera runs y 0 at the top of the page to about -26 at the bottom, so this decides where on the page you fly into the cloud tops.') +
+      row('Deck shape', 'hGrad', 0, 1, 0.02) +
+      row('Deck height', 'hSpan', 20, 400, 5) +
+      row('Tower base', 'towerLo', 0.2, 0.98, 0.01) +
+      note('How high a LOW-coverage cloud stops. Low = flat cloud where the weather is thin, towers where it is thick. 0.98 = every cloud the same height.') +
+
+      hd('SHAPE') +
+      row('Coverage', 'cov', 0, 1, 0.01) +
+      row('Density', 'dens', 0, 5, 0.05) +
+      row('Cloud size', 'scale', 0.001, 0.03, 0.0005) +
+      row('Weather size', 'wScale', 0.05, 1.5, 0.01) +
+      row('Erosion', 'detAmt', 0, 1, 0.02) +
+      row('Erosion freq', 'detScale', 1, 14, 0.1) +
+
+      hd('MOTION · TIME-LAPSE') +
+      row('Speed (resting)', 'speedIdle', 0, 12, 0.1) +
+      row('Speed (spinning)', 'speedSpin', 0, 80, 0.5) +
+      row('RPM for full speed', 'spinRpm', 20, 600, 5) +
+      row('Update Hz spinning', 'hzSpin', 10, 60, 1) +
+      row('Update Hz moving', 'hzMove', 10, 120, 1) +
+      row('March steps moving', 'stepsMove', 4, 32, 1) +
+      row('Counts as moving', 'moveFull', 0.005, 0.4, 0.005) +
+      note('While the camera moves the march runs FASTER — a stale render target is what made scrolling judder. Keep “steps moving” equal to “march steps”: a different step count visibly changes the clouds, so lowering it makes them snap between two looks every time you scroll.') +
+      row('Wind speed', 'windSpd', 0, 30, 0.1) +
+      row('Wind dir', 'windDir', 0, 360, 1) +
+      row('Rise', 'rise', 0, 1, 0.02) +
+      row('Evolve (form/dissolve)', 'evolve', 0, 4, 0.05) +
+
+      hd('SKY') +
+      bgRow() +
+      note('The clouds are lit to about 1.0. Take the sky much past 0.75 luminance and they stop reading as white.') +
+      row('Halo strength', 'haloStr', 0, 1, 0.02) +
+      row('Halo radius', 'haloR', 0.1, 2, 0.02) +
+      col('Halo colour', 'haloCol') +
+      note('The sky’s forward scatter around the sun, painted under the clouds. Fades on its own as the crescendo darkens the page.') +
+
+      hd('LIGHT — the spin IS the sun') +
+      row('Key at rest', 'sunBase', 0, 2, 0.02) +
+      row('Spin gain', 'sunGain', 0, 4, 0.05) +
+      row('Track crystal', 'sunLock', 0, 1, 0.05) +
+      row('Sun height', 'sunUp', -60, 60, 1) +
+      row('Fixed az', 'sunAz', 0, 360, 1) +
+      row('Fixed el', 'sunEl', -20, 90, 1) +
+      col('Sun colour', 'sunCol') +
+      row('Brightness', 'bright', 0, 2, 0.05) +
+      row('Absorb', 'absorb', 0, 3, 0.05) +
+      row('Powder', 'powder', 0, 1, 0.02) +
+      row('Silver lining', 'silver', 0, 1, 0.02) +
+      row('Phase fwd', 'g1', 0, 0.99, 0.01) +
+      row('Phase back', 'g2', 0, 0.99, 0.01) +
+      row('Shadow len', 'shadow', 0.5, 20, 0.5) +
+      row('Ambient', 'amb', 0, 2, 0.02) +
+      row('Ambient from spin', 'ambSpin', 0, 3, 0.02) +
+      row('Spin light curve', 'lightCurve', 0.5, 8, 0.1) +
+      row('Spin light amount', 'lightGain', 0, 2, 0.05) +
+      col('Ambient col', 'ambCol') +
+      row('Underside', 'dark', 0, 1, 0.02) +
+      col('Tint', 'tint') +
+
+      hd('LIGHT SHAFTS') +
+      chk('Shafts on', 'shOn') +
+      row('Strength', 'shStr', 0, 3, 0.05) +
+      row('Samples', 'shSamples', 4, 48, 2) +
+      row('Reach', 'shDensity', 0, 2, 0.02) +
+      row('Decay', 'shDecay', 0.8, 0.999, 0.002) +
+      row('Weight', 'shWeight', 0, 0.4, 0.005) +
+      row('Halo', 'shHalo', 0.05, 1.5, 0.02) +
+      row('Off-frame reach', 'shReach', 0.2, 4, 0.05) +
+
+      '<div id="csky-cost" style="font:700 9px Arial;color:#6f9a80;margin:12px 0 6px;text-align:center"></div>' +
+      '<div><button id="csky-dump" style="width:100%;font:700 10px Arial;color:#d6ffe8;' +
+      'background:rgba(40,180,110,0.18);border:1px solid rgba(61,220,132,0.45);border-radius:6px;padding:7px;cursor:pointer">' +
+      'Log what I changed (paste-ready)</button></div>' +
+      '<div style="margin-top:5px"><button id="csky-reset" style="width:100%;font:700 10px Arial;color:#ffd9d9;' +
+      'background:rgba(180,60,60,0.16);border:1px solid rgba(220,90,90,0.40);border-radius:6px;padding:6px;cursor:pointer">' +
+      'Reset to the values in the file</button></div>';
+  }
+
+  function make(){
+    // The baseline is snapshotted at FIRST OPEN, which is what makes the dump button a diff
+    // against the file rather than a dump of everything.
+    if(!base){ base = JSON.parse(JSON.stringify(CSKY.P)); base._SITE_BG = SITE_BG; }
+    el = document.createElement('div');
+    el.style.cssText = 'position:fixed;top:14px;left:14px;width:290px;z-index:2147483000;background:rgba(5,18,13,0.94);' +
+      'border:1px solid rgba(61,220,132,0.30);border-radius:11px;padding:11px 13px 13px;color:#cfe6ff;' +
+      'box-shadow:0 10px 40px rgba(0,0,0,0.7);max-height:88vh;overflow:auto;font-family:Arial,sans-serif';
+    el.innerHTML = build();
+    document.body.appendChild(el);
+
+    el.addEventListener('input', function(ev){
+      var t = ev.target;
+      var k = t.getAttribute && t.getAttribute('data-ck');
+      if(k){
+        var v = parseFloat(t.value);
+        CSKY.P[k] = v;
+        var o = el.querySelector('[data-v="' + k + '"]');
+        if(o) o.textContent = fmt(v, t.getAttribute('step'));
+        return;
+      }
+      var cc = t.getAttribute && t.getAttribute('data-cc');
+      if(cc){ CSKY.P[cc] = hexRgb(t.value); return; }
+      if(t.id === 'csky-bg'){
+        // Live-editing the page's own sky. updateOrbs re-reads SITE_BG every frame for both
+        // scene.background and scene.fog, so this lands on both without a rebuild — and the
+        // clouds pick it up because they read the background, not the constant.
+        SITE_BG = parseInt(t.value.slice(1), 16);
+        var bv = el.querySelector('#csky-bgv'); if(bv) bv.textContent = t.value;
+      }
+    });
+    el.addEventListener('change', function(ev){
+      var cb = ev.target && ev.target.getAttribute && ev.target.getAttribute('data-cb');
+      if(cb) CSKY.P[cb] = ev.target.checked;
+    });
+
+    el.querySelector('#csky-dump').onclick = function(){
+      var out = [], k;
+      for(k in CSKY.P){
+        if(!CSKY.P.hasOwnProperty(k) || k.charAt(0) === '_') continue;
+        var a = CSKY.P[k], b = base[k], same;
+        if(Array.isArray(a)) same = Array.isArray(b) && a.length === b.length && a.every(function(x, i){ return Math.abs(x - b[i]) < 1e-6; });
+        else if(typeof a === 'number') same = (typeof b === 'number') && Math.abs(a - b) < 1e-9;
+        else same = (a === b);
+        if(same) continue;
+        var lit = Array.isArray(a) ? '[' + a.map(function(x){ return x.toFixed(3); }).join(', ') + ']'
+                : (typeof a === 'number' ? String(parseFloat(a.toPrecision(6))) : String(a));
+        out.push('  ' + k + ': ' + lit + ',');
+      }
+      console.log('%c-- CSKY.P: paste these over the matching lines in `var P = {` --', 'color:#3ddc84;font-weight:700');
+      console.log(out.length ? out.join('\n') : '  (nothing changed)');
+      if(SITE_BG !== base._SITE_BG)
+        console.log('%cvar SITE_BG = 0x' + ('000000' + (SITE_BG >>> 0).toString(16)).slice(-6) + ';', 'color:#8fd6ff;font-weight:700');
+      try { console.log('cost:', CSKY.cost()); } catch(_e){}
+    };
+    el.querySelector('#csky-reset').onclick = function(){
+      for(var k in base){ if(k !== '_SITE_BG' && base.hasOwnProperty(k)) CSKY.P[k] = Array.isArray(base[k]) ? base[k].slice() : base[k]; }
+      SITE_BG = base._SITE_BG;
+      var keep = el.scrollTop;
+      el.innerHTML = build();
+      el.scrollTop = keep;
+    };
+    // The panel sits over a page that drags, spins and scrolls in 3D. Without this, sliding a
+    // slider also spins the product wheel underneath it.
+    ['wheel','pointerdown','pointermove','pointerup','mousedown','touchstart'].forEach(function(t){
+      el.addEventListener(t, function(e){ e.stopPropagation(); }, { passive: true });
+    });
+    // Live cost readout — the one number a slider can quietly ruin. Only ticks while visible.
+    if(!tick) tick = setInterval(function(){
+      if(!el || el.style.display === 'none') return;
+      var c = el.querySelector('#csky-cost'); if(!c) return;
+      try {
+        var q = CSKY.cost();
+        c.textContent = q.on ? (q.rt + ' · ' + q.steps + ' steps · tier ' + q.tier + ' · ' + q.avgMs + ' ms/frame') : 'clouds off';
+      } catch(_e){ c.textContent = ''; }
+    }, 500);
+  }
+
+  function toggle(){
+    if(!el) make();
+    else el.style.display = (el.style.display === 'none') ? '' : 'none';
+  }
+  window.addEventListener('keydown', function(e){
+    if(e.target && /input|textarea|select/i.test(e.target.tagName)) return;
+    if(e.key === 'h' || e.key === 'H') toggle();
+  });
+  // `?clouds` opens it on load. EXACT token, not a substring: the sibling flags this pairs with
+  // are `?cloudsonly` and `?noclouds`, and a substring test matches both — which opened the panel
+  // on the very flag that means "hold quality, do not touch anything".
+  var _qp = (location.search || '').split('?').join('').split('&');
+  if(_qp.indexOf('clouds') >= 0 || _qp.indexOf('cloudparams') >= 0)
+    window.addEventListener('load', function(){ setTimeout(toggle, 600); });
+})();
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// ▲▲▲ TEMPORARY — CLOUD PARAMETER WINDOW.  DELETE TO HERE ▲▲▲
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
 // CHUD — STOREFRONT HUD  (2026-08-12)
@@ -69491,10 +69897,33 @@ var HERO_GEM_SCALE   = HERO_LOGO_RADIUS / 0.8;   // the placeholder octahedron i
                                                  // purpose — the other order reads an unassigned
                                                  // var and yields NaN.
 var HERO_SPIN        = 0.22;    // radians/sec about the mark's own Y axis
-// Hand correction on top of the solved optical centre, in WORLD units (+x right, +y up). The
-// solver balances ink; if a mark still reads a hair off because of where its detail sits, nudge
-// it here rather than editing the model.
-var HERO_LOGO_NUDGE  = { x: 0.0, y: 0.0 };
+// Hand correction on top of the solved optical centre, in WORLD units (+x right, +y up).
+//
+// This mark NEEDS one, and it is not a bug in the solver. Measured on the glyph, every sane
+// centring rule agrees to within about 1% of its width — box centre, area centroid, ink median,
+// 5-95 midpoint all land within 0.012 object units of each other. The ink really is balanced
+// where it is put. What reads as off-centre is the DESIGN: the inner motif sits right of the
+// outer ring, so the eye centres on the core while the maths centres on the whole. No formula
+// resolves that — it is a judgement call, so it lives here as a number.
+var HERO_LOGO_NUDGE  = { x: -0.45, y: 0.0 };
+// Dial it without an edit:  ?nudge=-0.6   or   ?nudge=-0.6,0.1
+// For scale: the mark is ~7.9 world units wide, so 0.08 is ~1% of its width. Centring the inner
+// motif rather than the whole glyph is around -0.7; -0.45 is the middle of that range.
+(function(){
+  var m = /[?&]nudge=(-?[0-9.]+)(?:,(-?[0-9.]+))?/.exec(location.search);
+  if(!m) return;
+  HERO_LOGO_NUDGE.x = parseFloat(m[1]);
+  if(m[2] !== undefined) HERO_LOGO_NUDGE.y = parseFloat(m[2]);
+})();
+
+// ── GRAB BUBBLE ──
+// A generous invisible volume around the mark so it can be caught anywhere NEAR it rather than
+// only on the few pixels where the glyph actually has ink — most of this logo is holes, which
+// made it fiddly to grab. Vertical reach is capped against FLOOR_SPACING: a plain sphere at this
+// radius would hang 7.8 units down, past the row below at 6.5, and swallow clicks meant for that
+// row. It stays an ellipsoid for that reason, and re-caps itself if the mark is resized.
+var HERO_GRAB_R  = HERO_LOGO_RADIUS * 1.30;
+var HERO_GRAB_RY = Math.min(HERO_GRAB_R, FLOOR_SPACING * 0.75);
 var hero = { floor: null, logo: null, fitted: false };
 
 // The same lookup the customizer used, and for the same reason: fetchShopifyProducts() regroups
@@ -69516,6 +69945,24 @@ function heroUpdate(dt){
   if(!fl) return;
   if(fl !== hero.floor){ hero.floor = fl; hero.fitted = false; }   // the row was rebuilt under us
   heroLoadLogo();
+
+  // ── the grab bubble ── same trick and the same material as the gallery row's drag cylinder
+  // (see createOrbFloor): opacity 0 rather than visible:false, so it still raycasts AND still
+  // passes the `h.object.visible` filter the click path applies. `isDragPlane` is the site's
+  // existing convention — pMove already reads it to show the grab cursor, so that comes free.
+  // Parented to the floor GROUP, not to the centre star: the chain requires the mark to stay
+  // centerStar.children[0], and anything else added there would fight that.
+  if(!hero.grab || hero.grab.parent !== fl.group){
+    if(hero.grab && hero.grab.parent) hero.grab.parent.remove(hero.grab);
+    hero.grab = new THREE.Mesh(
+      new THREE.SphereGeometry(HERO_GRAB_R, 16, 12),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false })
+    );
+    hero.grab.scale.y = HERO_GRAB_RY / HERO_GRAB_R;   // squashed so it cannot reach the row below
+    hero.grab.userData.isDragPlane = true;
+    hero.grab.renderOrder = -1;
+    fl.group.add(hero.grab);
+  }
 
   // ── clear the row ── cheap: the test fails on every frame after the first.
   for(var p = 0; p < fl.panels.length; p++){
@@ -69851,7 +70298,17 @@ function animate(){
     // geometry floating in the room — it would smear into every crystal reflection. Hide it.
     CHUD.setHidden(true);
     CSKY.setHidden(true);
+    // REFLECT A WHITE ROOM, NOT A BLUE ONE. The cube map is a real render, so it picks up
+    // scene.background and the fog distant geometry fades into — both of which are the sky. Held
+    // at REFLECT_BG for these six faces only; the visible frame is untouched because this is
+    // restored before anything else draws. The clouds are already hidden above, so nothing here
+    // reads a background the clouds were composited against.
+    var _ccBg = scene.background.getHex(), _ccFog = scene.fog ? scene.fog.color.getHex() : 0;
+    scene.background.setHex(REFLECT_BG);
+    if(scene.fog) scene.fog.color.setHex(REFLECT_BG);
     cubeCamera.update(renderer,scene);
+    scene.background.setHex(_ccBg);
+    if(scene.fog) scene.fog.color.setHex(_ccFog);
     CSKY.setHidden(false);
     CHUD.setHidden(false);
     floors.forEach(function(f){if(f.hasRings){f.rings.top.forEach(function(r){r.visible=true;});f.rings.bottom.forEach(function(r){r.visible=true;});}});
