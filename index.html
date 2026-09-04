@@ -62171,7 +62171,7 @@ function cskyFrag(){ return [
 'uniform vec3 uSunDir, uSunCol, uAmbCol, uTint;',
 'uniform float uSunI, uAmb, uDark, uPowder, uSilver, uG1, uG2, uAbsorb, uBright, uShadow;',
 'uniform int uSteps, uLSteps;',
-'uniform float uGrow;',
+'uniform float uGrow, uWiden;',
 SKY_COMMON,
 SKY_SAMPLE_LIB,
 // The Worley lattice tiles at period 1, so read straight off world axes it lays the cloud
@@ -62226,7 +62226,12 @@ SKY_SAMPLE_LIB,
 '  return od * uAbsorb;',
 '}',
 'void main(){',
-'  vec3 vr = vRay;',
+// THE BACKGROUND HAS ITS OWN FIELD OF VIEW. SKY_VERT hands this over as (tanX, tanY, -1) in view
+// space, so widening the cone is literally scaling the tangents: one multiply, no second
+// projection matrix to build and keep in sync, and it stays exact at any aspect because both axes
+// scale together. The composite draws this RT 1:1, so a wider cone here is more sky in the same
+// pixels -- nothing in FRONT of the clouds is touched.
+'  vec3 vr = vec3(vRay.xy * uWiden, vRay.z);',
 '  vec3 rd = normalize((uCamW * vec4(vr,0.0)).xyz);',
 // A GEOMETRIC MARCH, not an even one. The deck sits below the eye and runs to the horizon, so a
 // uniform step spends as much of its budget on the far band — where a hundred units collapse
@@ -62352,6 +62357,22 @@ var P = {
   steps: 18,              // view-ray march steps
   grow: 1.13,              // per-step growth of the view march (1.0 = evenly spaced)
   lSteps: 1,              // taps toward the light per lit step
+
+  // -- HOW WIDE THE SKY IS -- a tan-space multiplier on the FIELD OF VIEW OF THE MARCH, and only
+  // of the march. The composite still blits the cloud RT 1:1 into the screen rect, so widening
+  // here does not move a single pixel of the shop in front of it: it renders a wider cone of sky
+  // into the same rectangle, i.e. the BACKGROUND zooms out. 1.0 is the camera's own FOV, which is
+  // exactly what shipped.
+  // It exists because the deck is anchored in the WORLD below the eye, so a narrow frame crops the
+  // cloud field down to the few billows directly under the camera -- worst in portrait, where 75
+  // degrees vertical over a ~0.46 aspect leaves almost no horizontal sky at all. The march was
+  // already paying for the whole deck; most of it was simply outside the frustum.
+  // Effective vertical FOV is 2*atan(tan(fov/2)*fovMul): at 1.25 that is 75 -> ~88 degrees in
+  // portrait and 60.75 -> ~72 in landscape. Phones go further (see init) because they crop most.
+  // The light shafts are divided by this to match, because they sample the cloud RT and have to
+  // agree with it. The sky halo deliberately is NOT -- it stays in screen space so its core keeps
+  // sitting just off the top edge however wide the sky gets. See the split at _sunUVc below.
+  fovMul: 1.25,
 
   // ── where the deck sits ── dIn/dOut are how far ALONG THE RAY the march runs, so they are a
   // shell of distance around the camera; everything else about the deck is fixed in world space.
@@ -62510,8 +62531,17 @@ var M = {
 };
 // ADAPTIVE LADDER. Steps DOWN only — an effect that flickers between quality levels is worse
 // than one that is quietly a bit cheaper, and the storefront has no frame budget to spend
-// finding out whether the machine got faster. Tier 3 is off.
-var TIERS = [ {r:1.00, s:1.00}, {r:0.78, s:0.72}, {r:0.58, s:0.55}, {r:0, s:0} ];
+// finding out whether the machine got faster. The last rung is off.
+// FOUR SMALL STEPS, NOT TWO BIG ONES. The old ladder's first demotion threw away 56% of the march
+// in a single jump (0.78 res x 0.72 steps) and the second left the deck at a third of the
+// resolution it was authored at — on a phone, which starts lower anyway, that landed somewhere
+// visibly broken rather than somewhere merely cheaper. Each rung here is ~30% cheaper than the one
+// above it (0.71 / 0.49 / 0.31 of full cost), so a machine that is 20% short stops one rung down
+// instead of falling through two, and the FLOOR before off is 0.70 res rather than 0.58 — on
+// mobile that is an effective 0.385, still above the 0.30 the phone tier used to run at flat out.
+// Time-to-floor is unchanged: the extra rung is paid for out of the settling window below.
+var TIERS = [ {r:1.00, s:1.00}, {r:0.90, s:0.88}, {r:0.80, s:0.76}, {r:0.70, s:0.64}, {r:0, s:0} ];
+var CS_OFF = TIERS.length - 1;   // the "clouds disabled" rung — derived, so adding a rung is one edit
 // The page runs for this long before a single line of cloud code executes. Two things come out
 // of that: the atlas bake and the first march never land in the middle of the load, and the
 // frame time measured during it is the PAGE'S OWN cost — which is what the adaptive ladder has
@@ -62526,6 +62556,10 @@ var _sun = new THREE.Vector3(), _sd = new THREE.Vector3(), _tmp = new THREE.Vect
 var _camPrev = new THREE.Vector3(1e9, 1e9, 1e9), _qPrev = new THREE.Quaternion();
 var _fwd = new THREE.Vector3();
 var _bg = new THREE.Color(), _sunUV = new THREE.Vector2(0.5, 0.5);
+// The sun's SCREEN position and its position inside the widened background image are two
+// different points once fovMul leaves 1.0, and the two things that consume it want opposite
+// answers. See the split at the projection below.
+var _sunUVc = new THREE.Vector2(0.5, 0.5);
 
 function _rt(w, h, alpha){
   return new THREE.WebGLRenderTarget(Math.max(2, Math.floor(w)), Math.max(2, Math.floor(h)), {
@@ -62588,7 +62622,7 @@ function _build(){
       uSunI:{value:0.3}, uAmb:{value:P.amb}, uDark:{value:P.dark}, uPowder:{value:P.powder},
       uSilver:{value:P.silver}, uG1:{value:P.g1}, uG2:{value:P.g2}, uAbsorb:{value:P.absorb},
       uBright:{value:P.bright}, uShadow:{value:P.shadow},
-      uSteps:{value:14}, uLSteps:{value:2}, uGrow:{value:P.grow}
+      uSteps:{value:14}, uLSteps:{value:2}, uGrow:{value:P.grow}, uWiden:{value:1}
     });
     M.mShaft = _mat(CSKY_SHAFT, {
       tCloud:{value:null}, uSunUV:{value:new THREE.Vector2(0.5,0.5)}, uAspect:{value:1},
@@ -62669,7 +62703,7 @@ function _sunWorld(out){
 }
 
 function _wantsOn(){
-  if(!P.on || P.opacity <= 0.001 || M.tier >= 3) return false;
+  if(!P.on || P.opacity <= 0.001 || M.tier >= CS_OFF) return false;
   if(typeof GAME_LOW_FX !== 'undefined' && GAME_LOW_FX && !P.mobile) return false;
   if(typeof gameMode !== 'undefined' && (gameMode.active || M.hidden)) return false;
   if(typeof editor !== 'undefined' && editor.active) return false;
@@ -62693,15 +62727,18 @@ function _adapt(dt){
   var ms = dt * 1000;
   if(ms < 200) M.avg += (ms - M.avg) * 0.05;   // ignore tab-switch and GC spikes
   M.tierT += dt;
-  if(M.tierT < 3.0) return;              // give each tier a settling window before judging it
+  // Each rung gets a settling window before it is judged. 2.2 s rather than 3.0 because there is
+  // now one more rung to walk: 4 x 2.2 s reaches the floor in 8.8 s, where the old 3 x 3.0 s took
+  // 9.0 s. A struggling machine gets relief exactly as fast as before, in gentler increments.
+  if(M.tierT < 2.2) return;
   // Step down when the clouds have made this page meaningfully worse than it was WITHOUT them
   // (the warm-up baseline), or when the result is bad in absolute terms whatever the baseline.
   var lim = Math.max(30, M.base * 1.45);
-  if((M.avg > lim || M.avg > 55) && M.tier < 3){
+  if((M.avg > lim || M.avg > 55) && M.tier < CS_OFF){
     M.tier++;
     M.tierT = 0;
     M.avg = M.base;
-    if(M.tier >= 3){ console.warn('CSKY: frame budget exceeded — clouds disabled for this session.'); }
+    if(M.tier >= CS_OFF){ console.warn('CSKY: frame budget exceeded — clouds disabled for this session.'); }
     else _size();
   }
 }
@@ -62845,6 +62882,8 @@ function update(dt){
   u.uSteps.value = Math.max(4, Math.min(32, Math.round((P.steps + (P.stepsMove - P.steps) * M.moveT) * tier.s)));
   u.uLSteps.value = Math.max(1, Math.min(4, Math.round(P.lSteps)));
   u.uGrow.value = Math.max(1.0, Math.min(1.4, P.grow));
+  var wide = Math.max(1, Math.min(2.5, P.fovMul || 1));
+  u.uWiden.value = wide;
 
   // ── the march, rate-capped ── the composite still runs every frame, so a held cloud frame is
   // invisible: the camera moves a few thousandths of a radian between them and the field itself
@@ -62854,6 +62893,21 @@ function update(dt){
   // at ~1.2 in NDC), which is why the halo reads as sky and not as a lens flare.
   _tmp.copy(camera.position).addScaledVector(_sd, 1e4).project(camera);
   _sunUV.set(_tmp.x*0.5 + 0.5, _tmp.y*0.5 + 0.5);
+  // AND THE SAME SUN IN CLOUD-RT SPACE, which stops being screen space the moment fovMul leaves
+  // 1.0: the march runs at `wide` x the camera's FOV and the composite blits that RT 1:1 into the
+  // screen rect, so a ray that leaves at NDC 1.02 lands in the RT at 1.02/wide.
+  _sunUVc.set(_tmp.x*0.5/wide + 0.5, _tmp.y*0.5/wide + 0.5);
+  // THE TWO CONSUMERS WANT DIFFERENT ANSWERS, and it is not an inconsistency.
+  //   SHAFTS read _sunUVc. They are a radial blur that SAMPLES tCloud, so their origin has to be
+  //   the sun's position in that texture or they fan from a point the clouds were never lit from.
+  //   THE HALO reads _sunUV, in true screen space. It is not sampled from the cloud RT — it is a
+  //   painted sky gradient mixed into bg before the clouds composite over it, and the whole
+  //   design of it is that the CORE stays off the top edge (that is what makes it read as sky
+  //   rather than as a lens flare, and it is why the page keeps its blue). Dividing it by wide
+  //   drags the core inside the frame — measured: at fovMul 1.4 the sun moves from NDC 1.02 to
+  //   0.73, and with haloR 0.52 half-heights that white core swallowed the entire blue band the
+  //   clouds need to read white against. Widening the sky is allowed to show more sky; it is not
+  //   allowed to move the sun into the shot.
   var behindCam = _sd.dot(_fwd.set(0,0,-1).applyQuaternion(camera.quaternion)) <= 0.0;
 
   var interval = 1000 / Math.max(4, Math.max(P.hz + (P.hzSpin - P.hz) * spinT,
@@ -62864,7 +62918,7 @@ function update(dt){
     if(P.shOn && M.rtShaft){
       var su = M.mShaft.uniforms;
       su.uInvProj.value.copy(camera.projectionMatrixInverse);
-      su.uSunUV.value.copy(_sunUV);
+      su.uSunUV.value.copy(_sunUVc);
       su.uAspect.value = window.innerWidth / Math.max(1, window.innerHeight);
       su.uHalo.value = P.shHalo; su.uDensity.value = P.shDensity;
       su.uDecay.value = P.shDecay; su.uWeight.value = P.shWeight;
@@ -62879,7 +62933,7 @@ function update(dt){
       // The sun is DELIBERATELY outside the frame, so this cannot fade the moment it leaves:
       // shafts fanning in from just past the top edge is the entire look. `shReach` is how far
       // beyond the edge, in half-screens, it can travel before they are gone.
-      var off = Math.max(Math.abs(_sunUV.x - 0.5), Math.abs(_sunUV.y - 0.5));
+      var off = Math.max(Math.abs(_sunUVc.x - 0.5), Math.abs(_sunUVc.y - 0.5));   // cloud space: the shafts live in that texture
       su.uFade.value = behind ? 0 : Math.max(0, 1 - Math.max(0, off - 0.5) / Math.max(0.05, P.shReach));
       _blit(M.mShaft, M.rtShaft);
     }
@@ -62911,10 +62965,22 @@ return {
     if(q.indexOf('noclouds') >= 0) P.on = false;
     if(q.indexOf('cloudsonly') >= 0) P.adapt = false;      // hold full quality while tuning
     if(typeof GAME_LOW_FX !== 'undefined' && GAME_LOW_FX){
-      // Phones get the same sky, drawn at a third of the pixels with half the march. It is the
-      // page's whole first impression; switching it off entirely is the last resort, not the
-      // opening move — and the adaptive ladder is still there underneath if this is too much.
-      P.res = 0.30; P.steps = 8; P.lSteps = 1; P.hz = 20; P.shSamples = 14;
+      // Phones get the same sky, drawn at fewer pixels with a shorter march. It is the page's
+      // whole first impression; switching it off entirely is the last resort, not the opening
+      // move — and the adaptive ladder is still there underneath if this is too much.
+      //
+      // res 0.30 WAS TOO LOW TO READ AS CLOUD. `res` is a fraction of CSS pixels, but the composite
+      // runs at the DEVICE resolution, so on a 3x phone 0.30 is one marched texel per 100 device
+      // pixels — the deck arrived as visible blocks with a linear ramp between them. 0.55 is 3.4x
+      // the texels and still under half the desktop's pixel count in absolute terms, because a
+      // portrait phone is a small viewport to begin with: 390x844 CSS at 0.55 is 0.18 MP, where
+      // the desktop's 1266x706 at 0.70 is 0.44 MP.
+      // steps 8 -> 10 for the same reason: at 8 the billows read as flat dotty patches, and that
+      // was not worth fixing while the resolution was the thing destroying them. It is now.
+      // fovMul is highest here: portrait crops the deck hardest, so widening buys the most
+      // (75 -> ~94 degrees vertical), and it spends the new texels on more sky rather than on a
+      // sharper look at the same three clouds.
+      P.res = 0.55; P.steps = 10; P.lSteps = 1; P.hz = 20; P.shSamples = 14; P.fovMul = 1.40;
     }
   },
   update: function(dt){ try { update(dt); } catch(e){ if(!M.failed){ M.failed = true; if(M.mesh) M.mesh.visible = false; console.warn('CSKY:', e); } } },
@@ -62932,7 +62998,7 @@ return {
 
   onResize: function(){ if(M.built){ M.w = 0; _size(); } },
   cost: function(){
-    if(!M.built || M.tier >= 3) return { on:false };
+    if(!M.built || M.tier >= CS_OFF) return { on:false };
     return { on:true, tier:M.tier, rt:M.w + 'x' + M.h, px:(M.w*M.h/1e6).toFixed(2) + 'MP',
              steps:M.mCloud.uniforms.uSteps.value,
              hz:Math.round(Math.max(P.hz + (P.hzSpin - P.hz) * (M.spinT || 0),
@@ -63024,6 +63090,8 @@ return {
       row('Step growth', 'grow', 1, 1.35, 0.01) +
       note('Growth spends the same steps unevenly — fine near, coarse at the horizon. 1.00 is an even march.') +
       row('Light taps', 'lSteps', 1, 4, 1) +
+      row('Sky FOV x', 'fovMul', 1, 2, 0.01) +
+      note('Widens the FIELD OF VIEW OF THE BACKGROUND ONLY - the shop in front is untouched. 1.00 is the camera own FOV; higher pulls back and shows more of the cloud deck in the same rectangle. Costs nothing extra (the march was already paying for the sky outside the frame).') +
 
       hd('WHERE THE DECK SITS') +
       row('Near dist', 'dIn', 5, 200, 1) +
