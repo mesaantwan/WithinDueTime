@@ -259,6 +259,10 @@ function assetWarmBytes(urls, prio){
 var ASSET_NO_PREFETCH = location.search.indexOf('noprefetch') >= 0;
 var _assetWorldPrefetched = false;
 function assetPrefetchWorld(){
+  // PUBLIC BUILD: warming game assets for a game that cannot be entered is bandwidth spent on
+  // nothing. Safe to read the flag here — this runs on an idle callback ~6s after boot, long
+  // after the declaration executes.
+  if(PUBLIC_BUILD) return;
   if(_assetWorldPrefetched || ASSET_NO_PREFETCH) return;
   _assetWorldPrefetched = true;
   if(!assetPrefetchAllowed()) return;
@@ -533,6 +537,42 @@ var PLANE_WIDTH = 3.0, PLANE_SPACING = 0.8;
 var LARGE_RADIUS = (10 * (PLANE_WIDTH + PLANE_SPACING) / (2 * Math.PI)) + 0.25;
 var SMALL_RADIUS = LARGE_RADIUS * 0.8;
 var VW_RADIUS_MULT = 0.62;
+
+// ══════════════════════════════════════════════
+// PUBLIC BUILD  (2026-09-03)
+// ══════════════════════════════════════════════
+// This file is the market-ready storefront, forked from `Chrysolin Website.html`, which stays the
+// development file with every in-progress feature live. Everything that differs between the two
+// is gated on PUBLIC_BUILD and tagged `PUBLIC BUILD:` in a comment, so the fork can be reconciled
+// by grep rather than by diffing four megabytes.
+//
+// What it switches off, and why:
+//   • THE CUSTOMIZER (CZ) — the two spinning garments on the top row. The feature is not finished,
+//     so the module is left in the file but never booted; every CZ call site already guards on
+//     czReady, which now stays false for the life of the page.
+//   • CHUD'S PARTICLE SPHERE AND BOTH PARTICLE RIVERS — the bottom-right orb and the two corner
+//     streams. The orb's arc text and the elbow leader off the scroll timeline go with it: both
+//     are anchored to the sphere's silhouette and read as stray marks pointing at empty screen
+//     without it. The bottom timeline, the tracker lines, the top-left feed and the scroll-up
+//     pill are independent of the orb and all stay.
+//
+//   • THE MINI-GAME, ENTIRELY. The bottom spinner and its whole crescendo are untouched — the
+//     wheel spins, the beam climbs, every stacked crystal lights, spins up and fires its shaft,
+//     and the top one still flares on contact. Only the COMMIT is gone: enterGameMode() returns
+//     immediately, the mid-spin world preloader never runs, and the idle asset prefetch is off,
+//     so nothing about the game is ever entered OR downloaded. The screen whiteout is the
+//     transition INTO the game, so it is capped rather than removed (see PUBLIC_WHITEOUT_CAP) —
+//     the climax still flares hard at full spin and recedes as the wheel slows, instead of
+//     going solid white and resolving to nothing.
+//   • THE TOP-LEFT SYSTEM TEXT — CHUD's rising tlx feed, behind P.sysLeft.
+//
+// What it adds: the top row becomes a HERO row — no product panels and no glass ring, just the
+// brand mark turning on its own. See the HERO block further down.
+var PUBLIC_BUILD = true;
+
+// How bright the spin-up climax is allowed to get now that it leads nowhere. 1 = the original
+// full whiteout (do not: it resolves to a white screen and nothing happens), 0 = no flare at all.
+var PUBLIC_WHITEOUT_CAP = 0.55;
 var BEVEL = 0.15, BEVEL_R = 0.3, SEG_X = 32, SEG_Y = 8;
 
 var raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
@@ -3025,6 +3065,24 @@ function updateWeldingSparks(dt, rpm, orbPositions, orbVelocities){
 // ══════════════════════════════════════════════
 var godrayFBO, godrayBlurFBO, godrayOccScene, godrayBlurScene, godrayBlurCamera, godrayBlurQuad;
 var godrayIntensity = 0;
+// ENTRY FLASH — 1 at the instant of the cut into the game, fading over GAME_FLASH_SEC. It is a
+// SEPARATE channel from the crescendo's own stage-3 whiteout because the crescendo's is a function
+// of RPM, and the first thing entering the game does is force RPM to 0 — so on its own it would
+// snap to black on exactly the frame the world changes, which is the one frame it must not.
+var GAME_INSTANT_ENTRY = false;   // false = keep the decel + camera-dive entry animation
+// ENTRY HAPPENS IN THE GAME WORLD, not in the shop. Region B is the whole arena — dome, planet,
+// sky, the chute the crystal hallway comes out of — parented to one group at a PURE TRANSLATION
+// P.D = (300,0,0) from Region A. So staging the entry "in the world" is: build the platform at
+// centre + P.D, put the ship and camera there, and switch the renderer into its interior pass.
+// The animation itself is untouched — it just plays against the planet instead of a black void.
+// EXPERIMENTAL, OFF BY DEFAULT. Proven to work: the entry animation plays in the arena with the
+// planet, rings and sky around it. What is NOT settled is WHERE in the world the staging should
+// sit — the translated crystal position lands the platform right at the planet surface, so the ship
+// rolls off it onto the terrain instead of driving the bridge into the chute. Needs a deliberate
+// placement (floating above the chute mouth) before it can be the default.
+var GAME_ENTRY_IN_WORLD = false;
+var GAME_FLASH_SEC = 0.55;
+var gameEntryFlash = 0;
 var occlusionMat;
 var smoothedRpmForPlanets = 0;
 
@@ -3278,12 +3336,22 @@ function updateCrystalChain(tipY, seqNorm, dt, beamClimb){
     // Spin: eases toward a small proximity-driven pre-spin, then to full speed after contact.
     var spinTarget = n.reached ? SPIN_MAX : prox*PRE_SPIN;
     n.spin += (spinTarget - n.spin) * 0.045;
-    if(n.mesh){ n.mesh.rotation.y += n.spin; n.mesh.rotation.x += n.spin*0.5; }
+    // PUBLIC BUILD: the hero mark spins up about Y with everything else but never TIPS. Two
+    // places would tumble it and this is the one that reaches it — the floors loop is the other
+    // (guarded there); updateOrbs' stage3 tumble cannot reach it, gallery floor only.
+    var nIsHero = PUBLIC_BUILD && typeof hero !== 'undefined' && hero && n.floor === hero.floor;
+    if(n.mesh){ n.mesh.rotation.y += n.spin; if(!nIsHero) n.mesh.rotation.x += n.spin*0.5; }
     // ── Crystal light ── base electric shine + proximity glow + its own emitted light, with an
     // electric flicker. Brightens blue→white-hot as it powers up. Re-applied every frame (the
     // per-floor brightness code resets idle crystals; this runs during the gallery floor, last).
     var L = ELECTRIC_BASE + prox*PROX_GLOW + n.ownLight;
-    if(n.mat){
+    // PUBLIC BUILD: not the mark. This writes a blue electric emissive EVERY FRAME while the
+    // wheel turns, and the disconnect branch at the top of this function clears reached/spin/
+    // prox/ownLight but never the material — so a single spin would leave the silver glowing
+    // blue for the rest of the session. Exempting it beats adding a reset, and "genuine silver"
+    // is the brief: the mark still spins up and still fires its light shaft, it just stays
+    // silver while it does.
+    if(n.mat && !nIsHero){
       var shimmer = 0.82 + 0.18*Math.sin(nowT*34.0 + n.localY*6.3);
       n.mat.emissive.setRGB(0.30 + L*0.45, 0.50 + L*0.42, 1.0);
       n.mat.emissiveIntensity = L * 8.0 * shimmer;
@@ -3295,7 +3363,10 @@ function updateCrystalChain(tipY, seqNorm, dt, beamClimb){
     var frac = (NCH>1) ? i/(NCH-1) : 0;
     var nodeSpinMax = FLOOR_SPIN_BOTTOM + (FLOOR_SPIN_TOP - FLOOR_SPIN_BOTTOM)*frac;
     fg.rotation.y += t * nodeSpinMax * fdir;
-    if(fg.userData.centerStar) fg.userData.centerStar.rotation.y = -fg.rotation.y;
+    // PUBLIC BUILD: the hero mark turns WITH its wheel (see the floors loop), so it is not
+    // counter-rotated during the crescendo either.
+    if(fg.userData.centerStar && !(PUBLIC_BUILD && typeof hero !== 'undefined' && hero && n.floor === hero.floor))
+      fg.userData.centerStar.rotation.y = -fg.rotation.y;
     // ── Electric shine shaft ── an electric beam of light from the crystal that GROWS in size
     // and strength as the beam approaches (prox²), then flares on contact (ownLight) and settles
     // into the crystal's own steady emission. This is the "connection of energy" reaching out.
@@ -3330,6 +3401,7 @@ function updateCrystalChain(tipY, seqNorm, dt, beamClimb){
 // UPDATE ORBS (merged: 3-stage brightness + curve deformation + beam particles)
 // ══════════════════════════════════════════════
 function updateOrbs(dt){
+  if(gameEntryFlash > 0) gameEntryFlash = Math.max(0, gameEntryFlash - dt / GAME_FLASH_SEC);
   var orbPositions = [];
   var orbVelocities = [];
   var globalRpm = 0;
@@ -3392,6 +3464,11 @@ function updateOrbs(dt){
     // their (idle) stage-based glow.
     var star=ud.centerStar;
     var isGal = (fl===gameMode.galleryFloor);
+    // MEASURED: nothing below here ever touches another row's crystal. This loop opens with
+    // `if(!fl.orbs) return;` and ONLY the gallery floor has orbs (createFloor returns no `orbs`
+    // key at all), so isGal is always true and the else-branch below is unreachable. The comment
+    // above about "other floors" predates that. The code that DOES reach every row's crystal —
+    // and therefore the hero mark — is updateCrystalChain, which is where the mark is exempted.
     if(star&&star.children[0]&&star.children[0].material){
       var sm=star.children[0].material;
       sm.emissive=sm.emissive||new THREE.Color(0x334466);
@@ -3425,7 +3502,7 @@ function updateOrbs(dt){
     }
 
     // Center star spins faster in stage 3
-    if(ud.centerStar){
+    if(ud.centerStar){   // gallery floor only — see the !fl.orbs early-out at the top of the loop
       ud.centerStar.rotation.z += stage3 * 0.15;
       ud.centerStar.rotation.x += stage3 * 0.08;
     }
@@ -3453,9 +3530,14 @@ function updateOrbs(dt){
     scene.background.setRGB(tR2, tG2, tB2);
     scene.fog.color.setRGB(tR2, tG2, tB2);
 
-    // Whiteout overlay — only stage 3
+    // Whiteout overlay — stage 3 while spinning, then the entry flash carries it across the cut.
     if(postQuad && postQuad.material.uniforms.whiteout){
-      postQuad.material.uniforms.whiteout.value = stage3 * stage3;
+      // PUBLIC BUILD: the whiteout is the cut INTO the game. Capped, not removed, so full spin
+      // still climaxes in a hard flare that recedes as the wheel slows. Everything else stage3
+      // drives — godrays, the crystal's blaze, the light rays — is left at full strength.
+      var _wo = stage3 * stage3;
+      if(PUBLIC_BUILD) _wo = Math.min(_wo, PUBLIC_WHITEOUT_CAP);
+      postQuad.material.uniforms.whiteout.value = Math.max(_wo, gameEntryFlash);
       // Screen shake — holds off until the climb is underway (~rpm 115), then builds with the
       // climb, peaking near the top. Starts later and tops out a touch lower than before.
       postQuad.material.uniforms.shakeAmount.value = Math.max(0.0, beamClimb - 0.12) * 0.11;
@@ -3469,7 +3551,15 @@ function updateOrbs(dt){
     // loadFacePlanet is idempotent, and buildPortal calls facePlanetActivate() again if the OBJ
     // beats it there, so arriving early is already a supported path. A visitor who never touches
     // the orb downloads nothing — the website's critical path is untouched.
-    if(stage1 > 0.02) loadFacePlanet();
+    //
+    // It is now step 0 of a longer chain (see gamePreloadStep): with the entry animation gone,
+    // EVERYTHING the game needs has to be standing before the whiteout, not hidden under a dive.
+    // Gated on the gallery floor because this loop runs once per floor and the step machine has a
+    // frame counter — without it the chain would advance once per floor per frame.
+    // PUBLIC BUILD: the preloader exists to have the world standing before the whiteout. With the
+    // commit gone there is nothing to stand up, and this is the 5MB planet fetch + bake + ship
+    // build — pure cost on a storefront the game is unreachable from.
+    if(isGal && !PUBLIC_BUILD && rpm > GAME_PRELOAD_RPM) gamePreloadStep();
 
     // God rays
     godrayIntensity = stage1 * 0.4 + stage2 * 1.8 + stage3 * 1.0;
@@ -4894,8 +4984,6 @@ function updateCursor(cx,cy){
     if(ho.type==='Sprite'||ho.type==='Points'||ho.type==='Line'||ho.type==='LineSegments')continue;
     // Drag plane = grabbable
     if(ho.userData.isDragPlane){el.classList.add('grabbable');return;}
-    // Planet = clickable
-    if(ho.userData.isPlanet){el.classList.add('clickable');return;}
     // Check if it's a panel (CylinderGeometry = clickable)
     if(ho.geometry&&ho.geometry.type==='CylinderGeometry'&&ho.visible){
       el.classList.add('clickable');return;
@@ -5256,22 +5344,6 @@ function pUp(cx,cy){
             }
           }
           check = check.parent;
-        }
-      }
-    }
-    
-    // ── Check for planet clicks — launch meteor ──
-    var allPlanetHitMeshes=[];
-    for(var pci=0;pci<planets.length;pci++){if(planets[pci].alive&&planets[pci].hitMesh)allPlanetHitMeshes.push(planets[pci].hitMesh);}
-    if(allPlanetHitMeshes.length>0){
-      var planetHits=raycaster.intersectObjects(allPlanetHitMeshes);
-      if(planetHits.length>0){
-        var hitPlanet=planetHits[0].object;
-        if(hitPlanet.userData.isPlanet){
-          launchMeteor(hitPlanet.userData.planetIdx);
-          isDragging=false;selectedFloor=null;if(dm.draggingVW)dm.draggingVW=false;
-          renderer.domElement.parentElement.classList.remove('dragging');
-          return;
         }
       }
     }
@@ -10232,13 +10304,10 @@ function ensureSceneHittables(){
       }
     }
     if(fl.group && fl.group.userData.centerStar){
-      sceneHittables.push({mesh: fl.group.userData.centerStar, radius: 1.0});
-    }
-  }
-  // Background planets
-  for(var pli = 0; pli < planets.length; pli++){
-    if(planets[pli].alive && planets[pli].mesh){
-      sceneHittables.push({mesh: planets[pli].mesh, radius: planets[pli].radius * 1.15});
+      // PUBLIC BUILD: the hero row's gem is scaled up, so a fixed 1.0 would let thrown balls
+      // pass visibly through it. Read the scale the group actually has — 1.0 on every other row.
+      sceneHittables.push({mesh: fl.group.userData.centerStar,
+                           radius: 1.0 * (fl.group.userData.centerStar.scale.x || 1)});
     }
   }
   sceneHittablesBuilt = true;
@@ -13202,350 +13271,17 @@ function updateDomeSky(){
   }
 }
 
-// ── Planets scattered in the background ──
+// ── Background planets: REMOVED (2026-09-01) ──────────────────────────────────
+// The 22 decorative planets that orbited the tower, the meteors you fired at them by clicking,
+// their explosions and their respawn are all gone.
+//
+// `planets` STAYS, deliberately empty. Four separate places still walk it: the click raycast,
+// the hit-jiggle registry, and — the ones that matter — the website-side FLIGHT code, which uses
+// it as a gravity-well list and as a sphere-collision list whenever the ship is airborne over the
+// shop. An empty array makes every one of those a zero-iteration no-op, which is exactly right
+// with nothing in the sky. Deleting the binding instead would throw a ReferenceError the first
+// time the ship left the ground — a crash nowhere near this line and nowhere near this feature.
 var planets = [];
-var meteors = []; // {mesh, target, velocity, trail}
-var explosions = []; // {particles, age, maxAge}
-
-function createPlanets() {
-  var planetConfigs = [
-    {r:4, x:-90, y:-60, z:-180, col:0xb0b0c0, emi:0x445566, emiI:0.1, ring:true, ringCol:0x8888a0},
-    {r:3.5, x:60, y:-40, z:-140, col:0xa8b0c8, emi:0x445566, emiI:0.12, ring:true, ringCol:0x8890a8},
-    {r:5, x:-55, y:-10, z:-100, col:0xb8c0d8, emi:0x556688, emiI:0.15, ring:true, ringCol:0x9098b0},
-    {r:3, x:100, y:30, z:-160, col:0xc0b8c8, emi:0x554466, emiI:0.1, ring:false},
-    {r:2.5, x:80, y:8, z:-100, col:0xb0b8d0, emi:0x556678, emiI:0.1, ring:false},
-    {r:2, x:-70, y:40, z:-80, col:0xc8c0b8, emi:0x665544, emiI:0.1, ring:true, ringCol:0xa8a098},
-    {r:1.8, x:35, y:-30, z:-70, col:0xb8b0c0, emi:0x554466, emiI:0.09, ring:false},
-    {r:1.5, x:-30, y:-45, z:-60, col:0xc0c8d0, emi:0x556688, emiI:0.08, ring:false},
-    {r:2.2, x:-45, y:55, z:-90, col:0xb0c0b8, emi:0x446655, emiI:0.1, ring:false},
-    {r:1.8, x:55, y:50, z:-85, col:0xc8b8b0, emi:0x776655, emiI:0.09, ring:false},
-    {r:1.2, x:-60, y:35, z:-60, col:0xc0b8b0, emi:0x776655, emiI:0.09, ring:false},
-    {r:1.0, x:50, y:-55, z:-50, col:0xd0c8c0, emi:0x887766, emiI:0.08, ring:false},
-    {r:0.8, x:-25, y:-35, z:-45, col:0xb8c0c8, emi:0x557788, emiI:0.1, ring:false},
-    {r:1.5, x:20, y:40, z:-55, col:0xc8c0d0, emi:0x665577, emiI:0.09, ring:false},
-    {r:0.7, x:45, y:15, z:-35, col:0xc8b8a8, emi:0x665544, emiI:0.1, ring:false},
-    {r:0.5, x:-40, y:22, z:-30, col:0xd0c8c0, emi:0x887766, emiI:0.08, ring:false},
-    {r:0.4, x:-20, y:30, z:-25, col:0xc0c8d8, emi:0x667788, emiI:0.12, ring:false},
-    {r:0.3, x:25, y:-5, z:-20, col:0xd8d0c8, emi:0x998877, emiI:0.06, ring:false},
-    {r:0.4, x:-10, y:-20, z:-22, col:0xc8d0c8, emi:0x778877, emiI:0.07, ring:false},
-    {r:0.5, x:15, y:20, z:-28, col:0xd0c0c0, emi:0x887777, emiI:0.08, ring:false},
-    {r:0.6, x:-50, y:-15, z:-40, col:0xb8c8c0, emi:0x557766, emiI:0.09, ring:false},
-    {r:0.5, x:60, y:-10, z:-35, col:0xc0c0c8, emi:0x666688, emiI:0.08, ring:false},
-  ];
-  
-  for(var i=0;i<planetConfigs.length;i++){
-    var cfg=planetConfigs[i];
-    var segs=cfg.r>10?48:cfg.r>3?32:16;
-    var planetGeo=new THREE.SphereGeometry(cfg.r,segs,segs/2);
-    var planetMat=new THREE.MeshStandardMaterial({
-      color:cfg.col, roughness:0.7, metalness:0.1,
-      emissive:cfg.emi, emissiveIntensity:cfg.emiI,
-      fog:true
-    });
-    var planetMesh=new THREE.Mesh(planetGeo,planetMat);
-    planetMesh.position.set(cfg.x,cfg.y,cfg.z);
-    planetMesh.rotation.set(Math.random()*0.5,Math.random()*Math.PI*2,Math.random()*0.3);
-    planetMesh.userData.isPlanet=true;
-    planetMesh.userData.planetIdx=i;
-    planetMesh.userData.radius=cfg.r;
-    planetMesh.userData.color=cfg.col;
-    scene.add(planetMesh);
-    
-    var planetObj={mesh:planetMesh,rotSpeed:0.0003+Math.random()*0.0005,alive:true,radius:cfg.r,
-      orbitRadius:50+i*8+Math.random()*4, // each planet gets its own band, spaced 8 units apart
-      orbitAngle:(i/planetConfigs.length)*Math.PI*2+Math.random()*0.3,
-      orbitSpeed:(0.0004+Math.random()*0.0006)*(Math.random()>0.5?1:-1),
-      orbitY:cfg.y, cfg:cfg
-    };
-    // Set initial position from orbit
-    planetMesh.position.x=Math.cos(planetObj.orbitAngle)*planetObj.orbitRadius;
-    planetMesh.position.z=Math.sin(planetObj.orbitAngle)*planetObj.orbitRadius;
-    
-    // Invisible hit detection sphere at 2x radius for easier clicking
-    var hitGeo=new THREE.SphereGeometry(cfg.r*2,8,6);
-    var hitMat=new THREE.MeshBasicMaterial({visible:false});
-    var hitMesh=new THREE.Mesh(hitGeo,hitMat);
-    hitMesh.position.copy(planetMesh.position);
-    hitMesh.userData.isPlanet=true;
-    hitMesh.userData.planetIdx=i;
-    hitMesh.userData.radius=cfg.r;
-    hitMesh.userData.color=cfg.col;
-    scene.add(hitMesh);
-    planetObj.hitMesh=hitMesh;
-    
-    if(cfg.ring){
-      var ringGeo=new THREE.RingGeometry(cfg.r*1.4,cfg.r*2.0,64);
-      var ringMat=new THREE.MeshStandardMaterial({
-        color:cfg.ringCol||0x9098b0, roughness:0.5, metalness:0.2,
-        emissive:cfg.ringCol||0x9098b0, emissiveIntensity:0.05,
-        side:THREE.DoubleSide, transparent:true, opacity:0.4, fog:true
-      });
-      var ringMesh=new THREE.Mesh(ringGeo,ringMat);
-      ringMesh.position.copy(planetMesh.position);
-      ringMesh.rotation.x=Math.PI*0.4+Math.random()*0.3;
-      ringMesh.rotation.y=Math.random()*0.5;
-      scene.add(ringMesh);
-      planetObj.ring=ringMesh;
-    }
-    planets.push(planetObj);
-  }
-}
-
-function launchMeteor(planetIdx){
-  var planet=planets[planetIdx];
-  if(!planet||!planet.alive)return;
-  
-  // Meteor starts from camera position
-  var startPos=camera.position.clone();
-  startPos.x+=(Math.random()-0.5)*2;
-  startPos.y+=(Math.random()-0.5)*2;
-  
-  var targetPos=planet.mesh.position.clone();
-  var dir=targetPos.clone().sub(startPos).normalize();
-  var speed=40+Math.random()*20;
-  
-  // Glowing meteor mesh
-  var meteorGeo=new THREE.SphereGeometry(0.15+planet.radius*0.02,8,8);
-  var meteorMat=new THREE.MeshBasicMaterial({color:0xff6633,transparent:true,opacity:1});
-  var meteorMesh=new THREE.Mesh(meteorGeo,meteorMat);
-  meteorMesh.position.copy(startPos);
-  scene.add(meteorMesh);
-  
-  // Trail particles
-  var trailCount=20;
-  var trailGeo=new THREE.BufferGeometry();
-  var trailPositions=new Float32Array(trailCount*3);
-  var trailAlphas=new Float32Array(trailCount);
-  for(var i=0;i<trailCount;i++){
-    trailPositions[i*3]=startPos.x;trailPositions[i*3+1]=startPos.y;trailPositions[i*3+2]=startPos.z;
-    trailAlphas[i]=0;
-  }
-  trailGeo.setAttribute('position',new THREE.BufferAttribute(trailPositions,3));
-  trailGeo.setAttribute('alpha',new THREE.BufferAttribute(trailAlphas,1));
-  var trailMat=new THREE.ShaderMaterial({
-    uniforms:{color:{value:new THREE.Color(0xff8844)}},
-    vertexShader:'attribute float alpha;varying float vA;void main(){vA=alpha;gl_PointSize=3.0;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}',
-    fragmentShader:'uniform vec3 color;varying float vA;void main(){float d=length(gl_PointCoord-0.5)*2.0;if(d>1.0)discard;gl_FragColor=vec4(color,vA*(1.0-d));}',
-    transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
-  });
-  var trail=new THREE.Points(trailGeo,trailMat);
-  scene.add(trail);
-  
-  meteors.push({
-    mesh:meteorMesh,trail:trail,trailPositions:trailPositions,trailAlphas:trailAlphas,trailGeo:trailGeo,
-    velocity:dir.multiplyScalar(speed),
-    target:planet,targetIdx:planetIdx,
-    trailHead:0,trailCount:trailCount
-  });
-}
-
-function explodePlanet(planet){
-  var pos=planet.mesh.position.clone();
-  var r=planet.radius;
-  var col=planet.mesh.userData.color||0xb0b8c8;
-  
-  // Create explosion particles
-  var count=Math.min(Math.floor(r*30),300);
-  var pGeo=new THREE.BufferGeometry();
-  var pPositions=new Float32Array(count*3);
-  var pVelocities=new Float32Array(count*3);
-  var pSizes=new Float32Array(count);
-  var pColors=new Float32Array(count*3);
-  
-  var baseCol=new THREE.Color(col);
-  var hotCol=new THREE.Color(0xff6633);
-  
-  for(var i=0;i<count;i++){
-    pPositions[i*3]=pos.x+(Math.random()-0.5)*r*0.5;
-    pPositions[i*3+1]=pos.y+(Math.random()-0.5)*r*0.5;
-    pPositions[i*3+2]=pos.z+(Math.random()-0.5)*r*0.5;
-    var spd=r*0.5+Math.random()*r*2;
-    var dx=(Math.random()-0.5),dy=(Math.random()-0.5),dz=(Math.random()-0.5);
-    var dl=Math.sqrt(dx*dx+dy*dy+dz*dz)||1;
-    pVelocities[i*3]=dx/dl*spd;pVelocities[i*3+1]=dy/dl*spd;pVelocities[i*3+2]=dz/dl*spd;
-    pSizes[i]=r*0.1+Math.random()*r*0.3;
-    var mix=Math.random();
-    var c=baseCol.clone().lerp(hotCol,mix*0.6);
-    pColors[i*3]=c.r;pColors[i*3+1]=c.g;pColors[i*3+2]=c.b;
-  }
-  
-  pGeo.setAttribute('position',new THREE.BufferAttribute(pPositions,3));
-  pGeo.setAttribute('aSize',new THREE.BufferAttribute(pSizes,1));
-  pGeo.setAttribute('aColor',new THREE.BufferAttribute(pColors,3));
-  
-  var pMat=new THREE.ShaderMaterial({
-    uniforms:{opacity:{value:1}},
-    vertexShader:'attribute float aSize;attribute vec3 aColor;varying vec3 vCol;varying float vAlpha;uniform float opacity;void main(){vCol=aColor;vAlpha=opacity;vec4 mv=modelViewMatrix*vec4(position,1.0);gl_PointSize=aSize*(200.0/-mv.z);gl_Position=projectionMatrix*mv;}',
-    fragmentShader:'varying vec3 vCol;varying float vAlpha;void main(){float d=length(gl_PointCoord-0.5)*2.0;if(d>1.0)discard;float g=1.0-d*d;gl_FragColor=vec4(vCol,g*vAlpha);}',
-    transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
-  });
-  
-  var particles=new THREE.Points(pGeo,pMat);
-  scene.add(particles);
-  
-  explosions.push({
-    particles:particles,positions:pPositions,velocities:pVelocities,count:count,
-    age:0,maxAge:3+r*0.3,mat:pMat
-  });
-  
-  // Remove planet
-  scene.remove(planet.mesh);
-  planet.mesh.geometry.dispose();planet.mesh.material.dispose();
-  if(planet.hitMesh){scene.remove(planet.hitMesh);planet.hitMesh.geometry.dispose();planet.hitMesh.material.dispose();}
-  if(planet.ring){scene.remove(planet.ring);planet.ring.geometry.dispose();planet.ring.material.dispose();}
-  planet.alive=false;
-  
-  // Respawn a new planet off-screen after a delay
-  setTimeout(function(){
-    respawnPlanet(planet);
-  }, 2000+Math.random()*3000);
-}
-
-function respawnPlanet(oldPlanet){
-  var cfg=oldPlanet.cfg;
-  var r=Math.min(cfg.r*(0.6+Math.random()*0.8), 5); // cap at 5
-  var segs=r>10?48:r>3?32:16;
-  var cols=[0xb8c0d8,0xc8b8a8,0xa8b0c8,0xd0c8c0,0xb0b8d0,0xc0c8d8,0xb0c0b8,0xc8b8b0];
-  var col=cols[Math.floor(Math.random()*cols.length)];
-  var planetGeo=new THREE.SphereGeometry(r,segs,Math.floor(segs/2));
-  var planetMat=new THREE.MeshStandardMaterial({
-    color:col, roughness:0.7, metalness:0.1,
-    emissive:col, emissiveIntensity:0.08, fog:true
-  });
-  var planetMesh=new THREE.Mesh(planetGeo,planetMat);
-  var newY=cfg.y+(Math.random()-0.5)*20;
-  // Spawn behind camera so it orbits into view naturally
-  var camAngle=Math.atan2(camera.position.z, camera.position.x);
-  var startAngle=camAngle+Math.PI+((Math.random()-0.5)*1.0); // behind camera ±0.5 rad
-  var orbitR=oldPlanet.orbitRadius; // keep the same orbit band
-  planetMesh.position.set(Math.cos(startAngle)*orbitR, newY, Math.sin(startAngle)*orbitR);
-  planetMesh.rotation.set(Math.random()*0.5,Math.random()*Math.PI*2,Math.random()*0.3);
-  planetMesh.userData.isPlanet=true;
-  planetMesh.userData.radius=r;
-  planetMesh.userData.color=col;
-  scene.add(planetMesh);
-  
-  // Hit detection sphere at 2x radius
-  var hitGeo=new THREE.SphereGeometry(r*2,8,6);
-  var hitMat=new THREE.MeshBasicMaterial({visible:false});
-  var hitMesh=new THREE.Mesh(hitGeo,hitMat);
-  hitMesh.position.copy(planetMesh.position);
-  hitMesh.userData.isPlanet=true;
-  hitMesh.userData.radius=r;
-  hitMesh.userData.color=col;
-  scene.add(hitMesh);
-  
-  var hasRing=Math.random()>0.7;
-  var ringMesh2=null;
-  if(hasRing){
-    var ringGeo2=new THREE.RingGeometry(r*1.4,r*2.0,64);
-    var ringMat2=new THREE.MeshStandardMaterial({
-      color:0x9098b0,roughness:0.5,metalness:0.2,emissive:0x9098b0,emissiveIntensity:0.05,
-      side:THREE.DoubleSide,transparent:true,opacity:0.4,fog:true
-    });
-    ringMesh2=new THREE.Mesh(ringGeo2,ringMat2);
-    ringMesh2.position.copy(planetMesh.position);
-    ringMesh2.rotation.x=Math.PI*0.4+Math.random()*0.3;
-    scene.add(ringMesh2);
-  }
-  
-  var idx=planets.indexOf(oldPlanet);
-  hitMesh.userData.planetIdx=idx;
-  planets[idx]={
-    mesh:planetMesh, rotSpeed:0.0003+Math.random()*0.0005, alive:true, radius:r,
-    orbitRadius:orbitR, orbitAngle:startAngle,
-    orbitSpeed:(0.0004+Math.random()*0.0006)*(Math.random()>0.5?1:-1),
-    orbitY:newY, ring:ringMesh2, hitMesh:hitMesh, cfg:cfg
-  };
-}
-
-function updatePlanets(){
-  // Orbital motion — speed linked to orb RPM
-  var rpmSpeedMult = 1.0 + smoothedRpmForPlanets * 20.0;
-  for(var i=0;i<planets.length;i++){
-    var p=planets[i];
-    if(!p.alive) continue;
-    p.mesh.rotation.y+=p.rotSpeed*rpmSpeedMult;
-    // Orbit around center column (x=0,z=0)
-    p.orbitAngle+=p.orbitSpeed*rpmSpeedMult;
-    var ox=Math.cos(p.orbitAngle)*p.orbitRadius;
-    var oz=Math.sin(p.orbitAngle)*p.orbitRadius;
-    p.mesh.position.x=ox;
-    p.mesh.position.z=oz;
-    if(p.hitMesh){p.hitMesh.position.x=ox;p.hitMesh.position.y=p.mesh.position.y;p.hitMesh.position.z=oz;}
-    if(p.ring){
-      p.ring.position.x=ox;
-      p.ring.position.z=oz;
-    }
-  }
-  
-  // Update meteors
-  var dt=1/60;
-  for(var mi=meteors.length-1;mi>=0;mi--){
-    var m=meteors[mi];
-    m.mesh.position.x+=m.velocity.x*dt;
-    m.mesh.position.y+=m.velocity.y*dt;
-    m.mesh.position.z+=m.velocity.z*dt;
-    
-    // Update trail
-    m.trailHead=(m.trailHead+1)%m.trailCount;
-    m.trailPositions[m.trailHead*3]=m.mesh.position.x;
-    m.trailPositions[m.trailHead*3+1]=m.mesh.position.y;
-    m.trailPositions[m.trailHead*3+2]=m.mesh.position.z;
-    for(var ti=0;ti<m.trailCount;ti++){
-      var age=((m.trailHead-ti+m.trailCount)%m.trailCount)/m.trailCount;
-      m.trailAlphas[ti]=age*0.8;
-    }
-    m.trailGeo.attributes.position.needsUpdate=true;
-    m.trailGeo.attributes.alpha.needsUpdate=true;
-    
-    // Check if hit planet
-    if(m.target.alive){
-      var dist=m.mesh.position.distanceTo(m.target.mesh.position);
-      if(dist<m.target.radius*1.1){
-        explodePlanet(m.target);
-        scene.remove(m.mesh);scene.remove(m.trail);
-        m.mesh.geometry.dispose();m.mesh.material.dispose();
-        m.trail.geometry.dispose();m.trail.material.dispose();
-        meteors.splice(mi,1);
-        continue;
-      }
-    }
-    
-    // Remove if traveled too far
-    if(m.mesh.position.distanceTo(camera.position)>250){
-      scene.remove(m.mesh);scene.remove(m.trail);
-      m.mesh.geometry.dispose();m.mesh.material.dispose();
-      m.trail.geometry.dispose();m.trail.material.dispose();
-      meteors.splice(mi,1);
-    }
-  }
-  
-  // Update explosions
-  for(var ei=explosions.length-1;ei>=0;ei--){
-    var exp=explosions[ei];
-    exp.age+=dt;
-    var lifeT=exp.age/exp.maxAge;
-    
-    // Move particles outward and slow them
-    for(var pi=0;pi<exp.count;pi++){
-      exp.positions[pi*3]+=exp.velocities[pi*3]*dt;
-      exp.positions[pi*3+1]+=exp.velocities[pi*3+1]*dt;
-      exp.positions[pi*3+2]+=exp.velocities[pi*3+2]*dt;
-      exp.velocities[pi*3]*=0.98;
-      exp.velocities[pi*3+1]*=0.98;
-      exp.velocities[pi*3+2]*=0.98;
-    }
-    exp.particles.geometry.attributes.position.needsUpdate=true;
-    exp.mat.uniforms.opacity.value=1-lifeT;
-    
-    if(exp.age>=exp.maxAge){
-      scene.remove(exp.particles);
-      exp.particles.geometry.dispose();exp.particles.material.dispose();
-      explosions.splice(ei,1);
-    }
-  }
-}
 
 function updateStarField(time) {
   if(starField && starField.material.uniforms) {
@@ -14657,7 +14393,11 @@ function updateGameCharge(rpmNorm) { return; }
 // controls WHEN compilation happens.
 var _gameWarm = { stage: 0, nextAt: 0, lastCount: -1 };
 function gameWorldReadyForWarmup(){
-  if(!gameMode.active || !renderer) return false;
+  // The spin-up preload compiles BEFORE the game is active — that is the entire point of it, so
+  // this gate has to let that phase through or ensureGameWarmup silently no-ops and the ~440ms
+  // compile sweep lands on the first rendered arena frame instead.
+  if(!renderer) return false;
+  if(!gameMode.active && !(typeof gamePreload !== 'undefined' && gamePreload.step > 4)) return false;
   if(!gameMode.portal.built) return false;                     // portal/dome materials must exist
   if(FACE_PLANET_ON && facePlanet.state === 'loading') return false;   // planet shader is the big one — wait for it
   return true;
@@ -14786,7 +14526,128 @@ function _warmFlushPrograms(budgetMs){
   }
 }
 
+// Bind the ship's "planet" to the gallery crystal and work out which way its carved doorway faces.
+// Split out of enterGameMode so the PRELOADER can run it mid-spin: everything here is either a
+// read or a value the floor loop ignores until the game actually owns the crystal (see
+// _gameHoldsCrystal), EXCEPT the one quaternion write, which visibly snaps the crystal to its
+// locked orientation. `lock` gates that write, so preload gets the geometry without the artifact.
+function gamePrepSurface(lock){
+  var gf = gameMode.galleryFloor;
+  gameMode.surface.crystal = (gf && gf.group.userData.centerStar) ? gf.group.userData.centerStar : null;
+  gameMode.surface.floor = gf;
+  // Use the crystal mesh's ACTUAL world position (the centerStar sits ~1.5 below the floor
+  // origin), not the floor Y — otherwise the radial ray + grip fallback aim at the wrong point.
+  if(gameMode.surface.crystal){
+    // Lock the crystal so the carved hole faces HORIZONTALLY toward the camera (world +Z) for the
+    // whole game — the platform + bridge staging area sits in front of it. holeUpQuat is the crystal's
+    // fixed world orientation; the per-frame floor loop re-applies it (countering the floor's Y spin).
+    var holeDirLocal = new THREE.Vector3(-1, 1, 1).normalize();
+    var _Ftarget = new THREE.Vector3(0, 0, 1);
+    var _Q0 = new THREE.Quaternion().setFromUnitVectors(holeDirLocal, _Ftarget);
+    // Roll the crystal around the hole axis so the triangular doorway sits flat-edge-down (apex up).
+    // The three edges are ~equilateral; ENTRY_HOLE_ROLL_STEPS (0/1/2 → 0°/120°/240°) picks WHICH edge
+    // becomes the base so the hallway FLOOR (not a wall) lands at the bottom. Flip the step if it's off.
+    var _roll = holeRollForFlatBottom(holeDirLocal, _Ftarget, _Q0) + ENTRY_HOLE_ROLL_STEPS * (Math.PI * 2 / 3);
+    gameMode.portal.holeUpQuat = new THREE.Quaternion().setFromAxisAngle(_Ftarget, _roll).multiply(_Q0);
+    gf.group.updateMatrixWorld(true);
+    if(lock){
+      gameMode.surface.crystal.quaternion.copy(
+        new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), -gf.group.rotation.y).multiply(gameMode.portal.holeUpQuat)
+      );
+    }
+    gameMode.surface.crystal.updateMatrixWorld(true);
+    gameMode.surface.crystal.getWorldPosition(gameMode.surface.center);
+  } else {
+    gameMode.surface.center.set(0, gf ? gf.group.position.y : 0, 0);
+  }
+}
+
+// Move the entry staging anchor from the shop into the arena. MUST run after buildPortal (it needs
+// P.D and the tunnel dimensions) and BEFORE buildEntryStage (which reads surface.center). It is
+// idempotent because two paths call it — the preloader mid-spin, and enterGameMode for anyone who
+// never spun long enough to reach that step — and applying a translation twice puts the platform
+// 600 units away with no error anywhere.
+function gameShiftStageToWorld(){
+  if(!GAME_ENTRY_IN_WORLD || gameMode._worldShifted) return false;
+  var P = gameMode.portal;
+  if(!P || !P.built) return false;
+  gameMode.surface.center.add(P.D);
+  gameMode.savedCamPos.add(P.D);   // the dive arcs in from the same relative pose, now in the arena
+  gameMode._worldShifted = true;
+  return true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// SPIN-UP PRELOAD — build the whole game world WHILE the wheel is being spun
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Entry used to be a 3-5 second choreography (hold → damp → camera dive) and the heavy building —
+// the 5MB planet, the Region B dome, the ship, the pooled materials, the shader links — was
+// deliberately hidden UNDER that animation. Cutting straight into the game at the whiteout removes
+// the hiding place, so the work has to have already happened.
+//
+// It runs one step per PRELOAD_GAP frames rather than all at once: several of these are 100ms+ of
+// blocking work, and spacing them means the spin loses a frame here and there instead of locking
+// up. Every step is idempotent, so enterGameMode calling the same helpers costs nothing the second
+// time — and if the visitor never spins hard enough to finish, entry just does whatever is left.
+//
+// Nothing built here is visible on the website: the ship group starts hidden, Region B is pruned by
+// the _wsIdle gate in animate(), and the entry platform is built at scale 0.0001 / opacity 0 (it
+// already sat like that for seconds during the old decel, so this is a proven-safe state).
+// Trigger on RAW RPM, not on the crescendo. The crescendo is tuned to slam (see lightCurve), so
+// anything keyed to it starts late; what we want is the earliest possible evidence that this
+// visitor intends to play, which is the wheel moving at all. 3 rpm is a deliberate nudge, not drift.
+// The gap matters more than it looks: buildPortal REPORTS 26ms but its real cost lands on the next
+// frames as GPU uploads and shader links (measured 1652ms and 2375ms two frames later), so each
+// step needs room to settle before the next one piles on.
+var GAME_PRELOAD_RPM = 3;
+var PRELOAD_GAP = 10;          // frames between steps
+var gamePreload = { step: 0, wait: 0, done: false, t0: 0, log: [] };
+function gamePreloadStep(){
+  if(gamePreload.done) return;
+  if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
+  if(typeof editor !== 'undefined' && editor.active) return;
+  if(gamePreload.wait-- > 0) return;
+  gamePreload.wait = PRELOAD_GAP;
+  var t = performance.now();
+  var name = '';
+  try {
+    switch(gamePreload.step){
+      case 0: name = 'planet';   loadFacePlanet(); break;                       // 5MB fetch + bake, already async
+      case 1: name = 'ship';     if(!gameMode.group) buildGameMode(); break;
+      case 2: name = 'pools';    _warmTouchPools(); break;                      // bullet/muzzle/glow materials
+      case 3:
+        name = 'portal';
+        buildPortal();                                   // Region B dome + render targets — the big one
+        // HIDE IT THE SAME FRAME. The _wsIdle gate that normally prunes Region B runs at the TOP
+        // of animate(), before this ran, so it left regionB at its default visible=true — and the
+        // rest of this frame then rendered a brand-new arena EIGHT times (glass FBO + six cube-map
+        // faces + the main pass), linking every shader in it at once. Measured: buildPortal itself
+        // is 663ms, the frame it landed in was 19,639ms. One line, and it is the difference
+        // between "loads while you spin" and "the page dies for twenty seconds".
+        if(gameMode.portal && gameMode.portal.regionB) gameMode.portal.regionB.visible = false;
+        break;
+      // surface AFTER portal, because the shift below needs P.D and the tunnel to exist
+      case 4: name = 'surface';  gamePrepSurface(false); gameShiftStageToWorld(); break;
+      case 5: name = 'stage';    if(!(gameMode.entry && gameMode.entry.built)) buildEntryStage(); break;
+      // Pre-LINK every arena program without drawing anything. renderer.compile walks the scene
+      // (visible or not) and is ~440ms in one lump — which is the cost that otherwise lands on the
+      // first frame the arena is actually rendered. Paying it here, on a frame nobody is looking at
+      // closely, is the whole point of preloading.
+      case 6: name = 'compile';  resetGameWarmup(); ensureGameWarmup(); break;
+      default: gamePreload.done = true; return;
+    }
+  } catch(e){ console.warn('preload ' + name + ':', e); }
+  gamePreload.log.push(name + ' ' + (performance.now() - t).toFixed(0) + 'ms');
+  gamePreload.step++;
+}
+
 function enterGameMode() {
+  // PUBLIC BUILD: the mini-game is not finished, so the storefront must never enter it. Guarding
+  // the funnel rather than the call sites is deliberate — the crystal chain's top contact, the
+  // double-tap on the gallery wheel and every dev path all arrive here, so one return closes all
+  // of them, including any route not found by grep. Nothing about the SPIN is affected: this is
+  // only the commit at the end of it.
+  if(PUBLIC_BUILD) return;
   if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
   if(PORTAL_TEST_MODE){ enterPortalTestMode(); return; }   // TEMP: jump straight into the flat portal sandbox
   if(!gameMode.group) buildGameMode();
@@ -14821,7 +14682,9 @@ function enterGameMode() {
   // shader programs; cached ones are skipped.
   var _firstEntryBuild = !gameMode.boostTrail.mesh;
   if(_firstEntryBuild) ensureBoostTrailMesh();
-  resetGameWarmup();   // the real shader warm-up runs from stepGameSim once the world is built (see ensureGameWarmup) — this only covers what exists THIS early
+  // Only reset if the preload did not already compile: resetGameWarmup throws away the warm state,
+  // and re-doing a sweep the spin already paid for is exactly the entry cost we are removing.
+  if(!(typeof gamePreload !== 'undefined' && gamePreload.step > 6)) resetGameWarmup();
   // MOBILE: also build the portal world (Region B dome, render targets, carved crystal) right
   // now, under the entry dive, instead of on the first gameplay frame — that build was the big
   // "loading in" freeze the moment the game started. One-time (buildPortal guards on P.built).
@@ -14854,39 +14717,18 @@ function enterGameMode() {
   // adjust this base; the per-frame adaptive term adds on top of it.
   gameMode.fovBase = camera.fov;
   camera.updateProjectionMatrix();
-  // Lock surface center to the gallery floor's crystal in world space, and bind the
-  // active crystal to it. Free-fall can later re-bind these to any other floor's crystal.
+  gamePrepSurface(true);
   var gf = gameMode.galleryFloor;
-  gameMode.surface.crystal = (gf && gf.group.userData.centerStar) ? gf.group.userData.centerStar : null;
-  gameMode.surface.floor = gf;
-  // Use the crystal mesh's ACTUAL world position (the centerStar sits ~1.5 below the floor
-  // origin), not the floor Y — otherwise the radial ray + grip fallback aim at the wrong point.
-  if(gameMode.surface.crystal){
-    // Lock the crystal so the carved hole faces HORIZONTALLY toward the camera (world +Z) for the
-    // whole game — the platform + bridge staging area sits in front of it. holeUpQuat is the crystal's
-    // fixed world orientation; the per-frame floor loop re-applies it (countering the floor's Y spin).
-    var holeDirLocal = new THREE.Vector3(-1, 1, 1).normalize();
-    var _Ftarget = new THREE.Vector3(0, 0, 1);
-    var _Q0 = new THREE.Quaternion().setFromUnitVectors(holeDirLocal, _Ftarget);
-    // Roll the crystal around the hole axis so the triangular doorway sits flat-edge-down (apex up).
-    // The three edges are ~equilateral; ENTRY_HOLE_ROLL_STEPS (0/1/2 → 0°/120°/240°) picks WHICH edge
-    // becomes the base so the hallway FLOOR (not a wall) lands at the bottom. Flip the step if it's off.
-    var _roll = holeRollForFlatBottom(holeDirLocal, _Ftarget, _Q0) + ENTRY_HOLE_ROLL_STEPS * (Math.PI * 2 / 3);
-    gameMode.portal.holeUpQuat = new THREE.Quaternion().setFromAxisAngle(_Ftarget, _roll).multiply(_Q0);
-    gf.group.updateMatrixWorld(true);
-    gameMode.surface.crystal.quaternion.copy(
-      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), -gf.group.rotation.y).multiply(gameMode.portal.holeUpQuat)
-    );
-    gameMode.surface.crystal.updateMatrixWorld(true);
-    gameMode.surface.crystal.getWorldPosition(gameMode.surface.center);
-  } else {
-    gameMode.surface.center.set(0, gf ? gf.group.position.y : 0, 0);
-  }
   // Build the portal (from the now hole-forward crystal) then the octagon platform + bridge staging
   // area in front of the mouth. buildPortal is idempotent; doing it here (not on the first game frame)
   // means the mouth/tube dimensions are known so the platform lines up with the hole.
   buildPortal();
-  var _estage = buildEntryStage();
+  // Now the portal exists, so the staging anchor can be moved into the arena. No-op if the
+  // preloader already did it mid-spin.
+  gameShiftStageToWorld();
+  // buildEntryStage() always tears down and rebuilds (clearEntryStage nulls gameMode.entry),
+  // so without this guard entry would throw away whatever the preloader stood up mid-spin.
+  var _estage = (gameMode.entry && gameMode.entry.built) ? gameMode.entry : buildEntryStage();
   // Spawn the ship at the CENTRE of the platform, sitting on top (normal +Y), facing the crystal hole
   // (−Z) so pressing W drives it across the bridge into the portal.
   if(_estage){
@@ -14938,6 +14780,52 @@ function enterGameMode() {
   selectedFloor = null;
   if(renderer && renderer.domElement && renderer.domElement.parentElement){
     renderer.domElement.parentElement.classList.remove('dragging');
+  }
+
+  // ── INSTANT ENTRY ─────────────────────────────────────────────────────────────────────────
+  // This fires at the exact frame the beam reaches the top crystal, which is also the frame the
+  // whiteout peaks — so the cut happens inside a fully white screen and reads as a teleport.
+  // The old path (decelerating = true → hold ~1s → damp → a camera dive) existed to give the
+  // heavy world-building somewhere to hide; gamePreloadStep does that during the spin now, so
+  // there is nothing left to cover and several seconds of watching the wheel slow down.
+  // Set GAME_INSTANT_ENTRY = false to get the original choreography back.
+  gameEntryFlash = 1;   // the flash marks the MOMENT OF TRANSPORT, whichever entry path follows
+  // THE TRANSPORT ITSELF. `inside` is what makes the frame render as the game world: the dark
+  // interior background, the far plane pushed out past the dome, and the atmosphere pass. `inB`
+  // tells the surface + crossing code which side of the portal it is standing on. Setting both
+  // here — inside the whiteout — is the moment the shop becomes the planet.
+  if(GAME_ENTRY_IN_WORLD && gameMode.portal && gameMode.portal.built){
+    gameMode.portal.inside = true;
+    gameMode.portal.inB = true;
+  }
+  if(GAME_INSTANT_ENTRY){
+    gameMode.decelerating = false;
+    if(gf){ gf.group.userData.velocity = 0; gf.group.userData.rpmSmooth = 0; gf.group.userData.lastAngle = gf.group.rotation.y; }
+    gameMode.lastCrystalRotY = gf ? gf.group.rotation.y : 0;
+    // Run the platform-forming morph straight to its end state rather than reimplementing it.
+    // updateEntryMorph is a pure function of its own frame counter and writes an explicit final
+    // pose once t >= TA+TB, so stepping it past that lands on exactly what the animation would
+    // have produced — no duplicated maths to drift out of sync when the morph is next edited.
+    startEntryMorphNow();
+    for(var _mf = 0; _mf < 260; _mf++) updateEntryMorph();
+    // Re-snap the ship: the platform moved under it while the morph ran.
+    var _ih = closestPointOnEntrySurface(gameMode.ship.position);
+    if(_ih){
+      gameMode.surfaceState.groundNormal.copy(_ih.normal).normalize();
+      gameMode.ship.position.copy(_ih.point).addScaledVector(gameMode.surfaceState.groundNormal, gameMode.surfaceState.hoverHeight);
+    }
+    var _icm = new THREE.Matrix4();
+    _icm.lookAt(new THREE.Vector3(0, 0, 0), gameMode.surfaceState.forward.clone().multiplyScalar(-1), gameMode.surfaceState.groundNormal);
+    gameMode.ship.quaternion.setFromRotationMatrix(_icm);
+    // Camera straight to the chase pose — no arc, no bump, no easing.
+    var _icp = computeChaseCamPose();
+    camera.position.copy(_icp.pos);
+    camera.up.copy(_icp.up).normalize();
+    camera.lookAt(_icp.lookAt);
+    gameMode.group.visible = true;
+    gameMode.entering = false;
+    gameMode.active = true;
+    gameMode.chargeProg = 0;
   }
 }
 
@@ -16030,7 +15918,12 @@ function advanceReversalGuide(ship, s){
 var AIR_ZOOM_EASE_OUT = 0.4, AIR_ZOOM_EASE_IN = 0.05;   // out ~90% in 5 frames; back in over ~1s
 function updateAirZoom(){
   var s = gameMode.surfaceState;
-  var want = (s.airborne || s.freeFalling || (s.barrelRoll && s.barrelRoll.active)) ? 1 : 0;
+  // FLIGHT COUNTS. Without it `_airZoom` decays to 0 across a flight and then rushes back out to
+  // AIR_ZOOM_TARGET (1.8x) in five frames the moment you exit — AIR_ZOOM_EASE_OUT is 0.4 — which
+  // is the camera lurch on every landing out of P. Flight IS airborne; the flight pose reads the
+  // same `_airZoom`, so now the toggle changes the framing by nothing at all.
+  var want = (s.airborne || s.freeFalling || (gameMode.fly && gameMode.fly.active)
+              || (s.barrelRoll && s.barrelRoll.active)) ? 1 : 0;
   var b = gameMode._airZoom || 0;
   b += (want - b) * (want > b ? AIR_ZOOM_EASE_OUT : AIR_ZOOM_EASE_IN);
   if(b < 0.0005) b = 0;
@@ -16063,6 +15956,175 @@ function camOrthoUp(lookTarget){
     if(camera.up.lengthSq() < 1e-8) camera.up.set(0, 1, 0);
   }
   camera.up.normalize();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// FLIGHT HANDOFF — making P invisible                                            (2026-09-02)
+//
+// Flight and the two surface loops are three different integrators with three different cameras,
+// and pressing P used to switch between them cold. Four separate things broke at that seam:
+//
+//   1. THE MOMENTUM WAS DELETED. `toggleFlightMode` zeroed `ss.speed` and left `ss.airTime` at 0
+//      — and the radial branch REBUILDS `arenaAirVel` from `jumpAxis·vertVel + forward·speed`
+//      whenever airTime is 0. So every bit of flight velocity was thrown away on the first
+//      surface frame. (`gravExitFlight` had always carried it correctly; only manual P did not.)
+//   2. ...AND THE CAP WOULD HAVE EATEN IT ANYWAY. The airborne cap is `jumpImpulse × 1.7` =
+//      0.029/frame near the ground, against a boosted 0.18 in flight and up to 1.73 in vacuum.
+//      Even a correct carry is clamped to a sixth of itself on the frame after.
+//   3. THE CAMERA JUMPED BACK 1.8×. `updateAirZoom` counts `airborne || freeFalling` — which
+//      flight is not, and which the surface becomes the instant you leave it — so exiting rushed
+//      the camera out to AIR_ZOOM_TARGET over five frames (AIR_ZOOM_EASE_OUT = 0.4). That is the
+//      lurch, and it happened on every single exit.
+//   4. THE LOOK TARGET WAS STALE. `gameMode._camLookSmooth` is the damped point the surface loops
+//      aim at; flight never touched it, so on exit the surface lerped toward its fresh target
+//      from wherever the ship had been when the flight STARTED, and swung the whole view to get
+//      there. (And the FOV: the crystal loop set it instantly from the ground drive speed, and
+//      the arena loop — where the real game is — has never had a FOV solver at all, so a wide
+//      flight FOV simply stayed wide forever after you landed.)
+//
+// FLYX is the seam. It carries the velocity across, holds the caps open while it bleeds off, and
+// blends the one camera quantity that cannot glide on its own. Everything is per-60Hz-frame.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+var FLYX = {
+  // ── THE CARRY ───────────────────────────────────────────────────────────────────────────
+  n: 240,                     // window length, frames (4s) — how long the caps stay open
+  f: 0,                       // frames left
+  v: new THREE.Vector3(),     // the world velocity flight handed over
+  spd: 0,                     // its magnitude, for the airborne cap
+  // ── THE FOV BLEND ───────────────────────────────────────────────────────────────────────
+  // Position and up need nothing: both solvers LERP from the live camera, so they are already
+  // continuous. The FOV is the one quantity a surface loop assigns outright, and the two modes
+  // measure speed against references 12x apart (p.boostMaxSpeed 0.015 on the ground against
+  // fly.boostMaxSpeed 0.18, x6 again in vacuum) — so a slow exit really does want two very
+  // different numbers and no amount of shared code makes them agree. Glide instead.
+  fovN: 40, fovF: 0, fov0: 0,
+
+  // Called from BOTH directions of toggleFlightMode. `vel` is the world velocity to carry (null
+  // when entering flight — there is nothing to hold open on the way in, only a FOV to glide).
+  arm: function(vel){
+    this.fov0 = camera.fov; this.fovF = this.fovN;
+    // RE-SEED THE JUMP-DAMP ANCHOR. updateCamAnchor keeps a damped altitude and shifts the chase
+    // pose DOWN by however far the ship has out-climbed it (_camExcess), so a hop holds its
+    // framing. It only runs in the surface loops — so across a flight _camAlt stays pinned at the
+    // altitude you took off from, and the first surface frame back reads an excess of the whole
+    // flight altitude and drops the camera by all of it. Measured: a 1.79-unit jump in ONE frame
+    // (camera 0.29 -> 1.71 from the hull) after a two-second flight. null makes the next
+    // updateCamAnchor re-seed from the live altitude, exactly as the portal cross already does.
+    gameMode._camAlt = null; gameMode._camExcess = 0;
+    if(vel){ this.v.copy(vel); this.spd = vel.length(); this.f = this.n; }
+    else { this.f = 0; this.spd = 0; this.v.set(0, 0, 0); }
+  },
+  // Flat at both ends: the carry holds, then bleeds, rather than decaying from frame one.
+  ease: function(){ var k = this.f / this.n; return k * k * (3 - k - k); },
+  tick: function(){ if(this.f > 0) this.f--; if(this.fovF > 0) this.fovF--; },
+
+  // The airborne speed cap, opened to whatever flight handed over and easing back to the value
+  // the jump physics would otherwise enforce.
+  airCap: function(maxAV){
+    if(this.f <= 0 || this.spd <= maxAV) return maxAV;
+    return maxAV + (this.spd - maxAV) * this.ease();
+  },
+  // The ground drive is a SCALAR along s.forward, so only the component along the heading can be
+  // represented — project live, which also means turning out of the carried line spends it, the
+  // way sliding sideways should. Squared ease: the ground bleeds a carry off about twice as fast
+  // as the air does, which is both what friction looks like and what keeps a 0.18/frame arrival
+  // from outrunning the surface grip's leash.
+  groundFloor: function(s){
+    if(this.f <= 0) return 0;
+    var t = this.v.dot(s.forward);
+    if(t <= 0) return 0;
+    var e = this.ease();
+    return t * e * e;
+  },
+  // Touchdown inside the window: hand the tangential part of the fall to the ground drive, so you
+  // arrive sliding instead of stopping dead. Outside the window every landing behaves exactly as
+  // it always has — an ordinary hop already preserves s.speed by never touching it.
+  land: function(s){
+    if(this.f <= 0 || !s.arenaAirVel) return;
+    var t = s.arenaAirVel.dot(s.forward);
+    if(t > s.speed) s.speed = t;
+  },
+  // ── THE FOLLOW LAG ──────────────────────────────────────────────────────────────────────
+  // An exponential ease toward a MOVING target never converges: it settles v x (1 - a) / a
+  // behind it. At walking pace and a = 0.18 that is 0.07 of a unit — the ground camera's tuned
+  // trail. Straight out of a flight the ship is doing 0.44 a frame and the same expression is
+  // 2.0, which reads as the camera dropping 0.29 -> 0.73 behind the hull on the seam frame.
+  //
+  // DO NOT CANCEL IT BY FEEDING THE PREDICTED LAG FORWARD. That is what the flight camera does,
+  // and it is safe there only because a lag clamp catches it. Out here it is unbounded and the
+  // prediction scales with speed: an auto-capture arriving at a planet (gravExitFlight, i.e.
+  // ENTERING AN ATMOSPHERE) hands over at up to 1.73/frame, so the term asks for 7.9 units of
+  // offset against a 0.27 chase distance — the camera is thrown clean past the hull and spends
+  // the window looking BACKWARD at it. Measured as exactly that report.
+  //
+  // Bound it instead. A clamp cannot overshoot by construction, whatever the speed: while the
+  // window is open the camera is pinned to the true chase pose and the bound eases back out to
+  // whatever the loop uses normally, so nothing outside the window changes.
+  lagTight: 0.01,
+  camLag: function(base){
+    if(this.f <= 0) return base;
+    var e = this.ease();
+    return base + (this.lagTight - base) * e;
+  },
+  // Apply a FOV, gliding out of whatever the other mode left on screen.
+  fov: function(want){
+    var f = want;
+    if(this.fovF > 0){
+      var k = this.fovF / this.fovN; k = k * k * (3 - k - k);
+      f = want + (this.fov0 - want) * k;
+    }
+    if(Math.abs(camera.fov - f) > 0.01){ camera.fov = f; camera.updateProjectionMatrix(); }
+  }
+};
+
+// ── THE SHIP'S WORLD VELOCITY ─────────────────────────────────────────────────────────────
+// Where it actually lives depends on which loop owns the frame, and none of the three is the
+// same field. Anything that wants "how fast is the ship really moving" — the FOV punch, the
+// speed blur, the handoff — reads it through here rather than through `s.speed`, which is the
+// ground DRIVE speed and is 0 for the whole time you are in the air.
+// (flyJumpCarryVel stays separate: it runs from flyJumpArm AFTER fly.active is already true and
+// deliberately wants the surface state, not fly.vel.)
+var _swvTmp = new THREE.Vector3();
+function shipWorldVel(out){
+  out = out || _swvTmp;
+  var s = gameMode.surfaceState, fly = gameMode.fly;
+  if(fly && fly.active) return out.copy(fly.vel);
+  // WHICH FIELD IS LIVE DEPENDS ON THE LOOP, and reading the wrong one is worse than reading none:
+  // the crystal loop integrates fly.vel through a free fall and never touches arenaAirVel, while
+  // the radial arena does the exact opposite. Same discriminator the physics itself branches on.
+  // portal.inside IS the loop dispatch (see stepGameSim), so it is the only honest test of which
+  // field is being integrated. combat.bodies is not: it is populated on the storefront too, where
+  // arenaAirVel is written by the handoff and then never touched again — which reported a ship
+  // coasting to a halt as still doing 0.477 a frame, forever.
+  if(gameMode.portal && gameMode.portal.inside){
+    if(s.airborne && s.arenaAirVel && s.arenaAirVel.lengthSq() > 1e-12) return out.copy(s.arenaAirVel);
+  } else if(s.freeFalling && fly && fly.vel.lengthSq() > 1e-12) return out.copy(fly.vel);
+  return out.copy(s.jumpAxis).multiplyScalar(s.vertVel || 0).addScaledVector(s.forward, s.speed || 0);
+}
+
+// The FOV the surface wants, shared by both surface loops so they cannot disagree. The arena
+// loop never had one at all, which is why a wide flight FOV used to stay wide after landing on a
+// planet — there was nothing left running to bring it home.
+function chaseSurfaceFovWant(){
+  return ((gameMode.fovBase != null) ? gameMode.fovBase : 60) + chaseSurfaceSpeedFrac() * 28;
+}
+function chaseSurfaceSpeedFrac(){
+  var p = gameMode.physics;
+  return Math.min(1, shipWorldVel(_swvTmp).length() / Math.max(1e-6, p.boostMaxSpeed));
+}
+
+// ── THE ONE LOOK TARGET ───────────────────────────────────────────────────────────────────
+// Every camera site in the game aims through this. `gameMode._camLookSmooth` is a single damped
+// point shared by the crystal loop, the arena loop, flight and the launch sequences — which is
+// exactly what makes a mode switch invisible: whichever solver runs next picks up from where the
+// last one left off instead of easing toward its own fresh target from one that is minutes stale.
+// `rate` >= 1 means the caller owns the target outright (a sequence, or a portal snap frame).
+function camLookAt(target, rate){
+  if(gameMode._camLookSmooth == null) gameMode._camLookSmooth = target.clone();
+  else if(rate >= 1) gameMode._camLookSmooth.copy(target);
+  else gameMode._camLookSmooth.lerp(target, rate);
+  camOrthoUp(gameMode._camLookSmooth);   // ← makes lookAt mathematically incapable of flipping
+  camera.lookAt(gameMode._camLookSmooth);
 }
 function computeChaseCamPose() {
   // Returns {pos, lookAt, up} for the chase camera.
@@ -16294,7 +16356,17 @@ function updateCamAnchor(inDome){
   if(!foot){ gameMode._camAlt = null; gameMode._camExcess = 0; return; }
   var alt = ship.position.clone().sub(foot.point).dot(foot.normal);
   if(gameMode._camAlt == null || gameMode.portal.snapCam) gameMode._camAlt = alt;   // init / portal-cross → snap (no lag)
-  else gameMode._camAlt += (alt - gameMode._camAlt) * GAME_CAM_JUMP_DAMP;
+  else {
+    // The damp deliberately LAGS the ship height so a hop holds its framing, and its steady-state
+    // lag is v x (1 - r) / r = nine times the per-frame climb at r = 0.1. That is a few hundredths
+    // for a jump and FOUR UNITS for a ship that just left flight at 0.48 a frame — the camera ends
+    // up further from the hull than the hull is long, which is not damping, it is losing the ship.
+    // So across the handoff window the follow starts GLUED and eases back to the tuned rate; by the
+    // time it is stock again the carry has bled off and the damp is seeing ordinary numbers.
+    var _jr = GAME_CAM_JUMP_DAMP;
+    if(typeof FLYX !== 'undefined' && FLYX.f > 0){ var _je = FLYX.ease(); _jr += (1 - _jr) * _je; }
+    gameMode._camAlt += (alt - gameMode._camAlt) * _jr;
+  }
   gameMode._camExcess = alt - gameMode._camAlt;   // hop height the camera hasn't followed yet
 }
 
@@ -17013,6 +17085,9 @@ function updateGamePhysicsAndCamera() {
     s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal)));
     if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
 
+    // FLIGHT CARRY. After the accel chain and before the move: every cap in that chain is a hard
+    // clamp, so a floor applied afterwards is the only place the carried speed survives.
+    { var _ffc = FLYX.groundFloor(s); if(_ffc > s.speed) s.speed = _ffc; }
     // ── Move ship tangentially along s.forward. Runs in the air too, so a hop
     //    carries its forward momentum and can still be steered (yaw above) —
     //    that's the air control the gravity rewrite had lost. ──
@@ -17174,6 +17249,7 @@ function updateGamePhysicsAndCamera() {
     // ── Air drag + fall-speed cap (terminal velocity) ── jump-fall speed (≈ jump impulse), small margin
     fly.vel.multiplyScalar(0.992);
     var maxAirVel = p.jumpImpulse * 1.15;
+    maxAirVel = FLYX.airCap(maxAirVel);   // just left flight → hold the speed it handed over
     if(fly.vel.length() > maxAirVel) fly.vel.setLength(maxAirVel);
 
     // ── Integrate ──
@@ -17249,6 +17325,7 @@ function updateGamePhysicsAndCamera() {
         if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
         s.speed = fly.vel.dot(s.forward);
         fly.vel.set(0, 0, 0);
+        if(s.arenaAirVel) s.arenaAirVel.set(0, 0, 0);   // this loop never integrates it — do not leave one behind
         s.airborne = false;
         s.freeFalling = false;
         s.airTime = 0;
@@ -17338,10 +17415,12 @@ function updateGamePhysicsAndCamera() {
   if(p.isBoosting) spawnBoostTrail();
 
   // === Adaptive FOV — widens linearly with speed for a sense of velocity ===
-  var fovBase = (gameMode.fovBase != null) ? gameMode.fovBase : 60;
-  var fovSpdRatio = Math.min(1, Math.abs(s.speed) / p.boostMaxSpeed);
-  camera.fov = fovBase + fovSpdRatio * 28;   // base → base+28° at boost-max speed
-  camera.updateProjectionMatrix();
+  // Fed the ship's TRUE world speed, not the ground drive scalar: `s.speed` reads 0 for the whole
+  // time you are in the air, so the punch used to vanish the instant you left the deck. On the
+  // ground the two are identical (world velocity there IS forward x speed), so driving is
+  // untouched. Through FLYX.fov so a mode switch glides instead of assigning outright.
+  var fovSpdRatio = chaseSurfaceSpeedFrac();
+  FLYX.fov(chaseSurfaceFovWant());
   // Radial speed blur (post) rides the same speed ratio — only ramps in past ~40% of boost-max, so
   // cruising stays crisp and it peaks with the FOV punch. No-op at low speed (uniform → 0).
   if(postQuad && postQuad.material.uniforms.speedBlur) postQuad.material.uniforms.speedBlur.value = Math.max(0.0, fovSpdRatio - 0.4) * 1.6;
@@ -17382,7 +17461,7 @@ function updateGamePhysicsAndCamera() {
       // Bound the follow-lag (see camClampLag). Generous enough that the drift swing — which is a
       // deliberate, tuned lag — is untouched, tight enough that riding an orbiting planet sweeping a
       // unit a frame cannot walk the camera off into space.
-      camClampLag(chase.pos, 0.45);
+      camClampLag(chase.pos, FLYX.camLag(0.45));   // tightened to a pin across a flight handoff
     }
     // ROTATION (up): 2026-07-21, user — "camera is a bit shaky as the ship moves on the terrain,
     // dampen it while drifting, more stable for aiming." Bumpy-terrain ground-normal wobble (fed
@@ -17397,16 +17476,9 @@ function updateGamePhysicsAndCamera() {
   // ground normal (via the drift pose's shipDir/right basis) and was being handed straight to
   // camera.lookAt() with ZERO damping every frame, regardless of how eased position/up were —
   // any per-frame terrain-normal noise showed up directly and instantly as crosshair jitter.
-  if(gameMode._camLookSmooth == null) gameMode._camLookSmooth = chase.lookAt.clone();
-  else {
-    // (the portal-cross snap frame already set _camLookSmooth = chase.lookAt.clone() above, so this
-    // lerp is a harmless no-op that frame — nothing extra needed to special-case it here.)
-    // Terrain-shake damping, as originally tuned.
-    var lookRate = gameMode.surfaceState.isDrifting ? 0.18 : 0.5;
-    gameMode._camLookSmooth.lerp(chase.lookAt, lookRate);
-  }
-  camOrthoUp(gameMode._camLookSmooth);   // ← makes lookAt mathematically incapable of flipping
-  camera.lookAt(gameMode._camLookSmooth);
+  // Terrain-shake damping, as originally tuned. (The portal-cross snap frame above already copied
+  // chase.lookAt in, so this lerp is a harmless no-op on that frame.)
+  camLookAt(chase.lookAt, gameMode.surfaceState.isDrifting ? 0.18 : 0.5);
   }
 }
 
@@ -17507,7 +17579,7 @@ function updateFlightPhysicsAndCamera() {
       camera.up.copy(FLYMODE.camUp).lerp(_lu2, _rls).normalize();
       var _lk = ship.position.clone().addScaledVector(_lu2, fly.ctl.lookUp * _lz);
       FLYMODE.camLook.lerp(_lk, 0.10 + 0.30 * _rls);
-      camOrthoUp(FLYMODE.camLook); camera.lookAt(FLYMODE.camLook);
+      camLookAt(FLYMODE.camLook, 1);   // the sequence owns it outright — but it must not go stale
       if(Math.abs(camera.fov - FLYMODE.camFov) > 0.05){ camera.fov = FLYMODE.camFov; camera.updateProjectionMatrix(); }
     }
     return;
@@ -17530,8 +17602,11 @@ function updateFlightPhysicsAndCamera() {
   // block below), so nothing here touches it.
   var rollAxis = (k.e ? 1 : 0) + (k.q ? -1 : 0);
   var vertAxis  = (k.space ? 1 : 0) + (k.ctrl ? -1 : 0);
-  var isBoosting = (gameMode.wBoost || k.shift || (t.active && t.boost)) && boostAllowed();   // boost: double-tap-W / Shift / touch
-  gameMode.physics.isBoosting = isBoosting;   // so the boost-fuel bar drains in flight too
+  // FLIGHT BOOST IS FREE. No boostAllowed() gate and no drain (see updateBoostFuel): holding
+  // SHIFT out here is the ordinary way to fly, not a metered resource. What IS metered is the
+  // ENGINE PULSE you spend while holding it — three charges, SPACE to fire one (see PULSE).
+  var isBoosting = (gameMode.wBoost || k.shift || (t.active && t.boost));   // boost: double-tap-W / Shift / touch
+  gameMode.physics.isBoosting = isBoosting;   // read by the FOV punch, the shake and the trail
 
   // BOOST WIND-UP. Climbs while held, bleeds off when released — so `bRamp` is 0 on the first
   // frame of a burn and 1 after a few seconds of holding it, and both thrust and the speed cap
@@ -17612,6 +17687,12 @@ function updateFlightPhysicsAndCamera() {
       fly.vel.copy(_flyDir).multiplyScalar(_s2);
     }
   }
+  // ── ENGINE PULSE ── SPACE while boosting spends one of three charges: the throat chokes for
+  // 0.43s while a mote field falls into it, then detonates. Before the drag and the cap, so the
+  // stroke is an ordinary thrust term and the hold below is what keeps the speed it buys.
+  // SPACE keeps its vertical thrust too — the pulse fires on the PRESS edge only, so holding it
+  // to climb through a burn behaves exactly as it always did.
+  PULSE.step(isBoosting, localFwd);
   // Vertical thrust along ship's local +Y (intuitive after tilts)
   if(Math.abs(vertAxis) > 0.01) {
     var localUp = new THREE.Vector3(0, 1, 0).applyQuaternion(ship.quaternion);
@@ -17652,6 +17733,11 @@ function updateFlightPhysicsAndCamera() {
     // back as it expires, so the release coasts instead of evaporating.
     fly.vel.multiplyScalar((1 - (1 - fly.drag) * (1 - JL.dragCut * _slK)) / fly.drag);
   }
+  // THE PULSE CARRY. Same shape as the sling hold and for the same two reasons: the cap alone
+  // is undone by the next frame's clamp, and the speed alone is deleted by drag long before the
+  // cap is ever consulted again. Fed the drag actually used this frame, so it is correct under
+  // water too (where fly.drag is not the number in force).
+  maxV = PULSE.capHold(maxV, _swim ? _swim.drag : fly.drag);
   if(fly.vel.length() > maxV) fly.vel.setLength(maxV);
   gameMode.flyMaxV = maxV;
 
@@ -17792,7 +17878,11 @@ function updateFlightPhysicsAndCamera() {
   //     pins the camera a full lag-length ahead of where it belongs.
   //   * Looking level with the hull while riding above it tilts the view axis down and throws
   //     the nose well above centre; the look target matches the camera's own height instead.
-  var _z4 = (gameMode.camZoom || 1) * C.zoom;   // the player is own zoom, exactly as grounded
+  // The player's own zoom AND the air-zoom pull-out, exactly as grounded — see updateAirZoom.
+  // Both terms must match the surface expression or P moves the camera.
+  var _z4 = (gameMode.camZoom || 1) * C.zoom;
+  var _az4 = gameMode._airZoom || 0;
+  if(_az4 > 0) _z4 += _az4 * Math.max(0, AIR_ZOOM_TARGET - _z4);
   var camLocalUp = new THREE.Vector3(0, 1, 0).applyQuaternion(ship.quaternion);
   var camPos = ship.position.clone()
     .addScaledVector(localFwd, -gameMode.camBackDist * _z4)
@@ -17824,16 +17914,14 @@ function updateFlightPhysicsAndCamera() {
     camClampLag(_flyTrue, gameMode.camBackDist * _z4 * C.camLag);
     camera.up.lerp(camLocalUp, C.camUp); camera.up.normalize();
   }
-  camOrthoUp(lookAt);
-  camera.lookAt(lookAt);
+  camLookAt(lookAt, 0.5);   // 0.5 = the surface loops' non-drifting rate; see camLookAt
 
   // Adaptive FOV — the punch the surface loop has always had and flight never did. Most of
   // why speed reads as speed.
   var _fovRef = Math.max(1e-6, fly.boostMaxSpeed * spdMul);
   var _sf = Math.min(1, fly.vel.length() / _fovRef);
   var _wantFov = ((gameMode.fovBase != null) ? gameMode.fovBase : 60) + _sf * C.fovPunch;
-  var _newFov = camera.fov + (_wantFov - camera.fov) * C.fovEase;
-  if(Math.abs(camera.fov - _newFov) > 0.01){ camera.fov = _newFov; camera.updateProjectionMatrix(); }
+  FLYX.fov(camera.fov + (_wantFov - camera.fov) * C.fovEase);
 }
 
 // ══════════════════════════════════════════════
@@ -18597,9 +18685,11 @@ function hideSpeedCounter(){ if(gameSpeedEl) gameSpeedEl.style.display = 'none';
 // Boosting drains the bar over `duration` s; once empty it LOCKS OUT and must recharge fully
 // over `recharge` s before you can boost again. The bar is only on screen while boosting (or
 // while locked out recharging from empty, so you can see the wait).
-// FLIGHT GETS A BIGGER TANK. On the surface a 1.5s burn is a combat resource and its balance is
-// tuned; in flight the same 1.5s is a tap, and crossing 1450 units between planets on it is
-// hopeless. So the tank is 5× deeper ONLY while flying — surface boosting is untouched.
+// FLIGHT NO LONGER DRAINS IT AT ALL (2026-09-01). This used to give flight a 5× deeper tank,
+// because crossing 1450 units between planets on a 1.5s burn is hopeless; the answer now is that
+// out there boosting is simply free, and the metered thing is the ENGINE PULSE you spend while
+// holding it (see PULSE). The multiplier below is kept because the drain branch is shared, but
+// flight can no longer reach it — surface boosting is, as before, untouched.
 var BOOST_FLY_DURATION_MUL = 5;
 var boostBar = { fuel: 1, lockout: false, duration: 1.5, recharge: 2.5, barEl: null, fillEl: null };
 function boostDurationNow(){
@@ -18622,6 +18712,8 @@ function ensureBoostBar(){
 }
 function updateBoostFuel(dt){
   ensureBoostBar();
+  // Ahead of the out-of-game early return, so the pips clear themselves on the way out.
+  PULSE.tick(dt); updatePulseHud();
   var B = boostBar;
   if(!gameMode.active || gameMode.exiting){
     // Out of game — keep it full + ready, hidden.
@@ -18629,6 +18721,11 @@ function updateBoostFuel(dt){
     return;
   }
   var boosting = !!gameMode.physics.isBoosting;
+  // FLIGHT BOOST IS FREE (2026-09-01). Out here the bar stops being a fuel gauge and becomes the
+  // WIND-UP readout instead — the visibility test below already shows it while boostRamp builds,
+  // which is the only thing left out there worth watching. The tank refills as if idle, so
+  // landing never hands you an empty one.
+  if(gameMode.fly && gameMode.fly.active) boosting = false;
   if(boosting){
     B.fuel -= dt / boostDurationNow();
     if(B.fuel <= 0){ B.fuel = 0; B.lockout = true; }     // ran out → must fully recharge
@@ -18654,6 +18751,54 @@ function updateBoostFuel(dt){
   // wind-up is still bleeding off (so you can watch the burn decay).
   var _bop = (boosting || B.lockout || _wind > 0.02) ? '1' : '0';
   if(B._opCache !== _bop){ B._opCache = _bop; B.barEl.style.opacity = _bop; }
+}
+
+// ── Engine-pulse charges ─────────────────────────────────────────────────────────────────
+// Three pips above the boost bar, flight only. Filled = a pulse in hand; the next one up fills
+// left-to-right as its cooldown runs, so the wait is something you watch rather than guess at.
+// Every write is change-gated, exactly as the bar's are — at full charges and idle this touches
+// no DOM at all, and it runs every single frame.
+var pulseHud = { el: null, pips: [], fills: [] };
+function ensurePulseHud(){
+  if(pulseHud.el) return;
+  var wrap = document.createElement('div');
+  wrap.id = 'game-pulse';
+  wrap.style.cssText = 'position:fixed;right:18px;bottom:66px;z-index:50;width:160px;height:7px;'
+    + 'display:flex;gap:4px;pointer-events:none;opacity:0;transition:opacity 0.25s;';
+  for(var i = 0; i < PULSE.max; i++){   // one pip per charge, so PULSE.max stays the only dial
+    var pip = document.createElement('div');
+    pip.style.cssText = 'flex:1;height:100%;background:rgba(20,16,30,0.65);'
+      + 'border:1px solid rgba(255,255,255,0.18);border-radius:3px;overflow:hidden;';
+    var fill = document.createElement('div');
+    fill.style.cssText = 'height:100%;width:0%;background:linear-gradient(90deg,#8ff0ff,#c9a3ff);'
+      + 'border-radius:2px;transition:width 0.08s linear;';
+    pip.appendChild(fill); wrap.appendChild(pip);
+    pulseHud.pips.push(pip); pulseHud.fills.push(fill);
+  }
+  document.body.appendChild(wrap);
+  pulseHud.el = wrap;
+}
+function updatePulseHud(){
+  ensurePulseHud();
+  var H = pulseHud;
+  // Flight only — it is a flight ability, and on the surface the bar below it is still a real
+  // fuel gauge that these pips would only confuse.
+  var show = !!(gameMode.active && !gameMode.exiting && gameMode.fly && gameMode.fly.active
+                && !gameMode.fps.active);
+  var op = show ? '1' : '0';
+  if(H._op !== op){ H._op = op; H.el.style.opacity = op; }
+  if(!show) return;
+  // The charging pip is the one directly above the count; everything below it is full and
+  // everything above it empty.
+  var partial = (PULSE.charges < PULSE.max) ? Math.max(0, Math.min(1, PULSE.cd / PULSE.cool)) : 0;
+  for(var i = 0; i < H.fills.length; i++){
+    var w = (i < PULSE.charges) ? 100 : (i === PULSE.charges ? Math.round(partial * 100) : 0);
+    var ws = w + '%';
+    if(H.fills[i]._w !== ws){ H.fills[i]._w = ws; H.fills[i].style.width = ws; }
+    // A spent pip glows while it is the one refilling, so the eye goes to the right one.
+    var bd = (i === PULSE.charges) ? 'rgba(143,240,255,0.55)' : 'rgba(255,255,255,0.18)';
+    if(H.pips[i]._bd !== bd){ H.pips[i]._bd = bd; H.pips[i].style.borderColor = bd; }
+  }
 }
 
 // ── Crosshair (screen-centre reticle = firing direction) ─────────────────────────────
@@ -36168,6 +36313,7 @@ function toggleFlightMode() {
     ss.barrelRoll.active = false;
     ss.barrelRoll.progress = 0;
     gameMode.wantJump = false;
+    FLYX.arm(null);   // no carry going IN (the launch sequences own the momentum) — only the FOV
   } else {
     // Fly → Surface: turn ON gravity, lose flight controls, same position.
     // Enter airborne state so surface mode treats us as falling (gravity
@@ -36194,6 +36340,27 @@ function toggleFlightMode() {
     var up = new THREE.Vector3(0, 1, 0).applyQuaternion(wq);
     ss.forward.copy(fwd).normalize();
     ss.groundNormal.copy(up).normalize();
+    // ── THE MOMENTUM ────────────────────────────────────────────────────────────────────
+    // The comment above this branch has always claimed the transition preserves fly.vel. It did
+    // not: ss.speed was zeroed and ss.airTime left at 0, and the radial branch REBUILDS
+    // arenaAirVel from `jumpAxis·vertVel + forward·speed` whenever airTime is 0 — so the whole
+    // velocity was thrown away on the first surface frame. gravExitFlight (the automatic
+    // gravity-capture exit) had carried it correctly all along; only manual P had not.
+    var _cv = gameMode.fly.vel;
+    if(!ss.arenaAirVel) ss.arenaAirVel = new THREE.Vector3();
+    ss.arenaAirVel.copy(_cv);
+    ss.airTime = 1;                       // ...and 1, not 0, so the rebuild above never runs
+    ss.jumpAxis.copy(ss.groundNormal);
+    // The crystal / dome loops have no world-velocity term at all — they integrate a radial
+    // vertVel plus a scalar drive along the heading — so hand them the same vector decomposed.
+    ss.vertVel = _cv.dot(ss.groundNormal);
+    // Clamped: this seed only has to be sane for the drift gates and the wing sweep to read on
+    // frame one — FLYX.groundFloor re-raises it to the real carried value inside the very same
+    // frame, so nothing is lost by not handing them a number four times their own ceiling.
+    ss.speed = Math.max(0, Math.min(gameMode.physics.boostMaxSpeed, _cv.dot(ss.forward)));
+    // Open the caps (see FLYX): a correct carry is still clamped to jumpImpulse x 1.7 = 0.029 a
+    // frame on the very next line of the airborne branch, which is a sixth of a boosted flight.
+    FLYX.arm(_cv);
   }
 }
 
@@ -38800,6 +38967,7 @@ function updatePortalInterior(){
   } else {
     s.coastFrames += 1; if(s.coastFrames > p.coastHoldFrames){ if(s.speed > 0) s.speed = Math.max(0, s.speed - p.coastLinearDecel); else if(s.speed < 0) s.speed = Math.min(0, s.speed + p.coastLinearDecel); }
   }
+  { var _ff = FLYX.groundFloor(s); if(_ff > s.speed) s.speed = _ff; }   // flight carry — see FLYX
   if(p.isBoosting) spawnBoostTrail();
 
   // ── yaw + tangential move (copied) ──
@@ -38865,6 +39033,7 @@ function updatePortalInterior(){
         maxAV = maxAV + (_cruise - maxAV) * _t;
       }
       if(gameMode._geyserBoost > 0){ gameMode._geyserBoost--; if((gameMode._geyserBoostVel || 0) > maxAV) maxAV = gameMode._geyserBoostVel; }   // GEYSER blast: lift the air-speed cap so the launch isn't clipped to a normal jump
+      maxAV = FLYX.airCap(maxAV);   // just left flight → hold the speed it handed over, easing back
       if(s.arenaAirVel.length() > maxAV) s.arenaAirVel.setLength(maxAV);
       ship.position.add(s.arenaAirVel); s.airTime += 1;
       if(s.barrelRoll.active){ s.barrelRoll.progress = Math.min(1, s.barrelRoll.progress + 1/s.barrelRoll.duration); var brP = s.barrelRoll.progress; var lat = s.barrelRoll.lateralPeak*(1-brP)*(1-brP); ship.position.addScaledVector(s.barrelRoll.lateralDir, lat); if(brP >= 1){ s.barrelRoll.active = false; s.barrelRoll.progress = 0; } }
@@ -38886,6 +39055,7 @@ function updatePortalInterior(){
               s.groundNormal.lerp(lp.normal, 0.5).normalize();
               ship.position.copy(lp.point).addScaledVector(s.groundNormal, s.hoverHeight);
               s.forward.sub(s.groundNormal.clone().multiplyScalar(s.forward.dot(s.groundNormal))); if(s.forward.lengthSq() > 0.0001) s.forward.normalize();
+              FLYX.land(s);   // touching down out of a flight arrives SLIDING, not stopped dead
               s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.airTime = 0; s.barrelRoll.active = false; s.barrelRoll.progress = 0;
             }
           }
@@ -39087,6 +39257,13 @@ function updatePortalInterior(){
   // ── chase camera — IDENTICAL framing to the crystal (computeChaseCamPose) so the portal-folded
   //    crystal pose equals the dome pose exactly: the cross is then truly seamless (no aim snap).
   //    Lock-on aware so the dome tank can be locked too. ──
+  // ADAPTIVE FOV. This loop is where the real game is and it has never had one: whatever the
+  // crystal loop or flight last assigned simply stayed on screen, so landing a flight on a planet
+  // left the view permanently wide. Same solver the crystal runs, same blend — and outside the
+  // branch below, exactly as the crystal has it, so a reversal hold cannot freeze it either.
+  FLYX.fov(chaseSurfaceFovWant());
+  if(postQuad && postQuad.material.uniforms.speedBlur)
+    postQuad.material.uniforms.speedBlur.value = Math.max(0.0, chaseSurfaceSpeedFrac() - 0.4) * 1.6;
   // TOTAL FREEZE during a counter-roll reversal, held until the ship is GUIDED into the
   // camera-computed target point — see the crystal apply site's comment for the full history and
   // triggerBarrelRoll's GUIDE-TO-TARGET comment for the math. Same fix, same reasoning.
@@ -39113,6 +39290,11 @@ function updatePortalInterior(){
       var swWP = gameMode.surfaceState.isDrifting ? (gameMode.driftCamSwing || 0) : 0;   // DRIFT SWING stiffens drift tracking (see crystal apply site)
       var camLerpP = (gameMode.surfaceState.isDrifting ? (0.13 + 0.77 * swWP) : 0.18) * bdampP;
       camera.position.lerp(chase.pos, camLerpP);
+      // THIS LOOP HAS NEVER HAD A LAG CLAMP — the crystal apply has always had one and this one
+      // never did, which is why an unbounded offset could walk the camera off the ship here and
+      // not there. Only applied across a flight handoff, so the arena camera is untouched the
+      // rest of the time; adding it permanently would change a tuned drift feel nobody asked for.
+      if(FLYX.f > 0) camClampLag(chase.pos, FLYX.camLag(0.45));
     }
     // ROTATION (up): more damping while drifting/aiming (see the crystal apply site — 2026-07-21
     // user req, bumpy-terrain ground-normal wobble reads as camera roll/tilt shake).
@@ -39122,12 +39304,11 @@ function updatePortalInterior(){
   // LOOK-AT: damped too — see the crystal apply site's comment (this was the biggest source of
   // shake, since chase.lookAt was being handed straight to camera.lookAt() every frame with no
   // damping at all, regardless of position/up).
-  if(gameMode._camLookSmooth == null) gameMode._camLookSmooth = chase.lookAt.clone();
-  else {
-    var lookRateP = (gameMode.surfaceState.isDrifting ? 0.18 : 0.5) * bdampP;
-    gameMode._camLookSmooth.lerp(chase.lookAt, lookRateP);
-  }
-  camera.lookAt(gameMode._camLookSmooth);
+  camLookAt(chase.lookAt, (gameMode.surfaceState.isDrifting ? 0.18 : 0.5) * bdampP);
+  // NOTE: routing through camLookAt also gives this site the camOrthoUp the crystal apply has
+  // always had and this one never did. It only removes the component of `up` along the view axis
+  // — which camera.lookAt discards anyway — so the ordinary frame is unchanged and the
+  // near-parallel frame stops flipping.
   }
 
   // ── exit: drive onto the return pad (placed behind the spawn-facing direction) ──
@@ -39412,7 +39593,6 @@ function init(){
   createGlassFBO();
   createBackdropBlur();
   createStarField();
-  createPlanets();
   // Set orb floor Y for light rays positioning + remember it for the mini game trigger
   for(var ofi=0;ofi<floors.length;ofi++){ if(floors[ofi].isOrbFloor){ orbFloorY=floors[ofi].group.position.y; gameMode.galleryFloor=floors[ofi]; break; } }
   createLightRays();
@@ -48843,6 +49023,7 @@ function flyModeEnsure(){
 function flyFillCruise(o){
   var fly = gameMode.fly;
   var hv = flyHover();
+  PULSE.fpApply();      // borrow the b2 gas params BEFORE FLYFX.update reads them out of FP
   o.t = FP.seqDur; o.u = 1; o.spool = 1; o.done = true;
   o.lift = FP.liftEnd; o.liftFrac = 1; o.split = 1; o.contact = 0;
   // ROTOR WASH. o.ground is what the dust and blast systems read, so feeding it the hover
@@ -48852,6 +49033,7 @@ function flyFillCruise(o){
   o.rattle = 0; o.nose = 0; o.throttle = FP.cruiseThr;
   o.vac = (typeof gameMode.flyVac === 'number') ? gameMode.flyVac : 0;
   o.boost = Math.max(o.vac * FP.b2Idle, fly.boostRamp || 0);
+  o.boost = PULSE.boostThr(o.boost);   // choke into the ignition, then the gush
   // The trio is what is holding the ship up, so it must not fold away while hovering — and it
   // works harder the closer to the deck it is.
   var airOrDeck = Math.max(1 - o.vac, hv.active ? 1 : 0);
@@ -49006,6 +49188,10 @@ function updateFlightEngines(){
   // FLYRIG drives the same pivots as updateWingSweep / updateCockpitSpin, so it only runs while
   // the liftoff owns the ship. In cruise the game's own animators keep the wings.
   if(FLYMODE.phase === 'lift') FLYRIG.update(o, 1);
+  // The pulse's accretion field + star + shockwave. Only in cruise: the sequences drive the very
+  // same sprites through flyJumpRig, and the liftoff owns FLYRIG's flare outright — so any other
+  // phase clears the pulse rather than drawing it (which also hands the borrowed FP back).
+  if(FLYMODE.phase === 'fly') PULSE.fx(); else PULSE.abort();
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
@@ -49392,6 +49578,7 @@ function flyJumpArm(){
   flyJumpCarryVel(_jlA);
   fly.vel.copy(_jlA);                       // THE CARRY. Manual P zeroes this; jump launch must not.
   FLYMODE.phase = 'jump'; FLYMODE.launched = false;
+  if(typeof PULSE !== 'undefined') PULSE.abort();   // never hand a sequence a borrowed FP
   JLS.stage = 'roll'; JLS.f = 0;
   JLS.rollDir  = (Math.random() < 0.5) ? -1 : 1;
   JLS.sideSign = -JLS.rollDir;              // the draw goes to the side OPPOSITE the roll
@@ -49657,7 +49844,7 @@ function flyJumpStep(){
 
   updateSpeedCounter(fly.vel.length());
   gameMode.flyVac = (typeof shipVacuumFrac === 'function') ? shipVacuumFrac(ship.position) : 0;
-  gameMode.physics.isBoosting = (JLS.stage !== 'roll');   // the sling burns real boost fuel
+  gameMode.physics.isBoosting = (JLS.stage !== 'roll');   // FOV punch / shake / trail; flight burns no fuel
 }
 
 // ── STAGE 1 · THE ROLL ────────────────────────────────────────────────────────────────────
@@ -50268,6 +50455,291 @@ try {
     }
   };
 } catch(e){}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// ENGINE PULSE — the burst you spend WHILE boosting
+//
+// Boost in flight is now free: holding SHIFT costs no fuel at all (see updateBoostFuel), so the
+// resource is no longer "how long may I burn" but "when do I spend a pulse". Three charges,
+// regenerating one at a time; SPACE while boosting spends one.
+//
+// ── THE 0.75 SECOND ───────────────────────────────────────────────────────────────────────
+// The whole event is exactly 45 frames — the sim is fixed-step at 60Hz (stepGameSim), so that
+// is 0.75s to the frame — and it is one continuous move in three parts:
+//
+//   GATHER   (0 → chokeF)     the throat CHOKES: the tail plume dims and narrows, the ship
+//                             sheds a few percent of its speed, and a field of motes is born on
+//                             a shell around the nozzle and falls inward. Nothing has fired yet.
+//   IMPLODE  (last impF)      the field stops replenishing and collapses; the ball of power
+//                             shrinks while it gets BRIGHTER. The energy went somewhere smaller.
+//   BURST    (chokeF → dur)   ignition. A four-point star at the throat, an expanding shock
+//                             ring, the throat blown out to blastThroat x its radius, and the
+//                             exhaust fired at several times its ordinary speed — the widening
+//                             is BORN at the nozzle and travels down the stream as a bulge,
+//                             because stepFlow sets each ring's radius from cfg.throat at birth.
+//
+// ── WHY THE THROTTLE NEVER DROPS BELOW 0.005 ──────────────────────────────────────────────
+// FLYFX's engine gate (`bThr > 0.005`) is binary and it switches the plume GEOMETRY, not its
+// brightness — dipping under it during the gather would delete the entire tail exhaust for
+// half a second, which reads as the engine cutting out rather than loading. The sling can get
+// away with a dark charge because it starts from a dark engine; a pulse is fired mid-burn, so
+// the choke DIMS to chokeThr and never crosses the gate.
+//
+// ── WHY A CAP HOLD, NOT AN IMPULSE ────────────────────────────────────────────────────────
+// Exactly the lesson slingHold exists for: raising the speed does nothing while the very next
+// frame's cap clamps it back off, and raising the cap does nothing while ordinary flight drag
+// deletes the speed you just paid for. So the pulse raises the cap AND suspends most of the
+// drag for holdFrames, easing both back — that hold is the "carries my momentum" part, and it
+// is much longer than the burn that earned it.
+//
+// Everything here is per-60Hz-frame except the charge cooldown, which is in seconds (it ticks
+// from updateBoostFuel so charges regenerate on the ground too).
+// ══════════════════════════════════════════════════════════════════════════════════════════
+var PULSE = {
+  // ── THE CHARGES ─────────────────────────────────────────────────────────────────────────
+  max:          3,      // how many pulses you carry
+  charges:      3,      // live
+  cool:      5.00,      // SECONDS to regenerate ONE charge (they refill one at a time)
+  cd:           0,      // live cooldown accumulator
+
+  // ── THE 0.75s ───────────────────────────────────────────────────────────────────────────
+  dur:         45,      // frames — 0.75s at the fixed 60Hz step. THE WHOLE EVENT.
+  chokeF:      26,      // gather ends / ignition fires here (0.43s in)
+  impF:         9,      // the collapse, run over the last frames of the gather
+  tail:        26,      // FX-only frames after the burst, so the shock ring can finish
+
+  // ── THE GATHER ──────────────────────────────────────────────────────────────────────────
+  chokeThr:  0.30,      // x the live boost throttle while loading (MUST stay above 0.005)
+  chokeR:    0.62,      // x the nozzle radius while choked — narrow, then blown out
+  chokeDrag: 0.0016,    // speed shed per gather frame; ~4% over the choke. Loading, not braking.
+
+  // ── THE BURST ───────────────────────────────────────────────────────────────────────────
+  burstThr:  1.00,      // throttle at ignition, decaying back across the burst
+  blastThroat: 4.20,    // x the nozzle radius at ignition — the gush, widest at frame one
+  blastSpread: 2.10,    // x the downstream cone growth, so the bulge keeps opening as it goes
+  blastPush:   3.40,    // x the exhaust ejection speed — the gas is thrown, not laid
+  blastCore:   1.70,    // x the white-hot barrel. Modest: this is an additive tube and it
+                        // turns into a white capsule long before it looks brighter.
+  blastPow:    1.60,    // >1 = the widening decays fast and then lingers
+
+  // ── THE SPEED ───────────────────────────────────────────────────────────────────────────
+  // Measured against the FULLY WOUND boost cap (boostMaxSpeed x (1+boostRampSpeed) x the vacuum
+  // multiplier), i.e. against the best a held boost can ever reach — the same reference
+  // jlTargetSpeed uses, and for the same reason: measuring against bare boostMaxSpeed quietly
+  // makes every multiplier here 1.6x smaller than it reads.
+  speedMul:  1.60,      // x that cap, per pulse
+  maxMul:    3.10,      // ...and where chained pulses stop compounding
+  mul:       1.00,      // live stack (1 = no pulse held)
+  gain:      0.17,      // how hard the burst closes the gap to the target each frame
+  holdFrames: 300,      // 5s of raised cap + suspended drag: "carry my momentum for a while"
+  dragCut:   0.92,      // how much of flight drag the hold suspends at its peak
+  hold:         0,      // live
+
+  // live animation state
+  f:           -1,      // frame within the event; <0 = idle
+  prevSpace: false,
+
+  // ── FP BORROW ───────────────────────────────────────────────────────────────────────────
+  // FLYFX reads its gas parameters straight out of FP, and FP is the preview Copy-JSON payload
+  // that has to stay re-pasteable — so the pulse borrows the five fields it needs every frame
+  // and hands them back the moment it ends. Always recomputed from the saved base, so applying
+  // twice in a frame is the same as applying once.
+  fp: null,
+
+  active: function(){ return this.f >= 0; },
+  canFire: function(){ return this.charges > 0 && this.f < 0; },
+
+  // Seconds-based charge regen. Runs from updateBoostFuel, so charges come back on the ground
+  // too and you never enter flight empty.
+  tick: function(dt){
+    if(!gameMode.active || gameMode.exiting){ this.charges = this.max; this.cd = 0; return; }
+    if(this.charges >= this.max){ this.cd = 0; return; }
+    this.cd += dt;
+    while(this.cd >= this.cool && this.charges < this.max){ this.cd -= this.cool; this.charges++; }
+    if(this.charges >= this.max) this.cd = 0;
+  },
+
+  // The speed one pulse is worth, at the live stack. The cap hold below derives from the same
+  // expression, so the burst can never reach a velocity the next frame clamps off.
+  target: function(){
+    var fly = gameMode.fly;
+    var sm = 1 + (fly.spaceSpeedMul - 1) * (gameMode.flyVac || 0);
+    if(typeof SWIM !== 'undefined' && SWIM.on) sm = SWIM.cfg().speedMul;
+    return fly.boostMaxSpeed * (1 + fly.boostRampSpeed) * sm * this.mul;
+  },
+
+  fire: function(){
+    if(!this.canFire()) return false;
+    this.charges--;
+    this.f = 0;
+    this.mul = Math.min(this.maxMul, Math.max(1, this.mul) * this.speedMul);   // chain compounds
+    // THE HOLD STARTS NOW, not at the end of the burn. The stroke below pushes past the ordinary
+    // boost cap, and `fly.vel.setLength(maxV)` runs on the very same frame — so without the raised
+    // cap already in force the burst would be clamped straight back off and the pulse would do
+    // visibly nothing. end() restarts it, so the carry is a full holdFrames from the burn's end.
+    this.hold = this.holdFrames;
+    // A fresh field every time. The implosion deliberately kills motes WITHOUT replacing them —
+    // that is what makes the charge run out rather than cycle — so without this re-seed the
+    // gather is visible exactly once per page load (the same trap jlFxReset exists for).
+    if(typeof jlFxReset === 'function') jlFxReset();
+    if(typeof JLS !== 'undefined'){ JLS.ringF = 1e9; JLS.flash = 0; }
+    return true;
+  },
+
+  // Trigger + thrust. Called from the flight integrator BEFORE drag and the cap.
+  step: function(isBoosting, fwd){
+    var fly = gameMode.fly, k = gameMode.keys;
+    var pressed = !!k.space && !this.prevSpace;
+    this.prevSpace = !!k.space;
+    if(pressed && isBoosting) this.fire();
+
+    if(this.f < 0) return;
+    this.f++;
+    if(this.f > this.dur + this.tail){ this.end(); return; }
+
+    if(this.f <= this.chokeF){
+      // LOADING. A few percent off the top, so the release has something to release against.
+      fly.vel.multiplyScalar(1 - this.chokeDrag);
+      return;
+    }
+    if(this.f > this.dur) return;   // tail frames are FX only
+
+    // THE STROKE. Closing a fraction of the gap to the target each frame gives a hard kick on
+    // frame one that eases as it converges — and it self-limits, so the same numbers work at
+    // 0.29/frame in atmosphere and 1.73/frame in vacuum without a second set of constants.
+    var u = (this.f - this.chokeF) / Math.max(1, this.dur - this.chokeF);
+    var env = Math.pow(1 - u, 1.40);
+    var want = this.target();
+    var spd = fly.vel.length();
+    if(spd < want) fly.vel.addScaledVector(fwd, (want - spd) * this.gain * env);
+  },
+
+  // The cap hold + drag suspension. Called from the flight integrator AFTER drag, alongside
+  // the sling's own hold. Returns the cap it wants; the caller takes the larger.
+  capHold: function(maxV, dragUsed){
+    var fly = gameMode.fly;
+    if(this.hold <= 0) return maxV;
+    this.hold--;
+    var kk = this.hold / this.holdFrames;
+    kk = kk * kk * (3 - kk - kk);      // flat at both ends: a long carry, then a bleed
+    var c = maxV + (this.target() - maxV) * kk;
+    // Suspending the drag is not optional. Measured on the sling: the cap alone left 2.55 →
+    // 0.45 in 200 frames with the cap sitting at 1.73 the whole way, because drag deletes the
+    // speed long before the cap is ever consulted again.
+    fly.vel.multiplyScalar((1 - (1 - dragUsed) * (1 - this.dragCut * kk)) / dragUsed);
+    if(this.hold <= 0) this.mul = 1;
+    return c > maxV ? c : maxV;
+  },
+
+  // ── THE EXHAUST OVERRIDE ────────────────────────────────────────────────────────────────
+  fpApply: function(){
+    if(this.f < 0) return;
+    if(!this.fp) this.fp = { thr: FP.b2Throat, spr: FP.b2Spread, ex: FP.b2Exhaust,
+                             cr: FP.b2CoreRad, rel: FP.b2ExhaustRel };
+    var F = this.fp;
+    if(this.f <= this.chokeF){
+      var c = this.f / Math.max(1, this.chokeF);
+      FP.b2Throat = F.thr * (1 + (this.chokeR - 1) * c);
+      FP.b2Spread = F.spr; FP.b2Exhaust = F.ex; FP.b2CoreRad = F.cr; FP.b2ExhaustRel = F.rel;
+      return;
+    }
+    // WIDE, THEN NARROWING. The blast opens at blastThroat x the nozzle radius and settles
+    // back, which is what makes the ignition read as a detonation rather than a throttle step.
+    var b = Math.pow(Math.max(0, 1 - (this.f - this.chokeF) / Math.max(1, this.dur - this.chokeF)), this.blastPow);
+    FP.b2Throat     = F.thr * (1 + (this.blastThroat - 1) * b);
+    FP.b2Spread     = F.spr * (1 + (this.blastSpread - 1) * b);
+    FP.b2Exhaust    = F.ex  * (1 + (this.blastPush   - 1) * b);
+    FP.b2ExhaustRel = F.rel;
+    FP.b2CoreRad    = F.cr  * (1 + (this.blastCore   - 1) * b);
+  },
+  fpRestore: function(){
+    var F = this.fp; if(!F) return;
+    FP.b2Throat = F.thr; FP.b2Spread = F.spr; FP.b2Exhaust = F.ex;
+    FP.b2CoreRad = F.cr; FP.b2ExhaustRel = F.rel;
+    this.fp = null;
+  },
+
+  // What the tail blaster burns while the pulse owns it. `base` is whatever cruise asked for.
+  boostThr: function(base){
+    if(this.f < 0 || this.f > this.dur) return base;
+    if(this.f <= this.chokeF){
+      // Choked — dimming into the ignition, and stuttering against its own chamber so it reads
+      // as pressure building rather than as a fade-out. Never under FLYFX's 0.005 gate.
+      var c = this.f / Math.max(1, this.chokeF);
+      var flick = 0.80 + 0.20 * Math.sin(this.f * 1.31) * Math.sin(this.f * 0.47 + 1.3);
+      return Math.max(0.02, base * (1 + (this.chokeThr - 1) * c) * flick);
+    }
+    var b = Math.pow(Math.max(0, 1 - (this.f - this.chokeF) / Math.max(1, this.dur - this.chokeF)), 1.10);
+    var burst = this.burstThr * b + base * (1 - b);
+    return burst > base ? burst : base;
+  },
+
+  // ── THE ANIMATION ───────────────────────────────────────────────────────────────────────
+  // The accretion field, the ball, the shockwave and the four-point star are the sling's, driven
+  // here instead: jlFxUpdate is a pure function of (charge, flash, implosion) about the b2
+  // nozzle, and it is idle during cruise (flyJumpRig is its only other caller and that runs
+  // only in the jump/sling phases), so nothing has to be duplicated to reuse it.
+  fx: function(){
+    if(this.f < 0) return;
+    if(typeof jlFxUpdate !== 'function' || typeof JLS === 'undefined') return;
+    var chg = 0, imp = 0;
+    if(this.f <= this.chokeF){
+      chg = _ss(0, 0.92, this.f / Math.max(1, this.chokeF));
+      var iw = this.chokeF - this.impF;
+      imp = (this.impF > 0 && this.f > iw) ? Math.min(1, (this.f - iw) / this.impF) : 0;
+    } else {
+      // Spent. The field is gone; only the star and the shock ring are left running.
+      if(this.f === this.chokeF + 1){ JLS.flash = 1; JLS.ringF = 0; }
+      JLS.flash = Math.max(0, JLS.flash - 1 / JL.flashFrames);
+    }
+    JLS.charge = chg; JLS.implode = imp;
+    JLS.f = this.f;             // the ball's own idle pulsation reads this
+    // The four-point star at the throat — FLYRIG's flare, on the takeoff's own curve.
+    var R = (typeof FLYRIG !== 'undefined') ? FLYRIG.rig() : null;
+    if(R && R.flare){
+      if(JLS.flash > 0.004){
+        var fl = 1 - JLS.flash, sh = gameMode.ship;
+        R.flare.visible = true;
+        R.flare.position.set(FP.b2X, FP.b2Y, FP.b2Z).multiplyScalar(sh.scale.x)
+               .applyQuaternion(sh.quaternion).add(sh.position);
+        R.flare.quaternion.copy(camera.quaternion);
+        R.flare.scale.setScalar(JL.flashSize * (0.45 + 1.55 * fl));
+        R.flare.material.opacity = JLS.flash * JLS.flash;
+      } else if(R.flare.visible) R.flare.visible = false;
+    }
+    jlFxUpdate(chg, JLS.flash, imp);
+  },
+
+  // Shared by end() and abort(): put the borrowed FP back and take every sprite off screen.
+  _clearFx: function(){
+    this.fpRestore();
+    if(typeof JLS !== 'undefined'){ JLS.charge = 0; JLS.implode = 0; JLS.flash = 0; JLS.ringF = 1e9; }
+    if(typeof jlFxUpdate === 'function') jlFxUpdate(0, 0, 0);   // hide the ball / streaks / ring
+    var R = (typeof FLYRIG !== 'undefined') ? FLYRIG.rig() : null;
+    if(R && R.flare) R.flare.visible = false;
+    if(typeof jlFxReset === 'function') jlFxReset();
+  },
+
+  end: function(){
+    if(this.f < 0) return;
+    this.f = -1;
+    this.hold = this.holdFrames;         // the carry starts where the burn stops
+    this._clearFx();
+  },
+
+  // Every way out of flight — P again, death, a portal, exitGameMode — and the launch sequences,
+  // which must not inherit a borrowed FP (JLS.fp would capture the OVERRIDDEN values as its base).
+  abort: function(){
+    if(this.f >= 0){ this.f = -1; this._clearFx(); }
+    this.fpRestore(); this.hold = 0; this.mul = 1;
+    // NOT false. This runs every surface frame (updateFlightEngines calls it whenever the phase
+    // is not 'fly'), so zeroing the edge state would make a SPACE still held from the jump that
+    // started the flight read as a fresh press on the first airborne frame — and fire a pulse
+    // nobody asked for. Adopting the live key state instead means only a real new press counts.
+    this.prevSpace = !!(gameMode.keys && gameMode.keys.space);
+  }
+};
+try { window.__PULSE = PULSE; } catch(e){}
 
 var FLYAIR = (function(){
   var NLC = String.fromCharCode(10);
@@ -61578,6 +62050,7 @@ function stepGameSim(dt){
     }
     checkGameLanded();   // airborne→grounded transition: reset jump/hover budgets + Ground Stomp blast
   }
+  FLYX.tick();           // flight-handoff carry + FOV blend windows
   updateAirZoom();       // jump/roll → pull the chase camera out for the hop, drift back in after
   updateRollCamFollow(); // barrel-roll camera hold: damped-follow the live heading (once/frame — see its own comment)
   updateBoostTrail();
@@ -61652,8 +62125,8 @@ function _perfHud(dt){   // add ?fps to the URL to show a frame-time readout (to
 // black, `bg·T` goes to nothing, and what is left is L — clouds lit from inside the tower, getting
 // brighter as the crystal does. Nothing cross-fades; the same equation does both ends.
 //
-// Press H → CLOUDS tab for the parameter window. TODO: delete the CSKY rows from CHUD_PANEL once
-// the values are dialled in.
+// PUBLIC BUILD: the H parameter window is deleted in this file. Tune the clouds in
+// `Chrysolin Website.html` (H → CLOUDS tab) and copy the values across.
 // ══════════════════════════════════════════════════════════════════════════════════════════
 // ── GLSL ──────────────────────────────────────────────────────────────────────────────────
 // 32³ instead of the atmosphere's 64³: this is background cloud at a quarter of the screen's
@@ -61905,6 +62378,14 @@ var P = {
   // survive — the phase function's range is 530:1, so "lit by the key" means a handful of pixels.
   // Sky bounce leaves, crystal bounce arrives, and the clouds get brighter, not dimmer.
   ambSpin: 1.84,
+  // HOW FAST THE SPIN BRIGHTENS THE SKY. The raw signal is the site's own crescendo energy, and
+  // that is built to slam: `godrayIntensity` is already at 2.2 of its 3.2 by about 86 rpm out of
+  // 960, because the screen has to go black almost the moment you touch the wheel. Riding it
+  // directly meant the clouds hit near-full brightness in the first second of spinning. This
+  // curve holds them back over that early range and hands the brightness to the top of the
+  // climb instead — the PEAK is unchanged, only the approach to it. Higher = stays dim longer.
+  lightCurve: 3.0,
+  lightGain: 1.0,         // overall amount of the spin's contribution (1 = the full peak)
   // Hand-picked, and NOT a sky colour on its own: the bounce is a green-teal and `tint` a cool
   // blue-grey, so what the eye gets is their product. Reading either one in isolation is
   // misleading — change one and the other has to move with it.
@@ -62182,7 +62663,10 @@ function update(dt){
     _tmp.set(Math.cos(el)*Math.sin(az), Math.sin(el), -Math.cos(el)*Math.cos(az));
     _sd.lerp(_tmp, 1 - P.sunLock).normalize();
   }
-  var spin = _spin();
+  // _spin() is the site's crescendo energy on 0→2.2. Normalise, shape, and put it back on the
+  // same scale, so lightCurve 1 / lightGain 1 is exactly the old behaviour and the top end never
+  // moves however hard the curve is bent.
+  var spin = Math.pow(Math.min(1, _spin() / 2.2), Math.max(0.2, P.lightCurve)) * 2.2 * P.lightGain;
   var sunI = P.sunBase + P.sunGain * spin;
   // TWO AMBIENT SOURCES, and the handover between them is the whole effect. `sky` is the page
   // itself, which the site's own crescendo takes to black; `crys` is the crystal, which the same
@@ -62221,6 +62705,7 @@ function update(dt){
                          P.ambCol[2] + (P.sunCol[2] - P.ambCol[2]) * w);
   u.uTint.value.setRGB(P.tint[0], P.tint[1], P.tint[2]);
   u.uSunI.value = sunI; u.uAmb.value = amb; u.uDark.value = P.dark;
+  M.lit = spin; M.sunI = sunI; M.ambNow = amb;   // harness readout only
   u.uPowder.value = P.powder; u.uSilver.value = P.silver;
   u.uG1.value = P.g1; u.uG2.value = P.g2; u.uAbsorb.value = P.absorb;
   u.uBright.value = P.bright; u.uShadow.value = P.shadow;
@@ -62307,7 +62792,9 @@ return {
              steps:M.mCloud.uniforms.uSteps.value,
              hz:Math.round(P.hz + (P.hzSpin - P.hz) * (M.spinT || 0)),
              avgMs:M.avg.toFixed(1), baseMs:M.base.toFixed(1),
-             rate:M.rate.toFixed(2), spinT:(M.spinT || 0).toFixed(2), rpm:Math.round(_wheelRpm()) };
+             rate:M.rate.toFixed(2), spinT:(M.spinT || 0).toFixed(2), rpm:Math.round(_wheelRpm()),
+             raw:_spin().toFixed(2), lit:(M.lit || 0).toFixed(3), sunI:(M.sunI || 0).toFixed(3),
+             amb:(M.ambNow || 0).toFixed(3) };
   }
 };
 })();
@@ -62328,14 +62815,19 @@ return {
 // It lives in the MAIN scene, so renderGlassFBO() captures it and the nav/cart glass refracts
 // it. Hidden during gameMode and during the cube-camera reflection pass.
 //
-// Press H (or ?hud) for the temporary parameter window. TODO: delete the CHUD_PANEL block and
-// the H binding once the values are dialled in.
+// PUBLIC BUILD: the H / ?hud parameter window is deleted in this file — see the marker further
+// down. Tune in `Chrysolin Website.html` and copy the values across.
 // ══════════════════════════════════════════════════════════════════════════════════════════
 var CHUD = (function(){
 'use strict';
 
 var P = {
   on: true,
+  // PUBLIC BUILD: the bottom-right particle orb. Switching it off also retires the arc text and
+  // the elbow leader (see sysFeed / contour / lnkOn below) — both are laid out against the
+  // sphere's silhouette and have nothing to describe without it. Everything else in the chrome
+  // is independent and unaffected.
+  sphere: !PUBLIC_BUILD,
   count: GAME_LOW_FX ? 3000 : 16000,
   size: 1.0, bright: 1.0, scale: 0.68, spin: 0.30,
   // ── protrusion ──
@@ -62351,9 +62843,16 @@ var P = {
   // ── placement ──
   anchorX: 0.865, anchorY: 0.805, lag: 0.16,
   // ── bottom scroller ──
-  tlCells: 34,        // segments PER SECTION
-  tlWidth: 0.53,      // fraction of screen width
-  tlY: 84,            // px up from the bottom edge
+  // PUBLIC BUILD: full-bleed strip standing on the bottom edge of the screen. The same asset
+  // ships to phone and desktop, so what is held constant across them is the segment DENSITY
+  // (tlSlotPx), not the segment COUNT — see tlPerSec where the count is solved per frame.
+  tlCells: 34,        // segments per section — now a CAP on the solved count, not the count
+  tlSlotPx: 9,        // target px per slot. The count adapts to hold a tick this wide anywhere
+  tlRise: PUBLIC_BUILD ? 1 : 0,   // 1 = cells STAND on the bottom edge and grow up
+  tlLabelY: 78,       // px above the bottom edge for the section names (rise mode)
+  tlFadeA: 0.22,      // peak alpha of the black wash at the very bottom edge. 0 = no wash
+  tlWidth: PUBLIC_BUILD ? 1 : 0.53,   // fraction of screen width — 1 = border to border
+  tlY: PUBLIC_BUILD ? 0 : 84,         // px up from the bottom edge (0 = flush)
   tlCellW: 0.59,      // cell width as a fraction of its slot
   tlRound: 0.16,      // 0 = square, 1 = full pill
   tlBaseH: 6,         // resting height of a minor cell
@@ -62363,7 +62862,7 @@ var P = {
   tlTrail: 107,       // px/sec the swell decays — LOWER = longer trail behind the playhead
   tlAlpha: 1.0,
   // ── nested tracker lines under the scroller ──
-  tkOn: 1, tkCount: 3,
+  tkOn: PUBLIC_BUILD ? 0 : 1, tkCount: 3,   // PUBLIC BUILD: no "under" left to sit in
   tkLen: 0.62,        // length of the first line, as a fraction of the track
   tkRatio: 0.55,      // each next line, as a fraction of the one above
   tkGap: 9,           // vertical spacing
@@ -62372,7 +62871,10 @@ var P = {
   tkMark: 6,          // length of the position mark
   tkAlpha: 1.0,
   // ── curved tail off the right end of the scroller ──
-  ceCount: 3, ceLen: 26, ceGrow: 1.45, ceGap: 7,
+  // PUBLIC BUILD: the three curved segments trailing off the right end of the scroller. Zero is
+  // a clean skip — the draw is guarded on ceCount > 0.5 — and the remaining params are left as
+  // they were so the tail can be brought back by changing one number.
+  ceCount: PUBLIC_BUILD ? 0 : 3, ceLen: 26, ceGrow: 1.45, ceGap: 7,
   ceCurve: 0.030,     // peak turn rate (rad/px) at the end of the run — 0 = dead straight
   ceDir: 1,           // 1 = sweep up the orb's near side, 0 = sweep down
   ceThick: 3,
@@ -62403,6 +62905,9 @@ var P = {
   txBallScale: 1.62,
   // ── chrome ──
   // ── top-left system text ──
+  // PUBLIC BUILD: the rising feed in the top-left corner. Unlike the sphere's arc text this one
+  // is free-standing, so it switches off on its own without taking anything else with it.
+  sysLeft: !PUBLIC_BUILD,
   tlxRows: 14, tlxRowH: 16, tlxSize: 7.0, tlxSpace: 0.8, tlxAlpha: 1.0,
   tlxRate: 0.6,       // seconds between new lines
   tlxW: 300,          // panel width
@@ -62412,7 +62917,7 @@ var P = {
   chrome: true, timeline: true, label: true,
   labelW: 210, labelH: 48, labelY: 54,   // px: pill size and its resting Y once pulled down
   // ── particle rivers ── (every other river param lives per-river in RV[], below)
-  river: true,           // master switch for both streams
+  river: !PUBLIC_BUILD,  // PUBLIC BUILD: master switch for both streams — off here
   riverSel: 0,           // which river the panel is editing: 0 = A, 1 = B, 2 = both
   rvRocks: false,        // draw the rock outlines — a tuning aid, not part of the look
   dark: false            // false = light ground (the live site). true = the dark-preview palette.
@@ -62476,6 +62981,7 @@ var feedRev = 0;
 var slLastRev = -1;
 var sfLastRev = -1, sfLastBX = -9e9, sfLastBY = -9e9, sfLastBR = -1, sfLastBtnY = -9e9;
 var tlLift = null, tlN = 0, tlTrackPx = 800;
+var tlPerSec = 34;   // segments per section, SOLVED from the viewport each frame (see tlSlotPx)
 var tlLastOrbY = -9e9;
 var chromeClock = 0, tlLast = -9, tlLastScroll = -9, tlLastSec = -1, tlLastW = -1, slLast = -9, ctLast = -9, ctLastWord = '';
 var mouse = null;
@@ -62783,11 +63289,15 @@ function buildField(N){
 function build(){
   if(built) return;
   SECS = sectionNames();
-  buildField(P.count);
+  // PUBLIC BUILD: two particles, not sixteen thousand. The field stays fully built — geometry,
+  // attributes, material, group — so every later reference is valid and the switch is a pure
+  // flip, but the per-frame loop is bounded by `n` and now costs nothing. Two rather than zero:
+  // fib(1) divides by (N-1) and would write a NaN position.
+  buildField(P.sphere ? P.count : 2);
   rvBuild();
   if(GAME_LOW_FX){ RV[0].count = 700; RV[1].count = 600; RV[0].nOct = 2; RV[1].nOct = 2; }
   applyTheme();
-  buildMask(SECS[0]);
+  if(P.sphere) buildMask(SECS[0]);   // PUBLIC BUILD: no sphere, no protrusion mask (~22ms each)
   timeline   = makePlane(900, 260, 8900);
   sysFeed    = makePlane(560, 900, 8900, FEED_PR);
   contour    = makePlane(400, 400, 8890);
@@ -62799,7 +63309,7 @@ function build(){
   // Pre-warm the remaining masks off the critical path — 22 ms each, and we never want that
   // landing inside a scroll frame.
   var warm = (window.requestIdleCallback || function(f){ setTimeout(f, 1200); });
-  warm(function(){ for(var i = 0; i < SECS.length; i++) if(!maskCache[SECS[i]]) buildMask(SECS[i]); buildMask(SECS[Math.max(0,lastSection)] || SECS[0]); });
+  if(P.sphere) warm(function(){ for(var i = 0; i < SECS.length; i++) if(!maskCache[SECS[i]]) buildMask(SECS[i]); buildMask(SECS[Math.max(0,lastSection)] || SECS[0]); });
 }
 function rebuildCount(N){
   if(!built || N === n) return;
@@ -62852,7 +63362,7 @@ function pushFeed(text, hot){
 // bleed back down at tlTrail px/sec, which is what leaves a comet trail of still-tall cells
 // behind you as you scroll. Returns true if anything moved enough to be worth repainting.
 function tickTimeline(dt){
-  var MAJ = SECS.length, total = MAJ * Math.max(1, P.tlCells | 0);
+  var MAJ = SECS.length, total = MAJ * Math.max(1, tlPerSec | 0);
   if(!tlLift || tlN !== total){ tlLift = new Float32Array(total); tlN = total; }
   var x0 = 0, span = 1;                      // work in normalised 0..1 along the track
   var pos = Math.max(0, Math.min(1, scroll01));
@@ -62908,10 +63418,33 @@ function drawTimeline(W, orbX, orbY){
   dbgTLDraws++;
   var o = timeline, g = o.ctx, w = o.w, h = o.h;
   g.clearRect(0, 0, w, h);
-  var midY = h - 74;
+  // RISE MODE: the cells stand ON the bottom edge and grow upward, instead of hanging either
+  // side of a centre line. baseY is that edge. midY still exists because the playhead star, the
+  // trackers and the curved tail are all anchored to it — in rise mode they collapse onto the
+  // same line, and all three are off in this build anyway.
+  var rise = P.tlRise > 0.5;
+  var baseY = rise ? h : (h - 74);
+  var midY  = rise ? h : (h - 74);
+
+  // ── CONTRAST WASH ── black, rising off the bottom border and dying out at the top of the
+  // strip, so it covers the asset and nothing more. The storefront is a LIGHT page (#f0f0f5)
+  // and the ticks were competing with a near-white sky; this is the least darkening that
+  // separates them without reading as a bar across the bottom. Drawn FIRST so it sits behind
+  // every cell. Normal alpha compositing, not additive — the plane is a MeshBasicMaterial with
+  // transparent:true, so black actually darkens here (additive would be invisible on a light
+  // ground, which is the trap the rest of this file keeps hitting).
+  if(rise && P.tlFadeA > 0.001){
+    var washH = Math.max(1, P.tlLabelY + 18);
+    var wash = g.createLinearGradient(0, h, 0, h - washH);
+    wash.addColorStop(0.00, 'rgba(0,0,0,' + P.tlFadeA.toFixed(4) + ')');
+    wash.addColorStop(0.55, 'rgba(0,0,0,' + (P.tlFadeA * 0.34).toFixed(4) + ')');
+    wash.addColorStop(1.00, 'rgba(0,0,0,0)');
+    g.fillStyle = wash;
+    g.fillRect(0, h - washH, w, washH);
+  }
   var trackW = w * Math.max(0.05, Math.min(1, P.tlWidth));   // fraction of screen width
   var x0 = (w - trackW) / 2, span = trackW;
-  var MAJ = SECS.length, PERSEC = Math.max(1, P.tlCells | 0), total = MAJ * PERSEC;
+  var MAJ = SECS.length, PERSEC = Math.max(1, tlPerSec | 0), total = MAJ * PERSEC;
   var act = Math.max(0, Math.min(MAJ - 1, Math.floor(scroll01 * MAJ)));
   var pos = Math.max(0, Math.min(1, scroll01));
   var px = x0 + span * pos;
@@ -62941,7 +63474,7 @@ function drawTimeline(W, orbX, orbY){
     var lit = (((i / PERSEC) | 0) === act);
     var a = ((maj ? 0.70 : 0.40) * (lit ? 1 : 0.55) + lift * 0.45) * A;
     var r = Math.min(cw, ch) * 0.5 * Math.max(0, Math.min(1, P.tlRound));
-    var rx = cx - cw / 2, ry = midY - ch / 2;
+    var rx = cx - cw / 2, ry = rise ? (baseY - ch) : (midY - ch / 2);
 
     var joins = useGoo && Math.abs(cx - px) <= P.tlGooRange;
     var t = joins ? gc : g;
@@ -62988,11 +63521,30 @@ function drawTimeline(W, orbX, orbY){
     g.restore();
   }
 
-  setFont(g, 8, 700, 1.4); g.textAlign = 'center'; g.textBaseline = 'top';
+  // ── SECTION NAMES ──────────────────────────────────────────────────────────────────────
+  // Each name gets span/MAJ of room: 316px on this desktop, 78px on a 390px phone. At a fixed
+  // 8px "ACCESSORIES" is ~72px wide, so on a phone the names very nearly touch and read as one
+  // smear. Solve the size against the widest name actually in the catalogue instead — that keeps
+  // desktop untouched (nothing needs shrinking at 316px) and pulls the type down only where the
+  // room really is tight. Truncation is the last resort, not the first.
+  var labGap = 14;                                   // breathing room between adjacent names
+  var labSlot = Math.max(8, (span / MAJ) - labGap);
+  var labPx = 8;
+  setFont(g, labPx, 700, 1.4);
+  var widest = 0;
+  for(var sW = 0; sW < MAJ; sW++) widest = Math.max(widest, g.measureText(SECS[sW]).width);
+  if(widest > labSlot && widest > 0){
+    labPx = Math.max(5.5, 8 * (labSlot / widest));
+    setFont(g, labPx, 700, labPx > 7 ? 1.4 : 0.6);   // drop the tracking too once it gets small
+  }
+  g.textAlign = 'center'; g.textBaseline = 'top';
   for(var sI = 0; sI < MAJ; sI++){
     var on = sI === act;
     g.fillStyle = rgba(on ? COL.white : COL.dim, (on ? 0.92 : 0.40) * A);
-    g.fillText(SECS[sI], x0 + span * ((sI + 0.5) / MAJ), h - 14);
+    // In rise mode the cells own the bottom of the strip, so the names sit ABOVE them, clear of
+    // the tallest a cell can swell to.
+    g.fillText(fitText(g, SECS[sI], labSlot), x0 + span * ((sI + 0.5) / MAJ),
+               rise ? (h - P.tlLabelY) : (h - 14));
   }
 
   // ── CURVED TAIL ────────────────────────────────────────────────────────────────────────
@@ -63036,7 +63588,7 @@ function drawTimeline(W, orbX, orbY){
   // Straight up out of the playhead, then a hard right-angle run across to the orb's outer ring.
   // The horizontal run is terminated on the ring's LEFT intersection at that height, so it lands
   // on the circle rather than overshooting into it.
-  if(P.lnkOn > 0.5 && orbX !== undefined){
+  if(P.lnkOn > 0.5 && P.sphere && orbX !== undefined){   // PUBLIC BUILD: leader lands ON the orb
     var eyL = midY - P.lnkUp;
     var dyL = eyL - orbY, rrL = P.lnkRing;
     var hitX = (Math.abs(dyL) < rrL) ? (orbX - Math.sqrt(rrL * rrL - dyL * dyL)) : (orbX - rrL);
@@ -65488,7 +66040,7 @@ function update(dt){
   var sec = Math.max(0, Math.min(SECS.length - 1, Math.floor(scroll01 * SECS.length)));
   if(sec !== lastSection){
     lastSection = sec;
-    if(SECS[sec] !== maskWord) buildMask(SECS[sec]);
+    if(P.sphere && SECS[sec] !== maskWord) buildMask(SECS[sec]);   // PUBLIC BUILD: no sphere, no mask
     pointWaveRandom(0.3);
     pushFeed('SEC ' + SECS[sec], true);
   }
@@ -65662,7 +66214,7 @@ function update(dt){
   posAttr.needsUpdate = true; colAttr.needsUpdate = true; sizeAttr.needsUpdate = true;
   pts.material.uniforms.uBright.value = P.bright;
   pts.material.uniforms.uScale.value = (H * PR) / (2 * Math.tan(camera.fov * Math.PI / 360));
-  grp.visible = !hidden && !RED.on;
+  grp.visible = !hidden && !RED.on && !!P.sphere;   // PUBLIC BUILD: P.sphere
 
   // ── particle rivers ──
   rvUpdate(dt, W, H, hh);
@@ -65674,6 +66226,13 @@ function update(dt){
   chromeClock += dt;
   var tlShow = P.chrome && P.timeline;
   tlTrackPx = W * P.tlWidth;
+  // A fixed 34 per section is a 9px slot on this desktop and under 3px on a phone, where the
+  // cells collide into a solid bar and the ruler stops reading as segmented at all. Solving for
+  // a target slot width instead keeps one tick the same physical size on every screen and simply
+  // gives a narrow one fewer of them. tickTimeline rebuilds its lift array whenever the total
+  // changes, so a resize (or a phone rotating) is already handled.
+  tlPerSec = Math.max(4, Math.min(P.tlCells | 0,
+             Math.round((tlTrackPx / Math.max(1, SECS.length)) / Math.max(2, P.tlSlotPx))));
   var tlMoved = tlShow ? tickTimeline(dt) : false;   // the trail decays whether or not we repaint
   var tlDirty = tlMoved || (Math.abs(scroll01 - tlLastScroll) > 0.0015) || sec !== tlLastSec || W !== tlLastW
               || Math.abs(scy - tlLastOrbY) > 1.5;
@@ -65681,13 +66240,17 @@ function update(dt){
   // keep the strip the width of the window so the leader can reach the orb
   if(timeline.w !== W){ resizePlaneCanvas(timeline, W, timeline.h); tlLastW = -1; }
   // orb centre in the strip's own pixel space (plane is full-width and centred ⇒ x maps 1:1)
-  var tlTop = (H - P.tlY + 80) - timeline.h;
+  // PUBLIC BUILD: tlY now means what its comment always claimed — px up from the bottom edge —
+  // so 0 puts the strip's baseline exactly on the screen border. The dev file's +80 offset is
+  // preserved for its own tlY of 84, so the two layouts stay independently correct.
+  var tlBotY = PUBLIC_BUILD ? (H - P.tlY) : (H - P.tlY + 80);
+  var tlTop = tlBotY - timeline.h;
   var orbLX = scx, orbLY = scy - tlTop;
   if(tlShow && tlDirty && chromeClock - tlLast > 0.028){   // cap at ~35Hz so the trail stays smooth
     drawTimeline(W, orbLX, orbLY); tlLastScroll = scroll01; tlLastSec = sec; tlLastW = W; tlLast = chromeClock;
   }
   timeline.opacity = tlShow ? 1 : 0;
-  place(timeline, W * 0.5, (H - P.tlY + 80) - timeline.h * 0.5, hw, hh, W, H);
+  place(timeline, W * 0.5, tlBotY - timeline.h * 0.5, hw, hh, W, H);
 
   // Feed panel is anchored to the BALL in the bottom-right: it spans the sphere's height and
   // reaches well above it, so the contour layout has the sphere's whole silhouette to work with.
@@ -65707,12 +66270,13 @@ function update(dt){
   var bLocalY = scy - (feedCY - sysFeed.h * 0.5);
   // Dirty-driven, not timed: the stack JUMPS on push and is otherwise static, so the only other
   // reason to repaint is the ball (and therefore the clip hole) actually moving.
-  if(P.chrome && (feedRev !== sfLastRev || Math.abs(bLocalX - sfLastBX) > 1.5 || Math.abs(bLocalY - sfLastBY) > 1.5
+  if(P.chrome && P.sphere && (feedRev !== sfLastRev || Math.abs(bLocalX - sfLastBX) > 1.5 || Math.abs(bLocalY - sfLastBY) > 1.5
      || Math.abs(ballR - sfLastBR) > 1)){
     drawSysFeed(bLocalX, bLocalY, ballR * P.txBallScale);
     sfLastRev = feedRev; sfLastBX = bLocalX; sfLastBY = bLocalY; sfLastBR = ballR;
   }
-  sysFeed.opacity = P.chrome ? 1 : 0;
+  // PUBLIC BUILD: this stack is clipped around the sphere and hangs in space without it.
+  sysFeed.opacity = (P.chrome && P.sphere) ? 1 : 0;
   place(sysFeed, feedCX, feedCY, hw, hh, W, H);
 
   // Panel is cut to the stack's own height, otherwise the rows sit at the bottom of an
@@ -65721,14 +66285,14 @@ function update(dt){
   var lh = Math.max(64, Math.min(1200, Math.ceil((P.tlxRows * P.tlxRowH + 32) / 32) * 32));
   if(sysLeft.w !== lw || sysLeft.h !== lh){ resizePlaneCanvas(sysLeft, lw, lh); slLastRev = -1; }
   // top-left stack — static geometry, so it only repaints when a line is pushed
-  if(P.chrome && feedLRev !== slLastRev){ drawSysLeft(); slLastRev = feedLRev; }
-  sysLeft.opacity = P.chrome ? 1 : 0;
+  if(P.chrome && P.sysLeft && feedLRev !== slLastRev){ drawSysLeft(); slLastRev = feedLRev; }
+  sysLeft.opacity = (P.chrome && P.sysLeft) ? 1 : 0;   // PUBLIC BUILD: P.sysLeft
   place(sysLeft, sysLeft.w * 0.5 + P.tlxX, P.tlxY + sysLeft.h * 0.5, hw, hh, W, H);
 
-  if(P.chrome && (SECS[sec] !== ctLastWord || chromeClock - ctLast > 0.125)){   // ~8Hz + on change
+  if(P.chrome && P.sphere && (SECS[sec] !== ctLastWord || chromeClock - ctLast > 0.125)){   // ~8Hz + on change
     drawContour(SECS[sec], tNow); ctLast = chromeClock; ctLastWord = SECS[sec];
   }
-  contour.opacity = P.chrome ? 1 : 0;
+  contour.opacity = (P.chrome && P.sphere) ? 1 : 0;   // PUBLIC BUILD: the arc rides the sphere's edge
   place(contour, scx, scy, hw, hh, W, H);
 
   // The label lives just ABOVE the top edge and is pulled down into view on scroll-up. Pure
@@ -66205,492 +66769,13 @@ return {
 };
 })();
 
-// ══ TEMPORARY parameter window ════════════════════════════════════════════════════════════
-// Press H to toggle. DELETE this whole block (and the keydown binding) once the look is locked.
-(function CHUD_PANEL(){
-  var el = null;
-  function row(label, key, min, max, step, after){
-    var v = CHUD.P[key];
-    return '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font:600 10px Arial;color:#9db8d6">' +
-      '<span style="flex:0 0 96px">' + label + '</span>' +
-      '<input data-k="' + key + '" data-after="' + (after || '') + '" type="range" min="' + min + '" max="' + max +
-      '" step="' + step + '" value="' + v + '" style="flex:1;accent-color:#2b8cff;min-width:0">' +
-      '<span data-v="' + key + '" style="flex:0 0 40px;text-align:right;color:#8fd6ff;font-weight:700">' + v + '</span></div>';
-  }
-  function chk(label, key){
-    return '<label style="display:flex;align-items:center;gap:6px;margin:5px 0;font:600 10px Arial;color:#9db8d6;cursor:pointer">' +
-      '<input data-c="' + key + '" type="checkbox"' + (CHUD.P[key] ? ' checked' : '') + ' style="accent-color:#2b8cff"> ' + label + '</label>';
-  }
-  // ── river rows ── these edit CHUD.RV[selected] rather than CHUD.P, and are tinted pink so it
-  // is obvious at a glance which stream a slider belongs to.
-  function rvSel(){ return Math.min(1, CHUD.P.riverSel | 0); }
-  function rvr(label, key, min, max, step){
-    var v = CHUD.RV[rvSel()][key];
-    return '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font:600 10px Arial;color:#c7a6bd">' +
-      '<span style="flex:0 0 96px">' + label + '</span>' +
-      '<input data-rk="' + key + '" type="range" min="' + min + '" max="' + max +
-      '" step="' + step + '" value="' + v + '" style="flex:1;accent-color:#ff5aa0;min-width:0">' +
-      '<span data-v="rv_' + key + '" style="flex:0 0 40px;text-align:right;color:#ffa8cd;font-weight:700">' + v + '</span></div>';
-  }
-  function rvh(t){ return '<div style="font:800 9px Arial;letter-spacing:.12em;color:#e0619b;margin:9px 0 2px">' + t + '</div>'; }
-  // ── colour stops ── params hold [r,g,b] in 0..1 (the site is Linear / NoToneMapping, so
-  // these reach the shader untouched); the picker speaks hex.
-  function rgbHex(a){
-    function c(v){ var x = Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16); return x.length < 2 ? '0' + x : x; }
-    return '#' + c(a[0]) + c(a[1]) + c(a[2]);
-  }
-  function hexRgb(s){
-    return [parseInt(s.substr(1, 2), 16) / 255, parseInt(s.substr(3, 2), 16) / 255, parseInt(s.substr(5, 2), 16) / 255];
-  }
-  function rvc(label, key){
-    return '<div style="display:flex;align-items:center;gap:6px;margin:5px 0;font:600 10px Arial;color:#c7a6bd">' +
-      '<span style="flex:0 0 96px">' + label + '</span>' +
-      '<input data-rc="' + key + '" type="color" value="' + rgbHex(CHUD.RV[rvSel()][key]) +
-      '" style="flex:1;min-width:0;height:22px;padding:0;border:1px solid rgba(255,90,160,0.35);' +
-      'border-radius:4px;background:transparent;cursor:pointer"></div>';
-  }
-  function rvTabs(){
-    var s = CHUD.P.riverSel | 0, nm = ['A · left', 'B · right', 'BOTH'], h = '';
-    for(var i = 0; i < 3; i++){
-      h += '<button data-rs="' + i + '" style="flex:1;font:800 9px Arial;padding:5px 0;cursor:pointer;border-radius:5px;' +
-        'border:1px solid ' + (s === i ? 'rgba(255,110,170,0.9)' : 'rgba(90,120,160,0.40)') + ';background:' +
-        (s === i ? 'rgba(255,90,160,0.28)' : 'rgba(20,40,70,0.5)') + ';color:' + (s === i ? '#ffd7e8' : '#8fa8c4') +
-        '">' + nm[i] + '</button>';
-    }
-    return '<div id="chud-rvtabs" style="display:flex;gap:4px;margin:5px 0 7px">' + h + '</div>';
-  }
-  // Re-point every river slider at the newly selected stream. BOTH shows A's values and writes
-  // to each of them, so it is a "link" mode rather than a third parameter set.
-  function rvRefresh(){
-    if(!el) return;
-    var tabs = el.querySelector('#chud-rvtabs');
-    if(tabs) tabs.outerHTML = rvTabs();
-    var q = CHUD.RV[rvSel()], ins = el.querySelectorAll('input[data-rk]');
-    for(var i = 0; i < ins.length; i++){
-      var k = ins[i].getAttribute('data-rk');
-      ins[i].value = q[k];
-      var o = el.querySelector('[data-v="rv_' + k + '"]');
-      if(o) o.textContent = q[k];
-    }
-    var cs = el.querySelectorAll('input[data-rc]');
-    for(i = 0; i < cs.length; i++) cs[i].value = rgbHex(q[cs[i].getAttribute('data-rc')]);
-  }
-  // ── cloud rows ── these edit CSKY.P rather than CHUD.P, and are tinted green so it is obvious
-  // which system a slider belongs to. Same pattern as the pink river rows above.
-  function cfmt(v, step){ var st = parseFloat(step); return (st >= 1) ? String(v) : v.toFixed(st < 0.005 ? 4 : (st < 0.05 ? 3 : 2)); }
-  function crow(label, key, min, max, step){
-    var v = CSKY.P[key];
-    return '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;font:600 10px Arial;color:#9ec9ae">' +
-      '<span style="flex:0 0 96px">' + label + '</span>' +
-      '<input data-ck="' + key + '" type="range" min="' + min + '" max="' + max +
-      '" step="' + step + '" value="' + v + '" style="flex:1;accent-color:#3ddc84;min-width:0">' +
-      '<span data-v="cs_' + key + '" style="flex:0 0 44px;text-align:right;color:#8fffc0;font-weight:700">' + cfmt(v, step) + '</span></div>';
-  }
-  function cchk(label, key){
-    return '<label style="display:flex;align-items:center;gap:6px;margin:5px 0;font:600 10px Arial;color:#9ec9ae;cursor:pointer">' +
-      '<input data-cb="' + key + '" type="checkbox"' + (CSKY.P[key] ? ' checked' : '') + ' style="accent-color:#3ddc84"> ' + label + '</label>';
-  }
-  function ccol(label, key){
-    return '<div style="display:flex;align-items:center;gap:6px;margin:5px 0;font:600 10px Arial;color:#9ec9ae">' +
-      '<span style="flex:0 0 96px">' + label + '</span>' +
-      '<input data-cc="' + key + '" type="color" value="' + rgbHex(CSKY.P[key]) +
-      '" style="flex:1;min-width:0;height:22px;padding:0;border:1px solid rgba(61,220,132,0.35);' +
-      'border-radius:4px;background:transparent;cursor:pointer"></div>';
-  }
-  function ch(t){ return '<div style="font:800 9px Arial;letter-spacing:.12em;color:#3ddc84;margin:10px 0 2px">' + t + '</div>'; }
-  function ptabs(){
-    var sel = window._chudTab || 0, nm = ['HUD', 'CLOUDS'], h = '';
-    for(var i = 0; i < 2; i++){
-      h += '<button data-pt="' + i + '" style="flex:1;font:800 10px Arial;padding:6px 0;cursor:pointer;border-radius:6px;' +
-        'border:1px solid ' + (sel === i ? 'rgba(90,190,255,0.9)' : 'rgba(90,120,160,0.40)') + ';background:' +
-        (sel === i ? 'rgba(50,140,240,0.30)' : 'rgba(20,40,70,0.5)') + ';color:' + (sel === i ? '#dff0ff' : '#8fa8c4') +
-        '">' + nm[i] + '</button>';
-    }
-    return '<div id="chud-ptabs" style="display:flex;gap:5px;margin:7px 0 9px">' + h + '</div>';
-  }
-  function make(){
-    el = document.createElement('div');
-    el.style.cssText = 'position:fixed;top:14px;left:14px;width:268px;z-index:2147483000;background:rgba(5,13,30,0.93);' +
-      'border:1px solid rgba(55,168,255,0.30);border-radius:11px;padding:11px 13px 13px;color:#cfe6ff;' +
-      'box-shadow:0 10px 40px rgba(0,0,0,0.7);max-height:88vh;overflow:auto;font-family:Arial,sans-serif';
-    el.innerHTML =
-      '<div style="font:800 11px Arial;letter-spacing:.15em;color:#6cc8ff;margin-bottom:2px">HUD PARAMS</div>' +
-      '<div style="font:600 9px Arial;color:#6b86a8;margin-bottom:8px">temporary — press H to hide</div>' +
-      ptabs() +
-      '<div id="chud-sec-cld" style="display:none">' +
-      ch('SHOW · COST') +
-      cchk('Clouds on', 'on') + cchk('Adaptive quality (auto step-down)', 'adapt') + cchk('Run on mobile', 'mobile') +
-      crow('Strength', 'opacity', 0, 1, 0.02) +
-      crow('RT scale', 'res', 0.15, 1, 0.05) +
-      crow('Update Hz', 'hz', 5, 60, 1) +
-      crow('March steps', 'steps', 4, 32, 1) +
-      crow('Light taps', 'lSteps', 1, 4, 1) +
-      ch('WHERE THE DECK SITS') +
-      crow('Near dist', 'dIn', 5, 200, 1) +
-      crow('Far dist', 'dOut', 20, 400, 5) +
-      crow('Deck shape', 'hGrad', 0, 1, 0.02) +
-      crow('Deck height', 'hSpan', 20, 400, 5) +
-      ch('SHAPE') +
-      crow('Coverage', 'cov', 0, 1, 0.01) +
-      crow('Density', 'dens', 0, 3, 0.05) +
-      crow('Cloud size', 'scale', 0.001, 0.03, 0.0005) +
-      crow('Weather size', 'wScale', 0.05, 1, 0.01) +
-      crow('Erosion', 'detAmt', 0, 1, 0.02) +
-      crow('Erosion freq', 'detScale', 1, 12, 0.1) +
-      ch('MOTION · TIME-LAPSE') +
-      crow('Speed (resting)', 'speedIdle', 0, 12, 0.1) +
-      crow('Speed (spinning)', 'speedSpin', 0, 80, 0.5) +
-      crow('RPM for full speed', 'spinRpm', 20, 600, 5) +
-      crow('Update Hz spinning', 'hzSpin', 10, 60, 1) +
-      crow('Wind speed', 'windSpd', 0, 30, 0.1) +
-      crow('Wind dir', 'windDir', 0, 360, 1) +
-      crow('Rise', 'rise', 0, 1, 0.02) +
-      crow('Evolve (form/dissolve)', 'evolve', 0, 4, 0.05) +
-      ch('LIGHT — the spin IS the sun') +
-      crow('Key at rest', 'sunBase', 0, 2, 0.02) +
-      crow('Spin gain', 'sunGain', 0, 4, 0.05) +
-      crow('Track crystal', 'sunLock', 0, 1, 0.05) +
-      crow('Sun height', 'sunUp', -60, 60, 1) +
-      crow('Fixed az', 'sunAz', 0, 360, 1) +
-      crow('Fixed el', 'sunEl', -20, 90, 1) +
-      ccol('Sun colour', 'sunCol') +
-      crow('Brightness', 'bright', 0, 2, 0.05) +
-      crow('Absorb', 'absorb', 0, 3, 0.05) +
-      crow('Powder', 'powder', 0, 1, 0.02) +
-      crow('Silver lining', 'silver', 0, 1, 0.02) +
-      crow('Phase fwd', 'g1', 0, 0.99, 0.01) +
-      crow('Phase back', 'g2', 0, 0.99, 0.01) +
-      crow('Shadow len', 'shadow', 0.5, 20, 0.5) +
-      crow('Ambient', 'amb', 0, 2, 0.02) +
-      crow('Ambient from spin', 'ambSpin', 0, 2, 0.02) +
-      ccol('Ambient col', 'ambCol') +
-      crow('Underside', 'dark', 0, 1, 0.02) +
-      ccol('Tint', 'tint') +
-      ch('LIGHT SHAFTS') +
-      cchk('Shafts on', 'shOn') +
-      crow('Strength', 'shStr', 0, 3, 0.05) +
-      crow('Samples', 'shSamples', 4, 48, 2) +
-      crow('Reach', 'shDensity', 0, 2, 0.02) +
-      crow('Decay', 'shDecay', 0.8, 0.999, 0.002) +
-      crow('Weight', 'shWeight', 0, 0.4, 0.005) +
-      crow('Halo', 'shHalo', 0.05, 1.5, 0.02) +
-      crow('Off-frame reach', 'shReach', 0.2, 4, 0.05) +
-      '<div style="margin-top:9px"><button id="chud-cdump" style="width:100%;font:700 10px Arial;color:#d6ffe8;' +
-      'background:rgba(40,180,110,0.18);border:1px solid rgba(61,220,132,0.45);border-radius:6px;padding:7px;cursor:pointer">' +
-      'Log cloud params to console</button></div>' +
-      '</div>' +
-      '<div id="chud-sec-hud">' +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">UNIFIED WAVE</div>' +
-      row('Depth', 'depth', 0, 0.7, 0.01) +
-      row('Response', 'response', 1, 40, 0.5) +
-      row('Wave amp', 'waveAmp', 0, 1.2, 0.02) +
-      row('Wave length', 'waveLen', 0.5, 20, 0.25) +
-      row('Wave speed', 'waveSpeed', 0, 10, 0.1) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">WORD</div>' +
-      row('Text size', 'textFit', 0.3, 1.1, 0.02, 'mask') +
-      row('Stroke wt', 'textBold', 0, 0.3, 0.01, 'mask') +
-      row('Edge soft', 'edgeSoft', 0, 1, 0.02, 'mask') +
-      row('Limb fade', 'limbFade', 0, 0.95, 0.02) +
-      row('Whiten', 'whiten', 0, 1, 0.02) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">SPHERE</div>' +
-      row('Particles', 'count', 600, 40000, 500, 'count') +
-      row('Size', 'size', 0.2, 4, 0.05) +
-      row('Brightness', 'bright', 0.05, 2, 0.05) +
-      row('Scale', 'scale', 0.1, 1.6, 0.02) +
-      row('Spin', 'spin', 0, 1, 0.02) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">BOTTOM SCROLLER</div>' +
-      row('Segments/sec', 'tlCells', 2, 40, 1) +
-      row('Track width', 'tlWidth', 0.2, 1, 0.01) +
-      row('Height (y)', 'tlY', 10, 200, 1) +
-      row('Cell width', 'tlCellW', 0.05, 1, 0.01) +
-      row('Roundness', 'tlRound', 0, 1, 0.02) +
-      row('Minor h', 'tlBaseH', 1, 30, 0.5) +
-      row('Mid h', 'tlMidH', 1, 40, 0.5) +
-      row('Major h', 'tlMajH', 1, 50, 0.5) +
-      row('Grow', 'tlGrow', 0, 90, 1) +
-      row('Focus width', 'tlFocus', 4, 300, 2) +
-      row('Trail decay', 'tlTrail', 1, 200, 1) +
-      row('Opacity', 'tlAlpha', 0, 1, 0.02) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">CURVED TAIL</div>' +
-      row('Count', 'ceCount', 0, 8, 1) +
-      row('First length', 'ceLen', 4, 160, 2) +
-      row('Length growth', 'ceGrow', 1, 2.5, 0.05) +
-      row('Gap', 'ceGap', 0, 40, 1) +
-      row('Curvature', 'ceCurve', 0, 0.12, 0.002) +
-      row('Sweep up', 'ceDir', 0, 1, 1) +
-      row('Thickness', 'ceThick', 0.5, 14, 0.5) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">ORB LEADER</div>' +
-      row('On', 'lnkOn', 0, 1, 1) +
-      row('Rise height', 'lnkUp', 0, 160, 1) +
-      row('Start above cells', 'lnkStart', 0, 80, 1) +
-      row('Orb ring radius', 'lnkRing', 20, 400, 1) +
-      row('Thickness', 'lnkThick', 0.5, 8, 0.5) +
-      row('End dot', 'lnkDot', 0, 10, 0.2) +
-      row('Opacity', 'lnkAlpha', 0, 1, 0.02) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">TRACKER LINES</div>' +
-      row('On', 'tkOn', 0, 1, 1) +
-      row('Count', 'tkCount', 1, 6, 1) +
-      row('First length', 'tkLen', 0.05, 1, 0.01) +
-      row('Length ratio', 'tkRatio', 0.1, 1, 0.01) +
-      row('Row gap', 'tkGap', 2, 40, 1) +
-      row('Top offset', 'tkTop', 0, 90, 1) +
-      row('Thickness', 'tkThick', 0.5, 8, 0.5) +
-      row('Mark length', 'tkMark', 1, 60, 1) +
-      row('Opacity', 'tkAlpha', 0, 1, 0.02) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">STAR + FUSION</div>' +
-      row('Star on', 'tlStar', 0, 1, 1) +
-      row('Spine up/down', 'tlStarV', 0, 120, 1) +
-      row('Spine left/right', 'tlStarH', 0, 300, 2) +
-      row('Waist', 'tlStarK', 0.5, 30, 0.5) +
-      row('Fusion blur', 'tlGoo', 0, 20, 0.25) +
-      row('Fusion lift', 'tlGooLift', 0, 6, 1) +
-      row('Fusion cut', 'tlGooCut', 0, 6, 1) +
-      row('Fusion range', 'tlGooRange', 0, 400, 5) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">SYSTEM TEXT</div>' +
-      row('Rows', 'txRows', 1, 200, 1) +
-      row('New line every', 'txRate', 0.05, 3, 0.05) +
-      row('Row height', 'txRowH', 4, 80, 1) +
-      row('Font size', 'txSize', 4, 20, 0.5) +
-      row('Letter space', 'txSpace', 0, 5, 0.1) +
-      row('Opacity', 'txAlpha', 0, 1, 0.02) +
-      row('Gap from ball', 'txPad', 0, 90, 1) +
-      row('Right margin', 'txRight', 0, 90, 1) +
-      row('Max length', 'txMaxLen', 40, 1200, 10) +
-      row('Min to show', 'txMin', 0, 200, 2) +
-      row('Contour radius', 'txBallScale', 0.5, 3.0, 0.01) +
-      row('Stack base', 'txBase', -6, 6, 0.05) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">TOP-LEFT TEXT</div>' +
-      row('Rows', 'tlxRows', 1, 60, 1) +
-      row('Row height', 'tlxRowH', 6, 60, 1) +
-      row('Font size', 'tlxSize', 4, 20, 0.5) +
-      row('Letter space', 'tlxSpace', 0, 5, 0.1) +
-      row('New line every', 'tlxRate', 0.05, 3, 0.05) +
-      row('Width', 'tlxW', 100, 700, 5) +
-      row('X', 'tlxX', 0, 400, 2) +
-      row('Y', 'tlxY', 0, 600, 2) +
-      row('Fade rows', 'tlxFade', 0.5, 20, 0.5) +
-      row('Opacity', 'tlxAlpha', 0, 1, 0.02) +
-      '<div style="font:800 11px Arial;letter-spacing:.15em;color:#ff6fae;margin:14px 0 1px;' +
-      'border-top:1px solid rgba(255,110,170,0.25);padding-top:10px">PARTICLE RIVERS</div>' +
-      '<div style="font:600 9px Arial;color:#a3708c;margin-bottom:2px">streams split by rocks · pick a stream</div>' +
-      rvTabs() +
-      chk('rivers on', 'river') + chk('show rock outlines', 'rvRocks') +
-      '<div style="margin:6px 0 3px"><button id="chud-rved" style="width:100%;font:800 10px Arial;' +
-      'color:#ffd7e8;background:rgba(255,90,160,0.22);border:1px solid rgba(255,110,170,0.55);' +
-      'border-radius:6px;padding:7px;cursor:pointer">OPEN TRACK EDITOR · J</button></div>' +
-      '<div style="font:600 8px Arial;color:#a3708c;margin-bottom:4px">draw branching tracks, set ' +
-      'spawn/flow/outfall and place rocks — zoomed OUT past the camera crop</div>' +
-      rvh('PLACEMENT  (analytic arc — ignored once a track is authored)') +
-      rvr('On', 'on', 0, 1, 1) +
-      rvr('Start X', 'x', -0.4, 1.4, 0.005) +
-      rvr('Start Y', 'y', -0.5, 1.5, 0.005) +
-      rvr('Heading°', 'angle', -180, 180, 1) +
-      rvr('Length', 'len', 0.1, 2.5, 0.01) +
-      rvr('Band width', 'width', 8, 600, 2) +
-      rvr('Bow°', 'bow', -140, 140, 1) +
-      rvh('FLOW') +
-      rvr('Particles', 'count', 0, 8000, 50) +
-      rvr('Speed', 'speed', 0, 900, 5) +
-      rvr('Speed spread', 'speedVar', 0, 1, 0.02) +
-      rvr('Bank drag', 'shear', 0, 1, 0.02) +
-      rvr('Scroll boost', 'scrollGain', 0, 12, 0.1) +
-      rvh('STREAMLINES') +
-      rvr('Centre crowding', 'bankFall', 0, 1, 0.01) +
-      rvr('Filament amount', 'filAmp', 0, 0.95, 0.01) +
-      rvr('Filament count', 'filFreq', 1, 40, 0.5) +
-      rvr('Filament seed', 'filSeed', 0, 60, 1) +
-      rvr('Scatter px', 'jitter', 0, 20, 0.1) +
-      rvr('Rigidity', 'pull', 0, 12, 0.05) +
-      rvh('THE SPLIT') +
-      rvr('Peel length', 'splitBlend', 0.02, 0.9, 0.01) +
-      rvr('Point bar', 'splitGap', 0, 0.3, 0.005) +
-      rvr('Apex stone', 'splitRock', 0, 2.5, 0.05) +
-      rvh('BANKS') +
-      rvr('Width wander', 'bankAmp', 0, 0.85, 0.01) +
-      rvr('Wander length', 'bankLen', 80, 2000, 10) +
-      rvr('Seed', 'bankSeed', 0, 60, 1) +
-      rvr('Width follows flux', 'wFlux', 0, 1, 0.02) +
-      rvh('TRACK GRAVITY') +
-      rvr('Pull reach', 'gravReach', 0.5, 8, 0.1) +
-      rvr('Free drift', 'gravFloor', 0, 1, 0.02) +
-      rvr('Momentum', 'inertia', 0, 0.6, 0.005) +
-      rvr('Cross-flow cap', 'crossMax', 0.05, 2, 0.05) +
-      rvh('MEANDER') +
-      rvr('Amp 1', 'meanAmp', 0, 160, 1) +
-      rvr('Wavelength 1', 'meanLen', 40, 2000, 10) +
-      rvr('Speed 1', 'meanSpeed', -4, 4, 0.05) +
-      rvr('Amp 2', 'meanAmp2', 0, 90, 0.5) +
-      rvr('Wavelength 2', 'meanLen2', 20, 900, 5) +
-      rvr('Speed 2', 'meanSpeed2', -6, 6, 0.05) +
-      rvh('TURBULENCE (curl)') +
-      rvr('Strength', 'nAmp', 0, 260, 1) +
-      rvr('Scale', 'nScale', 0.05, 12, 0.05) +
-      rvr('Octaves', 'nOct', 0, 5, 1) +
-      rvr('Lacunarity', 'nLac', 1.1, 4, 0.05) +
-      rvr('Gain', 'nGain', 0.1, 1, 0.02) +
-      rvr('Evolve speed', 'nSpeed', 0, 6, 0.05) +
-      rvr('Stretch', 'nAniso', 0.2, 10, 0.1) +
-      rvr('Seed', 'nSeed', 0, 60, 1) +
-      rvh('ROCKS') +
-      rvr('Count', 'rocks', 0, 12, 1) +
-      rvr('Radius', 'rockR', 3, 220, 1) +
-      rvr('Radius spread', 'rockRVar', 0, 1.6, 0.02) +
-      rvr('First at', 'rockS0', -0.2, 1.2, 0.01) +
-      rvr('Last at', 'rockS1', -0.2, 1.2, 0.01) +
-      rvr('Along jitter', 'rockJit', 0, 0.6, 0.01) +
-      rvr('Across spread', 'rockOff', 0, 1.6, 0.02) +
-      rvr('Seed', 'rockSeed', 0, 60, 1) +
-      rvr('Split strength', 'rockStr', 0, 4, 0.05) +
-      rvr('Reach (radii)', 'rockReach', 2, 14, 0.5) +
-      rvr('Flow floor', 'flowMin', 0, 0.6, 0.01) +
-      rvr('Max size (×hw)', 'rockCap', 0.1, 1.2, 0.05) +
-      rvr('Squeeze past', 'rockSqueeze', 0, 1.5, 0.02) +
-      rvr('Releases flow', 'rockFree', 0, 1, 0.02) +
-      rvh('WAKE (vortex street)') +
-      rvr('Amp', 'wakeAmp', 0, 3, 0.02) +
-      rvr('Wavelength', 'wakeLen', 4, 300, 2) +
-      rvr('Shed speed', 'wakeSpeed', 0, 14, 0.1) +
-      rvr('Spread', 'wakeSpread', 0.2, 5, 0.05) +
-      rvr('Decay', 'wakeFade', 0.5, 40, 0.5) +
-      rvh('CURSOR ROCK') +
-      rvr('Radius', 'mouseR', 0, 400, 5) +
-      rvr('Strength', 'mouseStr', 0, 4, 0.05) +
-      rvh('TRAIL') +
-      rvr('Segments', 'trailPts', 0, 12, 1) +
-      rvr('Sample every', 'trailStep', 0.006, 0.2, 0.002) +
-      rvr('Jump cutoff', 'trailJump', 1.5, 30, 0.5) +
-      rvr('Tail thinning', 'trailTaper', 0, 1, 0.02) +
-      rvr('Tail fade', 'trailFade', 0, 1, 0.02) +
-      rvh('LOOK') +
-      rvr('Dot size', 'size', 0.2, 14, 0.1) +
-      rvr('Size spread', 'sizeVar', 0, 2, 0.02) +
-      rvr('Min px', 'minPx', 0.35, 4, 0.05) +
-      rvr('Opacity', 'alpha', 0, 1, 0.02) +
-      rvr('Bank fade at', 'edgeFade', 0, 1, 0.02) +
-      rvr('Bank fade end', 'edgeEnd', 0.2, 3, 0.02) +
-      rvr('Bank fade shape', 'edgePow', 0.3, 4, 0.05) +
-      rvr('Fade in', 'fadeIn', 0, 700, 5) +
-      rvr('Fade out', 'fadeOut', 0, 700, 5) +
-      rvr('Blow-out kill', 'kill', 0.5, 6, 0.1) +
-      rvh('COLOUR — three stops, carried as dye') +
-      rvc('Centre', 'col1') +
-      rvc('Outer', 'col2') +
-      rvc('Outer outer', 'col3') +
-      rvr('Reach of col3', 'hueSpan', 0.2, 2.5, 0.05) +
-      rvr('Hold (sec)', 'hueHold', 0, 3, 0.05) +
-      rvr('Give-up rate', 'hueRate', 0.02, 3, 0.02) +
-      rvr('Settled band', 'hueDead', 0.01, 0.4, 0.01) +
-      rvr('Colour base', 'colMix', 0, 1, 0.02) +
-      rvr('Speed→colour', 'heatGain', 0, 6, 0.05) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:14px 0 3px;' +
-      'border-top:1px solid rgba(55,168,255,0.22);padding-top:10px">PLACEMENT</div>' +
-      row('Anchor X', 'anchorX', 0, 1, 0.005) +
-      row('Anchor Y', 'anchorY', 0, 1, 0.005) +
-      row('Follow lag', 'lag', 0.02, 1, 0.02) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">CURSOR</div>' +
-      row('Repel radius', 'cursorRadius', 0, 400, 5) +
-      row('Repel str', 'cursorStrength', 0, 30, 0.5) +
-      row('Click wave', 'clickWave', 0, 1.2, 0.02) +
-      '<div style="font:800 9px Arial;letter-spacing:.12em;color:#4f9fe0;margin:9px 0 3px">SHOW</div>' +
-      chk('HUD on', 'on') + chk('system text', 'chrome') + chk('timeline', 'timeline') + chk('Chrysolin label', 'label') +
-      row('Label width', 'labelW', 60, 520, 2) +
-      row('Label height', 'labelH', 16, 140, 1) +
-      row('Label Y', 'labelY', 0, 300, 1) +
-      chk('DARK ground palette', 'dark') +
-      '<div style="margin-top:8px"><button id="chud-dump" style="width:100%;font:700 10px Arial;color:#cfe6ff;' +
-      'background:rgba(40,120,220,0.18);border:1px solid rgba(60,150,240,0.45);border-radius:6px;padding:7px;cursor:pointer">' +
-      'Log params to console</button></div>' +
-      '</div>';
-    document.body.appendChild(el);
+// ══ TEMPORARY parameter window — REMOVED (PUBLIC BUILD) ═══════════════════════════════════
+// The H / ?hud tuning window lived here: ~490 lines of dev-only DOM, its own key binding and
+// sliders for CHUD.P, CHUD.RV and CSKY.P. Deleted rather than flagged, because a flag still
+// ships the markup and the listener to every customer. It is intact in `Chrysolin Website.html`,
+// which is where the values get tuned; nothing outside the IIFE ever referenced it.
+// ══════════════════════════════════════════════════════════════════════════════════════════
 
-    el.addEventListener('input', function(ev){
-      var t = ev.target;
-      if(t.type === 'color'){
-        var cc = t.getAttribute('data-cc');
-        if(cc){ CSKY.P[cc] = hexRgb(t.value); return; }
-        var ck = t.getAttribute('data-rc');
-        if(!ck) return;
-        var col = hexRgb(t.value), cs2 = CHUD.P.riverSel | 0;
-        if(cs2 >= 2){ CHUD.RV[0][ck] = col.slice(); CHUD.RV[1][ck] = col.slice(); }
-        else CHUD.RV[cs2][ck] = col;
-        return;
-      }
-      if(t.type === 'range'){
-        // cloud sliders first — they carry data-ck and write into CSKY.P
-        var cslk = t.getAttribute('data-ck');
-        if(cslk){
-          var csv = parseFloat(t.value);
-          CSKY.P[cslk] = csv;
-          var cso = el.querySelector('[data-v="cs_' + cslk + '"]');
-          if(cso) cso.textContent = cfmt(csv, t.getAttribute('step'));
-          return;
-        }
-        // river sliders next — they carry data-rk and write into CHUD.RV, not CHUD.P
-        var rk = t.getAttribute('data-rk');
-        if(rk){
-          var rvv = parseFloat(t.value), rs = CHUD.P.riverSel | 0;
-          if(rs >= 2){ CHUD.RV[0][rk] = rvv; CHUD.RV[1][rk] = rvv; } else CHUD.RV[rs][rk] = rvv;
-          var ro = el.querySelector('[data-v="rv_' + rk + '"]');
-          if(ro) ro.textContent = rvv;
-          return;
-        }
-        var k = t.getAttribute('data-k'), v = parseFloat(t.value);
-        CHUD.P[k] = v;
-        var out = el.querySelector('[data-v="' + k + '"]');
-        if(out) out.textContent = (Math.abs(v) < 10 && String(step_of(t)).indexOf('.') >= 0) ? v.toFixed(2) : v;
-        var af = t.getAttribute('data-after');
-        if(af === 'mask') CHUD.rebuildMask();
-        else if(af === 'count') CHUD.rebuildCount(v | 0);
-      }
-    });
-    el.addEventListener('change', function(ev){
-      var t = ev.target;
-      if(t.type === 'checkbox'){
-        var cb = t.getAttribute('data-cb');
-        if(cb){ CSKY.P[cb] = t.checked; return; }
-        var ck = t.getAttribute('data-c'); CHUD.P[ck] = t.checked; if(ck === 'dark') CHUD.applyTheme();
-      }
-    });
-    el.addEventListener('click', function(ev){
-      var pt = ev.target && ev.target.getAttribute && ev.target.getAttribute('data-pt');
-      if(pt !== null && pt !== undefined && pt !== ''){
-        window._chudTab = parseInt(pt, 10) || 0;
-        var tb = el.querySelector('#chud-ptabs'); if(tb) tb.outerHTML = ptabs();
-        el.querySelector('#chud-sec-hud').style.display = window._chudTab === 0 ? '' : 'none';
-        el.querySelector('#chud-sec-cld').style.display = window._chudTab === 1 ? '' : 'none';
-        el.scrollTop = 0;
-        return;
-      }
-      var rs = ev.target && ev.target.getAttribute && ev.target.getAttribute('data-rs');
-      if(rs !== null && rs !== undefined && rs !== ''){ CHUD.P.riverSel = parseInt(rs, 10) || 0; rvRefresh(); }
-    });
-    el.querySelector('#chud-rved').onclick = function(){ CHUD.riverEditor(true); };
-    el.querySelector('#chud-cdump').onclick = function(){
-      console.log('CSKY.P =', JSON.stringify(CSKY.P, null, 2));
-      try { console.log('CSKY.cost() =', CSKY.cost()); } catch(_e){}
-    };
-    el.querySelector('#chud-dump').onclick = function(){
-      console.log('CHUD.P =', JSON.stringify(CHUD.P, null, 2));
-      console.log('CHUD.RV[0] =', JSON.stringify(CHUD.RV[0], null, 2));
-      console.log('CHUD.RV[1] =', JSON.stringify(CHUD.RV[1], null, 2));
-    };
-    // don't let the panel drive the page scroll / the 3D drag handlers
-    ['wheel','pointerdown','pointermove','pointerup','mousedown','touchstart'].forEach(function(t){
-      el.addEventListener(t, function(e){ e.stopPropagation(); }, { passive: true });
-    });
-  }
-  function step_of(t){ return t.getAttribute('step'); }
-  function toggle(){
-    if(!el) make();
-    else el.style.display = (el.style.display === 'none') ? '' : 'none';
-  }
-  window.addEventListener('keydown', function(e){
-    if(e.target && /input|textarea/i.test(e.target.tagName)) return;
-    if(e.key === 'h' || e.key === 'H') toggle();
-    else if(e.key === 'j' || e.key === 'J') CHUD.riverEditor();
-  });
-  if(location.search.indexOf('hud') >= 0) window.addEventListener('load', function(){ setTimeout(toggle, 400); });
-})();
 
 // ── CHUD input ────────────────────────────────────────────────────────────────────────────
 // Passive listeners only: the site's own pointerdown/move handlers do the product raycasting
@@ -66700,7 +66785,6 @@ return {
   window.addEventListener('pointerleave', function(){ CHUD.setMouse(null); }, { passive: true });
   // "ball expands in point waves when you click on product panels"
   window.addEventListener('pointerdown', function(e){
-    if(e.target && e.target.closest && e.target.closest('div[style*="2147483000"]')) return;   // param panel
     CHUD.pointWaveRandom();
   }, { passive: true });
 })();
@@ -69369,7 +69453,288 @@ function czSyncChrome(){
   else if(czChudWasOn !== null){ CHUD.P.on = czChudWasOn; czChudWasOn = null; }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// HERO ROW — the brand mark at the top of the page        (PUBLIC BUILD, 2026-09-03)
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Takes over what the customizer used to own. The top row keeps its glass ring and its centre
+// object and loses everything else: no product panels, no two spinning garments. The first thing
+// a visitor sees is the brand, rather than a feature that is not finished.
+//
+// THE PLACEHOLDER IS THE FLOOR'S OWN GEM, scaled up and given a turn of its own. That is the
+// point of doing it this way: dropping the real logo in later is one call, HERO.setLogo(obj3d),
+// and every system that already knows about this object keeps working. Three of them do:
+//
+//   • THE CRYSTAL CHAIN. Each floor's centre gem is a node the rising beam mines as you spin the
+//     wheel up, and the TOP one — this one — is what fires enterGameMode(). buildCrystalChain
+//     reads centerStar.children[0], so the mark has to stay the first child of that group or the
+//     spin-to-enter sequence loses its trigger. setLogo() preserves that, and clears the cached
+//     chain so it rebuilds against the new object.
+//   • THE PER-FRAME SYNC in the floors loop, which counter-rotates the GROUP so the mark holds
+//     still while the wheel turns, and tumbles it on X from the wheel's residual velocity. The
+//     hero spin is therefore applied to the CHILD, not the group: the two compose instead of
+//     fighting, and the mark still answers a flick of the wheel.
+//   • THE REFLECTION CUBE MAP, which the gem's material samples through envMap.
+//
+// PANELS ARE RETIRED WITH visible=false AND layers.disableAll(). Visibility alone is not enough —
+// three r128's raycaster tests layers but NOT visibility, so a hidden panel is still a live click
+// target and a customer reaching the top of the page could open a quick-view on a product that is
+// not on screen. A zero layer mask fails Layers.test and is skipped by every pick in the file.
+//
+// Re-applied every frame rather than once, for the same reason the customizer did it:
+// rebuildFloors() runs when the live Shopify catalogue arrives and would bring the panels back.
+var HERO_ROW_LABEL = 'Pants';   // the top row, found by the label it was BUILT with
+var HERO_LOGO_RADIUS = 6.0;     // bounding-sphere radius the mark is fitted to, in world units
+var HERO_GEM_SCALE   = HERO_LOGO_RADIUS / 0.8;   // the placeholder octahedron is built at radius
+                                                 // 0.8, so deriving its scale keeps it the size of
+                                                 // the mark it stands in for and the swap on load
+                                                 // is not a jump. Declared AFTER the radius on
+                                                 // purpose — the other order reads an unassigned
+                                                 // var and yields NaN.
+var HERO_SPIN        = 0.22;    // radians/sec about the mark's own Y axis
+// Hand correction on top of the solved optical centre, in WORLD units (+x right, +y up). The
+// solver balances ink; if a mark still reads a hair off because of where its detail sits, nudge
+// it here rather than editing the model.
+var HERO_LOGO_NUDGE  = { x: 0.0, y: 0.0 };
+var hero = { floor: null, logo: null, fitted: false };
+
+// The same lookup the customizer used, and for the same reason: fetchShopifyProducts() regroups
+// PRODUCT_DATA by Shopify productType at runtime, so an index into it is not stable. The label a
+// floor was actually built with lives on floors[].group.userData.label. Index 0 is the top row
+// either way, so the fallback is still the right one.
+function heroFloor(){
+  if(typeof floors === 'undefined' || !floors.length) return null;
+  for(var i = 0; i < floors.length; i++){
+    var u = floors[i].group && floors[i].group.userData;
+    if(u && u.label === HERO_ROW_LABEL) return floors[i];
+  }
+  return floors[0];
+}
+
+function heroUpdate(dt){
+  if(!PUBLIC_BUILD) return;
+  var fl = heroFloor();
+  if(!fl) return;
+  if(fl !== hero.floor){ hero.floor = fl; hero.fitted = false; }   // the row was rebuilt under us
+  heroLoadLogo();
+
+  // ── clear the row ── cheap: the test fails on every frame after the first.
+  for(var p = 0; p < fl.panels.length; p++){
+    var pn = fl.panels[p];
+    if(pn.mesh.visible  || pn.mesh.layers.mask) { pn.mesh.visible  = false; pn.mesh.layers.disableAll(); }
+    if(pn.edges.visible || pn.edges.layers.mask){ pn.edges.visible = false; pn.edges.layers.disableAll(); }
+  }
+
+  // ── the glass ring ── hidden, not removed. Every other row keeps its own: the product detail
+  // view morphs that ring and hangs its star nodes off it, so deleting them would break the
+  // shop. The hero row can never enter that view (its panels are inert), so hiding this one is
+  // free. visible=false is enough here — a ring is not a click target the way a panel is, and
+  // leaving it on layer 0 keeps the row grabbable if it is ever shown again.
+  if(fl.glassRing && fl.glassRing.visible) fl.glassRing.visible = false;
+
+  var sg = fl.group.userData.centerStar;
+  if(!sg) return;
+
+  // ── the mark ── re-seated if rebuildFloors() replaced this row's centre group.
+  if(hero.logo && sg.children[0] !== hero.logo){
+    while(sg.children.length) sg.remove(sg.children[0]);
+    sg.add(hero.logo);
+    sg.scale.setScalar(1);            // setLogo() already sized the mark itself
+    hero.fitted = true;
+    if(typeof crystalChain !== 'undefined') crystalChain = null;
+  } else if(!hero.logo && !hero.fitted){
+    sg.scale.setScalar(HERO_GEM_SCALE);
+    hero.fitted = true;
+  }
+
+  var mark = sg.children[0];
+  if(mark) mark.rotation.y += HERO_SPIN * dt;
+}
+
+// Drop the real logo in when the model arrives:
+//
+//   HERO.setLogo(gltf.scene);              // fits to the default radius
+//   HERO.setLogo(gltf.scene, {radius: 1.7});
+//
+// Pass any Object3D already oriented the way you want it to face. It is measured, centred on its
+// own bounding sphere and scaled to sit inside the glass ring, so it lands the same size whatever
+// scale it was exported at, and it takes the gem's place as the first child of the centre group.
+//
+// GLTFLoader is NOT in the page by default — the customizer pulled it on demand. Load it the same
+// way (see the LAZY CDN SCRIPTS block at the top of the file) before calling this with a .glb.
+//
+// Two things worth knowing about what a real model changes:
+//   • getGameCrystals() identifies a landable crystal by OctahedronGeometry or by
+//     userData.isGameCrystal. A logo satisfies neither, so the mini-game ship will no longer
+//     land on the top row. Set that flag on a real MESH inside the model if you want it back.
+//   • the beam's emissive ratchet needs a material to drive; the wrapper Group has none, so the
+//     first emissive material found inside the model is hoisted onto it below.
+// THE OPTICAL CENTRE, which is not the bounding-box centre.
+//
+// A mark with long thin spikes has a bounding box stretched out to the spike tips while almost
+// none of its ink is out there, so box-centring lands the visible mass off-axis and the thing
+// reads crooked when it faces front. Measured on this logo: the area centroid sits 1.1% of the
+// width to the RIGHT of the box centre, which is exactly the drift that was visible.
+//
+// Area-weighting every triangle puts the origin where the eye balances the shape. It also
+// re-derives itself: the logo has already been re-exported once mid-build (21,840 verts down to
+// 13,352, and the box centre moved with it), and a hard-coded offset would have gone stale.
+// ~13k triangles, once, at load.
+var _hoA = new THREE.Vector3(), _hoB = new THREE.Vector3(), _hoC = new THREE.Vector3();
+var _hoU = new THREE.Vector3(), _hoV = new THREE.Vector3(), _hoX = new THREE.Vector3();
+function heroOpticalCentre(root, target){
+  var area = 0;
+  target.set(0, 0, 0);
+  root.updateMatrixWorld(true);
+  root.traverse(function(o){
+    if(!o.isMesh || !o.geometry) return;
+    var pos = o.geometry.attributes && o.geometry.attributes.position;
+    if(!pos) return;
+    var idx = o.geometry.index, n = idx ? idx.count : pos.count;
+    for(var i = 0; i + 2 < n; i += 3){
+      var a0 = idx ? idx.getX(i) : i, a1 = idx ? idx.getX(i+1) : i+1, a2 = idx ? idx.getX(i+2) : i+2;
+      _hoA.fromBufferAttribute(pos, a0).applyMatrix4(o.matrixWorld);
+      _hoB.fromBufferAttribute(pos, a1).applyMatrix4(o.matrixWorld);
+      _hoC.fromBufferAttribute(pos, a2).applyMatrix4(o.matrixWorld);
+      _hoU.subVectors(_hoB, _hoA); _hoV.subVectors(_hoC, _hoA);
+      var ar = _hoX.crossVectors(_hoU, _hoV).length() * 0.5;
+      if(!(ar > 0)) continue;
+      area += ar;
+      target.x += ar * (_hoA.x + _hoB.x + _hoC.x) / 3;
+      target.y += ar * (_hoA.y + _hoB.y + _hoC.y) / 3;
+      target.z += ar * (_hoA.z + _hoB.z + _hoC.z) / 3;
+    }
+  });
+  if(!(area > 1e-12)) return false;
+  target.multiplyScalar(1 / area);
+  return true;
+}
+
+function heroSetLogo(obj, opts){
+  opts = opts || {};
+  var fl = heroFloor(); if(!fl) return false;
+  var sg = fl.group.userData.centerStar; if(!sg) return false;
+
+  // Measure in the object's own frame, then move it so the chosen centre sits on the pivot's
+  // origin. Scaling the PIVOT after that scales about that centre rather than about wherever
+  // the exporter happened to leave the origin, and the mark spins about it without wobbling.
+  //
+  // SIZE still comes from the bounding sphere — the radius of a box does not depend on where
+  // you put the origin, so switching the centre below leaves the fitted size untouched.
+  obj.updateMatrixWorld(true);
+  var sph = new THREE.Box3().setFromObject(obj).getBoundingSphere(new THREE.Sphere());
+  var want = opts.radius || 2.0;
+  var k = sph.radius > 1e-4 ? (want / sph.radius) : 1;
+  var centre = new THREE.Vector3();
+  if(!heroOpticalCentre(obj, centre)) centre.copy(sph.center);   // degenerate mesh -> box centre
+  var pivot = new THREE.Group();
+  obj.position.sub(centre);
+  // Nudge is given in WORLD units, so undo the pivot scale to apply it in the pivot frame.
+  obj.position.x += HERO_LOGO_NUDGE.x / k;
+  obj.position.y += HERO_LOGO_NUDGE.y / k;
+  pivot.add(obj);
+  pivot.scale.setScalar(k);
+
+  // buildCrystalChain reads centerStar.children[0].material to run the beam's emissive ratchet.
+  // A Group has none, so hand it the first emissive material inside the model — the chain then
+  // lights the logo on the beam's approach exactly as it lit the gem. Purely cosmetic: the chain
+  // already guards on a null material, so a model without one simply does not glow.
+  pivot.traverse(function(o){
+    if(!pivot.material && o.isMesh && o.material && o.material.emissive) pivot.material = o.material;
+  });
+
+  var old = sg.children[0];
+  if(old){
+    sg.remove(old);
+    if(old.geometry) old.geometry.dispose();
+    if(old.material && old.material.dispose) old.material.dispose();
+  }
+  sg.add(pivot);
+  sg.scale.setScalar(1);
+  hero.logo = pivot;
+  hero.fitted = true;
+  if(typeof crystalChain !== 'undefined') crystalChain = null;   // rebuild against the new mark
+  return true;
+}
+
+// ── THE BRAND MARK ────────────────────────────────────────────────────────────────────────
+// Logo.obj is an SVG extrusion out of Blender: 21,840 verts with its own split normals, and it
+// lies FLAT in the X-Z plane with the extrusion running along Y (measured 1.045 x 0.150 x 1.140,
+// thinnest axis Y). Left as exported it would sit on the row like a coin on a table, so it goes
+// inside a group turned -90° about X and then faces the camera.
+//
+// HIGH, not CRITICAL: it is the first thing anyone sees, so it should not wait behind idle work,
+// but it must not block the product images either. Nothing looks broken while it travels — the
+// scaled gem is already on screen and setLogo swaps it the moment the mesh is ready.
+var HERO_LOGO_URLS = [
+  'Logo.obj',                    // deployed: repo root (GitHub Pages)
+  'product-images/Logo.obj',     // working tree
+  'https://raw.githubusercontent.com/mesaantwan/WithinDueTime/main/Logo.obj'
+];
+// HERO_LOGO_RADIUS is declared up with HERO_GEM_SCALE, which is derived from it.
+var heroLogoTried = false;
+
+// GENUINE SILVER, and the exposure is the whole game here.
+//
+// On a metal, `color` IS the F0 reflectance, not a diffuse tint — real silver's is about
+// (0.97, 0.96, 0.92): a very bright, faintly warm white. The crystal's 0x9a9aa2 is a ~0.6 grey,
+// which reads as dull steel beside it. The site renders Linear / NoToneMapping, so these numbers
+// reach the shader untouched and therefore have to already BE linear.
+//
+// WHY envMapIntensity IS BELOW 1. The first cut used 1.55 and the mark came out as a flat white
+// cut-out. It is not a material problem, it is a CLIPPING problem: 0.96 F0 x 1.55 x a ~0.9 sky is
+// 1.34, and with NoToneMapping everything above 1.0 is simply pure white. Every pixel of the face
+// clipped to the same value, so the form vanished. 0.68 lands the face around 0.6 — a mid silver
+// that still has somewhere to go brighter, which is what lets the edges read as highlights.
+//
+// AND WHY ROUGHNESS ALONE COULD NOT FIX IT. The mark is a flat plate (0.15 deep against 1.1
+// wide) seen face-on, so its front normal is essentially constant and the whole face reflects ONE
+// direction of the cube map. Roughness blurs the sample but cannot vary it, so the face is a flat
+// colour at any roughness — all the shape comes from the extruded sides, whose normals do sweep.
+// The job is therefore to put the FACE at a mid level so those sides have contrast to work
+// against. 0.28 keeps the side highlights soft rather than mirror-sharp, which is most of what
+// separates silver from chrome.
+//
+// envMap is the scene's own reflection cube, so the mark really is reflecting the storefront.
+var HERO_SILVER = {
+  color: 0xF7F3E9,      // silver F0, linear
+  roughness: 0.28,
+  envIntensity: 0.68    // keep the face off the 1.0 ceiling — see above
+};
+function heroSilverMaterial(){
+  return new THREE.MeshStandardMaterial({
+    color: HERO_SILVER.color, metalness: 1.0, roughness: HERO_SILVER.roughness,
+    envMap: cubeRenderTarget.texture, envMapIntensity: HERO_SILVER.envIntensity
+  });
+}
+
+function heroLoadLogo(){
+  if(heroLogoTried) return;
+  heroLogoTried = true;
+  assetFetchText(HERO_LOGO_URLS, ASSET_PRIO.HIGH, function(text){
+    if(!text){ console.warn('[HERO] Logo.obj unreachable — keeping the placeholder gem'); return; }
+    var p = _fpParseObj(text);   // the planet's own parser: tri soup, quads fan-triangulated
+    if(!p || !p.pos || !p.pos.length){ console.warn('[HERO] Logo.obj parsed empty'); return; }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(p.pos, 3));
+    if(p.nrm) geo.setAttribute('normal', new THREE.BufferAttribute(p.nrm, 3));
+    else geo.computeVertexNormals();
+    var stand = new THREE.Group();
+    stand.rotation.x = -Math.PI / 2;   // X-Z plane -> X-Y, so the face points at the camera
+    stand.add(new THREE.Mesh(geo, heroSilverMaterial()));
+    if(heroSetLogo(stand, { radius: HERO_LOGO_RADIUS })){
+      console.log('[HERO] mark adopted:', (p.pos.length / 9) | 0, 'tris from',
+                  (_assetQ.resolved[HERO_LOGO_URLS[0]] || '?'));
+    }
+  });
+}
+
+var HERO = { setLogo: heroSetLogo, floor: heroFloor, state: hero, loadLogo: heroLoadLogo };
+
 function czRenderOverlay(){
+  // PUBLIC BUILD: nothing to render, and czTakeOverFloor() in particular MUST NOT run — HERO owns
+  // the top row's panels now, and two systems hiding the same meshes for different reasons is
+  // exactly how a re-merge goes wrong later.
+  if(PUBLIC_BUILD) return;
   czSyncChrome();
   czTakeOverFloor();
   if(!czReady || !CZ.hasGlass() || !czOverlayScene) return;
@@ -69388,12 +69753,16 @@ function czRenderOverlay(){
 
 function animate(){
   requestAnimationFrame(animate);
-  czBoot();
+  // PUBLIC BUILD: the customizer stays in the file but is never booted, so czReady stays false
+  // and every CZ call site — pointer down/move/up, the scroll lock, onResize, the overlay pass —
+  // short-circuits on it. Flip PUBLIC_BUILD to false to get the feature back in one edit.
+  if(!PUBLIC_BUILD) czBoot();
   if(document.hidden) return;
   var time = performance.now() * 0.001;
   var dt = Math.min(1/30, time - (window._lastTime || time));
   window._lastTime = time;
   if(location.search.indexOf('fps')>=0) _perfHud(dt);
+  heroUpdate(dt);   // PUBLIC BUILD: hero row — clear the top wheel, turn the brand mark
 
   // ── KEEP THE GAME WORLD OFF THE WEBSITE'S BACK ────────────────────────────────────────────
   // The arena (planet, lava, rocks, dome, sky bodies — everything under P.regionB) lives in the
@@ -69417,7 +69786,10 @@ function animate(){
 
   // Drain pending shader links every frame we're in/entering the game, so nothing is left to block
   // on the first boost / first E / first minimap open. See _warmFlushPrograms.
-  if(gameMode.active || gameMode.entering || gameMode.decelerating) _warmFlushPrograms(2);
+  // Also drain during the spin-up preload: linking is asynchronous, but getUniforms() is the
+  // blocking half and it has to be paid somewhere. A 2ms slice per frame across a spin costs
+  // nothing visible; the same work in one lump at entry is what used to hitch the first boost.
+  if(gameMode.active || gameMode.entering || gameMode.decelerating || gamePreload.step > 4) _warmFlushPrograms(2);
   lpTick();   // ?loadperf only — no-op otherwise
 
   if(czReady) CZ.update(dt);
@@ -69465,7 +69837,6 @@ function animate(){
   // Stars
   updateStarField(time);
   updateShootingStars(dt);
-  updatePlanets();
   // Spawn shooting star randomly (~every 4-8 seconds)
   if(Math.random() < dt * 0.2) spawnShootingStar();
   
@@ -69668,7 +70039,16 @@ function animate(){
     var _gameHoldsCrystal = (gameMode.active || gameMode.entering || gameMode.decelerating) && fl === gameMode.galleryFloor && gameMode.portal.holeUpQuat;
     if(_gameHoldsCrystal && ud.centerStar){
       ud.centerStar.quaternion.copy(_holeUpYTmp.setFromAxisAngle(_yAxisTmp.set(0,1,0), -fl.group.rotation.y)).multiply(gameMode.portal.holeUpQuat);
-    } else if(ud.centerStar){ud.centerStar.rotation.y=-fl.group.rotation.y;ud.centerStar.rotation.x+=vel*0.5;}
+    } else if(ud.centerStar){
+      // PUBLIC BUILD: the hero mark stays UPRIGHT and turns only about its vertical axis. Every
+      // other row counter-rotates its gem so it holds still, then tumbles it on X with the
+      // wheel's residual velocity — right for a crystal, wrong for a logo, which reads as broken
+      // the instant it tips. Dropping the counter-rotation here is deliberate, not an omission:
+      // the mark then inherits the wheel's spin from its parent group, so DRAGGING THE ROW SPINS
+      // THE MARK. HERO_SPIN adds the slow idle turn on top of that.
+      if(PUBLIC_BUILD && hero && fl === hero.floor){ ud.centerStar.rotation.x = 0; ud.centerStar.rotation.z = 0; }
+      else { ud.centerStar.rotation.y=-fl.group.rotation.y; ud.centerStar.rotation.x+=vel*0.5; }
+    }
 
     // Sync rings
     var cs=Math.abs(vel),is=Math.abs(passive);
