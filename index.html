@@ -1576,6 +1576,621 @@ function createPanel(floorR, vertR, opts) {
   return {mesh:mesh, edges:outline};
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// HOLOGRAM SHIRTS                                                                2026-09-06
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// A flat cutout of a garment, projected in front of every product panel as a scanned hologram.
+// Placeholder art on purpose: four real T-shirt photographs standing in for the eventual
+// designs, so layout and framing can be judged against something garment-shaped instead of
+// against an empty panel.
+//
+// THE GROUND IS LIGHT. `SITE_BG` is 0x6fb8e0 — open sky. Every hologram instinct carried over
+// from a dark scene is wrong here: additive blending is invisible against a bright background,
+// and a pale cyan wash disappears into the sky it is drawn on. So this projection reads by
+// SUBTRACTION — deep-teal ink, scanline GAPS you see the sky through, and a saturated rim —
+// on NormalBlending, never Additive.
+//
+// THE ALIASING is deliberate and is three separate effects, because one alone reads as a bug:
+//   • uBlocky   — UVs quantised to a coarse grid, so the silhouette stair-steps
+//   • uCA       — the three channels sampled at different x, so edges split red/cyan
+//   • uGlitch   — per-scanline horizontal slip, with a fat tearing band sweeping through
+// The channel split is what actually sells it: `aMax` fattens the silhouette past any single
+// channel's coverage, and `fringe` (the disagreement between channels) is non-zero ONLY on
+// that fattened border, which is where the colour separation gets painted.
+//
+// Tuning window on **J** (H belongs to the cloud panel), or `?shirt` in the URL.
+//
+// Placement notes worth keeping:
+//   • The mesh is a CHILD of the panel, at local +Z — three's CylinderGeometry puts theta 0 on
+//     +Z, so the panel's arc is centred there and `floorR + gap` is dead in front of it. It
+//     therefore inherits the wheel's spin and the row's intro for free.
+//   • `raycast` is a no-op. The panel behind it owns every click; without this the shirt would
+//     eat hits, because pDown raycasts `scene.children` recursively.
+//   • depthWrite:false + renderOrder 2. Panels DO write depth, so a shirt on the far side of
+//     the wheel is depth-rejected by its own panel and the draw order stops mattering.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+var SHIRT = (function(){
+  'use strict';
+
+  // The four sample colourways. `-768` is a downscaled copy of the same art (581 KB for the set
+  // against 1.95 MB for the originals); the full-size names are kept as the next candidate so
+  // the feature works before those copies are uploaded.
+  var FILES = ['Shirt sand.png', 'Shirt Black.png', 'Shirt Maroon.png', 'Shirt Teal.png'];
+  var GH    = 'https://raw.githubusercontent.com/mesaantwan/WithinDueTime/main/';
+  var MAXPX = 768;
+
+  var P = {
+    on:         true,
+    // ── placement ────────────────────────────────────────────────────────────
+    gap:        0.55,   // world units the projection floats in front of the panel face
+    fit:        0.80,   // fraction of the panel the shirt is fitted into (contain, not cover)
+    bobAmp:     0.075,
+    bobSpeed:   0.85,
+    sway:       2.6,    // degrees of idle yaw/roll drift
+    // ── the projection ───────────────────────────────────────────────────────
+    alpha:      0.82,
+    tintMix:    0.34,   // 0 = the photograph, 1 = pure tint. The colourway has to survive this.
+    tint:       [0.10, 0.78, 0.74],
+    ink:        0.34,   // how dark the gaps between scanlines go
+    cone:       0.26,   // projector falloff at the top and bottom of the plane
+    // ── the aliasing ─────────────────────────────────────────────────────────
+    pixels:     110,
+    blocky:     0.85,
+    ca:         0.0080,
+    caPulse:    0.55,
+    fringe:     0.85,
+    glitch:     0.65,
+    // ── the scan ─────────────────────────────────────────────────────────────
+    scanFreq:   46,
+    scanDepth:  0.55,
+    scanScroll: 0.30,
+    bar:        0.40,
+    refresh:    0.50,
+    // ── the rim ──────────────────────────────────────────────────────────────
+    rim:        0.85,
+    rimW:       2.4,
+    rimCol:     [0.03, 0.42, 0.46],
+    // ── noise ────────────────────────────────────────────────────────────────
+    grain:      0.055,
+    flicker:    0.055
+  };
+
+  // Shared uniform OBJECTS, not values — every shirt material points at these same objects, so
+  // a slider write lands on all of them at once and the whole set stays one program. Only the
+  // four per-instance uniforms below are cloned per material.
+  var U = {
+    uTime:{value:0},
+    uPix:{value:0}, uBlocky:{value:0}, uCA:{value:0}, uCAPulse:{value:0},
+    uFringe:{value:0}, uGlitch:{value:0},
+    uScanFreq:{value:0}, uScanDepth:{value:0}, uScanScroll:{value:0},
+    uBar:{value:0}, uRefresh:{value:0},
+    uRim:{value:0}, uRimW:{value:0}, uRimCol:{value:new THREE.Color()},
+    uTint:{value:new THREE.Color()}, uTintMix:{value:0}, uInk:{value:0}, uCone:{value:0},
+    uGrain:{value:0}, uFlicker:{value:0}, uAlpha:{value:0},
+    uFogColor:{value:new THREE.Color(0xffffff)}, uFogDensity:{value:0}
+  };
+
+  function sync(){
+    U.uPix.value=P.pixels;        U.uBlocky.value=P.blocky;
+    U.uCA.value=P.ca;             U.uCAPulse.value=P.caPulse;
+    U.uFringe.value=P.fringe;     U.uGlitch.value=P.glitch;
+    U.uScanFreq.value=P.scanFreq; U.uScanDepth.value=P.scanDepth; U.uScanScroll.value=P.scanScroll;
+    U.uBar.value=P.bar;           U.uRefresh.value=P.refresh;
+    U.uRim.value=P.rim;           U.uRimW.value=P.rimW;
+    U.uTintMix.value=P.tintMix;   U.uInk.value=P.ink;            U.uCone.value=P.cone;
+    U.uGrain.value=P.grain;       U.uFlicker.value=P.flicker;    U.uAlpha.value=P.alpha;
+    U.uTint.value.setRGB(P.tint[0], P.tint[1], P.tint[2]);
+    U.uRimCol.value.setRGB(P.rimCol[0], P.rimCol[1], P.rimCol[2]);
+  }
+
+  var VS = [
+    'varying vec2 vUv;',
+    'varying float vDepth;',
+    'void main(){',
+    '  vUv = uv;',
+    '  vec4 mv = modelViewMatrix * vec4(position, 1.0);',
+    '  vDepth = -mv.z;',
+    '  gl_Position = projectionMatrix * mv;',
+    '}'
+  ].join('\n');
+
+  var FS = [
+    'uniform sampler2D uTex;',
+    'uniform float uTime, uPhase, uOpacity, uAspect, uAlpha;',
+    'uniform float uPix, uBlocky, uCA, uCAPulse, uFringe, uGlitch;',
+    'uniform float uScanFreq, uScanDepth, uScanScroll, uBar, uRefresh;',
+    'uniform float uRim, uRimW, uTintMix, uInk, uCone, uGrain, uFlicker;',
+    'uniform float uFogDensity;',
+    'uniform vec3 uTint, uRimCol, uFogColor;',
+    'varying vec2 vUv;',
+    'varying float vDepth;',
+    '',
+    'float h11(float n){ return fract(sin(n * 127.1) * 43758.5453); }',
+    'float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }',
+    '',
+    '// Off the UV box the cutout has no data. Returning empty rather than letting the sampler',
+    '// clamp matters: the fringe and rim taps read OUTSIDE the plane, and a clamped edge texel',
+    '// would smear the shirt into a solid border all the way round.',
+    'vec4 samp(vec2 uv){',
+    '  if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return vec4(0.0);',
+    '  return texture2D(uTex, uv);',
+    '}',
+    '',
+    'void main(){',
+    '  float t = uTime + uPhase;',
+    '  vec2 uv = vUv;',
+    '',
+    '  // ── TAPE SLIP: per-scanline horizontal jitter, plus a fat band that tears much harder ──',
+    '  float slipPos = fract(t * 0.21 + uPhase * 0.37);',
+    '  float sd = abs(vUv.y - slipPos); sd = min(sd, 1.0 - sd);',
+    '  float slip = 1.0 - smoothstep(0.0, 0.030, sd);',
+    '  float line = floor(vUv.y * uScanFreq);',
+    '  float j = h11(line * 13.7 + floor(t * 9.0) * 57.3) * 2.0 - 1.0;',
+    '  uv.x += j * (0.0015 + slip * 0.018) * uGlitch;',
+    '',
+    '  // ── ALIASING: quantise to a grid whose cells are square in WORLD space, not UV space ──',
+    '  vec2 grid = vec2(max(4.0, uPix * uAspect), max(4.0, uPix));',
+    '  uv = mix(uv, (floor(uv * grid) + 0.5) / grid, uBlocky);',
+    '',
+    '  // ── CHANNEL SPLIT ──',
+    '  float ca = uCA * (1.0 + uCAPulse * sin(t * 2.3 + vUv.y * 9.0) + slip * 4.0);',
+    '  vec4 cR = samp(uv + vec2( ca, 0.0));',
+    '  vec4 cG = samp(uv);',
+    '  vec4 cB = samp(uv + vec2(-ca, 0.0));',
+    '',
+    '  float aMin = min(cR.a, min(cG.a, cB.a));',
+    '  float aMax = max(cR.a, max(cG.a, cB.a));',
+    '  if(aMax < 0.004) discard;',
+    '  float fringe = aMax - aMin;   // non-zero ONLY where the three channels disagree: the border',
+    '',
+    '  vec3 photo = vec3(cR.r, cG.g, cB.b);',
+    '  float lum = dot(cG.rgb, vec3(0.299, 0.587, 0.114));',
+    '  vec3 col = mix(photo, uTint * (0.30 + 0.95 * lum), uTintMix);',
+    '',
+    '  // ── FRINGE: red where the red tap reached in, cyan where the blue one did ──',
+    '  float dirn = clamp((cR.a - cB.a) * 0.5 + 0.5, 0.0, 1.0);',
+    '  vec3 fCol = mix(vec3(0.03, 0.80, 0.92), vec3(0.92, 0.16, 0.34), dirn);',
+    '  col = mix(col, fCol, clamp(fringe * uFringe, 0.0, 1.0));',
+    '',
+    '  // ── RIM: a laplacian of the cutout alpha, so it hugs the inside of the silhouette ──',
+    '  float w = uRimW / max(4.0, uPix);',
+    '  float lap = clamp(cG.a * 4.0 - (samp(uv + vec2(-w, 0.0)).a + samp(uv + vec2(w, 0.0)).a',
+    '                               +  samp(uv + vec2(0.0, -w)).a + samp(uv + vec2(0.0, w)).a), 0.0, 1.0);',
+    '  col = mix(col, uRimCol, lap * uRim);',
+    '',
+    '  // ── SCAN: the gaps are HOLES, not dark pixels. On a bright sky that is the whole read. ──',
+    '  float scan = sin((vUv.y * uScanFreq - t * uScanScroll * uScanFreq) * 6.2831853) * 0.5 + 0.5;',
+    '  scan = smoothstep(0.22, 0.78, scan);',
+    '  float gate = mix(1.0, scan, uScanDepth);',
+    '  col *= 1.0 - uInk * (1.0 - scan);',
+    '',
+    '  // ── ROLL BAR ──',
+    '  float bp = fract(t * 0.09 + uPhase * 0.5);',
+    '  float bd = abs(vUv.y - bp); bd = min(bd, 1.0 - bd);',
+    '  float bar = 1.0 - smoothstep(0.0, 0.055, bd);',
+    '  col = mix(col, col * 0.5 + uRimCol * 0.75, bar * uBar);',
+    '  gate *= 1.0 + bar * 0.30 * uBar;',
+    '',
+    '  // ── REFRESH LINE ──',
+    '  float rp = fract(t * 0.13 + uPhase);',
+    '  float rd = abs(vUv.y - rp); rd = min(rd, 1.0 - rd);',
+    '  float refresh = (1.0 - smoothstep(0.0, 0.0055, rd)) * uRefresh;',
+    '  col = mix(col, mix(col, uTint, 0.55) * 1.25, refresh);',
+    '  gate = mix(gate, 1.0, refresh * 0.8);',
+    '',
+    '  // ── GRAIN + FLICKER ──',
+    '  col += (h21(floor(vUv * vec2(170.0, 210.0)) + floor(t * 12.0)) - 0.5) * uGrain;',
+    '  float flick = 1.0 - uFlicker * (0.5 + 0.5 * sin(t * 17.0 + sin(t * 5.1) * 3.0));',
+    '',
+    '  // ── PROJECTOR CONE ──',
+    '  float cone = smoothstep(0.0, 0.13, vUv.y) * smoothstep(1.0, 0.87, vUv.y);',
+    '  cone = mix(1.0, cone, uCone);',
+    '',
+    '  float a = aMax * gate * flick * cone * uAlpha * uOpacity;',
+    '  a = clamp(a + (fringe * 0.30 + lap * uRim * 0.25) * uAlpha * uOpacity, 0.0, 1.0);',
+    '  if(a < 0.004) discard;',
+    '',
+    '  // Fog by hand rather than through three\'s chunks: the panels are fogged and a shirt',
+    '  // floating half a unit in front of one must not read as a different distance.',
+    '  float fg = 1.0 - exp(-uFogDensity * uFogDensity * vDepth * vDepth);',
+    '  col = mix(col, uFogColor, clamp(fg, 0.0, 1.0));',
+    '',
+    '  gl_FragColor = vec4(col, a);',
+    '}'
+  ].join('\n');
+
+  var list   = [];                    // every live projection, wheel and detail-view alike
+  var texes  = [null, null, null, null];
+  var PLANE  = null;                  // one unit quad; size lives in mesh.scale
+  var BLANK  = null;                  // 1x1 fully transparent — draws nothing until the art lands
+  var booted = false;
+
+  function blankTex(){
+    if(BLANK) return BLANK;
+    var c = document.createElement('canvas'); c.width = c.height = 1;
+    c.getContext('2d').clearRect(0, 0, 1, 1);
+    BLANK = new THREE.CanvasTexture(c);
+    BLANK.generateMipmaps = false; BLANK.minFilter = THREE.LinearFilter;
+    return BLANK;
+  }
+
+  // ── COLOURWAY BAG ─────────────────────────────────────────────────────────────────────────
+  // A shuffled bag rather than an independent random per panel: with four colours and six
+  // panels a row, plain randomness gives visible runs of the same shirt side by side often
+  // enough to read as a bug. The bag guarantees all four appear before any repeats, and the
+  // wrap check stops a repeat straddling the seam between two bags.
+  var bag = [], lastPick = -1;
+  function pick(){
+    if(!bag.length){
+      bag = [0, 1, 2, 3];
+      for(var i = bag.length - 1; i > 0; i--){
+        var k = Math.floor(Math.random() * (i + 1)), tmp = bag[i]; bag[i] = bag[k]; bag[k] = tmp;
+      }
+      if(bag[bag.length - 1] === lastPick){ var s = bag[bag.length - 1]; bag[bag.length - 1] = bag[0]; bag[0] = s; }
+    }
+    lastPick = bag.pop();
+    return lastPick;
+  }
+
+  function makeMat(idx){
+    var u = {
+      uTex:     {value: texes[idx] || blankTex()},
+      uPhase:   {value: 0},
+      uOpacity: {value: 0},
+      uAspect:  {value: 1}
+    };
+    for(var k in U) if(U.hasOwnProperty(k)) u[k] = U[k];
+    return new THREE.ShaderMaterial({
+      uniforms: u, vertexShader: VS, fragmentShader: FS,
+      transparent: true, depthWrite: false, depthTest: true,
+      side: THREE.DoubleSide, blending: THREE.NormalBlending, fog: false
+    });
+  }
+
+  function texAspect(idx){
+    var t = texes[idx];
+    return (t && t.image && t.image.height) ? (t.image.width / t.image.height) : 0.93;
+  }
+
+  // Contain-fit inside the panel. `pW`/`pH` are the panel's own arc width and height, so the
+  // tall narrow top row gets a proportionally smaller shirt instead of one stretched to fill it.
+  function fit(r){
+    var ar = texAspect(r.idx);
+    r.h = Math.min(r.pH * P.fit, (r.pW * P.fit) / ar);
+    r.w = r.h * ar;
+    r.mat.uniforms.uAspect.value = ar;
+  }
+
+  function attach(panel, floorR, vertR, opts){
+    if(!P.on) return null;
+    if(!PLANE) PLANE = new THREE.PlaneGeometry(1, 1);
+    opts = opts || {};
+    var idx = pick();
+    var mat = makeMat(idx);
+    var mesh = new THREE.Mesh(PLANE, mat);
+    mesh.renderOrder = 2;
+    mesh.frustumCulled = false;          // the parent panel is the real cull unit
+    mesh.raycast = function(){};         // never a click target — the panel behind owns the hit
+    panel.mesh.add(mesh);
+    var r = {
+      mesh: mesh, mat: mat, idx: idx, panel: panel,
+      floorR: floorR, vertR: vertR,
+      pW: (opts.width  !== undefined ? opts.width  : PLANE_WIDTH),
+      pH: (opts.height !== undefined ? opts.height : PLANE_WIDTH),
+      phase: Math.random() * 100, w: 1, h: 1, temp: false
+    };
+    mat.uniforms.uPhase.value = r.phase;
+    fit(r);
+    list.push(r);
+    panel.shirt = r;
+    return r;
+  }
+
+  // The detail view hides the real panels and animates CLONES, so without this every shirt on
+  // the row blinks out the moment you click one — while a pixel-identical panel stays put.
+  // The clone shares the material, so it keeps its colourway and every live tuning value.
+  function cloneOnto(panel, target){
+    var src = panel && panel.shirt;
+    if(!src || !P.on) return null;
+    var m = new THREE.Mesh(PLANE, src.mat);
+    m.renderOrder = 2; m.frustumCulled = false; m.raycast = function(){};
+    target.add(m);
+    list.push({
+      mesh: m, mat: src.mat, idx: src.idx, panel: panel,
+      floorR: src.floorR, vertR: src.vertR, pW: src.pW, pH: src.pH,
+      phase: src.phase, w: src.w, h: src.h, temp: true
+    });
+    return m;
+  }
+
+  function update(time){
+    if(!list.length) return;
+    U.uTime.value = time;
+    // scene.fog is swapped out wholesale for the game's interior — read it every frame rather
+    // than caching, or a shirt keeps the arena's fog after you come back to the shop.
+    if(typeof scene !== 'undefined' && scene && scene.fog){
+      U.uFogColor.value.copy(scene.fog.color);
+      U.uFogDensity.value = scene.fog.density || 0;
+    } else U.uFogDensity.value = 0;
+
+    var sway = P.sway * Math.PI / 180;
+    for(var i = list.length - 1; i >= 0; i--){
+      var r = list[i], m = r.mesh, host = m.parent;
+      // A detail-view clone outlives its record when the view tears down; its host leaves the
+      // scene, so an orphaned host is the retirement signal.
+      if(r.temp && (!host || !host.parent)){ list.splice(i, 1); continue; }
+      if(!host) continue;
+
+      // Ride the panel's own fade. setFloorAlpha caps panel opacity at 0.7, so that is full
+      // strength here — this is what keeps a projection from arriving over an unrevealed row.
+      var pmat = r.panel.mesh.material;
+      m.material.uniforms.uOpacity.value = pmat ? Math.max(0, Math.min(1, pmat.opacity / 0.7)) : 1;
+
+      // The wheels stretch their panels in X while you hold them (the `expand` block in
+      // animate) and a child inherits it, which makes the shirt fat. The panel's Y never
+      // scales, so its ratio against X is exactly the correction.
+      var sx = host.scale.x || 1, sy = host.scale.y || 1;
+      m.scale.set(r.w * (sy / sx), r.h, 1);
+
+      // Follow the panel in from floorR to vertR as it morphs into the vertical wheel, or the
+      // projection is left hanging a third of the wheel's radius out in front of it.
+      var mt = (host.userData && host.userData.morphT) || 0;
+      m.position.z = r.floorR + (r.vertR - r.floorR) * mt + P.gap;
+
+      var t = time + r.phase;
+      m.position.x = 0;
+      m.position.y = Math.sin(t * P.bobSpeed) * P.bobAmp;
+      m.rotation.y = Math.sin(t * 0.43) * sway;
+      m.rotation.z = Math.sin(t * 0.31 + 1.7) * sway * 0.35;
+    }
+  }
+
+  // ── ART ───────────────────────────────────────────────────────────────────────────────────
+  function urlsFor(name){
+    var small = name.replace(/\.png$/i, '-768.png');
+    return ['product-images/' + small, 'product-images/' + name,
+            small, name,
+            GH + encodeURIComponent(small), GH + encodeURIComponent(name)];
+  }
+
+  function adopt(i, img){
+    var tex, sc = Math.min(1, MAXPX / Math.max(img.width, img.height));
+    if(sc < 1){
+      var c = document.createElement('canvas');
+      c.width  = Math.max(1, Math.round(img.width  * sc));
+      c.height = Math.max(1, Math.round(img.height * sc));
+      var cx = c.getContext('2d');
+      cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+      cx.drawImage(img, 0, 0, c.width, c.height);
+      var clean = true;
+      try { cx.getImageData(0, 0, 1, 1); } catch(e){ clean = false; }   // tainted: cannot upload it
+      if(clean) tex = new THREE.CanvasTexture(c);
+      else { tex = new THREE.Texture(img); tex.needsUpdate = true; }
+    } else {
+      tex = new THREE.Texture(img); tex.needsUpdate = true;
+    }
+    // NO MIPMAPS, deliberately. uBlocky quantises the UVs, which makes the screen-space
+    // derivatives discontinuous at every cell boundary — the GPU then picks a far coarser LOD
+    // along those seams and the shirt goes blurry in a grid. Point-ish minification is also
+    // simply the look being asked for here.
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    texes[i] = tex;
+    for(var k = 0; k < list.length; k++) if(list[k].idx === i){
+      list[k].mat.uniforms.uTex.value = tex;
+      fit(list[k]);
+    }
+  }
+
+  function loadOne(i){
+    var urls = urlsFor(FILES[i]);
+    (function tryAt(k){
+      if(k >= urls.length){ console.warn('[SHIRT] no candidate loaded for', FILES[i]); return; }
+      var img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload  = function(){ adopt(i, img); };
+      img.onerror = function(){ tryAt(k + 1); };
+      img.src = urls[k];
+    })(0);
+  }
+
+  // Deferred to idle on purpose: the art is ~580 KB the first frame has no use for, and the
+  // entry payload is a number this project has already spent a pass defending.
+  function boot(){
+    if(booted || !P.on) return;
+    booted = true;
+    sync();
+    var go = function(){ for(var i = 0; i < FILES.length; i++) loadOne(i); };
+    if(window.requestIdleCallback) requestIdleCallback(go, {timeout: 2500});
+    else setTimeout(go, 600);
+  }
+
+  function refit(){ sync(); for(var i = 0; i < list.length; i++) fit(list[i]); }
+
+  // Re-deal the colourways across the whole shop without a reload.
+  function reroll(){
+    bag = []; lastPick = -1;
+    for(var i = 0; i < list.length; i++){
+      if(list[i].temp) continue;
+      var idx = pick();
+      list[i].idx = idx;
+      list[i].mat.uniforms.uTex.value = texes[idx] || blankTex();
+      fit(list[i]);
+    }
+  }
+
+  return {P:P, U:U, boot:boot, attach:attach, cloneOnto:cloneOnto, update:update,
+          sync:sync, refit:refit, reroll:reroll, list:list, FILES:FILES};
+})();
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// ▼▼▼ TEMPORARY — HOLOGRAM SHIRT PARAMETER WINDOW (J, or ?shirt).  DELETE TO THE MARKER ▼▼▼
+// ══════════════════════════════════════════════════════════════════════════════════════════
+(function(){
+  var el = null, base = null;
+
+  function fmt(v, step){ var d = (String(step).split('.')[1] || '').length; return (+v).toFixed(d); }
+  function hd(t){ return '<div style="font:700 10px Arial;letter-spacing:1.2px;color:#7ff0e0;margin:11px 0 5px;' +
+                         'border-bottom:1px solid rgba(16,196,178,0.25);padding-bottom:3px">' + t + '</div>'; }
+  function note(t){ return '<div style="font:10px/1.45 Arial;color:#7f9b98;margin:3px 0 7px">' + t + '</div>'; }
+  function row(label, k, lo, hi, step){
+    return '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">' +
+      '<label style="flex:0 0 118px;font:10px Arial;color:#9fc4c0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + label + '</label>' +
+      '<input type="range" data-sk="' + k + '" min="' + lo + '" max="' + hi + '" step="' + step + '" value="' + SHIRT.P[k] + '" style="flex:1;height:12px;accent-color:#10c4b2;min-width:0">' +
+      '<span data-sv="' + k + '" style="flex:0 0 44px;text-align:right;font:10px Arial;color:#dff5f1">' + fmt(SHIRT.P[k], step) + '</span></div>';
+  }
+  function chk(label, k){
+    return '<div style="display:flex;align-items:center;gap:6px;margin:4px 0">' +
+      '<input type="checkbox" data-sb="' + k + '"' + (SHIRT.P[k] ? ' checked' : '') + '>' +
+      '<label style="font:10px Arial;color:#9fc4c0">' + label + '</label></div>';
+  }
+  function rgbHex(a){
+    return '#' + [0,1,2].map(function(i){ return ('0' + Math.round(Math.max(0, Math.min(1, a[i])) * 255).toString(16)).slice(-2); }).join('');
+  }
+  function hexRgb(h){ var n = parseInt(h.slice(1), 16); return [((n>>16)&255)/255, ((n>>8)&255)/255, (n&255)/255]; }
+  function col(label, k){
+    return '<div style="display:flex;align-items:center;gap:6px;margin:3px 0">' +
+      '<label style="flex:0 0 118px;font:10px Arial;color:#9fc4c0">' + label + '</label>' +
+      '<input type="color" data-sc="' + k + '" value="' + rgbHex(SHIRT.P[k]) + '" style="flex:1;height:18px;padding:0;border:0;background:none;min-width:0"></div>';
+  }
+
+  function build(){
+    return '<div style="font:700 11px Arial;letter-spacing:1.6px;color:#10c4b2;margin-bottom:2px">HOLOGRAM SHIRTS</div>' +
+      '<div style="font:9px Arial;color:#6f8e8b;margin-bottom:8px">J closes · placeholder art, four colourways</div>' +
+
+      hd('PLACEMENT') +
+      chk('Projections on', 'on') +
+      row('Float distance', 'gap', 0, 2, 0.01) +
+      row('Size in panel', 'fit', 0.2, 1.3, 0.01) +
+      note('Contain-fit against the panel\'s own arc width and height, so the tall top row keeps the same shirt proportions as the wide ones.') +
+      row('Bob height', 'bobAmp', 0, 0.4, 0.005) +
+      row('Bob speed', 'bobSpeed', 0, 3, 0.05) +
+      row('Sway (deg)', 'sway', 0, 15, 0.1) +
+
+      hd('THE PROJECTION') +
+      row('Opacity', 'alpha', 0, 1, 0.01) +
+      row('Tint mix', 'tintMix', 0, 1, 0.01) +
+      note('THE colourway knob. At 1 every shirt is the same tinted ghost and the four sample colours stop meaning anything; the point of the placeholders is that they differ.') +
+      col('Tint', 'tint') +
+      row('Gap ink', 'ink', 0, 1, 0.01) +
+      row('Projector cone', 'cone', 0, 1, 0.01) +
+
+      hd('THE ALIASING') +
+      row('Pixel grid', 'pixels', 24, 600, 2) +
+      row('Blockiness', 'blocky', 0, 1, 0.01) +
+      note('Blockiness 0 samples the photograph smoothly; 1 snaps every read to the grid, which is what stair-steps the silhouette.') +
+      row('Channel split', 'ca', 0, 0.03, 0.0002) +
+      row('Split pulse', 'caPulse', 0, 2, 0.02) +
+      row('Fringe colour', 'fringe', 0, 1.5, 0.01) +
+      note('Fringe paints the border where the three channel taps disagree. Take it to 0 and the split turns into a plain blur — this is the term that reads as a hologram rather than as a soft edge.') +
+      row('Line glitch', 'glitch', 0, 3, 0.02) +
+
+      hd('THE SCAN') +
+      row('Line count', 'scanFreq', 20, 400, 2) +
+      row('Line depth', 'scanDepth', 0, 1, 0.01) +
+      note('Depth cuts ALPHA, not brightness — the gaps are holes you see the sky through. On this light background that is what sells the projection; darkening alone just makes a striped shirt.') +
+      row('Line scroll', 'scanScroll', -2, 2, 0.01) +
+      row('Roll bar', 'bar', 0, 1, 0.01) +
+      row('Refresh line', 'refresh', 0, 1, 0.01) +
+
+      hd('THE RIM') +
+      row('Rim strength', 'rim', 0, 2, 0.01) +
+      row('Rim width', 'rimW', 0.5, 10, 0.1) +
+      col('Rim colour', 'rimCol') +
+      note('Deep, not bright. Against open sky a pale rim vanishes; the edge has to be darker than the background to hold an outline.') +
+
+      hd('NOISE') +
+      row('Grain', 'grain', 0, 0.4, 0.005) +
+      row('Flicker', 'flicker', 0, 0.5, 0.005) +
+
+      '<div style="margin-top:11px"><button id="shirt-roll" style="width:100%;font:700 10px Arial;color:#dff5f1;' +
+      'background:rgba(16,196,178,0.16);border:1px solid rgba(16,196,178,0.45);border-radius:6px;padding:6px;cursor:pointer">' +
+      'Re-deal the colourways</button></div>' +
+      '<div style="margin-top:5px"><button id="shirt-dump" style="width:100%;font:700 10px Arial;color:#d6ffe8;' +
+      'background:rgba(40,180,110,0.18);border:1px solid rgba(61,220,132,0.45);border-radius:6px;padding:7px;cursor:pointer">' +
+      'Log what I changed (paste-ready)</button></div>' +
+      '<div style="margin-top:5px"><button id="shirt-reset" style="width:100%;font:700 10px Arial;color:#ffd9d9;' +
+      'background:rgba(180,60,60,0.16);border:1px solid rgba(220,90,90,0.40);border-radius:6px;padding:6px;cursor:pointer">' +
+      'Reset to the values in the file</button></div>';
+  }
+
+  function make(){
+    // Snapshotted at FIRST OPEN, which is what makes the dump a diff against the file.
+    if(!base) base = JSON.parse(JSON.stringify(SHIRT.P));
+    el = document.createElement('div');
+    el.style.cssText = 'position:fixed;top:14px;left:14px;width:292px;z-index:2147483000;background:rgba(6,20,20,0.94);' +
+      'border:1px solid rgba(16,196,178,0.30);border-radius:11px;padding:11px 13px 13px;color:#cfe6ff;' +
+      'box-shadow:0 10px 40px rgba(0,0,0,0.7);max-height:88vh;overflow:auto;font-family:Arial,sans-serif';
+    el.innerHTML = build();
+    document.body.appendChild(el);
+
+    el.addEventListener('input', function(ev){
+      var t = ev.target, k = t.getAttribute && t.getAttribute('data-sk');
+      if(k){
+        SHIRT.P[k] = parseFloat(t.value);
+        var o = el.querySelector('[data-sv="' + k + '"]');
+        if(o) o.textContent = fmt(SHIRT.P[k], t.getAttribute('step'));
+        // gap and fit change geometry, not a uniform, so they need the refit path.
+        if(k === 'fit') SHIRT.refit(); else SHIRT.sync();
+        return;
+      }
+      var c = t.getAttribute && t.getAttribute('data-sc');
+      if(c){ SHIRT.P[c] = hexRgb(t.value); SHIRT.sync(); }
+    });
+    el.addEventListener('change', function(ev){
+      var b = ev.target && ev.target.getAttribute && ev.target.getAttribute('data-sb');
+      if(b){
+        SHIRT.P[b] = ev.target.checked;
+        // `on` gates whole meshes rather than a uniform; the projections already exist by now,
+        // so hiding them is the honest toggle — a rebuild would re-deal every colourway.
+        for(var i = 0; i < SHIRT.list.length; i++) SHIRT.list[i].mesh.visible = SHIRT.P.on;
+      }
+    });
+
+    el.querySelector('#shirt-roll').onclick  = function(){ SHIRT.reroll(); };
+    el.querySelector('#shirt-reset').onclick = function(){
+      for(var k in base) if(base.hasOwnProperty(k)) SHIRT.P[k] = Array.isArray(base[k]) ? base[k].slice() : base[k];
+      SHIRT.refit();
+      var keep = el.scrollTop; el.innerHTML = build(); el.scrollTop = keep;
+    };
+    el.querySelector('#shirt-dump').onclick = function(){
+      var out = [], k;
+      for(k in SHIRT.P){
+        if(!SHIRT.P.hasOwnProperty(k)) continue;
+        var a = SHIRT.P[k], b = base[k], same;
+        if(Array.isArray(a)) same = Array.isArray(b) && a.every(function(x, i){ return Math.abs(x - b[i]) < 1e-6; });
+        else if(typeof a === 'number') same = (typeof b === 'number') && Math.abs(a - b) < 1e-9;
+        else same = (a === b);
+        if(same) continue;
+        out.push('    ' + k + ': ' + (Array.isArray(a) ? '[' + a.map(function(x){ return x.toFixed(3); }).join(', ') + ']'
+                                                       : (typeof a === 'number' ? String(parseFloat(a.toPrecision(6))) : String(a))) + ',');
+      }
+      console.log('%c-- SHIRT.P: paste these over the matching lines in `var P = {` --', 'color:#10c4b2;font-weight:700');
+      console.log(out.length ? out.join('\n') : '  (nothing changed)');
+    };
+
+    // The panel sits over a page that drags and spins in 3D; without this a slider also spins
+    // the wheel underneath it.
+    ['wheel','pointerdown','pointermove','pointerup','mousedown','touchstart'].forEach(function(t){
+      el.addEventListener(t, function(e){ e.stopPropagation(); }, {passive: true});
+    });
+  }
+
+  function toggle(){ if(!el) make(); else el.style.display = (el.style.display === 'none') ? '' : 'none'; }
+  window.addEventListener('keydown', function(e){
+    if(e.target && /input|textarea|select/i.test(e.target.tagName)) return;
+    if(e.key === 'j' || e.key === 'J') toggle();
+  });
+  if((location.search || '').split('?').join('').split('&').indexOf('shirt') >= 0)
+    window.addEventListener('load', function(){ setTimeout(toggle, 600); });
+})();
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// ▲▲▲ TEMPORARY — HOLOGRAM SHIRT PARAMETER WINDOW.  DELETE TO HERE ▲▲▲
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+
 function morphTo(mesh, t) {
   var pos = mesh.geometry.attributes.position;
   var fp = mesh.userData.floorPos, vp = mesh.userData.vertPos;
@@ -2283,6 +2898,7 @@ function createFloors() {
       }
     });
   });
+  SHIRT.boot();   // fetches the placeholder garment art — deferred to idle inside
 }
 
 function createOrbFloor(y, radius, label, numOrbs, fi) {
@@ -3409,6 +4025,7 @@ function updateCrystalChain(tipY, seqNorm, dt, beamClimb){
 // ══════════════════════════════════════════════
 // UPDATE ORBS (merged: 3-stage brightness + curve deformation + beam particles)
 // ══════════════════════════════════════════════
+var _bgTmp = new THREE.Color();   // scratch for CSKY.skyBase — no per-frame allocation
 function updateOrbs(dt){
   if(gameEntryFlash > 0) gameEntryFlash = Math.max(0, gameEntryFlash - dt / GAME_FLASH_SEC);
   var orbPositions = [];
@@ -3517,8 +4134,16 @@ function updateOrbs(dt){
     }
 
     // Background: darkens during stage 2, stays dark into stage 3
-    var bgBase = SITE_BG;
-    var bgR2 = ((bgBase>>16)&0xff)/255, bgG2 = ((bgBase>>8)&0xff)/255, bgB2 = (bgBase&0xff)/255;
+    // TIME OF DAY FIRST, CRESCENDO ON TOP. The base sky is no longer the SITE_BG constant but
+    // whatever hour the visitor has spun the sun to; everything below (stage-2 darkening, the
+    // stage-3 crystal lift, the game's held black) then works on that unchanged. At rest
+    // skyBase returns SITE_BG exactly, so with no spinning this is the old line.
+    var bgR2, bgG2, bgB2;
+    if(typeof CSKY !== 'undefined' && CSKY.skyBase){
+      var _sb = CSKY.skyBase(_bgTmp); bgR2 = _sb.r; bgG2 = _sb.g; bgB2 = _sb.b;
+    } else {
+      bgR2 = ((SITE_BG>>16)&0xff)/255; bgG2 = ((SITE_BG>>8)&0xff)/255; bgB2 = (SITE_BG&0xff)/255;
+    }
     var darkT = stage2;
     var tR2 = bgR2 * (1 - darkT*0.96);
     var tG2 = bgG2 * (1 - darkT*0.97);
@@ -3975,6 +4600,7 @@ function createFloor(y, radius, vRadius, label, np, hasRings, fi, panelOpts) {
     p.edges.userData.baseAngle = angle;
     p.edges.userData.baseRadius = radius;
     g.add(p.mesh); g.add(p.edges);
+    SHIRT.attach(p, radius, vRadius, panelOpts);   // the floating garment projection
     panels.push(p);
   }
   
@@ -5522,6 +6148,9 @@ function enterDM(floorData, panelIdx, floorIdx) {
     tm.userData.vertPos = panel.mesh.userData.vertPos;
     tm.userData.morphT = 0;
     tm.userData.borderIndices = panel.mesh.userData.borderIndices;
+    // Carry the garment projection onto the clone, or every shirt on the row blinks out the
+    // instant you click one — while a pixel-identical panel stays exactly where it was.
+    SHIRT.cloneOnto(panel, tm);
     // Create outline for temp mesh
     var tempLineGeo = new THREE.BufferGeometry();
     var tempLinePos = new Float32Array(panel.mesh.userData.borderIndices.length * 3);
@@ -62172,6 +62801,11 @@ function cskyFrag(){ return [
 'uniform float uSunI, uAmb, uDark, uPowder, uSilver, uG1, uG2, uAbsorb, uBright, uShadow;',
 'uniform int uSteps, uLSteps;',
 'uniform float uGrow, uWiden;',
+'uniform float uCirAmt, uCirCov, uCirY, uCirSpan, uCirScale, uCirStretch, uCirDrift;',
+'uniform float uNight, uStarAmt, uTimeS, uMoonCos, uMoonI, uMoonGlow, uMoonGlowP;',
+'uniform vec3 uMoonDir, uMoonCol;',
+'uniform float uRayAmt, uRayFall, uRayG, uRayShadow, uRayH, uRayBase, uRayLod;',
+'uniform vec3 uRayCol;',
 SKY_COMMON,
 SKY_SAMPLE_LIB,
 // The Worley lattice tiles at period 1, so read straight off world axes it lays the cloud
@@ -62213,6 +62847,51 @@ SKY_SAMPLE_LIB,
 '  }',
 '  return sat(d) * uDens;',
 '}',
+// ── HIGH CIRRUS ───────────────────────────────────────────────────────────────────────────
+// A thin sheet a long way above the deck, and it is here for ONE reason: GOD RAYS NEED SOMETHING
+// TO BREAK. The shaft pass is a radial blur of cloud transmittance around the sun, and the sun on
+// this page sits above the top edge over open sky — blur a field that is 1.0 everywhere and all
+// you get is a smooth wash. That is exactly what the first version of the shafts looked like and
+// exactly why they shipped switched off ("the shafts read as a haze over the whole frame rather
+// than as beams"). Give the light an occluder and the same blur resolves into beams.
+// It is deliberately NOT a second deck. The band is a Gaussian in world Y so it reads as one
+// sheet; uCirStretch squashes the sample on X so the cells pull out into fibres rather than
+// staying blobs; and it is thin enough that the blue still comes through it.
+// GEOMETRY WORTH KNOWING: the camera sits at y 0 down to -26 and the deck tops reach about +1.5,
+// so a sheet at y +60 is above the eye — view rays going UP cross it and rays toward the horizon
+// never reach it inside dOut. That is why the cirrus lands in the upper frame, around the sun,
+// which is the only place it does the shaft pass any good.
+// uCirAmt 0 removes it entirely and the sky is the deck-only one again.
+// The sheet's pattern, with no height envelope on it — separated out because the SHADOW below
+// needs the pattern evaluated up at the slab, where the envelope is 1 by construction.
+'float cirNoise(vec3 p){',
+'  vec3 cp = p * uCirScale; cp.x *= uCirStretch;',
+'  vec4 n = tex3D(tBase, CROT*cp + uWind*uTime*uCirDrift);',
+'  float f = dot(n.gba, vec3(0.625,0.25,0.125));',
+'  float sh = rmap(n.r, f - 1.0, 1.0, 0.0, 1.0);',
+'  return sat(rmap(sh, 1.0 - uCirCov, 1.0, 0.0, 1.0));',
+'}',
+'float cCirrus(vec3 p){',
+'  if(uCirAmt <= 0.0001) return 0.0;',
+'  float dy = (p.y - uCirY) / max(uCirSpan, 1e-3);',
+'  float band = exp(-dy*dy);',
+'  if(band < 0.02) return 0.0;',
+'  return cirNoise(p) * band * uCirAmt;',
+'}',
+// ── THE SHADOW THE SHEET CASTS — SOLVED, NOT MARCHED ──────────────────────────────────────
+// This is the whole reason the rays are real this time. The cirrus is a HORIZONTAL SLAB, so the
+// sun ray from any point in the sky crosses it exactly once: one division for the crossing, one
+// texture read there, and the slant path through a Gaussian slab in closed form
+// (sigma * sqrt(pi) / sunDir.y). A shadow march toward the sun would have been 3-4 taps per step
+// and still only approximate; this is one tap and exact.
+// Points already ABOVE the sheet return 0 — there is nothing between them and the sun — which is
+// also why the beams live in the lower air and fade out as a ray climbs past the deck.
+'float cirShadow(vec3 p){',
+'  if(uCirAmt <= 0.0001 || uSunDir.y <= 0.03) return 0.0;',
+'  float t = (uCirY - p.y) / uSunDir.y;',
+'  if(t <= 0.0) return 0.0;',
+'  return cirNoise(p + uSunDir*t) * uCirAmt * (uCirSpan * 1.7725 / uSunDir.y);',
+'}',
 // Two taps, geometrically spaced, and the coverage is carried in from the view-ray sample rather
 // than re-read: coverage is the LOW-frequency term and a few units toward the light is nowhere
 // near a cell wall, so re-reading it buys nothing and costs a third of the shader.
@@ -62224,6 +62903,37 @@ SKY_SAMPLE_LIB,
 '    t += st; st *= 1.7;',
 '  }',
 '  return od * uAbsorb;',
+'}',
+// ── THE NIGHT SKY ── stars and the moon, and they live in the MARCH rather than in the
+// composite on purpose. The composite PAINTS the sky, so anything drawn after it is in front of
+// the cloud deck: stars added there would shine straight through solid cumulus. Added here they
+// go in under the same `trans` the background gets, so a cloud crossing a star occludes it for
+// free, with no sorting and no second pass.
+// It is also the cheap end of the frame. This pass runs at `res` (0.70) and 24 Hz; the composite
+// runs at full resolution every frame AND again inside the glass-refraction FBO.
+'float csStar(vec3 rd, float scale, float thr){',
+// ONE CELL, not the 3x3x3 neighbourhood the atmosphere's starLayer walks. 27 hashes per layer is
+// affordable in a pass that exists only to draw sky; it is not affordable as an extra term bolted
+// onto one that is already marching clouds. The exponent below puts the whole star inside ~0.2 of
+// a cell and the centre is parked in the middle 60% of it, so a star can never cross a cell border
+// and the seams that normally make the single-cell trick unusable cannot occur.
+'  vec3 p = rd*scale, id = floor(p), f = fract(p) - 0.5;',
+'  vec3 h = hash33n(id);',
+'  if(h.z > thr) return 0.0;',
+'  vec3 c = (h - 0.5)*0.6 - f;',
+'  return exp(-dot(c,c)*42.0) * (0.30 + h.y) * (1.0 + 0.6*sin(uTimeS*2.3 + h.x*31.0));',
+'}',
+'vec3 csNightSky(vec3 rd){',
+// A uniform branch, so it is coherent across the whole draw and costs nothing in daylight.
+'  if(uNight < 0.002) return vec3(0.0);',
+'  float st = csStar(rd, 140.0, 0.055) + 0.55*csStar(rd, 320.0, 0.075);',
+'  vec3 col = vec3(0.78,0.85,1.0) * st * uStarAmt;',
+// THE MOON — a disc and its halo, both straight off the angle to uMoonDir. A few ALU rather than
+// an object in the scene, which also means it is behind the clouds by construction.
+'  float md = dot(rd, uMoonDir);',
+'  col += uMoonCol * (smoothstep(uMoonCos, uMoonCos + 0.0007, md) * uMoonI',
+'                   + pow(max(md, 0.0), uMoonGlowP) * uMoonGlow);',
+'  return col * uNight;',
 '}',
 'void main(){',
 // THE BACKGROUND HAS ITS OWN FIELD OF VIEW. SKY_VERT hands this over as (tanX, tanY, -1) in view
@@ -62247,6 +62957,11 @@ SKY_SAMPLE_LIB,
 // this pass runs on whatever the visitor happens to own.
 '  float ph0 = max(hgPhase(uG1, mu), uSilver*hgPhase(0.985, mu)) + 0.35*hgPhase(-uG2, mu);',
 '  float ph1 = max(hgPhase(uG1*0.5, mu), uSilver*hgPhase(0.55, mu)) + 0.35*hgPhase(-uG2*0.5, mu);',
+// The haze's own phase. Deliberately a LOOSE lobe: at g 0.78 the ratio across this frame is ~30:1,
+// which reads as a blown corner rather than as air, and it is the same mistake the cloud g1 had
+// to be walked back from. At 0.40 it is under 2:1 top to bottom — enough that the beams brighten
+// toward the sun, not so much that only the top of the frame has any.
+'  float phR = hgPhase(uRayG, mu) * 12.566;',
 '  vec3 sun = uSunCol * uSunI;',
 '  float trans = 1.0; vec3 energy = vec3(0.0);',
 '  float t = uD0 + ds*jit;',
@@ -62254,7 +62969,7 @@ SKY_SAMPLE_LIB,
 '    if(i >= uSteps || trans < 0.012) break;',
 '    vec3 p = uCamPos + rd*t;',
 '    float cov = cWeather(p);',
-'    float d = cShape(p, cov, true);',
+'    float d = cShape(p, cov, true) + cCirrus(p);',
 '    if(d > 0.002){',
 '      float odL = lightOD(p, cov);',
 '      float od = d * ds * uAbsorb;',
@@ -62268,8 +62983,44 @@ SKY_SAMPLE_LIB,
 '      energy += trans * (direct + ambient) * uTint * (1.0 - ext);',
 '      trans *= ext;',
 '    }',
+// ── GOD RAYS, THE REAL ONES ───────────────────────────────────────────────────────────────
+// OUTSIDE the cloud branch on purpose: a shaft is not a bright bit of cloud, it is the SUNLIT AIR
+// you are looking through with the shadow of the cloud punched through it, so it has to accumulate
+// in the empty sky where there is no cloud at all. That is exactly what the screen-space blur
+// could not do — a radial blur has no depth, so it can only smear the source into a band and it
+// will never produce a beam that goes BEHIND something or converges properly.
+// Because the shadow is solved in the world, these fan from the sun with true perspective and are
+// broken by the actual cirrus pattern overhead. uRayFall keeps the near air weighted over the far,
+// where the ray has climbed above the sheet and is unshadowed anyway (that would just be a wash).
+'    if(uRayAmt > 0.0){',
+// THE HAZE HAS TO END WHERE THE SHADOW ENDS. Above the sheet cirShadow() is 0 by construction —
+// there is nothing left between that air and the sun — so unconfined haze pours a big UNSHADOWED
+// term into every upward ray and dilutes the very modulation the beams are made of. Measured: on
+// a ray 30 degrees up, half the accumulated airlight was already past the sheet and perfectly
+// flat, which is most of why the first attempt read as a band of light rather than as beams.
+// An exponential scale height is also just what haze does, so this costs nothing in realism.
+'      float hz = exp(-max(0.0, p.y - uRayBase) / max(uRayH, 1.0));',
+'      if(hz > 0.01){',
+// STEP-SIZE LOD ON THE SHADOW — this is what stops the beams from staggering.
+// The march step grows geometrically (4.6 world units at the near end, 37 at the far), while the
+// sheet's pattern has a period of 1/uCirScale = 40 units. So the FAR steps sample the shadow at
+// well under Nyquist and the beams break into hard stepped bands. Worse, exp(-k*x) is convex, so
+// undersampling does not just add noise — by Jensen it biases the result HIGH: measured, 18 steps
+// put 6.7x more light on the sky than a converged march, which is most of why the top was too
+// bright. Two complaints, one cause.
+// The fix is to soften the shadow exactly where it is badly sampled, by shrinking the exponent
+// with the step size. Near steps keep the hard, high-contrast shadow that makes a beam readable;
+// far steps get a smooth one that cannot alias. uRayLod 0 restores the old point-sampled shadow.
+'        float k = uRayShadow / (1.0 + ds * uCirScale * uRayLod);',
+'        float lit = exp(-cirShadow(p) * k);',
+'        energy += trans * uRayCol * (uRayAmt * ds * phR * lit * hz * exp(-t*uRayFall));',
+'      }',
+'    }',
 '    t += ds; ds *= kk;',
 '  }',
+// Under the deck, not over it: whatever light survived the clouds is exactly what the night sky
+// is allowed to contribute, so a star behind a cumulus tower is hidden by it.
+'  energy += csNightSky(rd) * trans;',
 '  gl_FragColor = vec4(energy, trans);',
 '}'
 ].join('\n'); }
@@ -62282,22 +63033,41 @@ var CSKY_SHAFT = [
 'precision mediump float;',
 'varying vec2 vUv;',
 'uniform sampler2D tCloud;',
-'uniform vec2 uSunUV; uniform float uAspect, uHalo, uDensity, uDecay, uWeight, uFade;',
+'uniform vec2 uSunUV; uniform float uAspect, uHalo, uDensity, uDecay, uWeight, uFade, uGamma, uDither;',
 'uniform int uSamples;',
+// Interleaved gradient noise. SKY_COMMON is not included in this pass, so it carries its own.
+'float ignS(vec2 p){ return fract(52.9829189*fract(dot(p, vec2(0.06711056, 0.00583715)))); }',
 'float prox(vec2 uv){',
 '  vec2 d = (uv - uSunUV) * vec2(uAspect, 1.0);',
 '  return exp(-dot(d,d)/max(uHalo*uHalo, 1e-4));',
 '}',
 'void main(){',
 '  vec2 dtc = (vUv - uSunUV) * (uDensity / float(uSamples));',
-'  vec2 tc = vUv; float illum = 1.0, acc = 0.0;',
+// JITTER THE FIRST STEP. Without it every pixel at the same radius from the sun walks the same
+// set of texels, so the under-sampling is perfectly CORRELATED and lays concentric arcs across
+// the fan — it reads as a rendering artefact, not as light. One noise value per pixel decorrelates
+// it and the same tap count looks about twice as smooth, which is what buys the step count back
+// on a phone.
+'  float j = ignS(gl_FragCoord.xy) * uDither;',
+'  vec2 tc = vUv - dtc*j;',
+'  float illum = 1.0, acc = 0.0, wsum = 0.0;',
 '  for(int i=0;i<48;i++){',
 '    if(i >= uSamples) break;',
-'    tc -= dtc;',
-'    acc += texture2D(tCloud, tc).a * prox(tc) * illum * uWeight;',
+// CONTRAST ON THE OCCLUDER, and this is the difference between beams and haze. Transmittance is
+// a smooth 0..1 ramp and blurring it raw averages the thin cloud in with the holes, which is a
+// wash by construction. The power curve says only a REAL GAP throws light: at gamma 3 a texel
+// that is 70% clear gives a third of what a fully clear one gives, so the beams come out of the
+// holes and the haze between them stops competing.
+'    acc += pow(texture2D(tCloud, tc).a, uGamma) * prox(tc) * illum;',
+'    wsum += illum;',
 '    illum *= uDecay;',
+'    tc -= dtc;',
 '  }',
-'  gl_FragColor = vec4(vec3(acc * uFade), 1.0);',
+// NORMALISED BY THE WEIGHT ACTUALLY ACCUMULATED, so the sample count is a QUALITY knob and not a
+// brightness knob. It has to be: the adaptive ladder scales uSamples by tier, and unnormalised a
+// demotion would visibly DIM the rays at the same moment it coarsened them — two changes at once,
+// which is the most legible kind of quality pop.
+'  gl_FragColor = vec4(vec3(acc / max(wsum, 1e-4) * uWeight * uFade), 1.0);',
 '}'
 ].join('\n');
 
@@ -62414,6 +63184,37 @@ var P = {
   detAmt: 0.88,           // high-frequency erosion of the edges
   detScale: 9.6,          // erosion frequency, relative to `scale`
 
+  // ── high cirrus ── the sheet the god rays break through. See cCirrus() for why it exists;
+  // the short version is that a radial blur of an empty sky is a wash, not beams. Set cirAmt 0
+  // and the sky is the deck-only one, with the rays reduced to the glow they used to be.
+  cirAmt: 0.0060,         // density of the sheet. THIS is the ray-contrast knob and it is touchy:
+                          // it multiplies a path of ~110 world units through the band, so the
+                          // useful range is a few thousandths. MEASURED — mean transmittance in
+                          // the top 38% of the frame, and the beam structure that comes out of it
+                          // (beamRatio = how much of the shaft buffer's variance is ACROSS the fan
+                          // rather than smooth radial falloff, i.e. beams vs wash):
+                          //   0.0000 -> T 0.94, beam 0.46   (nothing to occlude: a glow, not rays)
+                          //   0.0040 -> T 0.84, beam 0.58
+                          //   0.0060 -> T 0.71, beam 0.69   <- shipped
+                          //   0.0075 -> T 0.59, beam 0.71   (peak structure, but the blue is going)
+                          //   0.0200 -> T 0.22, beam 0.52   (overcast; the gaps close and it washes)
+  cirCov: 0.46,           // how much of the sky the sheet covers. Low = a few long fibres and
+                          // wide clear lanes, which is the shape that throws the cleanest beams.
+  cirY: 60,               // world height of the sheet. The eye is at 0..-26 and the deck tops
+                          // reach ~+1.5, so this has to stay well above both to sit in the
+                          // upper frame where the sun is.
+  cirSpan: 34,            // thickness (Gaussian sigma in world Y). Under ~20 the march puts
+                          // fewer than three steps through it and the sheet starts to strobe.
+  // FEATURE SIZE, and this is the parameter that decides whether there are beams at all. It was
+  // 0.0040 (period 250 world units) to look like high cirrus — but the frame only spans ~220 units
+  // at the sheet's altitude, so that is LESS THAN ONE FEATURE across the whole picture: the sky
+  // got one broad light region and one broad dark one, which reads as a gradient, not as rays.
+  // 0.025 is a period of 40 units, about five bands across the frame. Measured structure at equal
+  // brightness: 0.0040 -> 0.053 · 0.012 -> 0.081 · 0.025 -> 0.101 · 0.040 -> 0.095.
+  cirScale: 0.0250,       // feature size (period = 1/this). See above before changing it.
+  cirStretch: 0.30,       // X squash on the sample. <1 pulls the cells into fibres along X
+  cirDrift: 0.55,         // wind multiplier. Slower than the deck: high cloud reads as further away
+
   // ── motion ── windSpd/windDir/rise/evolve are the SHAPE of the movement (which way, how far
   // per unit of cloud time, how fast the field reorganises). The two speeds below are the CLOCK
   // RATE that shape runs at, and they are what the wheel drives.
@@ -62457,6 +63258,66 @@ var P = {
   // `sunAz` is measured from straight ahead (0 = directly behind the tower, +ve to the right).
   sunLock: 0.0,           // 0 = the fixed sun below, 1 = drag the light onto the gallery crystal
   sunAz: 5, sunEl: 38,
+
+  // ── SUNSET ── the sun is lowered by the visitor's own spinning, and the page pays NOTHING for
+  // it. Every value below feeds a uniform the shader already reads every frame (sun direction,
+  // sun/ambient/halo/ray colour, the page's own background); moving them is a handful of floats
+  // on the CPU. No extra pass, no extra texture, no extra draw call. The feature is a SCHEDULE.
+  setOn: true,
+  // HOW MUCH SPINNING, IN WHOLE TURNS OF THE MARK. This can be an honest revolution count only
+  // because the hero row is dragged 1:1 with the pointer: a turn of the logo is a turn of the
+  // finger, so 25 here really is 25 spins of the brand mark. (The gallery charge wheel at the
+  // bottom of the page is deliberately NOT wired to this — it is a flywheel that reaches ~1375
+  // rpm, where a revolution count would run a whole day/night cycle in about a second.)
+  // Release momentum counts too, so a hard flick is worth more than the drag alone; the row's
+  // own passive idle drift never does, or the sun would set with nobody touching the page.
+  setSpins: 25,
+  setEase: 0.6,           // how fast the drawn sun catches the accumulator, per second
+  // WHERE THE HORIZON IS — the CLOUD DECK, not y = 0. The tops are the only ground this page has,
+  // so the sunset is measured against them. deckTopY is rebuilt from the very same hWorld / hSpan
+  // / towerLo / cov that shape the deck (tTop is the same expression cShape uses), which means
+  // retuning the clouds moves the sunset with them and the two can never disagree.
+  setDrop: 4.0,           // degrees BELOW the visible tops that counts as down, so the sun slips
+                          // behind the deck instead of being cut by a hard line
+  setDist: 200,           // distance the far tops are measured at (the march itself runs to 290)
+  setKnee: 0.62,          // share of the spinning spent coming DOWN to the horizon. The remaining
+                          // 38% is the sunset and the fall into night — that split is what gives
+                          // the pretty part real screen time, where a straight lerp would blow
+                          // through the whole horizon crossing in the last few percent.
+  setElNight: -19,        // where the sun finally rests. Has to clear the horizon by more than
+                          // setNightW or full night is never reached — at -15 it stalled at
+                          // night 0.905 and the sky kept a dusk cast that never resolved.
+  setGlowW: 9.0,          // degrees either side of the horizon the sunset glow spans
+  setNightW: 11.0,        // degrees below the horizon over which night arrives
+  setAzNight: 0,          // azimuth it converges on. 0 is dead centre of frame: the sun tracks
+                          // from sunAz to here as it falls, so it lands down the middle.
+  setSunCol:   [1.00, 0.46, 0.17],    // key light at the horizon crossing
+  setSkyCol:   [0.92, 0.55, 0.42],    // the page's own sky at the crossing
+  setNightSky: [0.030, 0.055, 0.115],
+  setNightAmb: [0.34, 0.46, 0.78],
+  // ── the moon ── THE LIGHT HAS TO COME FROM SOMEWHERE. Once the sun is under the deck it
+  // cannot be lighting anything, so the key direction sweeps up to the moon as night arrives and
+  // the god rays go with it — which is what stops them being sun rays in a night sky.
+  // It COMES DOWN: parked high and out of frame while the sun is still setting, sinking into the
+  // upper sky as night takes over, so it reads as arriving rather than as having been there all
+  // along. Both angles are in degrees, moonAz 0 being dead centre like the sun.
+  moonAz: 0, moonElHigh: 78, moonElNight: 34,
+  moonSize: 1.6,          // angular RADIUS of the disc, in degrees
+  moonI: 2.4,             // disc brightness
+  moonGlow: 0.55, moonGlowP: 420,   // the halo around it; the power is its tightness
+  moonCol: [0.86, 0.90, 1.00],
+  starAmt: 0.95,          // star brightness. 0 removes them and leaves the moon.
+  // WHAT THE RAYS DO AT NIGHT. Not zero: the moon is a real key light now and it is directly
+  // overhead of the deck, so a little moonlight through the cirrus is correct and pretty. What
+  // was wrong was carrying the DAYTIME ray strength into a night sky.
+  setNightRay: 0.12,
+  setNightI: 0.06,        // fraction of the key light left at full night
+  setNightAmbF: 0.20,     // fraction of the ambient left at full night
+  // The NDC height the sun is HELD AT OR ABOVE, in the widened background image. 1.0 is exactly
+  // the top edge, so 1.02 is just past it. This is a floor on sunEl, not a replacement: raise
+  // sunEl above what this asks for and sunEl wins. Set it to 0 to switch the rule off entirely
+  // and put the sun wherever sunEl says — including inside the frame, if that is what you want.
+  sunEdge: 1.02,
   sunUp: 0.0,             // only used when sunLock > 0: raises the "sun" above the crystal
   // These are IRRADIANCE, and the shader multiplies by 4π, the phase function and `bright`.
   // THE ONE RULE: the composite is mix(bg, direct+ambient, 1-T), so direct+ambient is the only
@@ -62503,16 +63364,94 @@ var P = {
 
   // ── sun halo ── the sky's own forward scatter around the sun, painted into the background
   // BEFORE the clouds composite over it. haloStr 0 restores a flat scene.background exactly.
-  haloStr: 1.00,          // how white the sky goes at the centre of the glow
+  // WAS 1.00, before the god rays existed. The halo was the only thing making the sky bright near
+  // the sun, so it had to be strong enough to sell that on its own — and it whitened the top ~40%
+  // of the frame to do it. The rays now do that job with structure, and the halo's only remaining
+  // job is the soft forward-scatter right at the source. Turning it down is not a cosmetic tweak:
+  // additive rays are invisible over a near-white sky (see shStr), so this IS the ray-visibility
+  // control. Measured: the top of the frame keeps its blue at 0.44 and loses it by about 0.75.
+  haloStr: 0.30,          // how white the sky goes at the centre of the glow
   haloR: 0.52,            // screen radius of the glow, in half-heights
   haloCol: [1.00, 1.00, 1.00],
 
-  // ── light shafts ── a radial blur of where the light gets THROUGH the deck near the sun.
-  // OFF: with the deck this thick and this close, the shafts read as a haze over the whole frame
-  // rather than as beams. The pass is skipped entirely while shOn is false, so it costs nothing.
-  shOn: false, shStr: 2.10, shSamples: 16, shDensity: 1.26, shDecay: 0.955, shWeight: 0.10,
-  shHalo: 0.42,           // screen-space radius over which a pixel counts as "near the sun"
-  shReach: 1.6            // how far off-frame the sun may sit and still throw shafts
+  // ── GOD RAYS, part 1: THE VOLUMETRIC ONES ── the beams themselves. Sunlit haze, marched in the
+  // same loop as the cloud and shadowed by the cirrus overhead via the analytic slab crossing in
+  // cirShadow(). This is what makes them read as RAYS and not as a bright patch of sky: the light
+  // and dark alternate because the sheet above genuinely blocks the sun in some directions and not
+  // others, in 3D, with perspective. rayAmt 0 removes them.
+  // Airlight per world unit. CALIBRATE THIS BY MEASUREMENT, not by arithmetic: the first guess
+  // here was 0.0010 and it was ~25x too small to see, because the estimate assumed the haze and
+  // the shadow were both 1 along the whole march when in practice uRayH, uRayFall and `trans`
+  // between them throw most of it away. The honest way to read it is that at rayShadow 18 the
+  // shipped value puts a MEAN of ~0.06 of extra light on a sky sitting at 0.65-0.9.
+  // Retuned down with rayShadow: a softer shadow lets far more light through, and the converged
+  // march is ~6.7x dimmer than the aliased one that this was first set against.
+  rayAmt: 0.0013,
+  rayFall: 0.0060,        // how fast the beams give out with distance. Beyond the point where a
+                          // view ray climbs above the sheet there is no shadow left to see, so
+                          // letting the far field contribute equally just adds a wash
+  rayG: 0.40,             // forward scatter of the haze. See the note in the shader: a tight lobe
+                          // puts every beam in the top corner
+  // HOW DARK THE GAPS GO — the contrast knob, and the one that actually decides whether this
+  // reads as beams. MEASURED, as "structure across the frame at the same mean brightness"
+  // (every config renormalised to the same added light, because raw structure just rewards
+  // whichever setting is brightest and structure/mean just rewards whichever is darkest — both
+  // of those metrics sent me the wrong way once):
+  //     rayShadow    3      6      10     16
+  //     structure   0.025  0.033  0.051  0.101
+  // ...BUT that table could not tell a beam from an ALIASING BAND — both are across-frame
+  // structure — and most of what it was rewarding at the top end was the stagger. Re-measured with
+  // the two separated (beams = structure surviving a 4x box downsample, stagger = Laplacian
+  // energy), the beam-to-stagger ratio at equal brightness is 0.621 at rayShadow 10 against 0.442
+  // at 18: the exponent is what AMPLIFIES the undersampling, so turning it down beats filtering
+  // the result afterwards. 10 is the setting; see uRayLod for the rest of the fix.
+  rayShadow: 10.0,
+  // Haze scale height, and the base it is measured from. The deck tops are at about +1.5 and the
+  // sheet is at +60, so a scale height of ~34 puts the beams in the air BETWEEN them, which is
+  // exactly the volume that is both hazy and shadowed.
+  rayH: 34, rayBase: 0,
+  // How hard the shadow is softened as the march step grows — see the LOD note in the shader.
+  // 0 is the old point-sampled shadow, which staggers. Raising it trades a little far-field beam
+  // contrast for beams that hold together as continuous streaks.
+  rayLod: 6.0,
+  rayCol: [1.00, 0.98, 0.92],
+
+  // ── GOD RAYS, part 2: THE SCREEN-SPACE GLARE ── a radial blur of where light gets through the
+  // cloud, fanned from the sun's position in the background image. This is the BLOOM around the
+  // source, not the beams — it has no depth information, so on its own it can only ever produce a
+  // band of light near the sun (which is precisely what it did, and why it shipped switched off).
+  // Kept because glare around a bright source is real and it sells the sun; kept LOW because it
+  // brightens smoothly and competes with the volumetric beams above. The sun sits just past the top edge, so what lands in
+  // frame is light streaming DOWN into the shot, broken by the cirrus above and washing over the
+  // deck below.
+  // It was off for a long time and the note said "the shafts read as a haze over the whole frame
+  // rather than as beams" — that was true, and it was not the blur's fault: there was nothing up
+  // there to occlude the sun. cirAmt above is the other half of this feature; turning it to 0
+  // turns the rays back into that wash however these are set.
+  // The pass is skipped entirely while shOn is false, and then costs nothing.
+  shOn: true,
+  // STRENGTH IS CAPPED BY THE DISPLAY, NOT BY TASTE. The rays are additive over a sky that already
+  // sits near 0.9, so past about 2.1 they stop getting brighter and start getting FLATTER: measured
+  // clipped-pixel fraction 2.3% at shStr 2.1, then 14.3% at 2.6 and 21.9% at 3.4 — and the beam
+  // structure goes DOWN with it (0.67 -> 0.59) because a blown pixel has no structure left. If the
+  // rays look weak the lever is haloStr (give them somewhere darker to land) or shGamma, never this.
+  shStr: 0.28,            // master strength, applied in the composite against the headroom left
+  shSamples: 28,          // QUALITY only — the blur is normalised, so this cannot change brightness
+  shDensity: 1.30,        // how far toward the sun the blur reaches, as a fraction of that distance
+  shDecay: 0.975,         // per-tap falloff = how far a beam runs before it dies
+  shWeight: 2.20,         // gain inside the blur
+  shGamma: 7.5,           // CONTRAST on the occluder, and the knob that decides beams vs haze.
+                          // 1 is the old wash. High is counter-intuitively the SUBTLE end: it makes
+                          // only the clearest holes throw light, so the fan goes sparse and defined
+                          // and the sky keeps its blue instead of being evenly brightened.
+  shDither: 1.0,          // per-pixel jitter of the first tap. 0 brings the concentric banding back
+  shHalo: 0.85,           // how near the sun a texel has to be to count as throwing light
+  shSpin: 1.30,           // extra ray strength at the top of the crescendo, on the same eased
+                          // curve as the cloud light (lightCurve) so it cannot slam like the raw signal
+  shRes: 0.5,             // shaft RT as a fraction of the cloud RT. The blur is inherently soft,
+                          // so this is the cheapest quality in the whole effect
+  shCol: [1.00, 0.97, 0.90],
+  shReach: 1.6            // how far off-frame the sun may sit and still throw rays
 };
 
 
@@ -62527,6 +63466,9 @@ var M = {
   t0: 0, last: -1e9, half: false,
   tier: 0, avg: 16.7, tierT: 0, hidden: false, fade: 0, moveT: 0,
   warm: 0, base: 0,
+  // Sunset: setAcc is the raw accumulated push, setT the eased 0..1 the look is built from.
+  setAcc: 0, setT: 0, setEl: 38, setAz: 5, setGlow: 0, setNight: 0, setHorizon: 0,
+  setDir: 0,   // which way is "sunset" — 0 until the first spin picks it. See CSKY.spin.
   ct: 0, rate: 1
 };
 // ADAPTIVE LADDER. Steps DOWN only — an effect that flickers between quality levels is worse
@@ -62551,6 +63493,7 @@ var CS_OFF = TIERS.length - 1;   // the "clouds disabled" rung — derived, so a
 var CS_WARM = 1.4;
 
 var _sun = new THREE.Vector3(), _sd = new THREE.Vector3(), _tmp = new THREE.Vector3();
+var _md = new THREE.Vector3(0, 1, 0);   // moon direction, built in _sunset()
 // Previous-frame camera pose, for the motion metric. Seeded far away so the first frame reads as
 // a huge jump and settles, rather than reading as motion for the next third of a second.
 var _camPrev = new THREE.Vector3(1e9, 1e9, 1e9), _qPrev = new THREE.Quaternion();
@@ -62622,12 +63565,23 @@ function _build(){
       uSunI:{value:0.3}, uAmb:{value:P.amb}, uDark:{value:P.dark}, uPowder:{value:P.powder},
       uSilver:{value:P.silver}, uG1:{value:P.g1}, uG2:{value:P.g2}, uAbsorb:{value:P.absorb},
       uBright:{value:P.bright}, uShadow:{value:P.shadow},
-      uSteps:{value:14}, uLSteps:{value:2}, uGrow:{value:P.grow}, uWiden:{value:1}
+      uSteps:{value:14}, uLSteps:{value:2}, uGrow:{value:P.grow}, uWiden:{value:1},
+      uCirAmt:{value:P.cirAmt}, uCirCov:{value:P.cirCov}, uCirY:{value:P.cirY},
+      uCirSpan:{value:P.cirSpan}, uCirScale:{value:P.cirScale},
+      uCirStretch:{value:P.cirStretch}, uCirDrift:{value:P.cirDrift},
+      uNight:{value:0}, uStarAmt:{value:P.starAmt}, uTimeS:{value:0},
+      uMoonDir:{value:new THREE.Vector3(0,1,0)}, uMoonCol:{value:new THREE.Color(1,1,1)},
+      uMoonCos:{value:0.999}, uMoonI:{value:P.moonI},
+      uMoonGlow:{value:P.moonGlow}, uMoonGlowP:{value:P.moonGlowP},
+      uRayAmt:{value:P.rayAmt}, uRayFall:{value:P.rayFall}, uRayG:{value:P.rayG},
+      uRayShadow:{value:P.rayShadow}, uRayCol:{value:new THREE.Color(1,1,1)},
+      uRayH:{value:P.rayH}, uRayBase:{value:P.rayBase}, uRayLod:{value:P.rayLod}
     });
     M.mShaft = _mat(CSKY_SHAFT, {
       tCloud:{value:null}, uSunUV:{value:new THREE.Vector2(0.5,0.5)}, uAspect:{value:1},
       uHalo:{value:P.shHalo}, uDensity:{value:P.shDensity}, uDecay:{value:P.shDecay},
-      uWeight:{value:P.shWeight}, uFade:{value:1}, uSamples:{value:24}
+      uWeight:{value:P.shWeight}, uFade:{value:1}, uSamples:{value:24},
+      uGamma:{value:P.shGamma}, uDither:{value:P.shDither}
     });
     M.comp = new THREE.ShaderMaterial({
       uniforms: {
@@ -62663,8 +63617,11 @@ function _size(){
   // low-frequency effect it renders at a quarter of that anyway.
   var w = Math.max(64, Math.floor(window.innerWidth  * rs));
   var h = Math.max(48, Math.floor(window.innerHeight * rs));
-  var sw = Math.max(32, Math.floor(w * 0.5)), sh = Math.max(24, Math.floor(h * 0.5));
-  if(M.w === w && M.h === h) return;
+  var shr = Math.max(0.15, Math.min(1, P.shRes));
+  var sw = Math.max(32, Math.floor(w * shr)), sh = Math.max(24, Math.floor(h * shr));
+  // sw/sh are in the guard as well: without them shRes is a slider that silently does nothing,
+  // because the cloud RT has not changed and the function returns before reallocating.
+  if(M.w === w && M.h === h && M.sw === sw && M.sh === sh) return;
   M.w = w; M.h = h; M.sw = sw; M.sh = sh;
   if(M.rtCloud) M.rtCloud.dispose();
   if(M.rtShaft) M.rtShaft.dispose();
@@ -62700,6 +63657,52 @@ function _sunWorld(out){
     y = gameMode.galleryFloor.group.position.y;
   else if(typeof orbFloorY === 'number') y = orbFloorY;
   return out.set(0, y + P.sunUp, 0);
+}
+
+// ── THE SUNSET SCHEDULE ───────────────────────────────────────────────────────────────────
+// Pure arithmetic over numbers the frame already has. It allocates nothing and renders nothing;
+// its entire output is a handful of floats that the existing uniform writes then pick up.
+function _smooth(x){ return x*x*(3-2*x); }
+function _sunset(dt){
+  // THE DAYTIME ELEVATION IS STILL THE DERIVED ONE. The sun has to start exactly where the fixed
+  // sun sat — just past the top edge of the widened background — or turning this feature on would
+  // move the shipped composition before a single swipe. See the sun-direction block for why the
+  // floor is derived from the widened half-FOV rather than hard-coded.
+  var half = ((typeof camera !== 'undefined' ? camera.fov : 75) * 0.5) * Math.PI/180;
+  var elMin = Math.atan(Math.tan(half) * Math.max(1, P.fovMul || 1) * Math.max(0, P.sunEdge)) * 180/Math.PI;
+  var elDay = Math.max(P.sunEl, elMin);
+
+  if(!P.setOn){ M.setT = 0; M.setGlow = 0; M.setNight = 0; M.setEl = elDay; M.setAz = P.sunAz; return; }
+
+  // setAcc is in radians turned; setSpins is in whole turns of the mark.
+  var tgt = Math.min(1, M.setAcc / Math.max(0.001, P.setSpins * 6.2831853));
+  M.setT += (tgt - M.setT) * Math.min(1, dt * Math.max(0.01, P.setEase));
+
+  // THE HORIZON IS THE CLOUD DECK. tTop mirrors cShape's own mix(uTowerLo, 0.98, cov).
+  var tTop = P.towerLo + (0.98 - P.towerLo) * P.cov;
+  var deckTopY = P.hWorld + P.hSpan * (tTop - 0.5);
+  var camY = (typeof camera !== 'undefined') ? camera.position.y : 0;
+  var hEl = Math.atan2(deckTopY - camY, Math.max(1, P.setDist)) * 180/Math.PI - P.setDrop;
+  M.setHorizon = hEl;
+
+  // Two straight segments hinged at the horizon (setKnee).
+  var k = Math.min(0.999, Math.max(0.001, P.setKnee));
+  M.setEl = (M.setT < k) ? elDay + (hEl - elDay) * (M.setT / k)
+                         : hEl + (P.setElNight - hEl) * ((M.setT - k) / (1 - k));
+  M.setAz = P.sunAz + (P.setAzNight - P.sunAz) * M.setT;
+
+  var d = M.setEl - hEl;                       // + above the tops, - below them
+  M.setNight = _smooth(Math.min(1, Math.max(0, -d / Math.max(0.01, P.setNightW))));
+  // THE AFTERGLOW HAS TO DIE WITH THE LIGHT. A bare Gaussian on the horizon distance is still
+  // worth 0.38 once the sun is 9 degrees under, which left a permanent orange smear across a
+  // night sky. Folding night back into it is also just what dusk does: the glow is sunlight in
+  // the air above you, so it goes out as the sun sinks away from that air.
+  M.setGlow = Math.exp(-(d*d) / Math.max(0.01, P.setGlowW * P.setGlowW)) * (1 - M.setNight);
+  // THE MOON COMES DOWN as night arrives — see the moon params. Built here rather than earlier
+  // because its height is a function of setNight, which is only known on the line above.
+  var mEl = (P.moonElHigh + (P.moonElNight - P.moonElHigh) * M.setNight) * Math.PI/180;
+  var mAz = P.moonAz * Math.PI/180;
+  _md.set(Math.cos(mEl)*Math.sin(mAz), Math.sin(mEl), -Math.cos(mEl)*Math.cos(mAz)).normalize();
 }
 
 function _wantsOn(){
@@ -62745,6 +63748,9 @@ function _adapt(dt){
 
 function update(dt){
   if(M.failed) return;
+  // Before every early-out below — the page's own sky still has to know what time it is when the
+  // clouds are warming up, faded out, or switched off entirely.
+  _sunset(dt);
   // WARM-UP. Nothing is built, allocated or drawn for the first CS_WARM seconds; the only work
   // done is reading the page's own frame time, which becomes the baseline the adaptive ladder
   // measures against. It also keeps the noise atlas bake out of the load.
@@ -62821,13 +63827,34 @@ function update(dt){
   if(_sd.lengthSq() < 1e-6) _sd.set(0, 1, 0);
   _sd.normalize();
   if(P.sunLock < 0.999){
-    var az = P.sunAz * Math.PI/180, el = P.sunEl * Math.PI/180;
+    // KEEP THE SUN JUST PAST THE TOP EDGE. That is the composition the whole sky is built on: the
+    // halo reads as sky rather than as a lens flare, and the god rays fan DOWN INTO the shot
+    // instead of converging on a blob inside it.
+    // A fixed 38 degrees held that at both shipped FOVs, but it cannot survive fovMul. The
+    // background is marched at `wide` x the camera's FOV, so the sun's position in that image is
+    // NDC = tan(el) / (tan(fov/2) * wide), and widening the sky walks it DOWN into frame. Measured
+    // on a portrait phone at fovMul 1.40 it landed at UV 0.86 — a bright disc two thirds of the way
+    // up the screen with every ray converging on it.
+    // So the floor is DERIVED from the current widened half-FOV rather than hard-coded, and there
+    // is no per-device sun: landscape at 1.25 asks for 36.8 degrees and the shipped 38 already
+    // clears it (a no-op on desktop), portrait at 1.40 asks for 47.6 and gets lifted. The cost is
+    // that a phone is lit from slightly higher than a laptop, which is a far smaller price than
+    // the sun wandering into the middle of the page.
+    // Both angles come from the sunset schedule, which STARTS at that derived floor and only ever
+    // descends from it — so with no spinning this is bit-identical to the fixed sun and the
+    // off-the-top-edge guarantee holds for the whole daytime half of the fall.
+    var az = M.setAz * Math.PI/180, el = M.setEl * Math.PI/180;
     // -Z is straight ahead: the site camera always sits on +Z looking at the tower, so az 0 puts
     // the sun behind it. Getting this sign wrong parks the sun behind the viewer and every cloud
     // goes flat, with no visible error anywhere.
     _tmp.set(Math.cos(el)*Math.sin(az), Math.sin(el), -Math.cos(el)*Math.cos(az));
     _sd.lerp(_tmp, 1 - P.sunLock).normalize();
   }
+  // THE KEY LIGHT HANDS OVER TO THE MOON. A sun 19 degrees under the deck cannot be lighting the
+  // sky above it, so the direction everything derives from — cloud shading, the ray shadows, the
+  // halo, the screen-space glare — sweeps up to the moon as night comes in. This one line is why
+  // the rays stop being sun rays in a night sky and become moon rays.
+  if(M.setNight > 0.001) _sd.lerp(_md, M.setNight).normalize();
   // _spin() is the site's crescendo energy on 0→2.2. Normalise, shape, and put it back on the
   // same scale, so lightCurve 1 / lightGain 1 is exactly the old behaviour and the top end never
   // moves however hard the curve is bent.
@@ -62868,11 +63895,25 @@ function update(dt){
   u.uWind.value.set(Math.cos(wr)*ws, P.rise*0.004, Math.sin(wr)*ws);
   u.uEvolve.value = P.evolve * 0.02;
   u.uSunDir.value.copy(_sd);
-  u.uSunCol.value.setRGB(P.sunCol[0], P.sunCol[1], P.sunCol[2]);
-  u.uAmbCol.value.setRGB(P.ambCol[0] + (P.sunCol[0] - P.ambCol[0]) * w,
-                         P.ambCol[1] + (P.sunCol[1] - P.ambCol[1]) * w,
-                         P.ambCol[2] + (P.sunCol[2] - P.ambCol[2]) * w);
+  // SUNSET COLOUR. One lerp chain over values that were being written this frame anyway: warm
+  // toward setSunCol as the sun crosses the deck tops, then hand the key light over to setNightI.
+  var gT = M.setGlow, nT = M.setNight;
+  u.uSunCol.value.setRGB(P.sunCol[0] + (P.setSunCol[0] - P.sunCol[0]) * gT,
+                         P.sunCol[1] + (P.setSunCol[1] - P.sunCol[1]) * gT,
+                         P.sunCol[2] + (P.setSunCol[2] - P.sunCol[2]) * gT);
+  // Ambient turns over twice: `w` is the existing sky/crystal handover, then night pulls the whole
+  // thing to setNightAmb — the cool blue an unlit deck reads as after the sun has gone.
+  var _ar = P.ambCol[0] + (P.sunCol[0] - P.ambCol[0]) * w;
+  var _ag = P.ambCol[1] + (P.sunCol[1] - P.ambCol[1]) * w;
+  var _ab = P.ambCol[2] + (P.sunCol[2] - P.ambCol[2]) * w;
+  u.uAmbCol.value.setRGB(_ar + (P.setNightAmb[0] - _ar) * nT,
+                         _ag + (P.setNightAmb[1] - _ag) * nT,
+                         _ab + (P.setNightAmb[2] - _ab) * nT);
   u.uTint.value.setRGB(P.tint[0], P.tint[1], P.tint[2]);
+  // The sun going down is what takes the light out of the sky. Both terms keep a floor so the
+  // deck never turns into a silhouette — a night cloud is dim, not black.
+  sunI *= 1 - (1 - P.setNightI) * nT;
+  amb  *= 1 - (1 - P.setNightAmbF) * nT;
   u.uSunI.value = sunI; u.uAmb.value = amb; u.uDark.value = P.dark;
   M.lit = spin; M.sunI = sunI; M.ambNow = amb;   // harness readout only
   u.uPowder.value = P.powder; u.uSilver.value = P.silver;
@@ -62884,6 +63925,31 @@ function update(dt){
   u.uGrow.value = Math.max(1.0, Math.min(1.4, P.grow));
   var wide = Math.max(1, Math.min(2.5, P.fovMul || 1));
   u.uWiden.value = wide;
+  u.uCirAmt.value = P.cirAmt; u.uCirCov.value = P.cirCov;
+  u.uCirY.value = P.cirY; u.uCirSpan.value = Math.max(1, P.cirSpan);
+  u.uCirScale.value = P.cirScale; u.uCirStretch.value = Math.max(0.02, P.cirStretch);
+  u.uCirDrift.value = P.cirDrift;
+  // NIGHT SKY. uTimeS is wall-clock, deliberately NOT the cloud clock: the cloud clock runs 14x
+  // during a spin and the stars would strobe with it.
+  u.uNight.value = M.setNight;
+  u.uStarAmt.value = P.starAmt;
+  u.uTimeS.value = now * 0.001;
+  u.uMoonDir.value.copy(_md);
+  u.uMoonCol.value.setRGB(P.moonCol[0], P.moonCol[1], P.moonCol[2]);
+  u.uMoonCos.value = Math.cos(Math.max(0.05, P.moonSize) * Math.PI/180);
+  u.uMoonI.value = P.moonI; u.uMoonGlow.value = P.moonGlow;
+  u.uMoonGlowP.value = Math.max(1, P.moonGlowP);
+  // The beams follow the light down. They do not go to zero — the moon is a real key light now,
+  // and it sits above the deck — but carrying the DAYTIME strength into a night sky was the bug.
+  u.uRayAmt.value = P.rayAmt * (1 - (1 - P.setNightRay) * nT);
+  u.uRayFall.value = P.rayFall;
+  u.uRayG.value = Math.max(0, Math.min(0.95, P.rayG)); u.uRayShadow.value = P.rayShadow;
+  u.uRayH.value = Math.max(1, P.rayH); u.uRayBase.value = P.rayBase;
+  u.uRayLod.value = Math.max(0, P.rayLod);
+  // The beams are made of the sun, so they take its colour through the whole descent.
+  u.uRayCol.value.setRGB(P.rayCol[0] + (P.setSunCol[0] - P.rayCol[0]) * gT,
+                         P.rayCol[1] + (P.setSunCol[1] - P.rayCol[1]) * gT,
+                         P.rayCol[2] + (P.setSunCol[2] - P.rayCol[2]) * gT);
 
   // ── the march, rate-capped ── the composite still runs every frame, so a held cloud frame is
   // invisible: the camera moves a few thousandths of a radian between them and the field itself
@@ -62922,6 +63988,7 @@ function update(dt){
       su.uAspect.value = window.innerWidth / Math.max(1, window.innerHeight);
       su.uHalo.value = P.shHalo; su.uDensity.value = P.shDensity;
       su.uDecay.value = P.shDecay; su.uWeight.value = P.shWeight;
+      su.uGamma.value = Math.max(0.25, P.shGamma); su.uDither.value = P.shDither;
       su.uSamples.value = Math.max(4, Math.min(48, Math.round(P.shSamples * tier.s)));
       // Behind the camera the projection flips; without this the shafts snap to the far side of
       // the screen and sweep across it as the crystal passes out of view.
@@ -62943,12 +64010,18 @@ function update(dt){
   cu.uBg.value.copy(_bg);
   cu.uFade.value = M.fade * P.opacity;
   cu.uShaftOn.value = (P.shOn && M.rtShaft) ? 1 : 0;
-  cu.uShaftStr.value = P.shStr;
-  cu.uShaftCol.value.setRGB(P.sunCol[0], P.sunCol[1], P.sunCol[2]);
+  // Rays brighten into the crescendo on the SAME eased curve as the cloud light, not on the raw
+  // signal — godrayIntensity is 2.2 of its 3.2 by ~86 rpm out of 960, so anything riding it raw
+  // is at full brightness in the first second of a spin. `spin` is already normalised and curved.
+  cu.uShaftStr.value = P.shStr * (1 + P.shSpin * Math.min(1, spin / 2.2))
+                               * (1 - (1 - P.setNightRay) * M.setNight);
+  cu.uShaftCol.value.setRGB(P.shCol[0], P.shCol[1], P.shCol[2]);
   // The halo is SKY, so it leaves with the sky: the crescendo takes scene.background to black,
   // and scaling by that same luminance is what keeps a white smear from floating in the dark.
   // Behind the camera it is simply off — there is no glow on the wall you have turned away from.
-  cu.uHaloCol.value.setRGB(P.haloCol[0], P.haloCol[1], P.haloCol[2]);
+  cu.uHaloCol.value.setRGB(P.haloCol[0] + (P.setSunCol[0] - P.haloCol[0]) * M.setGlow,
+                           P.haloCol[1] + (P.setSunCol[1] - P.haloCol[1]) * M.setGlow,
+                           P.haloCol[2] + (P.setSunCol[2] - P.haloCol[2]) * M.setGlow);
   cu.uHaloUV.value.copy(_sunUV);
   cu.uHaloR.value = Math.max(0.02, P.haloR);
   cu.uHaloAsp.value = window.innerWidth / Math.max(1, window.innerHeight);
@@ -62980,7 +64053,14 @@ return {
       // fovMul is highest here: portrait crops the deck hardest, so widening buys the most
       // (75 -> ~94 degrees vertical), and it spends the new texels on more sky rather than on a
       // sharper look at the same three clouds.
+      // THE RAYS ARE MUCH STRONGER IN PORTRAIT and it is not a resolution effect. A tall frame
+      // puts far more of its pixels near the sun, which is exactly where the haze phase function
+      // peaks, and the widened 94-degree vertical FOV reaches further into that region again.
+      // MEASURED on a 390x844 phone, clipped frame fraction / how much of the picture still reads
+      // as blue sky: rayAmt 0.004 -> 2.5% / 47% · 0.008 -> 4.4% / 36% · 0.014 -> 17.6% / 21% ·
+      // 0.024 (the desktop value) -> 33.7% / 15%, i.e. the top half of the phone goes solid white.
       P.res = 0.55; P.steps = 10; P.lSteps = 1; P.hz = 20; P.shSamples = 14; P.fovMul = 1.40;
+      P.rayAmt = 0.00038;
     }
   },
   update: function(dt){ try { update(dt); } catch(e){ if(!M.failed){ M.failed = true; if(M.mesh) M.mesh.visible = false; console.warn('CSKY:', e); } } },
@@ -62993,6 +64073,35 @@ return {
   // plane sitting at the world origin drawn in black is a hole punched exactly where the gallery
   // crystal — the ray source — is. Hidden for that pass, which is also physically right: the
   // clouds are behind everything and cannot occlude a light in front of them.
+  // Called from the wheel's drag integration with the momentum the visitor just added. Two adds
+  // per dragged frame, and nothing at all when no one is touching the wheel.
+  // SIGNED, and the sign is LOCKED BY THE FIRST SPIN. Whichever way the visitor first turns the
+  // mark becomes "sunset"; turning it back the other way raises the sun again, which is the whole
+  // point — the gesture is reversible rather than a ratchet. Once it is wound all the way back to
+  // full day the lock is released, so the next spin is free to pick a direction again.
+  spin: function(a){
+    if(!P.setOn || !a) return;
+    if(M.setDir === 0) M.setDir = (a < 0) ? -1 : 1;
+    M.setAcc += a * M.setDir;
+    if(M.setAcc <= 0){ M.setAcc = 0; M.setDir = 0; }
+  },
+  // THE PAGE'S OWN SKY FOR THE CURRENT TIME OF DAY. updateOrbs calls this instead of reading the
+  // SITE_BG constant, and its crescendo then darkens (or the crystals brighten) on top exactly as
+  // before — night simply hands it a darker starting colour. Writes into the caller's Color so
+  // this allocates nothing in the frame loop.
+  skyBase: function(out){
+    var r = ((SITE_BG>>16)&0xff)/255, g = ((SITE_BG>>8)&0xff)/255, b = (SITE_BG&0xff)/255;
+    if(P.setOn){
+      var gT = M.setGlow, nT = M.setNight;
+      r += (P.setSkyCol[0] - r) * gT; g += (P.setSkyCol[1] - g) * gT; b += (P.setSkyCol[2] - b) * gT;
+      r += (P.setNightSky[0] - r) * nT; g += (P.setNightSky[1] - g) * nT; b += (P.setNightSky[2] - b) * nT;
+    }
+    return out.setRGB(r, g, b);
+  },
+  sun: function(){ return { acc:+M.setAcc.toFixed(3), dir:M.setDir, moonEl:+(Math.asin(Math.max(-1,Math.min(1,_md.y)))*180/Math.PI).toFixed(2),
+                            t:+M.setT.toFixed(3), el:+M.setEl.toFixed(2),
+                            az:+M.setAz.toFixed(2), horizon:+M.setHorizon.toFixed(2),
+                            glow:+M.setGlow.toFixed(3), night:+M.setNight.toFixed(3) }; },
   mesh: function(){ return M.mesh; },
   _M: function(){ return M; },   // harness hook: render targets + tier state
 
@@ -63111,6 +64220,17 @@ return {
       row('Erosion', 'detAmt', 0, 1, 0.02) +
       row('Erosion freq', 'detScale', 1, 14, 0.1) +
 
+      hd('HIGH CIRRUS — what the rays break through') +
+      row('Amount', 'cirAmt', 0, 0.03, 0.0005) +
+      note('The sheet the god rays are cast by. At 0 there is nothing above the deck to occlude the sun and the rays collapse back into a smooth glow — that is the whole reason this layer exists. Past about 0.02 it closes the sky over.') +
+      row('Coverage', 'cirCov', 0, 1, 0.01) +
+      row('Height Y', 'cirY', 0, 200, 2) +
+      row('Thickness', 'cirSpan', 5, 120, 1) +
+      row('Feature size', 'cirScale', 0.0005, 0.06, 0.0005) +
+      note('Also sets how many BEAMS there are: the frame spans roughly 220 world units up at the sheet, so a period much over ~80 (cirScale under 0.012) puts less than three bands across the picture and the rays turn back into a gradient.') +
+      row('Streak (X squash)', 'cirStretch', 0.05, 2, 0.05) +
+      row('Drift', 'cirDrift', 0, 2, 0.05) +
+
       hd('MOTION · TIME-LAPSE') +
       row('Speed (resting)', 'speedIdle', 0, 12, 0.1) +
       row('Speed (spinning)', 'speedSpin', 0, 80, 0.5) +
@@ -63140,6 +64260,8 @@ return {
       row('Sun height', 'sunUp', -60, 60, 1) +
       row('Fixed az', 'sunAz', 0, 360, 1) +
       row('Fixed el', 'sunEl', -20, 90, 1) +
+      row('Keep above edge', 'sunEdge', 0, 1.6, 0.02) +
+      note('A floor on the elevation, in screen heights: 1.0 is the top edge of the widened sky, so 1.02 holds the sun just past it however wide the background gets. 0 turns the rule off and lets "Fixed el" put the sun inside the frame.') +
       col('Sun colour', 'sunCol') +
       row('Brightness', 'bright', 0, 2, 0.05) +
       row('Absorb', 'absorb', 0, 3, 0.05) +
@@ -63156,14 +64278,70 @@ return {
       row('Underside', 'dark', 0, 1, 0.02) +
       col('Tint', 'tint') +
 
-      hd('LIGHT SHAFTS') +
-      chk('Shafts on', 'shOn') +
-      row('Strength', 'shStr', 0, 3, 0.05) +
-      row('Samples', 'shSamples', 4, 48, 2) +
+      hd('SUNSET — spin the LOGO to lower the sun') +
+      chk('Sunset on', 'setOn') +
+      row('Turns to full night', 'setSpins', 2, 120, 1) +
+      note('Whole turns of the BRAND MARK at the top of the page, either direction (the gallery wheel at the bottom does nothing). The mark is dragged 1:1 with the pointer, so a turn of the logo is a turn of your finger; release momentum counts, idle drift does not. The horizon is the cloud deck itself, so retuning the deck moves the sunset with it.') +
+      row('Catch-up speed', 'setEase', 0.05, 4, 0.05) +
+      row('Horizon drop', 'setDrop', -10, 25, 0.5) +
+      row('Horizon distance', 'setDist', 40, 400, 5) +
+      row('Descent knee', 'setKnee', 0.1, 0.95, 0.01) +
+      note('How much of the spinning is spent getting DOWN to the horizon. The rest is the sunset and the fall into night — lower it to reach the pretty part sooner.') +
+      row('Night elevation', 'setElNight', -40, 10, 0.5) +
+      row('Glow width', 'setGlowW', 1, 30, 0.5) +
+      row('Night width', 'setNightW', 1, 30, 0.5) +
+      row('Centre azimuth', 'setAzNight', -30, 30, 1) +
+      col('Sunset key', 'setSunCol') +
+      col('Sunset sky', 'setSkyCol') +
+      col('Night sky', 'setNightSky') +
+      col('Night ambient', 'setNightAmb') +
+      row('Night key left', 'setNightI', 0, 0.6, 0.01) +
+      row('Night rays left', 'setNightRay', 0, 1, 0.01) +
+      note('The beams follow the light down to the moon rather than switching off — at 0 the night sky has no rays at all.') +
+
+      hd('MOON + STARS — night only') +
+      row('Moon start el', 'moonElHigh', 20, 90, 1) +
+      row('Moon night el', 'moonElNight', -10, 80, 1) +
+      note('The moon COMES DOWN: it sits at the start angle while the sun is still setting and sinks to the night angle as night takes over. It is also where the key light ends up, so this decides which way the deck is lit after dark.') +
+      row('Moon azimuth', 'moonAz', -60, 60, 1) +
+      row('Moon size', 'moonSize', 0.2, 8, 0.1) +
+      row('Moon brightness', 'moonI', 0, 6, 0.05) +
+      row('Moon halo', 'moonGlow', 0, 3, 0.05) +
+      row('Moon halo tightness', 'moonGlowP', 40, 2000, 10) +
+      col('Moon colour', 'moonCol') +
+      row('Stars', 'starAmt', 0, 3, 0.05) +
+      note('Stars and the moon are drawn INSIDE the cloud march, so cloud passes in front of them. Both cost nothing in daylight — the whole block is behind a uniform branch on how dark it is.') +
+      row('Night ambient left', 'setNightAmbF', 0, 0.8, 0.01) +
+
+      hd('GOD RAYS — the beams') +
+      row('Amount', 'rayAmt', 0, 0.08, 0.001) +
+      note('Sunlit haze marched in 3D and shadowed by the cirrus overhead. THESE are the actual beams — light and dark alternate because the sheet really does block the sun in some directions. 0 removes them.') +
+      row('Gap darkness', 'rayShadow', 0, 30, 0.5) +
+      note('How deep the shadow between beams goes — the contrast knob, and the one that decides beams vs a bright patch of sky. Raise this before Amount, which only brightens everything at once. Past ~22 the shadow eats almost all the light and the sky goes dark with a few blown gaps.') +
+      row('Distance falloff', 'rayFall', 0, 0.03, 0.0005) +
+      row('Step LOD (anti-stagger)', 'rayLod', 0, 24, 0.5) +
+      note('Softens the shadow on the long far steps, where the sheet is sampled below Nyquist and the beams break into stepped bands. 0 is the raw point-sampled shadow.') +
+      row('Haze height', 'rayH', 4, 160, 2) +
+      row('Haze base Y', 'rayBase', -80, 80, 2) +
+      note('The haze must END below the cirrus: above the sheet nothing shadows it, so any airlight up there is a flat wash that dilutes the beams.') +
+      row('Forward scatter', 'rayG', 0, 0.9, 0.02) +
+      col('Beam colour', 'rayCol') +
+
+      hd('GOD RAYS — the glare') +
+      chk('Glare on', 'shOn') +
+      row('Strength', 'shStr', 0, 4, 0.05) +
+      row('Contrast (gamma)', 'shGamma', 1, 8, 0.1) +
+      note('THE look knob. 1.0 blurs the sky evenly and gives the old haze; 3 makes only real gaps throw light, which is what reads as beams; past 6 the fan goes sparse and hard.') +
+      row('Gain', 'shWeight', 0, 4, 0.05) +
       row('Reach', 'shDensity', 0, 2, 0.02) +
-      row('Decay', 'shDecay', 0.8, 0.999, 0.002) +
-      row('Weight', 'shWeight', 0, 0.4, 0.005) +
-      row('Halo', 'shHalo', 0.05, 1.5, 0.02) +
+      row('Beam length (decay)', 'shDecay', 0.8, 0.999, 0.002) +
+      row('Spread (halo)', 'shHalo', 0.05, 1.5, 0.02) +
+      col('Ray colour', 'shCol') +
+      row('Spin bloom', 'shSpin', 0, 4, 0.05) +
+      row('Samples', 'shSamples', 4, 48, 2) +
+      row('Dither', 'shDither', 0, 2, 0.05) +
+      note('Samples is quality only — the blur is normalised so it cannot change brightness. Dither trades the concentric banding of a cheap radial blur for a little noise; at 0 the banding comes back.') +
+      row('RT scale', 'shRes', 0.15, 1, 0.05) +
       row('Off-frame reach', 'shReach', 0.2, 4, 0.05) +
 
       '<div id="csky-cost" style="font:700 9px Arial;color:#6f9a80;margin:12px 0 6px;text-align:center"></div>' +
@@ -63323,8 +64501,65 @@ var P = {
   tlCells: 34,        // segments per section — now a CAP on the solved count, not the count
   tlSlotPx: 9,        // target px per slot. The count adapts to hold a tick this wide anywhere
   tlRise: PUBLIC_BUILD ? 1 : 0,   // 1 = cells STAND on the bottom edge and grow up
-  tlLabelY: 78,       // px above the bottom edge for the section names (rise mode)
-  tlFadeA: 0.22,      // peak alpha of the black wash at the very bottom edge. 0 = no wash
+  // THE ROW SITS LOW AND THE ACTIVE NAME CLIMBS OUT OF IT. An earlier pass raised the whole row
+  // to 104 so the riser had air to travel in, which worked but stranded every inactive name in
+  // the middle of nowhere. Lifting only the active one puts the air exactly where it is needed
+  // and nowhere else — and it states the hierarchy in the bluntest way available: the section
+  // you are on is physically standing above the others.
+  tlLabelY: 64,       // RESTING height above the bottom edge — where an INACTIVE name sits
+  tlLabelRise: 44,    // how much HIGHER the active name climbs. Active top = tlLabelY + this
+  // ── the scrim ──
+  // This used to be a BLACK wash, and it was working against itself. The section names are dark
+  // ink (that is what reads on a bright sky), so darkening the ground behind them closed the gap
+  // from both sides — measured, a black scrim strong enough to see made the labels WORSE. The
+  // job here is not to darken the background, it is to make it UNIFORM: the sky behind the strip
+  // swings from deep blue to blown-out cloud as you scroll, and that swing is why the type
+  // swims. A light haze flattens it to a near-constant pale ground that dark ink sits on
+  // cleanly, and on a cloudscape it reads as ground mist rather than as a UI bar.
+  // SUPERSEDED by the fog band below. The flat gradient is kept, switched off, because it is the
+  // honest A/B: set tlFadeA back to 0.72 and fog:false to see the version this replaced.
+  // Its problem was never the colour, it was that a linear alpha ramp across 1600px of straight
+  // horizontal edge has a visible knee at every colour stop and terminates on one exact scanline.
+  tlFadeA: 0.0,       // peak alpha of the flat haze at the very bottom edge. 0 = off
+  tlFadeC: '248,251,254',   // haze colour — the pale end of the sky, not white
+  tlFadeH: 42,        // px of headroom ABOVE the label line before the haze reaches zero
+  // ── the fog band ───────────────────────────────────────────────────────────────────────────
+  // The contrast behind the scroller, done as weather instead of as a UI element: cloud that has
+  // come forward and wrapped onto the near plane, rather than a white shape sitting behind the
+  // strip. Same job, same rough silhouette, but the boundary is eaten by noise and drifts, so
+  // there is no scanline where it stops and nothing to read as a bar.
+  //
+  // Three things kill the straight edge, and all three are needed:
+  //   1. the vertical profile is a smoothstep, so it leaves AND arrives with zero slope — a
+  //      linear ramp has a visible knee at every stop, which is what made the gradient cheap;
+  //   2. the profile is MULTIPLIED by the noise, so the height it dies at varies along x and
+  //      there is no single y where the band ends;
+  //   3. the plane is drawn taller than the fog ever reaches (fogRise < 1), so the quad's own
+  //      top edge sits in a region that is already exactly zero.
+  //
+  // Live-tunable from the console — every value is pushed to the uniforms each frame:
+  //   CHUD.P.fogRise = 0.8    CHUD.P.fogWisp = 1    CHUD.P.fog = false
+  fog: true,
+  fogH: 300,          // px tall the fog PLANE is. Must stay comfortably taller than fogRise*fogH
+  fogA: 0.82,         // master opacity
+  fogRise: 0.70,      // fraction of fogH the fog climbs before it is gone. THE main shape knob
+  fogFall: 1.35,      // profile exponent. >1 hugs the bottom edge, <1 lifts the mass upward
+  fogWisp: 0.85,      // 0 = smooth gradient (the old look), 1 = fully noise-eaten top edge
+  fogWarp: 0.85,      // domain warp — turns round blobs into billows that curl
+  fogScaleX: 5.5,     // noise cells across the screen width. Lower = bigger, slower forms
+  fogScaleY: 3.0,     // noise cells up the band
+  fogSpeed: 0.020,    // drift rate. Deliberately near-still: this is weather, not an animation
+  fogSoft: 0.75,      // density knee. Lower = harder-edged clumps, higher = softer wash
+  fogTex: 0.45,       // re-imprints billows AFTER the knee. 0 = flat where dense, 1 = fully modelled
+  fogCol:  '250,252,255',   // the lit face of the fog
+  fogColS: '214,228,243',   // the cool shaded side, mixed in by fogShade on the denser cores
+  fogShade: 0.45,     // 0 = flat white (reads as paper), 1 = heavily modelled
+  // ── section names ──
+  tlLabelPx: 11.5,    // was 8. Below ~10px this face stops resolving at all on a phone.
+  tlLabelMin: 9.0,    // hard floor. Reaching it switches to the 3-label layout instead of shrinking further
+  tlLabelA: 0.86,     // inactive alpha (was 0.40, against a colour that was already too light)
+  tlLabelAOn: 0.98,   // active alpha
+  tlLabelHover: 1,    // brighten the section under the pointer — the click affordance
   tlWidth: PUBLIC_BUILD ? 1 : 0.53,   // fraction of screen width — 1 = border to border
   tlY: PUBLIC_BUILD ? 0 : 84,         // px up from the bottom edge (0 = flush)
   tlCellW: 0.59,      // cell width as a fraction of its slot
@@ -63335,6 +64570,70 @@ var P = {
   tlFocus: 10,        // px falloff of the focus
   tlTrail: 107,       // px/sec the swell decays — LOWER = longer trail behind the playhead
   tlAlpha: 1.0,
+  // ══ CYBERNETIC PASS (2026-09-06) ══════════════════════════════════════════════════════
+  // Designed in `scroller-preview.html` — a standalone sandbox with a live param panel. The
+  // strip there is the same Canvas2D draw, and because this plane is full-screen-WIDTH and
+  // mapped 1:1, a pixel there is a pixel here. Tune there, paste here.
+  //
+  // ── TRACK MAPPING: x IS scroll, and only scroll ──
+  // The strip used to run TWO disagreeing coordinate systems. Labels were centred at
+  // (i+0.5)/MAJ and cells coloured by floor(i/PERSEC) — equal fifths — while the playhead sits
+  // at span*scroll01 and jumpToSection sends section i to i/(MAJ-1). Those agree only at dead
+  // centre: parked on SHIRTS the tallest cell on screen rendered OUTSIDE the section it was
+  // reporting. Everything now derives from the one mapping (see trackGeom).
+  // ── THE MARGIN ── ONE number, in PIXELS, deliberately not a percentage.
+  // A px margin is the same physical gap on every device, which means on a phone it is a much
+  // bigger FRACTION of the screen and reads as a real, noticeable frame, while on a wide desktop
+  // it stays a thin edge that never eats the track. A percentage margin does the exact opposite:
+  // invisible on mobile, enormous on desktop. The ruler starts here, the playhead's travel
+  // starts here, and the wrap box is clamped to it — so scrolling to either extreme puts the
+  // playhead exactly ON the margin rather than short of it.
+  tlInset: 28,
+  // RETIRED (0). This used to inset the scroll mapping a further 110px inside the ruler, to stop
+  // the first section's box being crushed into the corner on load. It worked, but stacked on top
+  // of tlInset it meant the playhead began 126px from the screen edge and the scroller visibly
+  // failed to reach either end. The corner-crush is solved properly now instead: the LABEL is
+  // clamped inside the margin while the PLAYHEAD still travels the whole track, so the end
+  // sections simply show a longer Manhattan jog. Left as a dial — anything above 0 shortens the
+  // playhead's travel.
+  tlHomePad: 0,
+  // ── adaptive cells: the section you are in RESOLVES ──
+  tlActAcc: 1,        // active section's cells take the accent colour
+  tlPast: 1,          // and split hard at the playhead: ground covered vs ground ahead
+  tlPastA: 0.92, tlAheadA: 0.34,
+  tlSub: 4,           // every Nth cell of the ACTIVE section gains height (0 = off)
+  tlSubH: 7,
+  tlChamf: 0.30,      // 45-degree cut on the cells' top corners. 0 = flat. Overrides tlRound
+  tlRail: 1, tlRailA: 0.30,       // hairline datum along the bottom edge
+  tlBrk: 1, tlBrkH: 14, tlBrkA: 0.42,   // boundary bracket: a vertical tick with a foot
+  // ── the active name grows, its neighbours give way ──
+  // The inactive SHRINK matters as much as the growth: it holds the row's total width roughly
+  // constant so nothing collides, and separates the two states from both sides, not one.
+  tlLabelGrow: 0.34, tlLabelDim: 0.94, tlLabelRate: 9,
+  // ── THE SNAKE WRAP BOX ──
+  // A single trace leaves the tip of the cell you are standing on, routes to the active name in
+  // right angles only (Manhattan / PCB routing — the motif Cyberpunk 2077 borrows off 80s
+  // circuitry), touches its floor at dead centre, then runs the whole perimeter and closes the
+  // loop where it entered. One head, one continuous body, no diagonals, no curves.
+  snOn: 1,
+  snFromFloor: 0,     // 1 = launch from the screen's bottom edge, 0 = from the playhead cell's tip
+  snGap: 3, snJog: 16, snPadX: 11, snPadY: 7,
+  snSpeed: 950, snRetract: 2600,   // px/sec drawing / unwrapping. Retract is deliberately faster
+  snThick: 1.8,
+  snBodyA: 0.62,      // alpha of the trailing body WHILE drawing
+  snDoneA: 0.88,      // alpha of the FINISHED box — one flat value, no grade, no seam
+  snGlow: 46,         // px of brightening behind the head — what makes it read as a BODY
+  // snHead OFF: a marker at the head reads as a little dark box being dragged around the title
+  // rather than as a line drawing itself, and the glow window already carries the leading edge.
+  snHead: 0,
+  // The wrap WAITS for the title to finish rising. Sequenced, not simultaneous: a box chasing a
+  // moving target re-solves its own geometry every frame and reads as a wobble.
+  snGate: 0.90,
+  snDim: 0.18,
+  // snCorner OFF. These threw an L outward past each corner, which crossed the box's own edges
+  // and made every corner read as a crop mark / registration tick — a sketch, not a solid box.
+  snCorner: 0,
+  snIdx: 1, snIdxPx: 8, snDir: 1,
   // ── nested tracker lines under the scroller ──
   tkOn: PUBLIC_BUILD ? 0 : 1, tkCount: 3,   // PUBLIC BUILD: no "under" left to sit in
   tkLen: 0.62,        // length of the first line, as a fraction of the track
@@ -63407,13 +64706,26 @@ var PAL = {
     rest: [0.40, 0.55, 0.76], warm: [0.16, 0.38, 0.72], hot: [0.02, 0.04, 0.12],
     accent: [0.01, 0.03, 0.10],
     blending: THREE.NormalBlending, bright: 1.0,
-    col: { line: '38,86,150', dim: '96,120,152', hot: '18,84,182', white: '10,20,42' }
+    // `lab` is the INACTIVE section name. It used to borrow `dim`, which is a mid-slate chosen
+    // for hairlines — at 8px and 40% alpha over the sky that measured 1.65:1, about a third of
+    // the WCAG AA floor. Section names are the only nav copy on the page, so they get their own
+    // colour: dark enough to clear 4.5:1 against the haze, still clearly subordinate to `white`.
+    // `acc` / `accD` — THE HIGHLIGHT, added 2026-09-06. The strip was monochrome blue, and
+    // monochrome has no hierarchy. Teal is the highlight, blue is the non-highlight. It needs
+    // TWO stops because this is a LIGHT ground: a teal bright enough to read as a mark against
+    // the pale haze (~3.5:1, clears the 3:1 graphics floor) is too light to carry TYPE, so the
+    // active section name uses the deeper one (~5.9:1, clears AA for text). One accent, two
+    // jobs, two values — trying to do both with a single teal fails one of them.
+    col: { line: '38,86,150', dim: '96,120,152', hot: '18,84,182', white: '10,20,42', lab: '52,68,96',
+           acc: '16,196,178', accD: '6,116,106' }
   },
   dark: {
     rest: [0.17, 0.47, 0.90], warm: [0.42, 0.80, 1.00], hot: [0.92, 0.99, 1.00],
     accent: [1.00, 1.00, 1.00],
     blending: THREE.AdditiveBlending, bright: 1.0,
-    col: { line: '78,158,238', dim: '104,152,200', hot: '124,222,255', white: '223,244,255' }
+    // On a dark ground the contrast problem inverts, so both accent stops go UP, not down.
+    col: { line: '78,158,238', dim: '104,152,200', hot: '124,222,255', white: '223,244,255', lab: '150,190,228',
+           acc: '64,240,214', accD: '150,255,238' }
   }
 };
 var C_REST, C_WARM, C_HOT, C_ACC;
@@ -63455,9 +64767,28 @@ var feedRev = 0;
 var slLastRev = -1;
 var sfLastRev = -1, sfLastBX = -9e9, sfLastBY = -9e9, sfLastBR = -1, sfLastBtnY = -9e9;
 var tlLift = null, tlN = 0, tlTrackPx = 800;
+// ── cybernetic pass state (2026-09-06) ──
+// ONE eased 0..1 per section drives BOTH the lift and the size, so a name rises and grows as a
+// single gesture rather than two animations that can disagree.
+var labAct = null;
+var snSec = -1, snT = 0, snPhase = 'grow';   // the snake: which title it wraps, how far round, and why
+// True while the snake or the title springs are still moving. drawTimeline is THROTTLED and
+// dirty-gated, so without this the animation would freeze the instant scroll01 stopped changing.
+var tlBusy = false;
+// drawTimeline is not called every frame, so its animations must integrate against the time
+// since the last DRAW, not the frame dt — otherwise a throttled repaint runs them slow.
+var tlDrawClock = -1;
+// ── click-to-jump state ──
+// tlHoverSec is the section under the pointer (-1 = none); drawTimeline brightens it, which is
+// the affordance. The site's own onMM rewrites the container cursor every mouse move, so a
+// cursor:pointer here would be stomped — brightening the name is both more visible and doesn't
+// fight it. tlBotPx / tlHitPx are the strip's live screen rect, published by the update pass so
+// the hit test doesn't have to re-derive the layout.
+var tlHoverSec = -1, tlBotPx = 0, tlHitPx = 0;
 var tlPerSec = 34;   // segments per section, SOLVED from the viewport each frame (see tlSlotPx)
 var tlLastOrbY = -9e9;
 var chromeClock = 0, tlLast = -9, tlLastScroll = -9, tlLastSec = -1, tlLastW = -1, slLast = -9, ctLast = -9, ctLastWord = '';
+var tlLastHover = -2;
 var mouse = null;
 
 // scratch — nothing in the hot loop allocates
@@ -63582,6 +64913,105 @@ function makePlane(wPx, hPx, order, prOverride){
   var o = { cv: cv, ctx: ctx, tex: tex, mesh: mesh, w: wPx, h: hPx, opacity: 1, pr: pr };
   planes.push(o); return o;
 }
+// ── THE FOG BAND ──────────────────────────────────────────────────────────────────────────
+// A shader quad rather than another Canvas2D plane, for two reasons: the noise has to be
+// evaluated per pixel (a JS loop over 1600x300 would cost more than the entire rest of the HUD),
+// and it has to drift continuously, which a canvas plane can only do by repainting and
+// re-uploading a texture every frame. Here nothing is uploaded — only a handful of uniforms.
+//
+// It joins `planes` so it inherits the existing visibility machinery for free: hidden with the
+// rest of the chrome during gameMode, during the reflection cube pass, and in the editor.
+// Layer 1 for the same reason the timeline is there — the post shader's chromatic aberration
+// would fringe the fog's soft edge into rainbow banding.
+// renderOrder sits BELOW the timeline's 8900 so the ticks and names draw over it.
+//
+// The noise is the file's own h21/vnoise/fbm family (the same one the zone walls use), so the
+// grain matches the rest of the site's procedural work rather than introducing a second style.
+function makeFogPlane(){
+  var mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uT: { value: 0 }, uA: { value: 0.8 }, uRise: { value: 0.62 }, uFall: { value: 1.35 },
+      uWisp: { value: 0.85 }, uWarp: { value: 0.85 }, uSX: { value: 3.2 }, uSY: { value: 2.0 },
+      uSoft: { value: 0.75 }, uShade: { value: 0.45 }, uTex: { value: 0.45 }, uLite: { value: GAME_LOW_FX ? 1 : 0 },
+      uCol: { value: new THREE.Color(0.98, 0.988, 1.0) },
+      uColS: { value: new THREE.Color(0.839, 0.894, 0.953) }
+    },
+    vertexShader: [
+      'varying vec2 vUv;',
+      'void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }'
+    ].join('\n'),
+    fragmentShader: [
+      'precision highp float;',
+      'uniform float uT,uA,uRise,uFall,uWisp,uWarp,uSX,uSY,uSoft,uShade,uTex,uLite;',
+      'uniform vec3 uCol,uColS;',
+      'varying vec2 vUv;',
+      'float h21(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }',
+      'float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); vec2 q=f*f*(3.0-2.0*f);',
+      '  return mix(mix(h21(i),h21(i+vec2(1.0,0.0)),q.x), mix(h21(i+vec2(0.0,1.0)),h21(i+vec2(1.0,1.0)),q.x), q.y); }',
+      'float fbm3(vec2 p){ return 0.55*vnoise(p)+0.28*vnoise(p*2.13+7.7)+0.17*vnoise(p*4.31+3.1); }',
+      'float fbm2(vec2 p){ return 0.66*vnoise(p)+0.34*vnoise(p*2.13+7.7); }',
+      'void main(){',
+      '  float y = vUv.y;',                     // 0 = screen bottom edge, 1 = top of the quad
+      '  vec2 p = vec2(vUv.x*uSX, y*uSY);',
+      // DOMAIN WARP. Displacing the sample point by another noise field is what separates cloud
+      // from cotton wool: it shears the lobes so they curl into each other instead of sitting as
+      // round blobs. A uniform branch, so it is coherent across the draw and free when skipped.
+      '  if(uLite < 0.5){',
+      '    vec2 w = vec2(fbm2(p*0.6 + vec2(uT*0.35, 0.0)), fbm2(p*0.6 + vec2(5.2, -uT*0.27)));',
+      '    p += (w - 0.5) * uWarp;',
+      '  }',
+      '  float n = (uLite < 0.5) ? fbm3(p + vec2(uT*0.5, -uT*0.12)) : fbm2(p + vec2(uT*0.5, -uT*0.12));',
+      // The profile is the SHAPE; the noise decides where that shape actually ends.
+      '  float prof = 1.0 - smoothstep(0.0, uRise, y);',
+      '  prof = pow(prof, uFall);',
+      '  float d = prof * mix(1.0, n*1.7, uWisp);',
+      '  d = smoothstep(0.0, uSoft, d);',
+      // The knee above saturates everything past uSoft to solid, which flattens the dense bottom
+      // of the band into exactly the milky wash this is meant to replace. uTex re-imprints the
+      // noise AFTER the knee, so the interior keeps its billows even where the band is opaque.
+      '  d *= (1.0 - uTex * (1.0 - n));',
+      '  d *= uA;',
+      '  if(d <= 0.002) discard;',              // most of the quad is empty — skip the blend
+      // Denser cores pull toward the cool shaded tone. This is the whole difference between
+      // reading as fog and reading as a white shape: flat white has no interior.
+      '  vec3 col = mix(uCol, uColS, uShade * (1.0 - n));',
+      '  gl_FragColor = vec4(col, d);',
+      '}'
+    ].join('\n'),
+    transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide
+  });
+  var mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+  mesh.frustumCulled = false; mesh.renderOrder = 8880;
+  mesh.layers.set(1);
+  scene.add(mesh);
+  // Shaped like a makePlane() object so place() and the planes[] visibility loops work on it
+  // unchanged. No cv/ctx/tex: nothing in those loops touches them.
+  var o = { mesh: mesh, w: 1, h: P.fogH, opacity: 1, isFog: true, mat: mat };
+  planes.push(o); return o;
+}
+
+// Push P into the uniforms every frame so the whole band is tunable live from the console.
+var _fogC = new THREE.Color(), _fogCS = new THREE.Color();
+function rgbStr(c, out){
+  var a = String(c).split(',');
+  out.setRGB((+a[0] || 0) / 255, (+a[1] || 0) / 255, (+a[2] || 0) / 255);
+  return out;
+}
+function fogSync(dt){
+  if(!fogBand) return;
+  var u = fogBand.mat.uniforms;
+  u.uT.value += dt * P.fogSpeed * 60;
+  u.uA.value = P.fogA; u.uRise.value = P.fogRise; u.uFall.value = P.fogFall;
+  u.uWisp.value = P.fogWisp; u.uWarp.value = P.fogWarp;
+  u.uSX.value = P.fogScaleX; u.uSY.value = P.fogScaleY;
+  u.uSoft.value = P.fogSoft; u.uShade.value = P.fogShade; u.uTex.value = P.fogTex;
+  u.uCol.value.copy(rgbStr(P.fogCol, _fogC));
+  u.uColS.value.copy(rgbStr(P.fogColS, _fogCS));
+  fogBand.h = P.fogH;
+  // opacity drives the shared visibility test in place() and setChromeVisible()
+  fogBand.opacity = (P.fog && P.chrome && P.timeline) ? 1 : 0;
+}
+
 function place(o, cx, cy, hw, hh, W, H){
   var sx = (hw * 2) / W, sy = (hh * 2) / H;
   o.mesh.scale.set(o.w * sx, o.h * sy, 1);
@@ -63598,7 +65028,7 @@ function setFont(ctx, px, weight, sp){
 function rgba(c, a){ return 'rgba(' + c + ',' + a + ')'; }
 var COL = PAL.light.col;   // replaced by applyTheme()
 
-var timeline, sysFeed, sysLeft, contour, glassLabel;
+var timeline, sysFeed, sysLeft, contour, glassLabel, fogBand = null;
 var labelGroup = null, labelGlass = null, labelText = null, labelAspect = 0;
 
 // The Chrysolin label is built from the SAME glass shader as the nav / cart icons (SDF rounded
@@ -63772,6 +65202,7 @@ function build(){
   if(GAME_LOW_FX){ RV[0].count = 700; RV[1].count = 600; RV[0].nOct = 2; RV[1].nOct = 2; }
   applyTheme();
   if(P.sphere) buildMask(SECS[0]);   // PUBLIC BUILD: no sphere, no protrusion mask (~22ms each)
+  fogBand    = makeFogPlane();   // BEFORE the timeline so it is behind it in the plane list too
   timeline   = makePlane(900, 260, 8900);
   sysFeed    = makePlane(560, 900, 8900, FEED_PR);
   contour    = makePlane(400, 400, 8890);
@@ -63835,11 +65266,29 @@ function pushFeed(text, hot){
 // Advances the per-cell swell. Cells snap UP the instant the playhead reaches them and then
 // bleed back down at tlTrail px/sec, which is what leaves a comet trail of still-tall cells
 // behind you as you scroll. Returns true if anything moved enough to be worth repainting.
+// ══ TRACK GEOMETRY ════════════════════════════════════════════════════════════════════════
+// ONE source of truth for where scroll lands on the strip, shared by the lift sim and the draw.
+// They used to compute it separately, which is exactly how a swell drifts off its own playhead.
+//   x0 / span    — the RULER, full-bleed (less tlInset)
+//   sx0 / sspan  — the SCROLL range, inset by tlHomePad so no section home lands on a border
+//   f            — the playhead as a fraction of the RULER, which is how tlLift is indexed
+function trackGeom(Wpx){
+  var trackW = Math.max(40, Wpx * Math.max(0.05, Math.min(1, P.tlWidth)) - P.tlInset * 2);
+  var x0 = (Wpx - trackW) / 2;
+  var hp = Math.max(0, Math.min(trackW * 0.35, P.tlHomePad));
+  var sx0 = x0 + hp, sspan = Math.max(20, trackW - hp * 2);
+  var pos = Math.max(0, Math.min(1, scroll01));
+  var px = sx0 + sspan * pos;
+  return { x0: x0, span: trackW, sx0: sx0, sspan: sspan, pos: pos, px: px,
+           f: (px - x0) / trackW };
+}
+function tlWidthPx(){ return (timeline && timeline.w) ? timeline.w : window.innerWidth; }
+
 function tickTimeline(dt){
   var MAJ = SECS.length, total = MAJ * Math.max(1, tlPerSec | 0);
   if(!tlLift || tlN !== total){ tlLift = new Float32Array(total); tlN = total; }
   var x0 = 0, span = 1;                      // work in normalised 0..1 along the track
-  var pos = Math.max(0, Math.min(1, scroll01));
+  var pos = trackGeom(tlWidthPx()).f;        // the playhead's position ON THE RULER, not raw scroll
   var focusN = Math.max(0.0001, P.tlFocus / Math.max(1, tlTrackPx));   // falloff in track units
   var decayN = (P.tlTrail / Math.max(1, P.tlGrow)) * dt;               // fraction of full swell/sec
   var moved = false;
@@ -63854,6 +65303,79 @@ function tickTimeline(dt){
     tlLift[i] = cur;
   }
   return moved;
+}
+// The lift at an arbitrary track fraction. The riser's launch height comes off the live swell,
+// so the trace grows OUT of the cell you are standing on rather than being pasted over it.
+function liftAt(f){
+  if(!tlLift || !tlN) return 0;
+  return tlLift[Math.max(0, Math.min(tlN - 1, Math.round(f * tlN - 0.5)))];
+}
+
+// ══ CELL SHAPE ════════════════════════════════════════════════════════════════════════════
+// The chamfer is the cheapest cybernetic tell there is: a 45-degree cut where a corner should
+// be. At a ~5px cell it does not read as a bevel, it reads as a TIP — the rhythm gains a pointed
+// silhouette instead of a row of soft pills.
+function cellPath(ctx, x, y, w, hgt, r, ch){
+  ctx.beginPath();
+  if(ch > 0.001){
+    var c = Math.min(w * 0.5, hgt * 0.6) * ch;
+    ctx.moveTo(x, y + c); ctx.lineTo(x + c, y); ctx.lineTo(x + w - c, y);
+    ctx.lineTo(x + w, y + c); ctx.lineTo(x + w, y + hgt); ctx.lineTo(x, y + hgt);
+    ctx.closePath();
+  } else if(ctx.roundRect){ ctx.roundRect(x, y, w, hgt, r); }
+  else { ctx.rect(x, y, w, hgt); }
+}
+
+// ══ THE SNAKE ═════════════════════════════════════════════════════════════════════════════
+// Every segment is axis-aligned by construction, so |dx|+|dy| IS the segment length and the
+// whole path can be walked without a single sqrt. Progress is stored NORMALISED (0..1) rather
+// than in px because the first segment's length changes continuously as you scroll within a
+// section — storing px would jitter the head every frame, while storing t only varies the
+// traversal speed slightly, which nobody can see.
+function snakePath(px, launchY, lx, bx0, bx1, by0, by1){
+  var jogY = Math.min(by1 + P.snJog, launchY - 2);   // never route DOWNWARD out of the launch
+  var pts = [[px, launchY], [px, jogY], [lx, jogY], [lx, by1]];
+  if(P.snDir > 0.5) pts.push([bx1, by1], [bx1, by0], [bx0, by0], [bx0, by1], [lx, by1]);
+  else              pts.push([bx0, by1], [bx0, by0], [bx1, by0], [bx1, by1], [lx, by1]);
+  return pts;
+}
+function polyCum(pts){
+  var cum = [0];
+  for(var i = 1; i < pts.length; i++){
+    cum.push(cum[i - 1] + Math.abs(pts[i][0] - pts[i - 1][0]) + Math.abs(pts[i][1] - pts[i - 1][1]));
+  }
+  return cum;
+}
+function pointAt(pts, cum, s){
+  var L = cum[cum.length - 1];
+  s = Math.max(0, Math.min(L, s));
+  for(var i = 1; i < cum.length; i++){
+    if(s <= cum[i]){
+      var seg = Math.max(1e-6, cum[i] - cum[i - 1]), t = (s - cum[i - 1]) / seg;
+      return [pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * t,
+              pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * t];
+    }
+  }
+  return [pts[pts.length - 1][0], pts[pts.length - 1][1]];
+}
+// Stroke the sub-path between two arc lengths. Contiguous segments share an endpoint, so the
+// per-segment moveTo/lineTo still produces ONE path with real mitred corners.
+function strokeRange(ctx, pts, cum, s0, s1){
+  if(s1 <= s0) return;
+  ctx.beginPath();
+  var started = false;
+  for(var i = 0; i < pts.length - 1; i++){
+    var a = cum[i], b = cum[i + 1];
+    if(b <= s0 || a >= s1) continue;
+    var seg = Math.max(1e-6, b - a);
+    var t0 = Math.max(0, (s0 - a) / seg), t1 = Math.min(1, (s1 - a) / seg);
+    var p = pts[i], q = pts[i + 1];
+    var x0s = p[0] + (q[0] - p[0]) * t0, y0s = p[1] + (q[1] - p[1]) * t0;
+    var x1s = p[0] + (q[0] - p[0]) * t1, y1s = p[1] + (q[1] - p[1]) * t1;
+    if(!started){ ctx.moveTo(x0s, y0s); started = true; } else { ctx.lineTo(x0s, y0s); }
+    ctx.lineTo(x1s, y1s);
+  }
+  if(started) ctx.stroke();
 }
 
 // ── the gooey / metaball fusion ──────────────────────────────────────────
@@ -63900,31 +65422,52 @@ function drawTimeline(W, orbX, orbY){
   var baseY = rise ? h : (h - 74);
   var midY  = rise ? h : (h - 74);
 
-  // ── CONTRAST WASH ── black, rising off the bottom border and dying out at the top of the
-  // strip, so it covers the asset and nothing more. The storefront is a LIGHT page (#f0f0f5)
-  // and the ticks were competing with a near-white sky; this is the least darkening that
-  // separates them without reading as a bar across the bottom. Drawn FIRST so it sits behind
+  // ── CONTRAST SCRIM ── a pale HAZE rising off the bottom border, not a black wash. See the
+  // note on P.tlFadeA: the labels are dark ink, so the scrim's job is to flatten the sky's
+  // luminance swing to a constant pale ground, not to darken it. Drawn FIRST so it sits behind
   // every cell. Normal alpha compositing, not additive — the plane is a MeshBasicMaterial with
-  // transparent:true, so black actually darkens here (additive would be invisible on a light
-  // ground, which is the trap the rest of this file keeps hitting).
+  // transparent:true, so a light fill actually lightens here (additive would blow straight to
+  // white on this ground, which is the trap the rest of this file keeps hitting).
+  //
+  // The old gradient died out at 55% of a 96px band while the labels sit at 78px — i.e. the
+  // scrim reached ~zero exactly where the only type on the strip is. The stops below are solved
+  // against the label line instead of hard-coded, so moving tlLabelY keeps them aligned.
+  // Solved against the HIGHEST the type ever goes — the RISEN active name — not the resting
+  // line. Using the resting height would let the one name that most needs the contrast help
+  // climb straight out of the top of the scrim.
+  var labTopMax = P.tlLabelY + P.tlLabelRise;
+  var hazeH = Math.max(1, labTopMax + P.tlFadeH);
   if(rise && P.tlFadeA > 0.001){
-    var washH = Math.max(1, P.tlLabelY + 18);
-    var wash = g.createLinearGradient(0, h, 0, h - washH);
-    wash.addColorStop(0.00, 'rgba(0,0,0,' + P.tlFadeA.toFixed(4) + ')');
-    wash.addColorStop(0.55, 'rgba(0,0,0,' + (P.tlFadeA * 0.34).toFixed(4) + ')');
-    wash.addColorStop(1.00, 'rgba(0,0,0,0)');
-    g.fillStyle = wash;
-    g.fillRect(0, h - washH, w, washH);
+    var labF = Math.max(0.05, Math.min(0.95, labTopMax / hazeH));   // where the type sits, 0..1 up the band
+    var hz = g.createLinearGradient(0, h, 0, h - hazeH);
+    var HC = P.tlFadeC;
+    hz.addColorStop(0.00, 'rgba(' + HC + ',' + P.tlFadeA.toFixed(4) + ')');
+    hz.addColorStop(Math.max(0.01, labF * 0.55), 'rgba(' + HC + ',' + (P.tlFadeA * 0.94).toFixed(4) + ')');
+    hz.addColorStop(Math.min(0.99, labF + 0.12),  'rgba(' + HC + ',' + (P.tlFadeA * 0.55).toFixed(4) + ')');
+    hz.addColorStop(1.00, 'rgba(' + HC + ',0)');
+    g.fillStyle = hz;
+    g.fillRect(0, h - hazeH, w, hazeH);
   }
-  var trackW = w * Math.max(0.05, Math.min(1, P.tlWidth));   // fraction of screen width
-  var x0 = (w - trackW) / 2, span = trackW;
+  // This function is throttled and dirty-gated, so animations integrate against the time since
+  // the last DRAW. Using the frame dt here would run them slow whenever a repaint was skipped.
+  var ddt = (tlDrawClock < 0) ? 0.016 : Math.max(0, Math.min(0.25, chromeClock - tlDrawClock));
+  tlDrawClock = chromeClock;
+
+  var TG = trackGeom(w);
+  var x0 = TG.x0, span = TG.span, px = TG.px, pos = TG.pos;
   var MAJ = SECS.length, PERSEC = Math.max(1, tlPerSec | 0), total = MAJ * PERSEC;
-  var act = Math.max(0, Math.min(MAJ - 1, Math.floor(scroll01 * MAJ)));
-  var pos = Math.max(0, Math.min(1, scroll01));
-  var px = x0 + span * pos;
+  // Section i's HOME is i/(MAJ-1) — the scroll value jumpToSection sends you to — and the
+  // boundary between i and i+1 is halfway between two homes. Rounding onto that grid is what
+  // "which section am I on" means. The old floor(scroll01*MAJ) belonged to the equal-fifths
+  // layout and disagreed with the playhead everywhere except dead centre.
+  var act = Math.max(0, Math.min(MAJ - 1, Math.round(pos * (MAJ - 1))));
+  var homeX = function(i){ return TG.sx0 + TG.sspan * (i / (MAJ - 1)); };
+  var midX  = function(i){ return (homeX(i) + homeX(i + 1)) / 2; };
+  var cellIdxAtX = function(x){ return Math.round(((x - x0) / span) * total - 0.5); };
   var slot = span / total;
   var cw = Math.max(1.5, slot * P.tlCellW);
   var A = P.tlAlpha;
+  tlBusy = false;
 
   // ── goo pass setup: only cells NEAR the star join the fusion, so the rest of the track keeps
   // its crisp separated-cell reading and the liquid effect stays local to the cursor.
@@ -63938,15 +65481,47 @@ function drawTimeline(W, orbX, orbY){
     gc.clearRect(0, 0, w, h);
   }
 
+  // ── BOTTOM RAIL ── one hairline holding the strip to the screen edge. Without a datum the
+  // cells just float, and varying heights read as tally marks; with it they read as a
+  // MEASUREMENT off a baseline, which is the difference between a readout and decoration.
+  if(rise && P.tlRail > 0.5){
+    g.fillStyle = rgba(COL.line, P.tlRailA * A);
+    g.fillRect(x0, baseY - 1, span, 1);
+  }
+
+  // A cell's owner is found by converting its x back into a SCROLL value and rounding onto the
+  // section grid. Cells outside the home range (the tlHomePad-wide overscroll at each end) clamp
+  // to the end sections, which is what keeps the full-bleed ruler meaningful out there.
+  var secOf = function(cxp){
+    var s = Math.max(0, Math.min(1, (cxp - TG.sx0) / TG.sspan));
+    return Math.max(0, Math.min(MAJ - 1, Math.round(s * (MAJ - 1))));
+  };
+  // A cell gets a MAJOR tick when it is the closest cell to a section's home, and a boundary
+  // tick when it is closest to a midpoint between two homes. Both marks then mean something
+  // specific, instead of being a decorative every-Nth cadence that lines up with nothing.
+  var isHome = {}, isEdge = {};
+  for(var sH = 0; sH < MAJ; sH++) isHome[cellIdxAtX(homeX(sH))] = 1;
+  for(var sE = 0; sE < MAJ - 1; sE++) isEdge[cellIdxAtX(midX(sE))] = 1;
+
   for(var i = 0; i < total; i++){
     var cx = x0 + span * ((i + 0.5) / total);
-    var k = i % PERSEC;
-    var maj = (k === 0), mid = (PERSEC >= 4 && k === (PERSEC >> 1));
+    var maj = !!isHome[i], mid = !!isEdge[i];
+    var inAct = (secOf(cx) === act);
     var baseH = maj ? P.tlMajH : (mid ? P.tlMidH : P.tlBaseH);
+    // Sub-rhythm: ONLY inside the section you are standing in, so the finer detail appears
+    // exactly where you are looking and the rest of the ruler stays quiet. That is what makes
+    // the strip "adaptive" rather than merely busy.
+    if(inAct && P.tlSub >= 2 && !maj && !mid && (i % (P.tlSub | 0)) === 0) baseH += P.tlSubH;
     var lift = tlLift ? tlLift[i] : 0;
     var ch = baseH + P.tlGrow * lift;
-    var lit = (((i / PERSEC) | 0) === act);
-    var a = ((maj ? 0.70 : 0.40) * (lit ? 1 : 0.55) + lift * 0.45) * A;
+
+    var col = (inAct && P.tlActAcc > 0.5) ? COL.acc : COL.line;
+    var a;
+    if(inAct && P.tlPast > 0.5) a = ((cx <= px) ? P.tlPastA : P.tlAheadA) * (maj ? 1 : 0.86);
+    else a = (maj ? 0.70 : 0.40) * (inAct ? 1 : 0.55);
+    a = Math.min(1, (a + lift * 0.40) * A);
+    if(lift > 0.42) col = (P.tlActAcc > 0.5) ? COL.acc : COL.hot;
+
     var r = Math.min(cw, ch) * 0.5 * Math.max(0, Math.min(1, P.tlRound));
     var rx = cx - cw / 2, ry = rise ? (baseY - ch) : (midY - ch / 2);
 
@@ -63954,11 +65529,26 @@ function drawTimeline(W, orbX, orbY){
     var t = joins ? gc : g;
     // Inside the fusion the alpha threshold flattens per-cell opacity anyway, so those cells are
     // drawn at one weight; outside, they keep their individual falloff.
-    t.fillStyle = joins ? rgba(COL.hot, Math.min(1, 0.55 + lift * 0.45) * A)
-                        : rgba(lift > 0.42 ? COL.hot : COL.line, Math.min(1, a));
-    t.beginPath();
-    if(t.roundRect) t.roundRect(rx, ry, cw, ch, r); else t.rect(rx, ry, cw, ch);
+    t.fillStyle = joins ? rgba(COL.hot, Math.min(1, 0.55 + lift * 0.45) * A) : rgba(col, a);
+    cellPath(t, rx, ry, cw, ch, r, rise ? P.tlChamf : 0);
     t.fill();
+  }
+
+  // ── SECTION BRACKETS ── a vertical tick with a foot at every real boundary: the midpoints
+  // between homes, the same lines secOf() switches on. It turns the continuous ruler into
+  // addressable ZONES, and because each foot points INTO the zone it belongs to, the pair either
+  // side of the active section frames it without needing a fill.
+  if(rise && P.tlBrk > 0.5){
+    g.lineWidth = 1; g.lineCap = 'butt'; g.lineJoin = 'miter';
+    for(var bI = 0; bI < MAJ - 1; bI++){
+      var bxp = Math.round(midX(bI)) + 0.5;
+      var onB = (bI === act || bI === act - 1);
+      g.strokeStyle = rgba(onB ? COL.acc : COL.line, (onB ? P.tlBrkA * 1.8 : P.tlBrkA) * A);
+      g.beginPath();
+      g.moveTo(bxp, baseY - 1); g.lineTo(bxp, baseY - 1 - P.tlBrkH);
+      g.lineTo(bxp + (bI < act ? 5 : -5), baseY - 1 - P.tlBrkH);
+      g.stroke();
+    }
   }
 
   // ── the playhead itself: the material morphing into a 4-pointed star ──
@@ -64003,22 +65593,177 @@ function drawTimeline(W, orbX, orbY){
   // room really is tight. Truncation is the last resort, not the first.
   var labGap = 14;                                   // breathing room between adjacent names
   var labSlot = Math.max(8, (span / MAJ) - labGap);
-  var labPx = 8;
+  var labPx = P.tlLabelPx;
   setFont(g, labPx, 700, 1.4);
   var widest = 0;
   for(var sW = 0; sW < MAJ; sW++) widest = Math.max(widest, g.measureText(SECS[sW]).width);
+  // The active name GROWS, so the solve has to reserve the grown width up front — otherwise
+  // growing it could push it into a neighbour on a narrow viewport. The inactive shrink
+  // (tlLabelDim) then buys most of that room back, which is why the row's total width barely
+  // moves as the highlight travels along it.
+  widest = widest * (1 + P.tlLabelGrow);
+  // NARROW MODE. The old solve shrank all five names until the widest fit its slot, with a floor
+  // of 5.5px — which on a 390px phone is what it actually reached, and 5.5px of a 700-weight
+  // grotesque is a smear, not a word. Shrinking is now bounded at tlLabelMin, and when even that
+  // will not fit we stop shrinking and start DROPPING: only the current section and its two
+  // neighbours are drawn. They stay at their true positions on the track rather than being
+  // centred — the whole point of this strip is that x means "where you are", and re-centring the
+  // active name would break the one thing it is for. Edge sections are nudged inboard instead.
+  var narrow = false;
   if(widest > labSlot && widest > 0){
-    labPx = Math.max(5.5, 8 * (labSlot / widest));
-    setFont(g, labPx, 700, labPx > 7 ? 1.4 : 0.6);   // drop the tracking too once it gets small
+    labPx = P.tlLabelPx * (labSlot / widest);
+    if(labPx < P.tlLabelMin){ labPx = P.tlLabelMin; narrow = true; }
+    setFont(g, labPx, 700, labPx > 10 ? 1.4 : 0.9);
   }
+  // In narrow mode each surviving name gets the room its dropped neighbours were using.
+  var labRoom = narrow ? Math.max(labSlot, (span / MAJ) * 2 - labGap) : labSlot;
+
+  // Per-section size springs. Eased toward grown (active) or dimmed (everything else); tlBusy
+  // stays true while any of them is still travelling so the throttled repaint keeps running.
+  if(!labAct || labAct.length !== MAJ) labAct = new Float32Array(MAJ);
+  var kS = 1 - Math.exp(-P.tlLabelRate * ddt);
+  for(var sS = 0; sS < MAJ; sS++){
+    var tgtS = (sS === act) ? 1 : 0;
+    labAct[sS] += (tgtS - labAct[sS]) * kS;
+    if(Math.abs(tgtS - labAct[sS]) > 0.002) tlBusy = true;
+  }
+
+  // Geometry of EVERY label is kept, because the snake wraps the section it is still attached
+  // to — during a swap that is the outgoing one, not the active one.
+  var labBox = [];
+  var labTopY = rise ? (h - P.tlLabelY) : (h - 14);
   g.textAlign = 'center'; g.textBaseline = 'top';
   for(var sI = 0; sI < MAJ; sI++){
+    var aI = labAct[sI];
+    var pxI = labPx * (P.tlLabelDim + (1 + P.tlLabelGrow - P.tlLabelDim) * aI);
+    var topI = labTopY - P.tlLabelRise * aI;      // y decreases upward: activation LIFTS it
+    setFont(g, pxI, 700, pxI > 10 ? 1.4 : 0.9);
+    var txtI = fitText(g, SECS[sI], labRoom);
+    var mI = g.measureText(txtI), lwI = mI.width;
+    var lx = homeX(sI);
+    // Keep an edge name inside the MARGIN — nudge inboard, never re-centre, because x meaning
+    // "where you are" is the one thing this strip exists for. Clamped to x0/span (the ruler,
+    // i.e. inside tlInset) rather than the raw screen edge, so the box respects the same margin
+    // as everything else, and it reserves the WRAP BOX's extent, not just the glyphs. The
+    // PLAYHEAD is deliberately NOT clamped: it still reaches the margin, and the gap to the
+    // nudged label simply draws as a longer jog.
+    var lHalf = Math.min(labRoom, lwI) / 2 + P.snPadX + P.snCorner + 4;
+    lx = Math.max(x0 + lHalf, Math.min(x0 + span - lHalf, lx));
+    // Cap band from real metrics where the engine reports them. With textBaseline='top' the
+    // alignment point is the em-box top, so actualBoundingBoxAscent comes back NEGATIVE for
+    // uppercase and subtracting it moves DOWN onto the cap line. Ratios are the fallback.
+    var capTop, capBot;
+    if(typeof mI.actualBoundingBoxAscent === 'number' && mI.actualBoundingBoxDescent > 0){
+      capTop = topI - mI.actualBoundingBoxAscent;
+      capBot = topI + mI.actualBoundingBoxDescent;
+    } else { capTop = topI + pxI * 0.16; capBot = topI + pxI * 0.84; }
+    labBox.push({ x: lx, x0: lx - lwI / 2 - P.snPadX, x1: lx + lwI / 2 + P.snPadX,
+                  y0: capTop - P.snPadY, y1: capBot + P.snPadY });
+
+    if(narrow && Math.abs(sI - act) > 1) continue;
     var on = sI === act;
-    g.fillStyle = rgba(on ? COL.white : COL.dim, (on ? 0.92 : 0.40) * A);
-    // In rise mode the cells own the bottom of the strip, so the names sit ABOVE them, clear of
-    // the tallest a cell can swell to.
-    g.fillText(fitText(g, SECS[sI], labSlot), x0 + span * ((sI + 0.5) / MAJ),
-               rise ? (h - P.tlLabelY) : (h - 14));
+    var hov = (P.tlLabelHover > 0.5 && sI === tlHoverSec && !on);
+    // The ACTIVE name goes to the deep accent, not to ink. This is the one place the highlight
+    // has to carry type, which is exactly why COL.accD exists as a separate, darker stop.
+    g.fillStyle = rgba(on ? COL.accD : COL.lab, (on ? P.tlLabelAOn : (hov ? 1.0 : P.tlLabelA)) * A);
+    g.fillText(txtI, lx, topI);
+  }
+
+  // ── THE SNAKE ──────────────────────────────────────────────────────────────────────────
+  // Leaves the tip of the cell you are standing on, jogs to the active name in right angles
+  // only, touches its floor at dead centre, then runs the perimeter and closes the loop where
+  // it entered. On a section change it RETRACTS off the old title first — the box unwinds
+  // before the riser does, because the box is at the END of the path — and only then re-targets.
+  if(rise && P.snOn > 0.5 && MAJ > 0 && labBox.length === MAJ){
+    if(snSec < 0 || snSec >= MAJ){ snSec = act; snT = 0; snPhase = 'grow'; }
+    if(act !== snSec && snPhase === 'grow') snPhase = 'retract';
+
+    var B = labBox[snSec];
+    var cellTip = baseY - (P.tlBaseH + P.tlGrow * liftAt(TG.f));
+    var launchY = (P.snFromFloor > 0.5) ? baseY : (cellTip - P.snGap);
+    var pts = snakePath(px, launchY, B.x, B.x0, B.x1, B.y0, B.y1);
+    var cum = polyCum(pts), L = cum[cum.length - 1];
+
+    var rate = ((snPhase === 'retract') ? P.snRetract : P.snSpeed) / Math.max(1, L);
+    if(snPhase === 'retract'){
+      snT -= rate * ddt;
+      if(snT <= 0){ snT = 0; snSec = act; snPhase = 'grow'; }
+    } else if(labAct[snSec] >= P.snGate){
+      // GATED: the title lifts clear of the row first, and only once it is standing proud does
+      // the trace start drawing. Raise THEN wrap, never both at once.
+      snT = Math.min(1, snT + rate * ddt);
+    }
+    if(snT < 0.999 || snPhase === 'retract' || snSec !== act) tlBusy = true;
+
+    var head = snT * L, hp2 = pointAt(pts, cum, head);
+    g.lineJoin = 'miter'; g.lineCap = 'butt'; g.lineWidth = Math.max(0.5, P.snThick);
+
+    if(snT > 0.999){
+      // ── SETTLED: ONE uniform stroke over the whole path ──
+      // While drawing, the body is deliberately GRADED — dim behind, bright at the leading edge
+      // — which is what makes it read as moving. Leaving that grade in place once it stops means
+      // the last stretch drawn stays permanently brighter than the rest, so the finished
+      // rectangle reads as two different lines meeting at a seam instead of one solid box.
+      g.strokeStyle = rgba(COL.acc, P.snDoneA * A);
+      strokeRange(g, pts, cum, 0, L);
+    } else {
+      // 1. the ghost route — where the trace is GOING. Reads as a planned circuit path and stops
+      //    the head looking like it is wandering. NOT during a retract: there the remaining path
+      //    leads to the title being ABANDONED, and on a long jump that draws a faint rule
+      //    straight across the whole screen for the entire transition. Unwinding has no plan.
+      if(P.snDim > 0.001 && snPhase === 'grow'){
+        g.strokeStyle = rgba(COL.acc, P.snDim * A);
+        strokeRange(g, pts, cum, head, L);
+      }
+      // 2. the travelled body
+      g.strokeStyle = rgba(COL.acc, P.snBodyA * A);
+      strokeRange(g, pts, cum, 0, head);
+      // 3. the glow window — the last snGlow px re-stroked in rising steps. THIS is what makes
+      //    it read as a body with a leading edge, not a line that is merely getting longer.
+      if(P.snGlow > 1 && head > 0){
+        var STEPS = 6, gw = Math.min(P.snGlow, head);
+        for(var q = 0; q < STEPS; q++){
+          var f0 = q / STEPS, f1 = (q + 1) / STEPS;
+          g.strokeStyle = rgba(COL.acc, (0.14 + 0.80 * f1) * A);
+          strokeRange(g, pts, cum, head - gw * (1 - f0), head - gw * (1 - f1));
+        }
+      }
+      // 4. optional head marker. Off by default — it reads as a dark box being dragged around
+      //    the title rather than as a line drawing itself.
+      if(P.snHead > 0.1 && snT > 0.001){
+        g.fillStyle = rgba(COL.accD, 0.95 * A);
+        g.fillRect(hp2[0] - P.snHead, hp2[1] - P.snHead, P.snHead * 2, P.snHead * 2);
+      }
+    }
+    // 5. on completion only: L-brackets off the corners and the index. Appearing only when the
+    //    loop closes makes "wrapped" a visibly different state from "wrapping".
+    if(snT > 0.999){
+      if(P.snCorner > 0.5){
+        g.strokeStyle = rgba(COL.acc, 0.75 * A);
+        var CC = P.snCorner;
+        var corners = [[B.x0, B.y0, -1, -1], [B.x1, B.y0, 1, -1], [B.x1, B.y1, 1, 1], [B.x0, B.y1, -1, 1]];
+        g.beginPath();
+        for(var c2 = 0; c2 < 4; c2++){
+          var cc = corners[c2];
+          g.moveTo(cc[0] + cc[2] * CC, cc[1]); g.lineTo(cc[0], cc[1]); g.lineTo(cc[0], cc[1] + cc[3] * CC);
+        }
+        g.stroke();
+      }
+      if(P.snIdx > 0.5){
+        setFont(g, P.snIdxPx, 700, 1.0);
+        g.textBaseline = 'bottom';
+        g.fillStyle = rgba(COL.accD, 0.85 * A);
+        var p2 = function(v){ return (v < 10 ? '0' : '') + v; };
+        var idxTxt = p2(snSec + 1) + '/' + p2(MAJ);
+        // Parks off the box's top-right — except on the last section, where the box is already
+        // against the right border and there is nothing to park in. Then it flips inboard.
+        var ix = B.x1 + P.snCorner + 3;
+        if(ix + g.measureText(idxTxt).width > w - 4){ g.textAlign = 'right'; ix = B.x0 - P.snCorner - 3; }
+        else { g.textAlign = 'left'; }
+        g.fillText(idxTxt, ix, B.y0 + P.snIdxPx * 0.9);
+        g.textAlign = 'center'; g.textBaseline = 'top';
+      }
+    }
   }
 
   // ── CURVED TAIL ────────────────────────────────────────────────────────────────────────
@@ -66708,8 +68453,11 @@ function update(dt){
   tlPerSec = Math.max(4, Math.min(P.tlCells | 0,
              Math.round((tlTrackPx / Math.max(1, SECS.length)) / Math.max(2, P.tlSlotPx))));
   var tlMoved = tlShow ? tickTimeline(dt) : false;   // the trail decays whether or not we repaint
-  var tlDirty = tlMoved || (Math.abs(scroll01 - tlLastScroll) > 0.0015) || sec !== tlLastSec || W !== tlLastW
-              || Math.abs(scy - tlLastOrbY) > 1.5;
+  // tlBusy: the snake and the title springs are animated INSIDE the throttled draw, so without
+  // this the wrap would freeze the instant scroll01 stopped changing — i.e. exactly when you
+  // come to rest on a section and the box is supposed to be drawing itself.
+  var tlDirty = tlMoved || tlBusy || (Math.abs(scroll01 - tlLastScroll) > 0.0015) || sec !== tlLastSec || W !== tlLastW
+              || Math.abs(scy - tlLastOrbY) > 1.5 || tlHoverSec !== tlLastHover;
   tlLastOrbY = scy;
   // keep the strip the width of the window so the leader can reach the orb
   if(timeline.w !== W){ resizePlaneCanvas(timeline, W, timeline.h); tlLastW = -1; }
@@ -66720,11 +68468,25 @@ function update(dt){
   var tlBotY = PUBLIC_BUILD ? (H - P.tlY) : (H - P.tlY + 80);
   var tlTop = tlBotY - timeline.h;
   var orbLX = scx, orbLY = scy - tlTop;
+  // Publish the strip's live screen rect for the hit test. The PLANE is 260px tall, but only the
+  // haze band carries ink — taking the whole plane as a click target would swallow taps across
+  // the bottom third of the screen, including the lower half of a product image.
+  tlBotPx = tlBotY;
+  tlHitPx = tlShow ? (P.tlLabelY + P.tlFadeH) : 0;
   if(tlShow && tlDirty && chromeClock - tlLast > 0.028){   // cap at ~35Hz so the trail stays smooth
     drawTimeline(W, orbLX, orbLY); tlLastScroll = scroll01; tlLastSec = sec; tlLastW = W; tlLast = chromeClock;
+    tlLastHover = tlHoverSec;
   }
   timeline.opacity = tlShow ? 1 : 0;
   place(timeline, W * 0.5, tlBotY - timeline.h * 0.5, hw, hh, W, H);
+
+  // ── the fog band ── stands on the same bottom edge as the strip, full width. Its quad is much
+  // taller than the fog inside it, which is what keeps the quad's own top edge invisible.
+  if(fogBand){
+    fogSync(dt);
+    fogBand.w = W;
+    place(fogBand, W * 0.5, tlBotY - fogBand.h * 0.5, hw, hh, W, H);
+  }
 
   // Feed panel is anchored to the BALL in the bottom-right: it spans the sphere's height and
   // reaches well above it, so the contour layout has the sphere's whole silhouette to work with.
@@ -67235,6 +68997,42 @@ return {
              peakNorm: +((mi + 0.5) / tlLift.length).toFixed(4), peakVal: +mx.toFixed(3),
              starNorm: +dbgStarNorm.toFixed(4) };
   },
+  // ── CLICK-TO-JUMP ────────────────────────────────────────────────────────────────────────
+  // The strip is the clearest thing on the page and it told you where you were without letting
+  // you go there, so people were clicking it and getting nothing. hitSection maps a screen point
+  // to a section index, or -1 if the point is outside the strip's ink band.
+  hitSection: function(px, py){
+    if(!built || !P.on || hidden || !P.chrome || !P.timeline || tlHitPx <= 0) return -1;
+    if(py > tlBotPx || py < tlBotPx - tlHitPx) return -1;
+    // Uses the SAME mapping the strip is drawn with, or a click lands on a different section
+    // than the one under the label you aimed at. floor(f*MAJ) belonged to the old equal-fifths
+    // layout; the strip is scroll-linear now, so a point maps back through trackGeom.
+    var MAJ = SECS ? SECS.length : 0;
+    if(MAJ < 1) return -1;
+    var TG = trackGeom(window.innerWidth);
+    var s = (px - TG.sx0) / TG.sspan;
+    if(px < TG.x0 || px > TG.x0 + TG.span) return -1;
+    return Math.max(0, Math.min(MAJ - 1, Math.round(Math.max(0, Math.min(1, s)) * (MAJ - 1))));
+  },
+  setHover: function(sec){ tlHoverSec = (typeof sec === 'number' ? sec : -1); },
+  get hover(){ return tlHoverSec; },
+  // Scroll the PAGE, not the camera. onScroll owns the camera target and re-derives it from
+  // pageYOffset every event, so moving the camera directly would be undone on the next wheel
+  // tick. Section i is aimed at floor i: scroll01 is -camera.y/((TOTAL_FLOORS-1)*FLOOR_SPACING),
+  // and the document maps pageYOffset linearly onto that same range, so the fraction is i/(N-1).
+  // SECS.length and TOTAL_FLOORS can disagree if the catalogue is replaced after build(), hence
+  // the clamp rather than an assumption they match.
+  jumpToSection: function(sec){
+    var MAJ = SECS ? SECS.length : 0;
+    if(MAJ < 1) return false;
+    var nF = Math.max(2, (typeof TOTAL_FLOORS === 'number' ? TOTAL_FLOORS : MAJ));
+    var i = Math.max(0, Math.min(Math.min(MAJ, nF) - 1, sec | 0));
+    var range = Math.max(1, document.body.scrollHeight - window.innerHeight);
+    var top = Math.round((i / (nF - 1)) * range);
+    try { window.scrollTo({ top: top, behavior: 'smooth' }); }
+    catch(e){ window.scrollTo(0, top); }     // older Safari: no options object
+    return true;
+  },
   labelGroup: function(){ return labelGroup; },
   rebuildMask: function(){ maskCache = {}; if(maskWord){ var wd = maskWord; maskWord = ''; buildMask(wd); } },
   applyTheme: applyTheme,
@@ -67255,12 +69053,60 @@ return {
 // Passive listeners only: the site's own pointerdown/move handlers do the product raycasting
 // and floor dragging, and must keep working untouched. We only observe.
 (function CHUD_INPUT(){
-  window.addEventListener('pointermove', function(e){ CHUD.setMouse({ x: e.clientX, y: e.clientY }); }, { passive: true });
-  window.addEventListener('pointerleave', function(){ CHUD.setMouse(null); }, { passive: true });
+  window.addEventListener('pointermove', function(e){
+    CHUD.setMouse({ x: e.clientX, y: e.clientY });
+    CHUD.setHover(tlBlocked() ? -1 : CHUD.hitSection(e.clientX, e.clientY));
+  }, { passive: true });
+  window.addEventListener('pointerleave', function(){ CHUD.setMouse(null); CHUD.setHover(-1); }, { passive: true });
   // "ball expands in point waves when you click on product panels"
   window.addEventListener('pointerdown', function(e){
     CHUD.pointWaveRandom();
   }, { passive: true });
+
+  // ── TAP THE STRIP TO JUMP TO A SECTION ───────────────────────────────────────────────────
+  // Still passive, still observe-only: nothing here calls preventDefault or stopPropagation, so
+  // the site's own pointerdown/raycast path and the touch drag-scroll keep working untouched.
+  // It is safe to let the event through because a TAP is the one gesture neither of them acts
+  // on — the wheel needs travel to spin and the page needs travel to scroll — so the only thing
+  // a bottom-edge tap can currently hit is empty cloud.
+  var TAP_SLOP = 8;      // px of travel still counted as a tap, not a drag
+  var TAP_MS   = 500;
+  var dn = null;
+
+  // Don't hijack the bottom of the screen while something is layered over the storefront: the
+  // product view, the display wheel, the lightbox and the open nav all put their own controls
+  // (or a full-bleed product image) down there. `typeof` guards throughout — this block runs
+  // before some of those objects exist on a cold boot.
+  function tlBlocked(){
+    try {
+      if(typeof gameMode !== 'undefined' && gameMode && gameMode.active) return true;
+      if(typeof pdv !== 'undefined' && pdv && (pdv.active || pdv.entering)) return true;
+      if(typeof dm !== 'undefined' && dm && dm.active) return true;
+      if(typeof imgLightbox !== 'undefined' && imgLightbox && (imgLightbox.active || imgLightbox.entering)) return true;
+      if(typeof navMenu !== 'undefined' && navMenu && (navMenu.open || navMenu.barMode)) return true;
+      if(typeof cart !== 'undefined' && cart && cart.panelOpen) return true;
+    } catch(e){}
+    return false;
+  }
+
+  window.addEventListener('pointerdown', function(e){
+    if(e.button !== undefined && e.button !== 0) return;
+    if(tlBlocked()) { dn = null; return; }
+    var s = CHUD.hitSection(e.clientX, e.clientY);
+    dn = (s < 0) ? null : { x: e.clientX, y: e.clientY, t: performance.now(), sec: s };
+  }, { passive: true });
+
+  window.addEventListener('pointerup', function(e){
+    var d = dn; dn = null;
+    if(!d || tlBlocked()) return;
+    if(performance.now() - d.t > TAP_MS) return;
+    if(Math.abs(e.clientX - d.x) > TAP_SLOP || Math.abs(e.clientY - d.y) > TAP_SLOP) return;
+    // Re-test on release so a tap that started on the strip and ended off it does nothing.
+    if(CHUD.hitSection(e.clientX, e.clientY) !== d.sec) return;
+    CHUD.jumpToSection(d.sec);
+  }, { passive: true });
+
+  window.addEventListener('pointercancel', function(){ dn = null; }, { passive: true });
 })();
 
 
@@ -70496,10 +72342,16 @@ function animate(){
   updateCrosshair((crosshairActive() || (gameMode.fps.active && gameMode.fps.camTarget !== 0)) && !playerDeath.active);   // shown drifting / in first-person; hidden during the death animation
   if(!gameMode.active) hideSpeedCounter();
 
+  SHIRT.update(time);   // the garment projections: bob, sway, and the panel fade they ride
+
   floors.forEach(function(fl){
     var ud=fl.group.userData;
     var vel=ud.velocity;
     var passive=ud.rotationSpeed;
+    // Only the HERO MARK at the top of the tower drives the sunset — see the accumulator at the
+    // end of this callback. Same identity test the crystal chain uses.
+    var _heroSpin = PUBLIC_BUILD && typeof hero !== 'undefined' && hero && fl === hero.floor;
+    var _hRot0 = _heroSpin ? fl.group.rotation.y : 0;
 
     // Freeze the crystal the player is standing on while the mini-game is active, so the portal
     // (and the surface) is a stationary target to fly into. The website wheel still spins
@@ -70556,6 +72408,23 @@ function animate(){
       if(Math.abs(vel)<0.00005)vel=0;
       ud.velocity=vel;
       fl.group.rotation.y+=passive+vel;
+    }
+
+    // ── SUNSET ── the sun is lowered by spinning the BRAND MARK at the top of the page, in
+    // either direction, and by nothing else on the site.
+    // The two states are measured differently, because the hero row is dragged 1:1 with the
+    // pointer (see the PRODUCT WHEELS branch above). While it is held, the rotation IS the
+    // gesture, so this frame's rotation delta is exactly how far the visitor turned it. Once
+    // released the row also carries its own passive idle drift, so only the decaying user
+    // velocity counts there — charging for `passive` too would walk the sun down to night on its
+    // own while nobody was touching the page.
+    if(_heroSpin){
+      var _hd = fl.group.rotation.y - _hRot0;
+      if(_hd > Math.PI) _hd -= 2*Math.PI; else if(_hd < -Math.PI) _hd += 2*Math.PI;
+      // SIGNED — CSKY.spin locks the sunset direction to the first spin and lets the opposite
+      // one wind it back, so the sign has to survive this far.
+      var _turn = (isDragging && selectedFloor === fl) ? _hd : vel;
+      if(_turn !== 0 && typeof CSKY !== 'undefined' && CSKY.spin) CSKY.spin(_turn);
     }
 
     // Sync center star. While the mini-game owns the gallery crystal, hold it hole-up (+Y) by
