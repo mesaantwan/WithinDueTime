@@ -1606,8 +1606,16 @@ function createPanel(floorR, vertR, opts) {
 //     therefore inherits the wheel's spin and the row's intro for free.
 //   • `raycast` is a no-op. The panel behind it owns every click; without this the shirt would
 //     eat hits, because pDown raycasts `scene.children` recursively.
-//   • depthWrite:false + renderOrder 2. Panels DO write depth, so a shirt on the far side of
-//     the wheel is depth-rejected by its own panel and the draw order stops mattering.
+//   • depthWrite:false + renderOrder 6. The projection never writes depth, so its order against
+//     anything that DOES write depth is settled by that geometry's own draw, not by the depth
+//     buffer: whatever draws after it simply paints over it. The glass ring is renderOrder 5 with
+//     depthWrite:true and sits at radius 3 — a third of the way in from the panels — so at
+//     renderOrder 2 the shirt was correctly in FRONT of the ring in space and still got painted
+//     over by it. 6 clears the ring and stays well under the overlay chrome, which starts at 10.
+//     Depth still does the right thing in both directions, because every competitor writes it: a
+//     shirt on the far side of the wheel is rejected by its own panel, and one behind the ring is
+//     rejected by the ring. The gaps between scanlines still show the ring through them, which is
+//     why this is the fix rather than giving the shirt depthWrite.
 // ══════════════════════════════════════════════════════════════════════════════════════════
 var SHIRT = (function(){
   'use strict';
@@ -1622,36 +1630,42 @@ var SHIRT = (function(){
   var P = {
     on:         true,
     // ── placement ────────────────────────────────────────────────────────────
-    gap:        0.55,   // world units the projection floats in front of the panel face
-    fit:        0.80,   // fraction of the panel the shirt is fitted into (contain, not cover)
-    bobAmp:     0.075,
-    bobSpeed:   0.85,
-    sway:       2.6,    // degrees of idle yaw/roll drift
+    gap:        0.28,   // world units the projection floats in front of the panel face
+    fit:        1.50,   // multiple of the panel the shirt is fitted to (contain, not cover). Over
+                        // 1 it deliberately OVERFLOWS the panel — the garment is the hero here and
+                        // the panel behind it reads as a backing plate, not as a frame.
+    bobAmp:     0,      // idle motion OFF — the drift read as the garment being loose rather than
+    bobSpeed:   0,      // projected, and a still image is the honest anchor to design against
+    sway:       0,      // degrees of idle yaw/roll drift
     // ── the projection ───────────────────────────────────────────────────────
-    alpha:      0.82,
-    tintMix:    0.34,   // 0 = the photograph, 1 = pure tint. The colourway has to survive this.
+    alpha:      1.00,
+    tintMix:    0,      // 0 = the photograph, 1 = pure tint. The colourway has to survive this.
+                        // At 0 the garment keeps its real colour and the hologram is carried
+                        // entirely by the scan, the split and the glitch.
     tint:       [0.10, 0.78, 0.74],
     ink:        0.34,   // how dark the gaps between scanlines go
     cone:       0.26,   // projector falloff at the top and bottom of the plane
     // ── the aliasing ─────────────────────────────────────────────────────────
-    pixels:     110,
-    blocky:     0.85,
-    ca:         0.0080,
-    caPulse:    0.55,
-    fringe:     0.85,
-    glitch:     0.65,
+    pixels:     600,
+    blocky:     0.18,
+    ca:         0.0026,
+    caPulse:    0.34,
+    fringe:     0.76,
+    glitch:     3.00,
     // ── the scan ─────────────────────────────────────────────────────────────
-    scanFreq:   46,
-    scanDepth:  0.55,
-    scanScroll: 0.30,
-    bar:        0.40,
+    scanFreq:   166,   // sized against a RETINA framebuffer: the renderer runs at pixelRatio up
+                       // to 2, so this is ~3 device px a line. On a 1x display it is under Nyquist
+                       // and beats into a coarse moire — drop it toward 50 if that ever shows up.
+    scanDepth:  0.40,
+    scanScroll: 0.99,
+    bar:        0.18,
     refresh:    0.50,
     // ── the rim ──────────────────────────────────────────────────────────────
-    rim:        0.85,
+    rim:        0,
     rimW:       2.4,
-    rimCol:     [0.03, 0.42, 0.46],
+    rimCol:     [0.184, 0.376, 0.396],   // still live at rim 0: the roll bar mixes toward it
     // ── noise ────────────────────────────────────────────────────────────────
-    grain:      0.055,
+    grain:      0,
     flicker:    0.055
   };
 
@@ -1753,10 +1767,15 @@ var SHIRT = (function(){
     '  col = mix(col, fCol, clamp(fringe * uFringe, 0.0, 1.0));',
     '',
     '  // ── RIM: a laplacian of the cutout alpha, so it hugs the inside of the silhouette ──',
-    '  float w = uRimW / max(4.0, uPix);',
-    '  float lap = clamp(cG.a * 4.0 - (samp(uv + vec2(-w, 0.0)).a + samp(uv + vec2(w, 0.0)).a',
-    '                               +  samp(uv + vec2(0.0, -w)).a + samp(uv + vec2(0.0, w)).a), 0.0, 1.0);',
-    '  col = mix(col, uRimCol, lap * uRim);',
+    '  // Guarded, because four texture taps is real fill on a quad this size and uRim is uniform',
+    '  // across the draw: at 0 the branch is skipped outright rather than multiplied away.',
+    '  float lap = 0.0;',
+    '  if(uRim > 0.0){',
+    '    float w = uRimW / max(4.0, uPix);',
+    '    lap = clamp(cG.a * 4.0 - (samp(uv + vec2(-w, 0.0)).a + samp(uv + vec2(w, 0.0)).a',
+    '                           +  samp(uv + vec2(0.0, -w)).a + samp(uv + vec2(0.0, w)).a), 0.0, 1.0);',
+    '    col = mix(col, uRimCol, lap * uRim);',
+    '  }',
     '',
     '  // ── SCAN: the gaps are HOLES, not dark pixels. On a bright sky that is the whole read. ──',
     '  float scan = sin((vUv.y * uScanFreq - t * uScanScroll * uScanFreq) * 6.2831853) * 0.5 + 0.5;',
@@ -1802,6 +1821,7 @@ var SHIRT = (function(){
   var list   = [];                    // every live projection, wheel and detail-view alike
   var texes  = [null, null, null, null];
   var PLANE  = null;                  // one unit quad; size lives in mesh.scale
+  var hidden = false;                 // suppressed for a pass that must not see them (the cube map)
   var BLANK  = null;                  // 1x1 fully transparent — draws nothing until the art lands
   var booted = false;
 
@@ -1831,6 +1851,14 @@ var SHIRT = (function(){
     lastPick = bag.pop();
     return lastPick;
   }
+
+  function applyVisible(){ for(var i = 0; i < list.length; i++) list[i].mesh.visible = (P.on && !hidden); }
+
+  // The crystal reflection cube map renders the whole scene six times from the CENTRE of the
+  // wheel, and every projection hangs 0.55 outside its panel — so from in there they are behind
+  // solid, depth-writing panels and contribute nothing but 126 draw calls every third frame.
+  // Hidden the same way the rings, CHUD and CSKY already are around that block.
+  function setHidden(v){ if(hidden === !!v) return; hidden = !!v; applyVisible(); }
 
   function makeMat(idx){
     var u = {
@@ -1868,7 +1896,8 @@ var SHIRT = (function(){
     var idx = pick();
     var mat = makeMat(idx);
     var mesh = new THREE.Mesh(PLANE, mat);
-    mesh.renderOrder = 2;
+    mesh.renderOrder = 6;   // clears the glass ring (5); overlay chrome starts at 10
+    mesh.visible = !hidden;
     mesh.frustumCulled = false;          // the parent panel is the real cull unit
     mesh.raycast = function(){};         // never a click target — the panel behind owns the hit
     panel.mesh.add(mesh);
@@ -1893,7 +1922,7 @@ var SHIRT = (function(){
     var src = panel && panel.shirt;
     if(!src || !P.on) return null;
     var m = new THREE.Mesh(PLANE, src.mat);
-    m.renderOrder = 2; m.frustumCulled = false; m.raycast = function(){};
+    m.renderOrder = 6; m.visible = !hidden; m.frustumCulled = false; m.raycast = function(){};
     target.add(m);
     list.push({
       mesh: m, mat: src.mat, idx: src.idx, panel: panel,
@@ -1946,10 +1975,15 @@ var SHIRT = (function(){
   }
 
   // ── ART ───────────────────────────────────────────────────────────────────────────────────
+  // Page-relative FIRST, the same order FACE_PLANET_URLS uses and for the same reason: on the
+  // deployed site the art sits beside the page, so every candidate tried before the one that hits
+  // is a real 404 on a page whose request count has already had a pass spent on it. Upload the
+  // four `-768.png` copies (they are in product-images/) and this costs zero misses; until then
+  // it falls through to the full-size names, which are already in the repo.
   function urlsFor(name){
     var small = name.replace(/\.png$/i, '-768.png');
-    return ['product-images/' + small, 'product-images/' + name,
-            small, name,
+    return [small, 'product-images/' + small,
+            name,  'product-images/' + name,
             GH + encodeURIComponent(small), GH + encodeURIComponent(name)];
   }
 
@@ -2022,7 +2056,8 @@ var SHIRT = (function(){
   }
 
   return {P:P, U:U, boot:boot, attach:attach, cloneOnto:cloneOnto, update:update,
-          sync:sync, refit:refit, reroll:reroll, list:list, FILES:FILES};
+          sync:sync, refit:refit, reroll:reroll, setHidden:setHidden, applyVisible:applyVisible,
+          list:list, FILES:FILES};
 })();
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
@@ -2063,8 +2098,8 @@ var SHIRT = (function(){
       hd('PLACEMENT') +
       chk('Projections on', 'on') +
       row('Float distance', 'gap', 0, 2, 0.01) +
-      row('Size in panel', 'fit', 0.2, 1.3, 0.01) +
-      note('Contain-fit against the panel\'s own arc width and height, so the tall top row keeps the same shirt proportions as the wide ones.') +
+      row('Size vs panel', 'fit', 0.2, 3.5, 0.01) +
+      note('Contain-fit against the panel\'s own arc width and height, so the tall top row keeps the same shirt proportions as the wide ones. Past 1 the garment overflows its panel; past ~2.1 it reaches the rows above and below, which are 6.5 apart.') +
       row('Bob height', 'bobAmp', 0, 0.4, 0.005) +
       row('Bob speed', 'bobSpeed', 0, 3, 0.05) +
       row('Sway (deg)', 'sway', 0, 15, 0.1) +
@@ -2145,7 +2180,7 @@ var SHIRT = (function(){
         SHIRT.P[b] = ev.target.checked;
         // `on` gates whole meshes rather than a uniform; the projections already exist by now,
         // so hiding them is the honest toggle — a rebuild would re-deal every colourway.
-        for(var i = 0; i < SHIRT.list.length; i++) SHIRT.list[i].mesh.visible = SHIRT.P.on;
+        SHIRT.applyVisible();
       }
     });
 
@@ -72212,6 +72247,7 @@ function animate(){
     // geometry floating in the room — it would smear into every crystal reflection. Hide it.
     CHUD.setHidden(true);
     CSKY.setHidden(true);
+    SHIRT.setHidden(true);   // occluded by their own panels from in here anyway — see setHidden
     // REFLECT A WHITE ROOM, NOT A BLUE ONE. The cube map is a real render, so it picks up
     // scene.background and the fog distant geometry fades into — both of which are the sky. Held
     // at REFLECT_BG for these six faces only; the visible frame is untouched because this is
@@ -72223,6 +72259,7 @@ function animate(){
     cubeCamera.update(renderer,scene);
     scene.background.setHex(_ccBg);
     if(scene.fog) scene.fog.color.setHex(_ccFog);
+    SHIRT.setHidden(false);
     CSKY.setHidden(false);
     CHUD.setHidden(false);
     floors.forEach(function(f){if(f.hasRings){f.rings.top.forEach(function(r){r.visible=true;});f.rings.bottom.forEach(function(r){r.visible=true;});}});
