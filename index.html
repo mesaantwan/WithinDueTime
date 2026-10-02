@@ -181,6 +181,9 @@ var SHOP = (function(){
   var API    = 'https://' + DOMAIN + '/api/2026-07/graphql.json';
   // The address the Contact link writes to. Empty hides the link.
   var CONTACT_EMAIL = '';
+  // Offered for listings with no size variants (the 3D size toggle's stand-in is the same three).
+  // The pick reaches the order as a "Size" line note — see add().
+  var STAND_IN_SIZES = ['S', 'M', 'L'];
   // Used until the live policy list arrives, so the Privacy link is there from the first frame.
   var PRIVACY_URL = 'https://checkout.shopify.com/71938572374/policies/40583823446.html?locale=en';
 
@@ -318,10 +321,16 @@ var SHOP = (function(){
     if(!v.available) return no(p.name + (p.shopifyVariants.length > 1 ? ' in ' + v.title : '') + ' is sold out.');
     var price = parseFloat(v.price && v.price.amount);
     if(!(price > 0)) return no(p.name + ' isn’t for sale yet.');
+    // A listing with no size variants is still offered in S/M/L (STAND_IN_SIZES, and the 3D size
+    // toggle's stand-in). That pick can't choose a variant, so it rides to the order as a "Size"
+    // line note, and each size is its own bag line.
+    var real = p.shopifyVariants.length > 1;
+    var note = !real && sizeLabel && sizeLabel !== v.title ? sizeLabel : '';
     return { ok: true, item: addLine({
-      cartId: v.id, id: p.id, variantId: v.id, name: p.name, price: price,
+      cartId: v.id + (note ? '|' + note : ''), id: p.id, variantId: v.id, name: p.name, price: price,
       currency: (v.price && v.price.currencyCode) || 'USD',
-      size: p.shopifyVariants.length > 1 ? v.title : ''
+      size: real ? v.title : note,
+      attrs: note ? [{ key: 'Size', value: note }] : undefined
     }) };
   }
   // Lines with the same cartId stack. `attrs` ([{key, value}]) ride to the order as line
@@ -579,6 +588,14 @@ var SHOP = (function(){
         var o = h('option', { value: v.title, text: v.title + (v.available ? '' : ' — sold out') });
         if(!v.available) o.disabled = true;
         else if(!picked){ o.selected = true; picked = true; }
+        sel.appendChild(o);
+      });
+      info.push(h('label', { class: 'shop-size' }, ['Size ', sel]));
+    } else if(!p.sold && p.price > 0){
+      sel = h('select', { 'aria-label': 'Size for ' + p.name });
+      STAND_IN_SIZES.forEach(function(s){
+        var o = h('option', { value: s, text: s });
+        if(s === 'M') o.selected = true;
         sel.appendChild(o);
       });
       info.push(h('label', { class: 'shop-size' }, ['Size ', sel]));
@@ -3064,9 +3081,9 @@ var DML = (function(){
     // ── the size toggle ──────────────────────────────────────────────────────
     // Replaces the three action orbs with one control — see THE SIZE TOGGLE below.
     sizeOn:      true,
-    sizeStandIn: false,  // true: products with no size variants show S/M/L rather than ONE SIZE. OFF for
-                         // the live store: the pick was thrown away, so a customer choosing L got the one
-                         // listing whatever its size. Add real size variants in Shopify instead.
+    sizeStandIn: true,   // products with no size variants show S/M/L rather than ONE SIZE. The pick is
+                         // not a variant, so sizeLabel() hands it to the cart and SHOP sends it to the
+                         // order as a "Size" line note. Real size variants in Shopify replace it.
     // The track is the SAME frost as the product card and the image switcher (frostMaterial), so
     // its colour, blur, frost, bevel and opacity are the plate* knobs above — deliberately no
     // second set.
@@ -3970,9 +3987,9 @@ var DML = (function(){
     return null;
   }
   function sizeDragging(){ return !!sz.drag; }
-  // What the cart line should carry. Empty for a product that has no sizes at all — whatever
-  // the track shows for those (the stand-in, or ONE SIZE) is a label, not a variant.
-  function sizeLabel(){ return (sz.hasSizes && sz.sizes[sz.sel]) ? sz.sizes[sz.sel] : ''; }
+  // What the cart line should carry: a real size variant, or the stand-in S/M/L pick (SHOP turns
+  // that into a "Size" note on the order line). ONE SIZE is a label, not a choice — it carries nothing.
+  function sizeLabel(){ var s = sz.sizes[sz.sel]; return (s && (sz.hasSizes || P.sizeStandIn)) ? s : ''; }
   // What the track is showing, stand-in included — for readouts, never for the cart.
   function sizeShown(){ return sz.sizes[sz.sel] || ''; }
 
