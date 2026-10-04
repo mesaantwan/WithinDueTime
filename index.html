@@ -1230,11 +1230,6 @@ var PUBLIC_WHITEOUT_CAP = 0.55;
 // The guards are written `PUBLIC_BUILD && !PUBLIC_GAME` so flipping PUBLIC_BUILD to false still
 // gives the full dev build in one edit, as before.
 var PUBLIC_GAME = true;
-// PUBLIC BUILD: the FITTING ROOM (avatar editor) — the glass button bottom-left. Everything it needs
-// lives in avatar/ next to this file and is only fetched on the first press; see the AVB block.
-// false = no button, nothing loaded. ?room opens it on load (testing).
-var PUBLIC_AVATAR = true;
-var AVATAR_BASE = 'avatar/';
 var BEVEL = 0.15, BEVEL_R = 0.3, SEG_X = 32, SEG_Y = 8;
 
 var raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
@@ -7278,6 +7273,53 @@ var STOREFRONT_MODEL = (function(){
     geometries[m.name]=g;
     return g;
   }
+
+  // Prepare baked meshes in small CPU units before attaching a row. Base64 decoding,
+  // position expansion and bounds used to happen for the whole row inside one idle job.
+  var preparations = {};
+  function hasFloor(fi){return DATA.meshes.some(function(m){return m.floor===fi;});}
+  function prepareStep(fi){
+    var m=null;
+    for(var mi=0;mi<DATA.meshes.length;mi++){
+      var candidate=DATA.meshes[mi];
+      if(candidate.floor===fi && !geometries[candidate.name]){m=candidate;break;}
+    }
+    if(!m)return true;
+    var state=preparations[m.name];
+    if(!state)state=preparations[m.name]={channel:0,offset:0,arrays:[],cursor:0};
+    if(state.channel<3){
+      var encoded=m[['p','n','i'][state.channel]];
+      if(!state.bytes){
+        var padding=encoded.endsWith('==')?2:encoded.endsWith('=')?1:0;
+        state.bytes=new Uint8Array(encoded.length/4*3-padding);
+      }
+      // A multiple of four keeps each independent base64 block aligned.
+      var end=Math.min(encoded.length,state.offset+16384);
+      var decoded=atob(encoded.slice(state.offset,end)),byteOffset=state.offset/4*3;
+      for(var bi=0;bi<decoded.length;bi++)state.bytes[byteOffset+bi]=decoded.charCodeAt(bi);
+      state.offset=end;
+      if(end===encoded.length){
+        var Type=state.channel===1?Int16Array:Uint16Array;
+        state.arrays.push(new Type(state.bytes.buffer));state.bytes=null;state.offset=0;state.channel++;
+      }
+      return false;
+    }
+    var raw=state.arrays[0];
+    if(!state.pos)state.pos=new Float32Array(raw.length);
+    if(state.cursor<raw.length){
+      var stop=Math.min(raw.length,state.cursor+4096);
+      for(var pi=state.cursor;pi<stop;pi++)state.pos[pi]=m.lo[pi%3]+raw[pi]/65535*m.span[pi%3];
+      state.cursor=stop;return false;
+    }
+    var g=new THREE.BufferGeometry();
+    g.setAttribute('position',new THREE.BufferAttribute(state.pos,3));
+    g.setAttribute('normal',new THREE.BufferAttribute(state.arrays[1],3,true));
+    if(m.glass)g.setAttribute('uv',new THREE.BufferAttribute(new Float32Array(raw.length/3*2),2));
+    g.setIndex(new THREE.BufferAttribute(state.arrays[2],1));
+    g.computeBoundingBox();g.computeBoundingSphere();
+    geometries[m.name]=g;delete preparations[m.name];
+    return false; // yield between meshes, including the last one
+  }
   function bind(id,node,fl){
     node.name=id;
     bindings.push({id:id,node:node,floor:fl,angle:0,last:fl.group.rotation.y,base:node.quaternion.clone()});
@@ -7424,7 +7466,7 @@ var STOREFRONT_MODEL = (function(){
   });
   if(/[?&]modelparams(?:[=&]|$)/.test(location.search)) window.addEventListener('load',open);
   return {P:P,defaults:defaults,labels:labels,source:DATA.source,sourceHash:DATA.sourceHash,holoGap:HOLO_GAP,floorY:floorY,scrollY:scrollY,progress:progress,
-    attach:attach,tick:tick,rate:rate,wheelRate:wheelRate,orbSpin:orbSpin,captureHidden:captureHidden,set:set,save:save,reset:reset,open:open,
+    attach:attach,hasFloor:hasFloor,prepareStep:prepareStep,tick:tick,rate:rate,wheelRate:wheelRate,orbSpin:orbSpin,captureHidden:captureHidden,set:set,save:save,reset:reset,open:open,
     inspect:function(){return bindings.map(function(b){return {id:b.id,angle:b.angle,floor:b.floor.group.userData.label,vertices:b.node.children[0].geometry.attributes.position.count};});}};
 })();
 // END BAKED STOREFRONT MODEL
@@ -7460,6 +7502,12 @@ var HOLO = (function(){
   'use strict';
   var LOW = (typeof GAME_LOW_FX !== 'undefined' && !!GAME_LOW_FX);
   var KEY = 'chrysolin.holo.v1';
+  // ── THE REAL JEANS GO HERE ── a same-origin .glb/.gltf path, e.g. 'product-images/jeans.glb'.
+  // Empty = the procedural stand-in below. ?holomodel=<path> on the URL overrides it, so a new
+  // export can be checked on the live page without editing this file. A file that fails to load
+  // (wrong path, Draco-compressed, not CORS-readable) falls back to the stand-in.
+  var MODEL_URL = '';
+  try { var _qm = new URLSearchParams(location.search).get('holomodel'); if(_qm) MODEL_URL = _qm; } catch(e){}
   var P = {
     on: true,
     showBody: true, showSeams: true, showRays: true, showCones: true, showFlares: true,   // layer switches (panel / look-dev)
@@ -7493,6 +7541,8 @@ var HOLO = (function(){
     seamA: 0.9,
     seamBack: 0.28,
     dashP: 2.2,            // stitch period, model units
+    creases: true,         // a LOADED model (no traced seams) shows its own creases as seams instead
+    creaseAngle: 32,       // degrees of fold that count as a crease
     // ── rays ──
     rays: LOW ? 26 : 56,   // per emitter
     scanShare: 0.42,       // share of rays that follow the scan band
@@ -7527,7 +7577,7 @@ var HOLO = (function(){
   var bodyMat, seamMat, rayMat, coneMat, flareMat;
   var built = false, building = false, hidden = {}, power = 0, T = 0, theta = 0, bandY = 0;
   var lo = new THREE.Vector3(), size = new THREE.Vector3(1,1,1);
-  var S = 0, sL = null, sN = null, sY = null, sW = null, sWN = null;     // samples: local pos/normal, height 0..1, world pos/normal
+  var S = 0, sL = null, sN = null, sY = null, sAz = null, sW = null, sWN = null;     // samples: local pos/normal, height 0..1, world pos/normal
   var E = [new THREE.Vector3(), new THREE.Vector3()], C = new THREE.Vector3(), Cs = new THREE.Vector3();
   var tipLocal = [null, null], tipGeo = [null, null], tipGem = [null, null];
   var scaleS = 0, haveFit = false, spanNow = 0, failNote = '';
@@ -7939,10 +7989,10 @@ var HOLO = (function(){
         '  float spike = exp(-abs(vP.x)*40.0)*exp(-abs(vP.y)*3.2) + exp(-abs(vP.y)*40.0)*exp(-abs(vP.x)*3.2);',
         '  float rq = (r - 0.42 - 0.03*sin(uTime*3.0))*28.0, ring = exp(-rq*rq)*0.35;',
         '  float k = uA * uPow * (0.85 + 0.15*sin(uTime*9.0));',
-        '  float g = (core + halo + spike*0.55) * k, r = ring * 1.6 * k;',
+        '  float g = (core + halo + spike*0.55) * k, ringGlow = ring * 1.6 * k;',
         // premultiplied by construction: glow from the core, an INK ring around it for contrast by day
-        '  vec3 rgb = ramp(0.6 + 0.4*core) * g + uInk * r;',
-        '  float a = clamp(g + r, 0.0, 1.0);',
+        '  vec3 rgb = ramp(0.6 + 0.4*core) * g + uInk * ringGlow;',
+        '  float a = clamp(g + ringGlow, 0.0, 1.0);',
         '  gl_FragColor = vec4(rgb, a*(1.0 - uAdd));',
         '}'
       ].join('\n')
@@ -8002,6 +8052,7 @@ var HOLO = (function(){
     if(!root) init();
     var g = geometry;   // indexed or not, both work
     if(!g.attributes.normal) g.computeVertexNormals();
+    if(!seams && P.creases) seams = creaseSeams(g);
     g.computeBoundingBox();
     var bb = g.boundingBox, c = bb.getCenter(new THREE.Vector3());
     g.translate(-c.x, -c.y, -c.z);
@@ -8034,6 +8085,30 @@ var HOLO = (function(){
     return HOLO;
   }
 
+  // A loaded model has no traced stitching, so its own CREASES stand in for it: every edge where the
+  // surface folds by more than creaseAngle — on a real garment mesh that is the panel seams, hems,
+  // waistband and pocket edges. Normals come from the source vertex at each edge start, so the
+  // far-side dimming still works. Skipped on very heavy meshes (EdgesGeometry hashes every triangle).
+  function creaseSeams(g){
+    var tris = g.index ? g.index.count/3 : g.attributes.position.count/3;
+    if(tris > 200000) return null;
+    var eg = new THREE.EdgesGeometry(g, P.creaseAngle), ep = eg.attributes.position.array, n = Math.min(20000, ep.length/6);
+    if(!n){ eg.dispose(); return null; }
+    var pa = g.attributes.position, na = g.attributes.normal, map = new Map(), i;
+    function key(x, y, z){ return Math.round(x*1e4) + ',' + Math.round(y*1e4) + ',' + Math.round(z*1e4); }
+    for(i=0;i<pa.count;i++) map.set(key(pa.getX(i), pa.getY(i), pa.getZ(i)), i);
+    var a = new Float32Array(n*3), b = new Float32Array(n*3), nn = new Float32Array(n*3), sl = new Float32Array(n*2), d = new Float32Array(n), acc = 0;
+    for(i=0;i<n;i++){
+      a.set(ep.subarray(i*6, i*6+3), i*3); b.set(ep.subarray(i*6+3, i*6+6), i*3);
+      var vi = map.get(key(ep[i*6], ep[i*6+1], ep[i*6+2]));
+      if(vi !== undefined){ nn[i*3] = na.getX(vi); nn[i*3+1] = na.getY(vi); nn[i*3+2] = na.getZ(vi); } else nn[i*3+1] = 1;
+      var L = Math.hypot(ep[i*6+3]-ep[i*6], ep[i*6+4]-ep[i*6+1], ep[i*6+5]-ep[i*6+2]);
+      sl[i*2] = acc; sl[i*2+1] = acc + L; acc += L;
+    }
+    eg.dispose();
+    return { a: a, b: b, n: nn, s: sl, dash: d };
+  }
+
   // Area-weighted points on the surface: what the rays aim at and what the cones are fitted to.
   function sample(g){
     var pos = g.attributes.position.array, nrm = g.attributes.normal.array;
@@ -8047,7 +8122,7 @@ var HOLO = (function(){
       tot += 0.5*Math.sqrt(cx*cx+cy*cy+cz*cz); cum[i] = tot;
     }
     S = LOW ? 700 : 1400; _seed = 7;
-    sL = new Float32Array(S*3); sN = new Float32Array(S*3); sY = new Float32Array(S); sW = new Float32Array(S*3); sWN = new Float32Array(S*3);
+    sL = new Float32Array(S*3); sN = new Float32Array(S*3); sY = new Float32Array(S); sAz = new Float32Array(S); sW = new Float32Array(S*3); sWN = new Float32Array(S*3);
     for(var s=0;s<S;s++){
       var r = rnd()*tot, l0 = 0, h0 = tc-1;
       while(l0 < h0){ var m = (l0+h0)>>1; if(cum[m] < r) l0 = m+1; else h0 = m; }
@@ -8059,6 +8134,7 @@ var HOLO = (function(){
       }
       var nl = Math.hypot(sN[s*3], sN[s*3+1], sN[s*3+2]) || 1; sN[s*3]/=nl; sN[s*3+1]/=nl; sN[s*3+2]/=nl;
       sY[s] = (sL[s*3+1] - lo.y) / size.y;
+      sAz[s] = Math.atan2(sL[s*3+2], sL[s*3]);   // local azimuth, fixed: the scan buckets subtract the turntable angle
     }
     VIS.n = S; VIS.vis = [new Uint8Array(S), new Uint8Array(S)];
   }
@@ -8080,8 +8156,12 @@ var HOLO = (function(){
   // The stand-in is built OFF THE MAIN THREAD: the generator is a pure function, so its own
   // source text is the worker. ~50–120 ms of meshing never touches a frame. Falls back to a
   // direct call if workers are unavailable (file://, CSP).
-  function buildStandIn(){
+  function buildModel(){
     if(building || built) return; building = true;
+    if(MODEL_URL){ loadModel(MODEL_URL, function(ok){ if(!ok){ console.warn('[HOLO] falling back to the stand-in'); MODEL_URL = ''; standIn(); } }); return; }
+    standIn();
+  }
+  function standIn(){
     var cell = LOW ? 1.4 : 1.1;
     function done(J){
       var g = new THREE.BufferGeometry();
@@ -8141,7 +8221,7 @@ var HOLO = (function(){
   var VIS = { minD: new Float32Array(AZ*EL), bin: null, n: 0, vis: null, tan: null, dist: null,
               env: [new Float32Array(K), new Float32Array(K)], envAl: [new Float32Array(K), new Float32Array(K)], near: [0,0], far: [0,0], ax: [new THREE.Vector3(), new THREE.Vector3()],
               bu: [new THREE.Vector3(), new THREE.Vector3()], bv: [new THREE.Vector3(), new THREE.Vector3()] };
-  var bucketList = null, bucketCount = new Int32Array(AZB), _envTmp = new Float32Array(K), _envTmpA = new Float32Array(K);
+  var _envTmp = new Float32Array(K), _envTmpA = new Float32Array(K);
   function analyse(k){
     var e = E[k], A = VIS.ax[k].copy(C).sub(e).normalize();
     var U = VIS.bu[k], V = VIS.bv[k];
@@ -8190,46 +8270,51 @@ var HOLO = (function(){
     }
   }
 
-  // samples inside the scan band, bucketed by azimuth around the model's own axis
-  function bandBuckets(){
-    if(!bucketList || bucketList.length !== AZB*S) bucketList = new Int32Array(AZB*S);
-    bucketCount.fill(0);
-    var w = Math.max(0.012, P.bandW*0.7);
+  // Samples near a given model height, bucketed by WORLD azimuth (local minus the turntable angle),
+  // so each scan ray keeps its bearing while the model turns under the fan instead of the fan
+  // spinning with the model. One set per emitter: while the projector boots, each emitter scans
+  // its own BUILD FRONT (the edge it is drawing); once built, both follow the shared scan band.
+  var SB = [{ list: null, count: new Int32Array(AZB), h: 0 }, { list: null, count: new Int32Array(AZB), h: 0 }];
+  function scanBuckets(k, h){
+    var sb = SB[k], tw = 2*Math.PI, w = Math.max(0.012, P.bandW*0.7);
+    sb.h = h;
+    if(!sb.list || sb.list.length !== AZB*S) sb.list = new Int32Array(AZB*S);
+    sb.count.fill(0);
     for(var i=0;i<S;i++){
-      if(Math.abs(sY[i] - bandY) > w) continue;
-      // WORLD azimuth (local minus the turntable angle), so each scan ray keeps its bearing while
-      // the model turns under the fan instead of the fan spinning with the model
-      var az = Math.atan2(sL[i*3+2], sL[i*3]) - theta; az -= Math.floor(az / (2*Math.PI)) * 2*Math.PI;
-      var b = Math.floor(az / (2*Math.PI) * AZB) % AZB;
-      bucketList[b*S + bucketCount[b]++] = i;
+      if(Math.abs(sY[i] - h) > w) continue;
+      var az = sAz[i] - theta; az -= Math.floor(az / tw) * tw;
+      var b = Math.floor(az / tw * AZB) % AZB;
+      sb.list[b*S + sb.count[b]++] = i;
     }
   }
 
-  function updateRays(dt, rayP){
+  function updateRays(dt, rayP, buildP){
     var n = P.rays*2, A = rayM.geometry.attributes.iA.array, B = rayM.geometry.attributes.iB.array, Kk = rayM.geometry.attributes.iK.array;
+    var booting = buildP < 0.999, half = buildP*0.5 + 0.02, w = Math.max(0.012, P.bandW*0.7);
     for(var i=0;i<n;i++){
       var k = i < P.rays ? 0 : 1, e = E[k], vis = VIS.vis[k], t = R.tgt[i], kind = R.kind[i];
       var wantNew = false;
       if(kind === 1){
-        // scan rays: stay inside the band; when the band leaves your point, jump to another
-        // point in your own azimuth bucket so the fan slides up the model instead of flickering
-        var inBand = t >= 0 && Math.abs(sY[t] - bandY) <= Math.max(0.012, P.bandW*0.7);
-        if(!inBand){
-          var b = R.bucket[i], c = bucketCount[b];
-          R.tgt[i] = t = c ? bucketList[b*S + Math.floor(rnd()*c)] : -1;
+        // scan rays: stay on your emitter's scan height; when it leaves your point, jump to another
+        // point in your own azimuth bucket so the fan slides along the model instead of flickering
+        var sb = SB[k];
+        if(!(t >= 0 && Math.abs(sY[t] - sb.h) <= w)){
+          var b = R.bucket[i], c = sb.count[b];
+          R.tgt[i] = t = c ? sb.list[b*S + Math.floor(rnd()*c)] : -1;
         }
-        // the nearer emitter carries the scan
-        var nearW = k === 0 ? sat((bandY - 0.25) * 2) : sat((0.75 - bandY) * 2);
+        // booting: each emitter draws its own half. Built: the nearer emitter carries the band.
+        var nearW = booting ? 1 : (k === 0 ? sat((bandY - 0.25) * 2) : sat((0.75 - bandY) * 2));
         R.al[i] += ((t >= 0 ? nearW : 0) - R.al[i]) * Math.min(1, dt*10);
       } else {
+        // surface rays only ever land on what is both SEEN from this tip and already DRAWN
         R.life[i] -= dt;
-        if(t < 0 || !vis[t] || R.life[i] <= 0){
+        if(t < 0 || !vis[t] || Math.min(sY[t], 1 - sY[t]) > half || R.life[i] <= 0){
           R.al[i] -= dt * 4;
           if(R.al[i] <= 0){ R.al[i] = 0; wantNew = true; }
         } else R.al[i] = Math.min(1, R.al[i] + dt*3);
         if(wantNew){
           t = -1;
-          for(var tries=0; tries<12; tries++){ var c2 = Math.floor(rnd()*S); if(vis[c2]){ t = c2; break; } }
+          for(var tries=0; tries<12; tries++){ var c2 = Math.floor(rnd()*S); if(vis[c2] && Math.min(sY[c2], 1 - sY[c2]) <= half){ t = c2; break; } }
           R.tgt[i] = t; R.life[i] = P.rayLife * (0.5 + rnd());
         }
       }
@@ -8269,14 +8354,15 @@ var HOLO = (function(){
     return 1 - sat(lum / Math.max(0.05, site));
   }
 
-  var lastErr = 0;
+  var lastErr = 0, msAvg = 0, _frame = 0;
   function update(dt){
-    try { tick(dt); }
+    var t0 = performance.now();
+    try { tick(dt); if(root && root.visible) msAvg += (performance.now() - t0 - msAvg) * 0.05; }
     catch(e){ if(performance.now() - lastErr > 5000){ lastErr = performance.now(); console.warn('[HOLO]', e); } if(root) root.visible = false; }
   }
   function tick(dt){
     if(!root){ if(typeof scene === 'undefined' || typeof floors === 'undefined' || !floors.length) return; init(); }
-    if(!built){ if(P.on) buildStandIn(); root.visible = false; return; }
+    if(!built){ if(P.on) buildModel(); root.visible = false; return; }
     dt = Math.max(0, Math.min(0.1, dt || 0));
     if(!tips()){ root.visible = false; power = 0; return; }
     spanNow = E[0].distanceTo(E[1]);
@@ -8314,9 +8400,14 @@ var HOLO = (function(){
     var flareP = sat(power/0.22), coneP = sat((power-0.12)/0.35), rayP = sat((power-0.22)/0.35), buildP = sat((power-0.30)/0.70);
     buildP = buildP*buildP*(3 - 2*buildP);
 
-    analyse(0); analyse(1);
-    bandBuckets();
-    updateRays(dt, rayP);
+    // Phones analyse one emitter per frame, alternating: the envelopes and depth maps move slowly
+    // enough that a frame of lag is invisible, and it halves the only per-sample cost here.
+    _frame++;
+    if(!LOW || !(_frame & 1)) analyse(0);
+    if(!LOW || (_frame & 1)) analyse(1);
+    scanBuckets(0, buildP < 0.999 ? 1 - buildP*0.5 : bandY);   // top emitter draws the top half down
+    scanBuckets(1, buildP < 0.999 ? buildP*0.5 : bandY);       // bottom emitter draws the bottom half up
+    updateRays(dt, rayP, buildP);
     var nearT0 = updateCone(0), nearT1 = updateCone(1);
 
     // flares sit on the tips and face the camera
@@ -8376,13 +8467,26 @@ var HOLO = (function(){
   // The real jeans: HOLO.loadModel('product-images/jeans.glb'). Every mesh in the file is merged
   // into one geometry (world transforms applied), so any export layout works. Rays and cones
   // re-derive from the new surface on the next frame; the stand-in's traced seams go away.
+  // GLTFLoader is not in the page by default and the site's own ensureGLTFLoader lives inside the
+  // (never-booted) customizer, so HOLO pulls it the same lazy-CDN way. Checks THREE.GLTFLoader
+  // first, so whichever module loads it first, nobody loads it twice.
+  var GLTF_URL = 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js', _gq = null;
+  function needGLTF(cb){
+    if(typeof THREE.GLTFLoader === 'function'){ cb(true); return; }
+    if(_gq){ _gq.push(cb); return; }
+    _gq = [cb];
+    var sc = document.createElement('script'); sc.src = GLTF_URL;
+    sc.onload  = function(){ var q = _gq; _gq = null; q.forEach(function(f){ f(typeof THREE.GLTFLoader === 'function'); }); };
+    sc.onerror = function(){ var q = _gq; _gq = null; q.forEach(function(f){ f(false); }); };
+    document.head.appendChild(sc);
+  }
   function loadModel(url, cb){
-    if(typeof ensureGLTFLoader !== 'function'){ console.warn('[HOLO] no GLTF loader'); return; }
-    ensureGLTFLoader(function(ok){
-      if(!ok) return;
+    needGLTF(function(ok){
+      if(!ok){ console.warn('[HOLO] GLTFLoader unavailable'); if(cb) cb(false); return; }
       new THREE.GLTFLoader().load(url, function(gltf){
         var parts = [];
         gltf.scene.updateMatrixWorld(true);
+        try {
         gltf.scene.traverse(function(o){ if(o.isMesh && o.geometry && o.geometry.attributes.position) parts.push(o); });
         var vtot = 0, itot = 0;
         parts.forEach(function(o){ vtot += o.geometry.attributes.position.count; itot += o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count; });
@@ -8404,6 +8508,7 @@ var HOLO = (function(){
         geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
         geo.setIndex(new THREE.BufferAttribute(ind, 1));
         setModel(geo, null);
+        } catch(e){ console.warn('[HOLO] could not use', url, e); if(cb) cb(false); return; }
         if(cb) cb(true);
       }, undefined, function(err){ console.warn('[HOLO] load failed', url, err); if(cb) cb(false); });
     });
@@ -8485,7 +8590,7 @@ var HOLO = (function(){
         centre: Cs.toArray().map(function(x){ return +x.toFixed(3); }), scale: +scaleS.toFixed(5), modelH: +(size.y*scaleS).toFixed(3),
         samples: S, visTop: v0, visBottom: v1, liveRays: live, bandY: +bandY.toFixed(3),
         envTop: VIS.env[0] ? +Math.max.apply(null, VIS.env[0]).toFixed(3) : 0, envBottom: VIS.env[1] ? +Math.max.apply(null, VIS.env[1]).toFixed(3) : 0,
-        fail: failNote, stats: HOLO.stats || null };
+        fail: failNote, stats: HOLO.stats || null, ms: +msAvg.toFixed(3), tipRings: tipRings ? tipRings.length : -1 };
     },
     stats: null
   };
@@ -8525,12 +8630,12 @@ function storeBootSchedule(){
         STORE_BOOT.maxUnitMs = Math.max(STORE_BOOT.maxUnitMs, performance.now() - t);
         if(done === false) _storeBootJobs.push(job); else STORE_BOOT.completed++;
         count++;
-      } while(_storeBootJobs.length && count < 8 && performance.now() - start < STORE_BOOT.budgetMs && (!deadline || (!deadline.didTimeout && deadline.timeRemaining() > 1)));
+      } while(_storeBootJobs.length && count < 8 && performance.now() - start < STORE_BOOT.budgetMs && (!deadline || deadline.didTimeout || deadline.timeRemaining() > 1));
       STORE_BOOT.pending = _storeBootJobs.length;
       STORE_BOOT.maxSliceMs = Math.max(STORE_BOOT.maxSliceMs, performance.now() - start);
       storeBootSchedule();
     };
-    if(window.requestIdleCallback) requestIdleCallback(run, {timeout:160});
+    if(window.requestIdleCallback) requestIdleCallback(run, {timeout:48});
     else setTimeout(function(){ run(null); }, 0);
   });
 }
@@ -8540,7 +8645,8 @@ function createFloors() {
     var y = STOREFRONT_MODEL.floorY(idx);
     var r = cfg.isSmall ? SMALL_RADIUS : LARGE_RADIUS;
     var vr = r * VW_RADIUS_MULT;
-    var hasRings = !cfg.isSmall;
+    // Edited rows supply their own rings. Do not build and dispose 64 legacy meshes per row.
+    var hasRings = !cfg.isSmall && !STOREFRONT_MODEL.hasFloor(idx);
     if(cfg.isOrbFloor){
       floors.push(createOrbFloor(y, SMALL_RADIUS, cfg.label, np, idx));
     } else {
@@ -10336,7 +10442,11 @@ function createFloor(y, radius, vRadius, label, np, hasRings, fi, panelOpts, sta
         p.mesh.visible = false; p.edges.visible = false;
         return false;
       }
-      floor.glassRing = createGlassRing(3.0, 0.25, 0.5); g.add(floor.glassRing);
+      if(!floor.glassRing){
+        floor.glassRing = createGlassRing(3.0, 0.25, 0.5); g.add(floor.glassRing);
+        return false; // keep glass construction out of the model-attachment slice
+      }
+      if(!STOREFRONT_MODEL.prepareStep(fi))return false;
       setupFloorIntro(floor, fi);
       if(tRG) tRG.visible = true;
       if(bRG) bRG.visible = true;
@@ -11006,7 +11116,6 @@ function onTE(e){
 
 function pDown(cx,cy){
   if(czReady && CZ.onPointerDown(cx,cy,false)) return;
-  if(avatarBtnDown(cx,cy)) return;
   mouseDownX=cx;mouseDownY=cy;mouseDownTime=performance.now();
   // Detect glass UI press for visual feedback
   mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
@@ -11349,7 +11458,6 @@ function updateCursor(cx,cy){
   var el=renderer.domElement.parentElement;
   el.classList.remove('clickable','grabbable');
   hoveredGlassMesh = null;
-  if(avatarBtnHover(cx,cy,el)) return;
 
   mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
@@ -11485,7 +11593,6 @@ function updateCursor(cx,cy){
 
 function pUp(cx,cy){
   if(czReady && CZ.isLockingScroll()){ CZ.onPointerUp(); return; }
-  if(avatarBtnUp(cx,cy)) return;
   pressedGlassMesh = null;
   // Release in-game window drag
   if(gameUI.drag.active){
@@ -15486,145 +15593,6 @@ function positionNavMenu(){
 }
 
 // ══════════════════════════════════════════════
-// FITTING ROOM BUTTON (AVB) — opens the avatar editor
-// ══════════════════════════════════════════════
-// The third corner of the set: nav top-left, cart top-right, this bottom-left — cut from the same
-// createGlassCircleBtn glass, the same size (NAV_CR) and inset (0.30), the same tether.
-// Pressing it lazy-loads avatar/ (catalog, the embedded GLBs, engine, editor — nothing is fetched
-// before the first press) and opens the fitting room over the page. While the room is open the
-// storefront's animate() returns early, like it does for document.hidden, and the frozen last
-// frame is what sits blurred behind the room's scrim; closing resumes it on the next frame.
-// The editor saves the avatar itself (localStorage 'chrysolin.avatar'); this block holds no state.
-// Traps honoured: the glass samples glassFBO, so renderGlassFBO hides it; r128 raycasts ignore
-// .visible, so every hit test checks it; the icon is a map-textured sibling of the glass, so the
-// shared hover/press traverse tints it exactly like the nav's hamburger.
-var AVATAR_SCRIPTS = ['avatar-catalog.js', 'assets/avatar-assets.js', 'avatar-core.js', 'avatar-editor.js'];
-var avatarBtn = { group: null, glassMesh: null, icon: null, physX: 0, physY: 0, initialized: false,
-                  pressed: false, open: false, loading: false, frameDebt: 0, scripts: null };
-var _avbRay = new THREE.Raycaster(), _avbNdc = new THREE.Vector2();
-
-function createAvatarButton(){
-  if(!PUBLIC_AVATAR) return;
-  var g = createGlassCircleBtn(NAV_CR);
-  avatarBtn.group = g; avatarBtn.glassMesh = g.userData.glassMesh;
-  // Icon: a bust, drawn like the hamburger (same canvas, stroke and colour, so they read as a set)
-  var c = document.createElement('canvas'); c.width = c.height = 64;
-  var x = c.getContext('2d');
-  x.strokeStyle = '#c0c8d8'; x.lineWidth = 4; x.lineCap = 'round'; x.lineJoin = 'round';
-  x.beginPath(); x.arc(32, 23, 8.5, 0, Math.PI * 2); x.stroke();
-  x.beginPath(); x.moveTo(15, 50); x.bezierCurveTo(17, 40, 24, 36, 32, 36); x.bezierCurveTo(40, 36, 47, 40, 49, 50); x.stroke();
-  var tex = new THREE.CanvasTexture(c); tex.needsUpdate = true;
-  avatarBtn.icon = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.3),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false, depthTest: false }));
-  avatarBtn.icon.renderOrder = 20; avatarBtn.icon.position.z = 0.02;
-  g.add(avatarBtn.icon);
-  g.layers.enable(1); g.traverse(function(o){ o.layers.enable(1); });
-  scene.add(g);
-  if(/[?&]room/.test(location.search)) setTimeout(function(){ openFittingRoom(); }, 1200);
-}
-
-// Storefront only: not in the game, the world editor, the detail view or the lightbox.
-function avatarBtnVisible(){
-  return PUBLIC_AVATAR && !avatarBtn.open &&
-    !gameMode.active && !gameMode.entering && !gameMode.exiting && !gameMode.decelerating &&
-    !dm.active && !dm.animating && !pdv.active && !imgLightbox.active && !imgLightbox.entering && !imgLightbox.exiting &&
-    !(typeof editor !== 'undefined' && editor.active);
-}
-
-function positionAvatarButton(){
-  var g = avatarBtn.group; if(!g) return;
-  g.visible = avatarBtnVisible();
-  if(!g.visible){ avatarBtn.initialized = false; avatarBtn.pressed = false; return; }
-  // Screen position — bottom-left, the nav's left inset, but seated ABOVE the bottom scroller.
-  // In the corner itself the glass sat on the risen active title ("PANTS") and cut its riser.
-  // The strip is drawn in screen px and its tallest mark is that title — tlLabelY + tlLabelRise,
-  // plus its wrap box — so clear it by reading the same params the strip draws from.
-  var dist = 4.5, fovRad = camera.fov * Math.PI / 180;
-  var halfH = Math.tan(fovRad / 2) * dist, halfW = halfH * camera.aspect;
-  var stripPx = 0; try { stripPx = CHUD.P.tlLabelY + CHUD.P.tlLabelRise + 30; } catch(_e){}
-  var wpp = 2 * halfH / window.innerHeight;
-  var tx = camera.position.x - halfW + 0.30, ty = camera.position.y - halfH + Math.max(0.30, stripPx * wpp + NAV_CR + 0.05);
-  if(!avatarBtn.initialized){ avatarBtn.physX = tx; avatarBtn.physY = ty; avatarBtn.initialized = true; }
-  avatarBtn.physX += (tx - avatarBtn.physX) * 0.45;
-  avatarBtn.physY += (ty - avatarBtn.physY) * 0.45;
-  var off = new THREE.Vector3(avatarBtn.physX - camera.position.x, avatarBtn.physY - camera.position.y, -dist);
-  off.applyQuaternion(camera.quaternion);
-  g.position.copy(camera.position).add(off);
-  g.quaternion.copy(camera.quaternion);
-  var u = avatarBtn.glassMesh.material.uniforms, t = performance.now() * 0.001;
-  u.time.value = t;
-  u.res.value.set(window.innerWidth * renderer.getPixelRatio(), window.innerHeight * renderer.getPixelRatio());
-  if(glassFBO) u.tBg.value = glassFBO.texture;
-  // The first press downloads the room: the icon breathes until it is up.
-  avatarBtn.icon.material.opacity = avatarBtn.loading ? 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(t * 7)) : 1;
-}
-
-function avatarBtnHit(cx, cy){
-  if(!avatarBtn.group || !avatarBtn.group.visible) return false;      // r128 raycasts ignore .visible
-  var el = renderer.domElement;
-  _avbNdc.set(cx / el.clientWidth * 2 - 1, -(cy / el.clientHeight) * 2 + 1);
-  _avbRay.setFromCamera(_avbNdc, camera);
-  return _avbRay.intersectObject(avatarBtn.glassMesh).length > 0;
-}
-// pDown/pUp/updateCursor call these FIRST. Down re-arms on every press, so a touch that turned
-// into a scroll (onTE skips pUp for those) cannot leave the button armed.
-function avatarBtnDown(cx, cy){
-  avatarBtn.pressed = avatarBtnHit(cx, cy);
-  if(!avatarBtn.pressed) return false;
-  pressedGlassMesh = avatarBtn.glassMesh;
-  return true;
-}
-function avatarBtnUp(cx, cy){
-  if(!avatarBtn.pressed) return false;
-  avatarBtn.pressed = false; pressedGlassMesh = null;
-  if(avatarBtnHit(cx, cy)) openFittingRoom();
-  return true;
-}
-function avatarBtnHover(cx, cy, el){
-  if(!avatarBtnHit(cx, cy)) return false;
-  hoveredGlassMesh = avatarBtn.glassMesh; el.classList.add('clickable');
-  return true;
-}
-
-function avatarLoadScripts(){
-  if(avatarBtn.scripts) return avatarBtn.scripts;
-  avatarBtn.scripts = AVATAR_SCRIPTS.reduce(function(p, f){
-    return p.then(function(){ return new Promise(function(res, rej){
-      var sc = document.createElement('script'); sc.src = AVATAR_BASE + f; sc.async = false;
-      sc.onload = res; sc.onerror = function(){ rej(new Error('could not load ' + sc.src)); };
-      document.head.appendChild(sc);
-    }); });
-  }, Promise.resolve());
-  avatarBtn.scripts.catch(function(){ avatarBtn.scripts = null; });
-  return avatarBtn.scripts;
-}
-
-// opts go straight to AVATAR_EDITOR.open — e.g. { equip: 'tee_teal' } for a "try it on" button.
-function openFittingRoom(opts){
-  if(!PUBLIC_AVATAR || avatarBtn.open || avatarBtn.loading) return;
-  avatarBtn.loading = true;
-  avatarLoadScripts().then(function(){
-    avatarBtn.loading = false; avatarBtn.open = true;
-    var o = opts || {};
-    o.base = AVATAR_BASE;
-    o.onClose = function(){ avatarBtn.open = false; avatarBtn.frameDebt = 0; };
-    return AVATAR_EDITOR.open(o);
-  }).catch(function(e){
-    avatarBtn.loading = false;
-    console.warn('[avatar] fitting room unavailable:', (e && e.message) || e);
-  });
-}
-
-// animate() asks this right after its document.hidden check. A resize clears the canvas under
-// the room's scrim, so it lets a couple of frames through after one.
-function avatarRoomPaused(){
-  if(!avatarBtn.open) return false;
-  if(avatarBtn.frameDebt > 0){ avatarBtn.frameDebt--; return false; }
-  return true;
-}
-window.addEventListener('resize', function(){ if(avatarBtn.open) avatarBtn.frameDebt = 2; });
-
-// ══════════════════════════════════════════════
 // 3D CART SYSTEM
 // ══════════════════════════════════════════════
 // ══════════════════════════════════════════════
@@ -17811,8 +17779,6 @@ function renderGlassFBO() {
   cart.iconGroup.visible=false;
   if(cart.panelGroup)cart.panelGroup.visible=false;
   if(navMenu.group)navMenu.group.visible=false;
-  var _avbFboVis = avatarBtn.group ? avatarBtn.group.visible : false;
-  if(avatarBtn.group) avatarBtn.group.visible = false;   // AVB glass samples glassFBO
   // CHUD glass label — same reason as the others: it samples glassFBO, so it must not be IN it.
   var _chudLbl = null;
   try { _chudLbl = CHUD.labelGroup(); if(_chudLbl) _chudLbl.visible = false; } catch(_e){}
@@ -17871,7 +17837,6 @@ function renderGlassFBO() {
   STOREFRONT_MODEL.captureHidden(false);
   try { DML.setHidden('fbo', false); } catch(_dmlE2){}
   if(_chudLbl) _chudLbl.visible = true;
-  if(avatarBtn.group) avatarBtn.group.visible = _avbFboVis;
   if(_stFboVis) treeUI.frame.visible = true;
   for(var cfi2=0;cfi2<cartFlyAnims.length;cfi2++) cartFlyAnims[cfi2].ball.visible=true;
   for(var bdi=0;bdi<bdHidden.length;bdi++) bdHidden[bdi].visible=true;
@@ -56145,6 +56110,28 @@ function installProgressiveGPU(r){
       for(var i=0;i<hidden.length;i++)hidden[i].visible=true;}
   };
 }
+// A cube capture must never sample its own output texture. Hiding consumers for
+// this pass avoids WebGL feedback errors without toggling material/shader variants.
+function captureStorefrontReflections(){
+  var hidden=[],texture=cubeRenderTarget.texture;
+  function samples(m){
+    if(!m)return false;
+    if(m.envMap===texture || m.map===texture)return true;
+    var uniforms=m.uniforms;
+    if(uniforms)for(var key in uniforms){
+      var value=uniforms[key]&&uniforms[key].value;
+      if(value===texture || (Array.isArray(value)&&value.indexOf(texture)>=0))return true;
+    }
+    return false;
+  }
+  scene.traverseVisible(function(o){
+    if(!o.material)return;
+    var materials=Array.isArray(o.material)?o.material:[o.material];
+    if(materials.some(samples)){hidden.push(o);o.visible=false;}
+  });
+  try {cubeCamera.update(renderer,scene);}
+  finally {for(var i=0;i<hidden.length;i++)hidden[i].visible=true;}
+}
 function init(){
   scene=new THREE.Scene();scene.background=new THREE.Color(SITE_BG);scene.fog=new THREE.FogExp2(SITE_BG,0.018);
   camera=new THREE.PerspectiveCamera(75,window.innerWidth/window.innerHeight,0.1,200);
@@ -56214,7 +56201,6 @@ function init(){
   loadProductImages();
   createCartIcon();
   createNavMenu();
-  createAvatarButton();   // PUBLIC BUILD: fitting room (AVB)
   createGameJoystick();
   setupIntersectionGlow();
   createGlassFBO();
@@ -95216,7 +95202,6 @@ function animate(){
   // short-circuits on it. Flip PUBLIC_BUILD to false to get the feature back in one edit.
   if(!PUBLIC_BUILD) czBoot();
   if(document.hidden) return;
-  if(avatarRoomPaused()) return;   // the fitting room is open over the page (AVB)
   var time = performance.now() * 0.001;
   var dt = Math.min(1/30, time - (window._lastTime || time));
   window._lastTime = time;
@@ -95321,7 +95306,7 @@ function animate(){
     var _ccBg = scene.background.getHex(), _ccFog = scene.fog ? scene.fog.color.getHex() : 0;
     scene.background.setHex(REFLECT_BG);
     if(scene.fog) scene.fog.color.setHex(REFLECT_BG);
-    cubeCamera.update(renderer,scene);
+    captureStorefrontReflections();
     scene.background.setHex(_ccBg);
     if(scene.fog) scene.fog.color.setHex(_ccFog);
     SHIRT.setHidden('cube', false);
@@ -95986,7 +95971,6 @@ function animate(){
   updateCartItemClipPlanes();
   updateCartItemGlassUniforms(time);
   positionNavMenu();
-  positionAvatarButton();
   positionGameJoystick();
   updateGameWindows();
   updateSkillTreeUI();   // skill tree overlay (frame glue, pan/zoom, hover, XP-fly sparks)
@@ -97539,4 +97523,3 @@ init();onScroll();initShopify();
 </script>
 </body>
 </html>
-
