@@ -3027,6 +3027,23 @@ var DML = (function(){
     mPullClose:  0.12,   // pull down past the top by this × H and let go to close; 0 = never
     mSpinK:     -1.0,    // a sideways swipe on the wheel spins it: speed, SIGNED (flip to reverse)
 
+    // ── THE VIEWER: the stack's full-screen product image (the VIEWER module, after DML) ──
+    // A tap, double tap, click or two-finger spread on the product photo: everything but the
+    // garment fades away, the garment grows to a little past the screen's width, and a glass ×
+    // takes the bag's corner. Inside, a pinch zooms, one finger pans, a double tap zooms to the
+    // spot and back; the ×, Esc, a pinch in past rest or a pull down from rest close it.
+    vwOn:        true,   // off = a tap on the photo does nothing on a phone, as before
+    vwFill:      1.08,   // resting size: the garment fitted to the screen × this (1 = touching its sides)
+    vwRestY:     0,      // resting centre above the screen's centre, × H
+    vwMaxZoom:   6,      // deepest pinch, × the resting size (the full-size art is ~2100 px across)
+    vwTapZoom:   2.6,    // a double tap zooms to this × rest at the finger; another goes back to rest
+    vwOpenMs:    380,    // the garment's flight off the card to rest (home again a touch quicker)
+    vwFadeMs:    300,    // everything else fading away / back
+    vwEase:      14,     // how briskly it springs back inside its bounds after a pinch or fling, per second
+    vwFling:     0.92,   // how much of a pan's release speed is kept per 60 Hz frame
+    vwPullClose: 0.12,   // at rest, drag it down this × H and let go to close; 0 = never
+    vwHiRes:     true,   // the full-size art while it is open (the card shows the 768 px copy)
+
     // ── the wheel half ───────────────────────────────────────────────────────
     // APPARENT SIZE DOES NOT DEPEND ON DEPTH. halfH is proportional to d, so the fit cancels it
     // exactly: the wheel subtends tan(fov/2) x bleed of the frame at ANY wheelDepth. Depth is
@@ -3138,6 +3155,20 @@ var DML = (function(){
     // same track, same slot spacing, same orbs, every dimension the toggle's. Where it sits is
     // the ONE BUBBLE layout below.
     actOn:       true,
+    // ── the corner orbs (nav top-left, bag top-right) ────────────────────────
+    // The page's two corner buttons are this view's orbs (THE CORNER ORBS, outside DML): the same
+    // glass, icon set, size-track pad and frost seat. Sized on SCREEN so they match the orbs here.
+    cornerSize:   0.1225, // orb diameter x screen height: the action column's orb, measured (98.5 of 804 px).
+                          // P.mOrb x the width wins where it is smaller, the phone stack's own rule
+    cornerMargin: 0.16,   // screen edge -> the seat's frost, x the orb diameter
+    navFont:      0.17,   // the open menu's section names: type height x the orb diameter
+    navGap:       0.42,   // between two sections, x the orb diameter
+    navLead:      0.22,   // seat -> first section, and last section -> the track's end, x the orb
+    cornerStain:  1.0,    // the button itself: 1 = stained (the frost recipe on the bubble), 0 = clear
+    cornerLens:   1.0,    // the glass round it, which pulls out into the bar: 1 = clear refracting glass, 0 = frost
+    navBand:      0.9,    // the bar's band of frost behind the sections: strength
+    navBandH:     1.5,    // its half-height, x the section type's height (it fades off like a soft spot)
+    navBandLift:  0.6,    // how far the band is lifted from the frost toward near-white (contrast for dark type)
     // ── THE WHOLE OBJECT ─────────────────────────────────────────────────────
     // The one bubble as a whole: garment, card, both tracks, orbs, letters and strip scale
     // together, and move together. Scale goes in at the product solve (the card is sized from
@@ -3146,7 +3177,10 @@ var DML = (function(){
     // while the product is still opening out.
     uniScale:    1.0,
     uniX:       -0.42,
-    uniY:       -0.16,
+    // -0.356 (was -0.16): the action column's × lands exactly one slot below the bag corner orb,
+    // which sits in the same column at every desktop size, so the bag heads the column (×, bag+, →)
+    // instead of crowding the × (2026-10-03, THE CORNER ORBS).
+    uniY:       -0.356,
     // ── THE DESCRIPTION BOX ──────────────────────────────────────────────────
     // A frost box under the wheel with the product's name, price and description. A click
     // morphs it up over the wheel into a zoom view of the product image, which pans with the
@@ -4017,6 +4051,9 @@ var DML = (function(){
     if(mob.t >= 0 && mob.t <= mob.max) mob.v = v;
     return null;
   }
+  // Let go of a stack scroll with no fling and no close: another gesture took the fingers over
+  // (THE VIEWER's spread on the photo).
+  function mobDragCancel(){ mob.drag = false; mob.hist.length = 0; mob.v = 0; }
   function sizeDragging(){ return !!sz.drag; }
   // What the cart line should carry: a real size variant, or the stand-in S/M/L pick (SHOP turns
   // that into a "Size" note on the order line). ONE SIZE is a label, not a choice — it carries nothing.
@@ -4648,8 +4685,10 @@ var DML = (function(){
         '  vec2 s = (aspect > A) ? vec2(1.0, A / aspect) : vec2(aspect / A, 1.0);',
         '  vec2 q = vUv - 0.5;',
         '  vec2 uvi = (q - pan) / (s * zoom) + 0.5;',
-        '  vec4 c = vec4(0.0);',
-        '  if(uvi.x >= 0.0 && uvi.x <= 1.0 && uvi.y >= 0.0 && uvi.y <= 1.0) c = texture2D(tImg, contentBox.xy + uvi * contentBox.zw);',
+        // Sampled outside any branch, then masked — inside an if, a mipmapped map (THE VIEWER's
+        // full-size art) has no derivatives at the branch's edge and draws its smallest mip there.
+        '  float inb = step(0.0, uvi.x) * step(uvi.x, 1.0) * step(0.0, uvi.y) * step(uvi.y, 1.0);',
+        '  vec4 c = texture2D(tImg, contentBox.xy + clamp(uvi, 0.0, 1.0) * contentBox.zw) * inb;',
         '  gl_FragColor = vec4(c.rgb, c.a * mask * opacity);',
         '}'
       ].join('\n'),
@@ -5237,7 +5276,16 @@ var DML = (function(){
         segC: {value: [new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2()]},
         segH: {value: [new THREE.Vector2(1, 1), new THREE.Vector2(1, 1), new THREE.Vector2(1, 1), new THREE.Vector2(1, 1)]},
         segR: {value: [0, 0, 0, 0]},
-        form: {value: 1.0}
+        form: {value: 1.0},
+        // LENS: clear glass instead of frost — the scene bent through a rim that curls over the
+        // last lensW of the shape, the bubble orb's refraction, fringing and glare on any SDF. The
+        // corner orbs' surround is this. lens 0 (the default) is the frost, unchanged.
+        lens: {value: 0.0}, lensW: {value: 0.1}, time: {value: 0.0},
+        tScratch: {value: null}, tFrost: {value: null},
+        // A soft band of the frost along a line (centre bandC, half-length/half-height bandH),
+        // laid into the lens so type on clear glass has something calm behind it.
+        bandC: {value: new THREE.Vector2()}, bandH: {value: new THREE.Vector2(1, 0.1)}, bandAmt: {value: 0.0},
+        bandLift: {value: 0.0}, bandTint: {value: new THREE.Color(0.94, 0.95, 0.97)}
       },
       vertexShader: [
         'varying vec2 vUv;',
@@ -5252,6 +5300,10 @@ var DML = (function(){
         'uniform vec2 holeC[4]; uniform float holeR[4];',
         'uniform vec2 segC[4]; uniform vec2 segH[4]; uniform float segR[4];',
         'uniform float rad, aa, blurPx, frost, bevel, bevelW, opacity, dim, holeN, holeAA, segN, blend, form;',
+        'uniform float lens, lensW, time, bandAmt, bandLift;',
+        'uniform vec3 bandTint;',
+        'uniform vec2 bandC, bandH;',
+        'uniform sampler2D tScratch, tFrost;',
         'uniform vec3 tint;',
         'varying vec2 vUv;',
         '',
@@ -5266,8 +5318,8 @@ var DML = (function(){
         '  return min(a, b) - h * h * k * 0.25;',
         '}',
         '',
-        'void main(){',
-        '  vec2 p = (vUv - 0.5) * 2.0 * hsize;',
+        '// The silhouette: one rounded rect, or the smooth union of the segments.',
+        'float sdShape(vec2 p){',
         '  float sd;',
         '  if(segN < 0.5){ sd = sdRoundRect(p, hsize, rad); }',
         '  else {',
@@ -5278,6 +5330,12 @@ var DML = (function(){
         '      sd = (i == 0) ? d : smin(sd, d, blend);',
         '    }',
         '  }',
+        '  return sd;',
+        '}',
+        '',
+        'void main(){',
+        '  vec2 p = (vUv - 0.5) * 2.0 * hsize;',
+        '  float sd = sdShape(p);',
         '  if(sd > aa) discard;',
         '  float mask = clamp(-sd / aa, 0.0, 1.0);',
         '',
@@ -5302,6 +5360,40 @@ var DML = (function(){
         '  // rather than a cut edge. Shading only — it bends nothing behind it.',
         '  float lip = 1.0 - clamp(-sd / max(0.0001, bevelW), 0.0, 1.0);',
         '  col += tint * lip * lip * bevel;',
+        '',
+        '  if(lens > 0.0){',
+        '    vec3 frostCol = col;',
+        '    // The rim curls over the last lensW like the bubble orb\'s outer 30%: slope 0.533 at the',
+        '    // edge, the normal leaning outward along the silhouette\'s gradient.',
+        '    float ge = max(aa, 1e-4);',
+        '    vec2 gr = vec2(sdShape(p + vec2(ge, 0.0)) - sdShape(p - vec2(ge, 0.0)), sdShape(p + vec2(0.0, ge)) - sdShape(p - vec2(0.0, ge)));',
+        '    vec2 gn = length(gr) > 1e-6 ? normalize(gr) : vec2(0.0);',
+        '    float tc = clamp(1.0 + sd / max(1e-4, lensW), 0.0, 1.0);',
+        '    vec3 N = normalize(vec3(gn * 0.533 * tc, 1.0));',
+        '    vec3 V = vec3(0.0, 0.0, 1.0);',
+        '    vec2 refr = N.xy * 0.15 + 0.003 * vec2(sin(time * 1.5 + uv.y * 8.0), cos(time * 1.2 + uv.x * 8.0));',
+        '    float ef = 1.0 - abs(dot(V, N));',
+        '    float ca = 0.23 * (0.3 + ef * 2.5);',
+        '    vec2 tx = 1.0 / res;',
+        '    vec2 ru = uv + refr * (1.0 + ca), gu = uv + refr, bu = uv + refr * (1.0 - ca);',
+        '    float cr = texture2D(tBg, ru).r * .6 + texture2D(tBg, ru + tx).r * .2 + texture2D(tBg, ru - tx).r * .2;',
+        '    float cg = texture2D(tBg, gu).g * .6 + texture2D(tBg, gu + tx).g * .2 + texture2D(tBg, gu - tx).g * .2;',
+        '    float cb = texture2D(tBg, bu).b * .6 + texture2D(tBg, bu + tx).b * .2 + texture2D(tBg, bu - tx).b * .2;',
+        '    col = vec3(cr, cg, cb);',
+        '    float fresnel = pow(1.0 - max(dot(V, N), 0.0), 2.0) * 0.15;',
+        '    col = mix(col, vec3(0.95, 0.96, 0.98), fresnel * 0.1);',
+        '    col += vec3(0.7, 0.75, 0.9) * smoothstep(aa * 4.0, 0.0, abs(sd)) * 0.15;',
+        GLARE_GLSL_CALC,
+        '    col += glareResult;',
+        '    // The band: frost again, strongest on the line and fading off it and past its ends.',
+        '    vec2 bq = p - bandC;',
+        '    float bm = exp(-2.0 * bq.y * bq.y / max(1e-8, bandH.y * bandH.y))',
+        '             * (1.0 - smoothstep(0.0, max(1e-4, 2.0 * bandH.y), abs(bq.x) - bandH.x));',
+        '    // Over a plain sky the frost is barely lighter than the clear glass round it, so the band is',
+        '    // lifted toward near-white: dark type then has a light ground whatever is behind.',
+        '    col = mix(col, mix(frostCol, bandTint, bandLift), clamp(bm * bandAmt, 0.0, 1.0));',
+        '    col = mix(frostCol, col, lens);',
+        '  }',
         '',
         '  // The cut-out, with the same pixel softness as the rim. Zero everywhere unless a',
         '  // radius was given, so this line changes nothing for the card and the switcher.',
@@ -6018,7 +6110,7 @@ var DML = (function(){
   return {P:P, begin:begin, placeWheel:placeWheel, panelRot:panelRot, applyPanels:applyPanels,
           applyWheelRot:applyWheelRot, idleSpin:idleSpin,
           displayArt:displayArt, applyBackdrop:applyBackdrop, cardMode:cardMode,
-          applyPost:applyPost, pick:pick, applyAlt:applyAlt,
+          applyPost:applyPost, pick:pick, applyAlt:applyAlt, frostMaterial:frostMaterial, imgMaterial:descImgMaterial,
           // Exposed to be READ: swArt() is the set the one frame is sized to clear, and each
           // record carries the measured content box. `DML.swArt().map(a => a.aspect)` is the
           // fastest way to see whether the calibration has real numbers or fell back to the file.
@@ -6038,12 +6130,664 @@ var DML = (function(){
           isLive:isLive, isLeftSide:isLeftSide, enabled:enabled,
           // THE STACK — the phone layout, and its own scroll
           mobile:mobile, stackWanted:stackWanted, mobileLive:mobileLive, mobScrollWheel:mobScrollWheel,
-          mobDragStart:mobDragStart, mobDragMove:mobDragMove, mobDragEnd:mobDragEnd,
+          mobDragStart:mobDragStart, mobDragMove:mobDragMove, mobDragEnd:mobDragEnd, mobDragCancel:mobDragCancel,
           get _mob(){ return mob; },
           get side(){ return side; },
           // read-only peeks for the harnesses — never written through
           get _sz(){ return sz; }, get _ac(){ return ac; }, get _uni(){ return uni; }, get _desc(){ return desc; }, get _prodPanel(){ return prodPanel; },
           _uniForget: function(){ uniCardW = uniCardH = uniCardD = 0; uniCardS = 1; }};
+})();
+
+// ══════════════════════════════════════════════
+// THE VIEWER — the phone's full-screen product image
+// ══════════════════════════════════════════════
+// On a phone (THE STACK) a tap, a double tap, a click or a two-finger spread on the product photo
+// clears the screen down to the garment: everything else fades away, the garment lifts off the
+// card and grows to a little past the screen's width, and a glass × takes the bag's corner.
+// Inside, a pinch zooms about the fingers, one finger pans (and flings), a double tap zooms to the
+// spot and back; the ×, Esc, a pinch in past rest or a pull down from rest let it go. Params are
+// DML.P.vw* (N window, THE VIEWER).
+//
+// HOW EVERYTHING ELSE VANISHES. Not by fading each piece — the bubble, its orbs, the description,
+// the wheel and the corner chrome each own their opacity in a dozen places, every frame. The frame
+// is cut instead, at render time, so nothing that owns a piece is disturbed:
+//   • fully open, the main pass runs with every top-level object that is not SKY hidden — sky is
+//     the lights, stars and shooting stars (Points, Lines) and the sky composites drawn first
+//     (renderOrder <= -1000: CSKY) — and each is restored the instant the pass returns;
+//   • while it fades, that same sky-only frame is rendered into cleanRT (a clear and some points)
+//     and `curtain` lays it over the normal frame at the fade's opacity, the last thing the main
+//     pass draws. At 1 the two are the same picture, so the hand-over cannot be seen.
+// The garment and the × are drawn in the layer-1 overlay pass, after the post chain and sharp —
+// the corner orbs' pass — where the nav orb shrinks away and the bag orb is swapped for this ×
+// in an identical seat, so the bag's icon turning into the × is all that visibly changes.
+// None of the viewer's meshes is visible outside the one pass that draws it: the glass capture,
+// the cube map and the god-ray pass never see them.
+//
+// THE GARMENT is ONE full-screen quad of DML's zoom-plane material (the description box's: the
+// card's own texture, contain-fitted, zoomed and panned in the shader). Its whole state is one
+// transform against REST — the garment contain-fitted to the screen × vwFill, centred:
+//   z = its size × rest's,   px, py = its centre's offset from rest's, in CSS px.
+// Opening sets the transform to the card photo's exact screen rect and eases it to rest, so the
+// garment visibly lifts off the card. A spread on the card commits once the fingers part and then
+// drives the same transform 1:1 — the pinch that opens it is the pinch that zooms it.
+var VIEWER = (function(){
+  var P = DML.P;
+  var DIST = 4.4;   // the quads' distance in front of the camera — any depth works: both are drawn by
+                    // order with depthTest off and sized to the frustum where they stand
+  var S = {open: false, closing: false, fade: 0, z: 1, px: 0, py: 0, vx: 0, vy: 0,
+           tw: null, hold: false, last: 0, ignoreTap: 0, bagShown: true,
+           tex: null, base: null, box: new THREE.Vector4(0, 0, 1, 1), aspect: 1};
+  var G = {mode: null, x0: 0, y0: 0, t0: 0, lx: 0, ly: 0, moved: false, multi: false, mouse: false,
+           hist: [], pull: null, pz: 1, d0: 1, z0: 1, zlo: 1, mx0: 0, my0: 0, mx: 0, my: 0,
+           cx0: 0, cy0: 0, armed: null, tapT: 0, tapX: 0, tapY: 0};
+  var quad = null, curtain = null, cleanRT = null, xg = null, xseat = null, xorb = null;
+  var _v = new THREE.Vector3(), _rest = {}, _card = {}, _pr = {}, _xf = {}, _twTo = {z: 1, px: 0, py: 0}, _xs = {};
+  var _mh = [], _fh = [], _ov = [], _navS = new THREE.Vector3(), _navScaled = false;
+  var warned = false;
+  function warn(where, e){ if(!warned){ warned = true; console.warn('[VIEWER] ' + where + ':', e); } }
+
+  // ── what is on screen ─────────────────────────────────────────────────────────────────────
+  function photo(){
+    var bd = (typeof displayAnim !== 'undefined') && displayAnim.backdrop;
+    var im = bd && bd.userData && bd.userData.imgMesh;
+    return (im && im.material && im.material.uniforms && im.material.uniforms.productTex.value) ? im : null;
+  }
+  // The garment's rect on screen, CSS px, as the card draws it. The photo is a square quad whose
+  // shader contain-fits the garment (productTexAspect against panelAspect), so the garment is the
+  // middle fw × fh of it; its four corners are projected and boxed, which holds whatever the
+  // photo's counter-scale. matrixWorldInverse is refreshed first: project() reads it, and only
+  // renderer.render keeps it current.
+  function cardRect(o){
+    var im = photo(); if(!im) return null;
+    var u = im.material.uniforms;
+    var sc = u.productTexAspect.value / Math.max(1e-4, u.panelAspect ? u.panelAspect.value : 1);
+    var g = im.geometry.parameters;
+    var hw = 0.5 * g.width * Math.min(1, sc), hh = 0.5 * g.height * Math.min(1, 1 / sc);
+    im.updateWorldMatrix(true, false);
+    camera.updateMatrixWorld();
+    camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+    var W = window.innerWidth, H = window.innerHeight, x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    for(var i = 0; i < 4; i++){
+      _v.set((i & 1) ? hw : -hw, (i & 2) ? hh : -hh, 0).applyMatrix4(im.matrixWorld).project(camera);
+      var x = (_v.x + 1) * 0.5 * W, y = (1 - _v.y) * 0.5 * H;
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+    }
+    o.cx = (x0 + x1) * 0.5; o.cy = (y0 + y1) * 0.5; o.w = x1 - x0; o.h = y1 - y0;
+    return o;
+  }
+  // REST: the garment contain-fitted to the screen, × vwFill (1 = touching the nearer pair of edges).
+  function restRect(o){
+    var W = window.innerWidth, H = window.innerHeight, a = S.aspect, w, h;
+    if(a > W / H){ w = W; h = W / a; } else { h = H; w = H * a; }
+    o.w = w * P.vwFill; o.h = h * P.vwFill; o.cx = W * 0.5; o.cy = H * (0.5 - P.vwRestY);
+    return o;
+  }
+  function toXf(r, o){
+    restRect(_rest);
+    o.z = r.w / Math.max(1e-3, _rest.w); o.px = r.cx - _rest.cx; o.py = r.cy - _rest.cy;
+    return o;
+  }
+  // How far it may be panned at size z: wider (taller) than the screen, its edges may not come
+  // inside the screen's; narrower, it is held on rest's line.
+  function panRange(z, o){
+    restRect(_rest);
+    var W = window.innerWidth, H = window.innerHeight, w = _rest.w * z, h = _rest.h * z;
+    o.x0 = w > W ? (W - w * 0.5) - _rest.cx : 0;  o.x1 = w > W ? (w * 0.5) - _rest.cx : 0;
+    o.y0 = h > H ? (H - h * 0.5) - _rest.cy : 0;  o.y1 = h > H ? (h * 0.5) - _rest.cy : 0;
+    if(o.x0 > o.x1){ var mx = (o.x0 + o.x1) * 0.5; o.x0 = o.x1 = mx; }
+    if(o.y0 > o.y1){ var my = (o.y0 + o.y1) * 0.5; o.y0 = o.y1 = my; }
+    return o;
+  }
+  function clampTo(z, px, py, o){
+    var r = panRange(z, _pr);
+    o.z = z; o.px = Math.max(r.x0, Math.min(r.x1, px)); o.py = Math.max(r.y0, Math.min(r.y1, py));
+    return o;
+  }
+  // Size z with the point under (fx, fy) kept where it is, then clamped into bounds.
+  function zoomAbout(z, fx, fy, from, o){
+    restRect(_rest);
+    var k = z / Math.max(1e-4, from.z);
+    return clampTo(z, fx + (_rest.cx + from.px - fx) * k - _rest.cx, fy + (_rest.cy + from.py - fy) * k - _rest.cy, o);
+  }
+  // The glass × — in the bag's seat: the corner orbs' own placement, solved to CSS px.
+  function xSpot(o){
+    var d = cornerOrbD(), hh = Math.tan(camera.fov * Math.PI / 360) * CORNER_DIST, hw = hh * camera.aspect;
+    var ins = cornerInset(d), W = window.innerWidth, H = window.innerHeight;
+    o.x = W * 0.5 + (hw - ins) / (2 * hw) * W; o.y = H * 0.5 - (hh - ins) / (2 * hh) * H;
+    o.r = cornerSeatR(d) / (2 * hh) * H;
+    return o;
+  }
+  // Tested in screen space: it is drawn on layer 1, which r128's raycaster (layer 0) never hits.
+  function xHit(x, y){ xSpot(_xs); var dx = x - _xs.x, dy = y - _xs.y; return dx * dx + dy * dy <= _xs.r * _xs.r; }
+  function xGlass(){ return xorb ? xorb.userData.glassMesh : null; }
+
+  // ── the full-size art ─────────────────────────────────────────────────────────────────────
+  // The card shows the -768 copy of the sample art (SHIRT.urlsFor); the full file sits beside it
+  // (~2100 px across — what a deep zoom needs). Fetched on the first open, swapped in when it lands,
+  // the two most recent kept. The content box is in UV, so it holds for either copy. A store photo
+  // or art that already came full-size from GitHub has no -768 in its name and is left alone.
+  var hi = {}, hiList = [];
+  function hiFor(tex){
+    if(!P.vwHiRes || !tex || !tex.image) return null;
+    var src = tex.image.currentSrc || tex.image.src || '';
+    var m = /^(.*)-768\.png(\?.*)?$/i.exec(src);
+    if(!m) return null;
+    var rec = hi[src];
+    if(rec) return rec.tex;
+    rec = hi[src] = {tex: null};
+    var img = new Image();
+    if(/^https?:/i.test(src) && src.indexOf(location.origin) !== 0) img.crossOrigin = 'anonymous';
+    img.onload = function(){
+      var t = new THREE.Texture(img);
+      t.encoding = tex.encoding; t.flipY = tex.flipY; t.premultiplyAlpha = tex.premultiplyAlpha;
+      t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+      t.generateMipmaps = true; t.minFilter = THREE.LinearMipmapLinearFilter; t.magFilter = THREE.LinearFilter;
+      t.anisotropy = renderer.capabilities.getMaxAnisotropy ? renderer.capabilities.getMaxAnisotropy() : 1;
+      t.needsUpdate = true;
+      rec.tex = t; hiList.push(src);
+      while(hiList.length > 2){
+        var old = hiList.shift(), orec = hi[old];
+        if(orec && orec.tex === S.tex){ hiList.push(old); break; }   // on screen: kept, try later
+        if(orec && orec.tex) orec.tex.dispose();
+        delete hi[old];
+      }
+      if(S.open && S.base === tex) S.tex = t;
+      console.log('[VIEWER] full-size art ' + img.width + '×' + img.height + ' (card copy ' + tex.image.width + '×' + tex.image.height + ')');
+    };
+    img.onerror = function(){ rec.failed = true; };
+    img.src = m[1] + '.png' + (m[2] || '');
+    return null;
+  }
+
+  // ── the meshes, built on the first open ───────────────────────────────────────────────────
+  function build(){
+    if(quad) return;
+    quad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), DML.imgMaterial());
+    quad.renderOrder = 25;            // over everything else in the overlay pass, under the × (30-32)
+    quad.frustumCulled = false; quad.visible = false; quad.raycast = function(){};
+    quad.layers.set(1);
+    scene.add(quad);
+    curtain = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({
+      transparent: true, opacity: 0, depthTest: false, depthWrite: false, fog: false, toneMapped: false}));
+    curtain.renderOrder = 1e6;        // the main pass's last word
+    curtain.frustumCulled = false; curtain.visible = false; curtain.raycast = function(){};
+    scene.add(curtain);
+    // The bag's own build (createCartIcon): a frost seat and the orb — wearing the bag, then the ×.
+    xg = new THREE.Group();
+    xseat = createCornerPane(); xg.add(xseat);
+    xorb = createCornerOrb(['bag', 'close']); xg.add(xorb);
+    xg.traverse(function(c){ c.layers.enable(1); c.frustumCulled = false; });
+    xg.visible = false;
+    scene.add(xg);
+  }
+  function cleanTarget(){
+    var w = postFBO.width, h = postFBO.height;
+    if(!cleanRT){
+      cleanRT = new THREE.WebGLRenderTarget(w, h, {minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+        format: postFBO.texture.format, type: postFBO.texture.type, depthBuffer: true, stencilBuffer: false});
+      cleanRT.texture.generateMipmaps = false;
+      cleanRT.texture.encoding = postFBO.texture.encoding;
+    } else if(cleanRT.width !== w || cleanRT.height !== h) cleanRT.setSize(w, h);
+    return cleanRT;
+  }
+  function onCamera(m, dist){
+    var hh = Math.tan(camera.fov * Math.PI / 360) * dist, hw = hh * camera.aspect;
+    m.position.copy(camera.position).add(_v.set(0, 0, -dist).applyQuaternion(camera.quaternion));
+    m.quaternion.copy(camera.quaternion);
+    m.scale.set(2 * hw, 2 * hh, 1);
+    return hh;
+  }
+
+  // ── open / close ──────────────────────────────────────────────────────────────────────────
+  function canOpen(){
+    if(S.open || !P.vwOn || typeof dm === 'undefined' || !DML.mobileLive()) return false;
+    if(dm.animating || (typeof displayAnim !== 'undefined' && displayAnim.active)
+       || (typeof switchAnim !== 'undefined' && switchAnim.active)) return false;
+    var im = photo();
+    if(!im || !im.visible) return false;
+    if(cart.panelOpen || cart.panelAnimating || cartMorphT > 0.01) return false;   // the bag's corner is the ×'s
+    if(navMenu.open || navMenu.morphT > 0.01) return false;
+    return true;
+  }
+  function open(how){
+    if(!canOpen()) return false;
+    build();
+    var u = photo().material.uniforms;
+    S.base = u.productTex.value; S.aspect = u.productTexAspect.value; S.box.copy(u.contentBox.value);
+    S.tex = hiFor(S.base) || S.base;
+    S.open = true; S.closing = false; S.fade = 0; S.vx = S.vy = 0; S.hold = false; S.last = performance.now();
+    S.bagShown = !!(cart.iconGroup && cart.iconGroup.visible);
+    if(!cardRect(_card)){ S.open = false; return false; }
+    toXf(_card, _xf); S.z = _xf.z; S.px = _xf.px; S.py = _xf.py; S.tw = null;
+    if(how !== 'pinch') tweenTo(1, 0, 0, P.vwOpenMs);
+    S.ignoreTap = performance.now() + 380;    // the second tap of a double tap that opened it
+    G.tapT = 0; hoveredGlassMesh = null;
+    restRect(_rest);
+    console.log('%c[VIEWER] open (' + how + ')  card ' + Math.round(_card.w) + '×' + Math.round(_card.h) + ' px → rest '
+      + Math.round(_rest.w) + '×' + Math.round(_rest.h) + ' px (fill ' + P.vwFill + ' of ' + window.innerWidth + '×' + window.innerHeight + ')'
+      + (S.tex !== S.base ? '  [full-size art]' : '  [card art ' + (S.base.image ? S.base.image.width + '×' + S.base.image.height : '?') + ']'),
+      'color:#10c4b2;font-weight:700');
+    return true;
+  }
+  function close(){
+    if(!S.open || S.closing) return;
+    S.closing = true; S.hold = false; G.mode = null; S.vx = S.vy = 0;
+    if(pressedGlassMesh && pressedGlassMesh === xGlass()) pressedGlassMesh = null;
+    // Home to the card's LIVE rect — the stack could have settled a hair while it was open.
+    tweenTo(function(o){ return cardRect(_card) ? toXf(_card, o) : null; }, 0, 0, P.vwOpenMs * 0.85);
+  }
+  function reset(){
+    S.open = S.closing = false; S.fade = 0; S.tw = null; S.hold = false; S.vx = S.vy = 0;
+    G.mode = null; G.mouse = false;
+    if(pressedGlassMesh && pressedGlassMesh === xGlass()) pressedGlassMesh = null;
+    if(hoveredGlassMesh && hoveredGlassMesh === xGlass()) hoveredGlassMesh = null;
+    if(typeof renderer !== 'undefined' && renderer.domElement) renderer.domElement.style.cursor = '';
+  }
+  // A timed flight from where it is to (z, px, py) — or to whatever `z` returns, if it is a function.
+  function tweenTo(z, px, py, ms){
+    var live = (typeof z === 'function');
+    if(!live){ _twTo.z = z; _twTo.px = px; _twTo.py = py; }
+    S.tw = {t0: performance.now(), dur: Math.max(1, ms), fz: S.z, fx: S.px, fy: S.py, to: live ? z : _twTo};
+    S.vx = S.vy = 0;
+  }
+  function tweenXf(o, ms){ tweenTo(o.z, o.px, o.py, ms); }
+
+  // The fade as drawn: smoothstepped, and let back down while it is pulled down to close, so the
+  // view shows through as you drag it away.
+  function fadeE(){
+    var f = S.fade, e = f * f * (3 - 2 * f);
+    if(!S.tw && !S.closing && S.z < 0.999 && S.py > 0)
+      e *= 1 - 0.65 * Math.min(1, S.py / (0.5 * window.innerHeight));
+    return e;
+  }
+
+  // Every frame, from animate().
+  function update(){
+    var now = performance.now(), dt = Math.min(0.1, Math.max(0, (now - (S.last || now)) / 1000));
+    S.last = now;
+    if(!S.open) return;
+    try {
+      // The view underneath went away (closed, or the product with it): let go at once.
+      if(typeof dm === 'undefined' || !dm.active || dm.closing || !photo()){ reset(); return; }
+      var fd = Math.max(0.05, P.vwFadeMs / 1000);
+      S.fade = S.closing ? Math.max(0, S.fade - dt / fd) : Math.min(1, S.fade + dt / fd);
+      if(S.tw){
+        var tw = S.tw, k = Math.min(1, (now - tw.t0) / tw.dur), e = 1 - Math.pow(1 - k, 3);
+        var to = (typeof tw.to === 'function') ? tw.to(_xf) : tw.to;
+        if(to){ S.z = tw.fz + (to.z - tw.fz) * e; S.px = tw.fx + (to.px - tw.fx) * e; S.py = tw.fy + (to.py - tw.fy) * e; }
+        if(k >= 1) S.tw = null;
+      } else if(!S.hold && !S.closing){
+        // A fling coasts; then the size and the pan spring back inside their bounds.
+        var f60 = dt * 60;
+        if(Math.abs(S.vx) + Math.abs(S.vy) > 0.02){
+          S.px += S.vx * f60; S.py += S.vy * f60;
+          var dk = Math.pow(P.vwFling, f60); S.vx *= dk; S.vy *= dk;
+        } else S.vx = S.vy = 0;
+        var zc = Math.max(1, Math.min(P.vwMaxZoom, S.z));
+        var r = panRange(zc, _pr);
+        if(S.px < r.x0 || S.px > r.x1) S.vx *= 0.5;
+        if(S.py < r.y0 || S.py > r.y1) S.vy *= 0.5;
+        var tx = Math.max(r.x0, Math.min(r.x1, S.px)), ty = Math.max(r.y0, Math.min(r.y1, S.py));
+        var ks = 1 - Math.exp(-dt * P.vwEase);
+        S.z += (zc - S.z) * ks; S.px += (tx - S.px) * ks; S.py += (ty - S.py) * ks;
+      }
+      if(S.closing && S.fade <= 0 && !S.tw) reset();
+    } catch(e){ warn('update', e); reset(); }
+  }
+
+  // ── the render passes ─────────────────────────────────────────────────────────────────────
+  function isSky(c){
+    return c.isLight || c.isCamera || c.isPoints || c.isLine || c.isSprite || c.renderOrder <= -1000
+           || c === quad || c === curtain || c === xg;
+  }
+  function hideAll(list){
+    for(var i = 0; i < scene.children.length; i++){
+      var c = scene.children[i];
+      if(c.visible && !isSky(c)){ c.visible = false; list.push(c); }
+    }
+  }
+  function unhide(list){ for(var i = 0; i < list.length; i++) list[i].visible = true; list.length = 0; }
+  function hideOne(o, list){ if(o && o.visible){ o.visible = false; list.push(o); } }
+
+  // Just before the main pass renders into postFBO.
+  function beforeMain(){
+    if(!S.open) return;
+    try {
+      var fe = fadeE();
+      if(fe >= 0.999){ hideAll(_mh); return; }
+      // The card's photo is the garment the viewer now draws.
+      var im = photo();
+      hideOne(im, _mh);
+      if(im && im.parent) hideOne(displayAnim.backdrop && displayAnim.backdrop.userData.shadowMesh, _mh);
+      if(fe > 0.001){
+        var rt = renderer.getRenderTarget(), tmp = [];
+        hideAll(tmp);
+        renderer.setRenderTarget(cleanTarget());
+        renderer.clear();
+        renderer.render(scene, camera);
+        renderer.setRenderTarget(rt);
+        unhide(tmp);
+        onCamera(curtain, DIST);
+        if(curtain.material.map !== cleanRT.texture){ curtain.material.map = cleanRT.texture; curtain.material.needsUpdate = true; }
+        curtain.material.opacity = fe;
+        curtain.visible = true;
+      }
+    } catch(e){ warn('beforeMain', e); }
+  }
+  function afterMain(){
+    if(curtain) curtain.visible = false;
+    unhide(_mh);
+  }
+
+  // Around the layer-1 overlay pass: the garment and the ×, and every other overlay object out of
+  // it — but the nav orb, which shrinks away, and the bag, whose seat the × now fills.
+  function onOverlay(o){
+    if(o.layers.mask & 2) return true;
+    for(var i = 0; i < o.children.length; i++) if(onOverlay(o.children[i])) return true;
+    return false;
+  }
+  function beforeOverlay(){
+    if(!S.open) return;
+    try {
+      var fe = fadeE();
+      feedQuad(); feedX(fe);
+      quad.visible = true; xg.visible = true;
+      for(var i = 0; i < scene.children.length; i++){
+        var c = scene.children[i];
+        if(!c.visible || c === quad || c === xg || c === curtain) continue;
+        if(c === navMenu.group){
+          _navS.copy(c.scale); _navScaled = true;
+          c.scale.multiplyScalar(Math.max(1e-4, 1 - fe));
+          continue;
+        }
+        if(onOverlay(c)){ c.visible = false; _ov.push(c); }
+      }
+    } catch(e){ warn('beforeOverlay', e); }
+  }
+  function afterOverlay(){
+    if(quad) quad.visible = false;
+    if(xg) xg.visible = false;
+    unhide(_ov);
+    if(_navScaled && navMenu.group){ navMenu.group.scale.copy(_navS); _navScaled = false; }
+  }
+  function feedQuad(){
+    var hh = onCamera(quad, DIST), hw = hh * camera.aspect, u = quad.material.uniforms;
+    var W = window.innerWidth, H = window.innerHeight, a = S.aspect;
+    restRect(_rest);
+    var w = _rest.w * S.z, cx = _rest.cx + S.px, cy = _rest.cy + S.py;
+    var sx = (a > W / H) ? 1 : a / (W / H);              // the material's contain-fit, across
+    u.tImg.value = S.tex; u.contentBox.value.copy(S.box); u.aspect.value = a;
+    u.hsize.value.set(hw, hh); u.rad.value = 0; u.aa.value = 1e-5;
+    u.zoom.value = Math.max(1e-4, (w / W) / sx);
+    u.pan.value.set(cx / W - 0.5, 0.5 - cy / H);
+    u.opacity.value = 1;
+  }
+  // The bag's seat and orb exactly as positionCartIcon feeds them shut — so swapped in for the bag
+  // nothing moves — with the icon crossfading bag → × the way the nav's goes menu → ×.
+  function feedX(fe){
+    var d = cornerOrbD(), R = cornerSeatR(d);
+    var hh = Math.tan(camera.fov * Math.PI / 360) * CORNER_DIST, hw = hh * camera.aspect, ins = cornerInset(d);
+    xg.position.copy(camera.position).add(_v.set(hw - ins, hh - ins, -CORNER_DIST).applyQuaternion(camera.quaternion));
+    xg.quaternion.copy(camera.quaternion);
+    var s = S.bagShown ? 1 : Math.max(1e-4, fe);         // no bag to stand in for: it grows in
+    xg.scale.setScalar(s);
+    feedCornerPane(xseat, [{x: 0, y: 0, hw: R, hh: R, r: R}], [{x: 0, y: 0, r: d * 0.5 * P.sizeHole}],
+                   cornerBlend(cartPanelOrbD()) * 0.75, s, 1, {lens: P.cornerLens, lensW: 0.3 * R});
+    xorb.position.set(0, 0, CORNER_Z + 0.04 * d);
+    xorb.scale.setScalar(d);
+    var xs = cornerRamp(fe, 0.15, 0.85);
+    xorb.userData.icons.bag.material.opacity = 1 - xs;
+    xorb.userData.icons.close.material.opacity = xs;
+    feedCornerOrb(xorb);
+  }
+  // Inside renderGlassFBO: fully open, the × refracts the sky it now sits over, not the hidden view.
+  function fbo(on){
+    if(on){ if(S.open && fadeE() >= 0.999) hideAll(_fh); }
+    else unhide(_fh);
+  }
+
+  // ── gestures ──────────────────────────────────────────────────────────────────────────────
+  function dist2(a, b){ var dx = b.clientX - a.clientX, dy = b.clientY - a.clientY; return Math.sqrt(dx * dx + dy * dy) || 1; }
+  function inRect(r, x, y, grow){ var g = grow || 0; return Math.abs(x - r.cx) <= r.w * (0.5 + g) && Math.abs(y - r.cy) <= r.h * (0.5 + g); }
+  // Whatever the page started under the first finger — a stack scroll, a wheel drag — is let go.
+  function releasePage(){
+    touchScroll.active = false; touchScroll.locked = null; hoveredPanel = null;
+    if(isDragging){ isDragging = false; selectedFloor = null; renderer.domElement.parentElement.classList.remove('dragging'); }
+    if(typeof dm !== 'undefined') dm.draggingVW = false;
+    DML.mobDragCancel();
+    pressedGlassMesh = null;
+  }
+
+  function beginPinch(ts){
+    var a = ts[0], b = ts[1];
+    G.mode = 'pinch'; G.multi = true; G.moved = true; S.hold = true; S.tw = null; S.vx = S.vy = 0;
+    if(pressedGlassMesh && pressedGlassMesh === xGlass()) pressedGlassMesh = null;
+    G.d0 = dist2(a, b); G.mx0 = G.mx = (a.clientX + b.clientX) * 0.5; G.my0 = G.my = (a.clientY + b.clientY) * 0.5;
+    G.z0 = S.z; G.zlo = Math.min(1, S.z);
+    restRect(_rest); G.cx0 = _rest.cx + S.px; G.cy0 = _rest.cy + S.py;
+  }
+  // The image point under the fingers' first midpoint stays under their midpoint now.
+  function movePinch(ts){
+    var a = ts[0], b = ts[1], d = dist2(a, b);
+    var mx = (a.clientX + b.clientX) * 0.5, my = (a.clientY + b.clientY) * 0.5;
+    var z = G.z0 * d / G.d0;
+    // Past either limit it gives rather than stopping dead; it springs back on release.
+    if(z > P.vwMaxZoom) z = P.vwMaxZoom * Math.pow(z / P.vwMaxZoom, 0.35);
+    else if(z < G.zlo) z = G.zlo * Math.pow(z / G.zlo, 0.5);
+    restRect(_rest);
+    var k = z / G.z0;
+    S.z = z; S.px = mx + (G.cx0 - G.mx0) * k - _rest.cx; S.py = my + (G.cy0 - G.my0) * k - _rest.cy;
+    G.mx = mx; G.my = my;
+  }
+  // Resolved when the FIRST finger lifts, not the last: fingers rarely leave together (CDP lifts
+  // them one per event too), and a pinch that handed straight over to a one-finger pan never got
+  // its let-go test — pinching in to close simply sprang back.
+  function endPinch(){
+    S.hold = false;
+    // Pinched in from rest (or a spread on the card taken back): let it go.
+    if((G.z0 >= 0.98 && S.z < 0.82) || (G.z0 < 0.98 && S.z < G.z0 * 0.92)){ close(); return false; }
+    tweenXf(zoomAbout(Math.max(1, Math.min(P.vwMaxZoom, S.z)), G.mx, G.my, S, _xf), 240);
+    return true;
+  }
+
+  function beginPan(x, y){
+    G.mode = 'pan'; S.hold = true; S.tw = null; S.vx = S.vy = 0;
+    G.lx = x; G.ly = y; G.hist.length = 0; G.hist.push({x: x, y: y, t: performance.now()});
+    G.pull = (P.vwPullClose > 0 && S.z <= 1.02 && !S.closing) ? 'maybe' : null; G.pz = S.z;
+  }
+  function movePan(x, y){
+    var dx = x - G.lx, dy = y - G.ly; G.lx = x; G.ly = y;
+    if(Math.abs(x - G.x0) > 8 || Math.abs(y - G.y0) > 8) G.moved = true;
+    if(G.pull === 'maybe' && G.moved){
+      var tx = x - G.x0, ty = y - G.y0;
+      G.pull = (ty > 0 && ty > Math.abs(tx) * 1.2) ? 'pull' : null;
+    }
+    if(G.pull === 'pull'){
+      // Held under the finger, shrinking a little as it goes (fadeE lets the view back in).
+      S.px += dx; S.py += dy;
+      S.z = G.pz * (1 - 0.25 * Math.max(0, Math.min(1, S.py / (window.innerHeight * 0.5))));
+    } else {
+      var r = panRange(S.z, _pr);
+      S.px += ((S.px < r.x0 && dx < 0) || (S.px > r.x1 && dx > 0)) ? dx * 0.35 : dx;
+      S.py += ((S.py < r.y0 && dy < 0) || (S.py > r.y1 && dy > 0)) ? dy * 0.35 : dy;
+    }
+    var now = performance.now();
+    G.hist.push({x: x, y: y, t: now});
+    // Two samples minimum: a window pruned to one measures zero speed whenever a frame runs long.
+    while(G.hist.length > 2 && now - G.hist[0].t > 100) G.hist.shift();
+  }
+  function endPan(){
+    S.hold = false;
+    var h = G.hist, now = performance.now(), vx = 0, vy = 0;
+    if(h.length >= 2 && now - h[h.length - 1].t < 80){
+      var dt = Math.max(8, h[h.length - 1].t - h[0].t);
+      vx = (h[h.length - 1].x - h[0].x) / dt * (1000 / 60);
+      vy = (h[h.length - 1].y - h[0].y) / dt * (1000 / 60);
+    }
+    if(G.pull === 'pull'){
+      if(S.py > P.vwPullClose * window.innerHeight || vy > 18) close();
+      return;   // else update() springs it home: size back to rest, pan back in range
+    }
+    S.vx = vx; S.vy = vy;
+  }
+
+  function tapAt(x, y){
+    var now = performance.now();
+    if(now < S.ignoreTap) return;
+    if(now - G.tapT < 320 && Math.abs(x - G.tapX) < 40 && Math.abs(y - G.tapY) < 40){ G.tapT = 0; doubleTap(x, y); return; }
+    G.tapT = now; G.tapX = x; G.tapY = y;
+  }
+  // Zoomed: back to rest. At rest: to vwTapZoom, the tapped spot held under the finger.
+  function doubleTap(x, y){
+    if(S.z > 1.05) tweenTo(1, 0, 0, 300);
+    else tweenXf(zoomAbout(Math.max(1, Math.min(P.vwMaxZoom, P.vwTapZoom)), x, y, S, _xf), 300);
+  }
+  function finish(x, y){
+    var mode = G.mode, tap = !G.moved && !G.multi && performance.now() - G.t0 < 350;
+    G.mode = null;
+    if(mode === 'x'){ pressedGlassMesh = null; if(xHit(x, y)) close(); }
+    else if(mode === 'pinch') endPinch();
+    else if(mode === 'pan'){ if(tap){ S.hold = false; tapAt(x, y); } else endPan(); }
+    else S.hold = false;
+    G.multi = false;
+  }
+  function press(x, y){
+    G.x0 = x; G.y0 = y; G.t0 = performance.now(); G.moved = false; G.multi = false;
+    if(S.closing){ G.mode = 'dead'; return; }
+    if(xHit(x, y)){ G.mode = 'x'; pressedGlassMesh = xGlass(); return; }
+    beginPan(x, y);
+  }
+  function dragX(x, y){
+    if(Math.abs(x - G.x0) > 12 || Math.abs(y - G.y0) > 12){ pressedGlassMesh = null; G.moved = true; beginPan(x, y); }
+  }
+
+  // ── touch (onTS / onTM / onTE) — true = handled, the caller stops ──
+  function touchStart(e){
+    var ts = e.touches;
+    if(S.open){
+      if(ts.length >= 2){ if(!S.closing) beginPinch(ts); return true; }
+      press(ts[0].clientX, ts[0].clientY);
+      return true;
+    }
+    // Shut: a second finger landing on the product photo ARMS a spread. Nothing happens until the
+    // fingers part — two resting fingers are not a zoom — but from here the page is out of it.
+    if(!G.armed && ts.length === 2 && canOpen() && cardRect(_card)){
+      var a = ts[0], b = ts[1], mx = (a.clientX + b.clientX) * 0.5, my = (a.clientY + b.clientY) * 0.5;
+      if(inRect(_card, mx, my, 0.1) || inRect(_card, a.clientX, a.clientY) || inRect(_card, b.clientX, b.clientY)){
+        releasePage();
+        G.armed = {d0: dist2(a, b)};
+      }
+    }
+    return !!G.armed;
+  }
+  function touchMove(e){
+    var ts = e.touches;
+    if(!S.open){
+      if(!G.armed) return false;
+      if(ts.length >= 2 && dist2(ts[0], ts[1]) / G.armed.d0 > 1.04 && open('pinch')){
+        // The spread so far counts: the pinch is measured from where the fingers landed.
+        beginPinch(ts); G.d0 = G.armed.d0; G.armed = null;
+        movePinch(ts);
+      }
+      return true;
+    }
+    if(S.closing) return true;
+    if(ts.length >= 2){ if(G.mode !== 'pinch') beginPinch(ts); movePinch(ts); return true; }
+    var t = ts[0];
+    if(G.mode === 'x') dragX(t.clientX, t.clientY);
+    else if(G.mode === 'pan') movePan(t.clientX, t.clientY);
+    else if(G.mode === 'after' && (Math.abs(t.clientX - G.x0) > 6 || Math.abs(t.clientY - G.y0) > 6)){
+      beginPan(t.clientX, t.clientY); G.pull = null;   // takes it over from the settle, where it is
+    }
+    return true;
+  }
+  function touchEnd(e){
+    var ts = e.touches;
+    if(!S.open){
+      if(!G.armed) return false;
+      if(ts.length === 0) G.armed = null;
+      return true;
+    }
+    if(ts.length >= 2){ if(!S.closing) beginPinch(ts); return true; }
+    if(ts.length === 1){
+      // Down to one finger. A pinch is resolved now (let go, or settle into bounds); the finger
+      // left behind pans from where it is once it really moves — and is never a tap.
+      if(S.closing){ G.mode = 'dead'; return true; }
+      G.multi = true; G.moved = true; G.x0 = G.lx = ts[0].clientX; G.y0 = G.ly = ts[0].clientY;
+      if(G.mode === 'pinch'){ G.mode = endPinch() ? 'after' : 'dead'; return true; }
+      beginPan(ts[0].clientX, ts[0].clientY);
+      return true;
+    }
+    var c = e.changedTouches && e.changedTouches[0];
+    finish(c ? c.clientX : G.lx, c ? c.clientY : G.ly);
+    return true;
+  }
+  function touchCancel(){
+    G.armed = null;
+    if(!S.open) return;
+    G.mode = null; G.multi = false; S.hold = false;
+    if(pressedGlassMesh && pressedGlassMesh === xGlass()) pressedGlassMesh = null;
+  }
+
+  // ── mouse (pDown / pMove / pUp) and the wheel ──
+  function pDown(x, y){
+    if(!S.open) return false;
+    G.mouse = true; press(x, y);
+    return true;
+  }
+  function pMove(x, y){
+    if(!S.open) return false;
+    if(G.mouse && G.mode === 'pan' && !S.closing) movePan(x, y);
+    else if(G.mouse && G.mode === 'x') dragX(x, y);
+    var onX = xHit(x, y);
+    hoveredGlassMesh = onX ? xGlass() : null;
+    renderer.domElement.style.cursor = onX ? 'pointer' : (G.mouse && G.mode === 'pan' ? 'grabbing' : 'grab');
+    return true;
+  }
+  function pUp(x, y){
+    if(!S.open) return false;
+    if(G.mouse){ G.mouse = false; finish(x, y); }
+    if(S.open && !S.closing) renderer.domElement.style.cursor = xHit(x, y) ? 'pointer' : 'grab';
+    return true;
+  }
+  function wheel(e){
+    if(!S.open) return false;
+    e.preventDefault();
+    if(S.closing) return true;
+    var dy = e.deltaY * (e.deltaMode === 1 ? 16 : (e.deltaMode === 2 ? window.innerHeight : 1));
+    // Steps accumulate onto where the last step was heading, so a fast scroll does not lag.
+    var from = (S.tw && S.tw.to === _twTo) ? {z: _twTo.z, px: _twTo.px, py: _twTo.py} : {z: S.z, px: S.px, py: S.py};
+    var z = Math.max(1, Math.min(P.vwMaxZoom, from.z * Math.exp(-dy * 0.0016)));
+    tweenXf(zoomAbout(z, e.clientX, e.clientY, from, _xf), 140);
+    return true;
+  }
+  // From pUp's click branch: a click or tap on the product photo, in the stack.
+  function tapOpen(rc){
+    if(!canOpen()) return false;
+    var im = photo();
+    if(!rc || !rc.intersectObject(im, false).length) return false;
+    return open('tap');
+  }
+
+  // Esc lets it go. iOS Safari zooms the PAGE on a pinch through its own gesture events unless
+  // they are refused — touchmove's preventDefault alone is not always enough there.
+  window.addEventListener('keydown', function(e){
+    if(S.open && !S.closing && (e.key === 'Escape' || e.key === 'Esc')){ e.preventDefault(); e.stopImmediatePropagation(); close(); }
+  }, true);
+  window.addEventListener('touchcancel', touchCancel, true);
+  ['gesturestart', 'gesturechange'].forEach(function(n){
+    document.addEventListener(n, function(e){ if(S.open || G.armed) e.preventDefault(); }, {passive: false});
+  });
+
+  return {open: open, close: close, update: update, canOpen: canOpen,
+          active: function(){ return S.open; },
+          tapOpen: tapOpen, touchStart: touchStart, touchMove: touchMove, touchEnd: touchEnd,
+          pDown: pDown, pMove: pMove, pUp: pUp, wheel: wheel,
+          beforeMain: beforeMain, afterMain: afterMain, beforeOverlay: beforeOverlay, afterOverlay: afterOverlay, fbo: fbo,
+          cardRect: function(){ return cardRect({}); }, restRect: function(){ return restRect({}); },
+          xSpot: function(){ return xSpot({}); },
+          // read-only peeks for the harnesses
+          get _S(){ return S; }, get _G(){ return G; }};
 })();
 
 // Registered here rather than inside SHIRT, so SHIRT stays ignorant of the detail view: it asks
@@ -6168,6 +6912,21 @@ SHIRT.setFilter(DML.shirtVisible);
       note('Pull the stack down past its top by this much and let go, and the product closes. 0 turns it off — the × in the action column still closes.') +
       row('Swipe spin (signed)', 'mSpinK', -3, 3, 0.05) +
 
+      hd('THE VIEWER (PHONE IMAGE)') +
+      chk('Full-screen image on a phone', 'vwOn') +
+      note('In the stack, a tap, double tap, click or two-finger spread on the product photo clears the screen down to the garment, with a glass × in the bag’s corner. Inside: pinch to zoom, drag to pan, double tap to zoom to a spot and back. The ×, Esc, a pinch in past rest or a pull down from rest close it.') +
+      row('Resting size (× fit)', 'vwFill', 0.8, 1.6, 0.01) +
+      note('1 = the garment exactly touches the screen’s sides (top and bottom on a wide screen); over 1 it runs a little past them.') +
+      row('Resting height (× H)', 'vwRestY', -0.3, 0.3, 0.005) +
+      row('Deepest zoom (× rest)', 'vwMaxZoom', 1.5, 12, 0.1) +
+      row('Double-tap zoom (× rest)', 'vwTapZoom', 1.2, 6, 0.05) +
+      row('Flight off the card (ms)', 'vwOpenMs', 120, 900, 10) +
+      row('Fade (ms)', 'vwFadeMs', 100, 900, 10) +
+      row('Spring back (per s)', 'vwEase', 4, 30, 0.5) +
+      row('Fling kept (per frame)', 'vwFling', 0.8, 0.98, 0.002) +
+      row('Pull down to close (× H)', 'vwPullClose', 0, 0.4, 0.005) +
+      chk('Full-size art while open', 'vwHiRes') +
+
       hd('WHEEL HALF') +
       row('Depth (how close)', 'wheelDepth', 1.5, 26, 0.1) +
       note('Purely how close it sits. Apparent SIZE does not change with depth — the fit re-solves for the new distance and the two cancel exactly. What depth decides is what the wheel passes in front of and behind.') +
@@ -6263,6 +7022,19 @@ SHIRT.setFilter(DML.shirtVisible);
       hd('THE ACTION COLUMN') +
       chk('Close / add to bag / buy now beside the card', 'actOn') +
       note('The size toggle\u2019s mirror on the card\u2019s other side: the same track, slot spacing and orbs \u2014 every dimension is the toggle\u2019s. Close on top, add to bag (at the size the toggle is set to), then buy now, which adds and goes straight to checkout.') +
+
+      hd('THE CORNER ORBS (menu + bag)') +
+      note('The two buttons in the page\u2019s top corners are this view\u2019s orbs in the same frost seat. Their size is a share of the SCREEN, so they match the orbs beside the card; frost, bevel and pad follow the plate and size-track settings above.') +
+      row('Orb size (\u00d7 screen height)', 'cornerSize', 0.05, 0.2, 0.0025) +
+      row('Gap from the screen edge (\u00d7 orb)', 'cornerMargin', 0, 0.6, 0.01) +
+      row('Menu: section type (\u00d7 orb)', 'navFont', 0.08, 0.35, 0.005) +
+      row('Menu: gap between sections (\u00d7 orb)', 'navGap', 0.1, 1.2, 0.01) +
+      row('Menu: seat \u2192 first section (\u00d7 orb)', 'navLead', 0, 0.8, 0.01) +
+      row('Button: stained (1) \u2194 clear (0)', 'cornerStain', 0, 1, 0.01) +
+      row('Surround + bar: clear glass (1) \u2194 frost (0)', 'cornerLens', 0, 1, 0.01) +
+      row('Bar: band behind the sections', 'navBand', 0, 1, 0.01) +
+      row('Bar: band height (\u00d7 type)', 'navBandH', 0.5, 4, 0.05) +
+      row('Bar: band lift toward white', 'navBandLift', 0, 1, 0.01) +
 
       hd('THE DESCRIPTION BOX') +
       chk('Description box under the wheel', 'descOn') +
@@ -7035,32 +7807,48 @@ function createGlassCircleBtn(circleR) {
       tFrost:{value:generateFrostTexture()},
       res:{value:new THREE.Vector2(window.innerWidth,window.innerHeight)},
       cR:{value:CR}, time:{value:0},
-      hoverPress:{value:0.0}
+      hoverPress:{value:0.0},
+      // STAINED: the site's frost on the button itself — blurred in place, tinted, a bevel lip —
+      // instead of the scene bent through it. 0 (the default) is the clear bubble, unchanged.
+      stain:{value:0.0}, blurPx:{value:7.0}, tint:{value:new THREE.Color(0.80,0.82,0.85)},
+      frost:{value:0.55}, bevel:{value:0.30}, bevelW:{value:0.06}
     },
     vertexShader:[
-      'uniform float hoverPress;',
+      'uniform float hoverPress,cR;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
+      // Clipping is a no-op unless a caller sets clippingPlanes (the cart's scrolling lines do).
+      '#include <clipping_planes_pars_vertex>',
       'void main(){',
-      '  vec3 transformed = position - normal * hoverPress * 0.04;',
+      // The press: back 0.04 and the rim drawn in 4%, about what the push along the normals gave —
+      // but those normals are garbage where the square grid is folded onto the circle (its four
+      // corners), and pushing along them flung those vertices outward as smudges on the diagonals.
+      '  vec3 transformed = position;',
+      '  transformed.z -= hoverPress * 0.04;',
+      '  transformed.xy *= 1.0 - hoverPress * 0.04 * smoothstep(0.7, 1.0, length(position.xy) / cR);',
       '  vLP=transformed;',
       '  vUv=uv;',
       '  vec4 mv=modelViewMatrix*vec4(transformed,1.0);',
       '  vN=normalize(normalMatrix*normal);',
       '  vV=normalize(-mv.xyz);',
       '  gl_Position=projectionMatrix*mv;',
+      '  vec4 mvPosition=mv;',
+      '  #include <clipping_planes_vertex>',
       '}'
     ].join('\n'),
     fragmentShader:[
       'uniform sampler2D tBg,tScratch,tFrost;',
       'uniform vec2 res;',
-      'uniform float cR,time,hoverPress;',
+      'uniform float cR,time,hoverPress,stain,blurPx,frost,bevel,bevelW;',
+      'uniform vec3 tint;',
       'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
+      '#include <clipping_planes_pars_fragment>',
       GLARE_GLSL_FUNCS,
       'void main(){',
+      '  #include <clipping_planes_fragment>',
       '  vec3 N=normalize(vN); vec3 V=normalize(vV);',
-      '  float sd=length(vLP.xy)-cR;',
+      '  float sd=length(vLP.xy)-cR*(1.0-hoverPress*0.04);',   // the pushed circle exactly
       '  float edge=fwidth(sd)*1.5;',
       '  float alpha=1.0-smoothstep(-edge,edge,sd);',
       '  if(alpha<0.01)discard;',
@@ -7079,6 +7867,19 @@ function createGlassCircleBtn(circleR) {
       '  float fresnel=pow(1.0-max(dot(V,N),0.0),2.0)*0.15;',
       '  col=mix(col,vec3(0.95,0.96,0.98),fresnel*0.1);',
       '  col+=vec3(0.7,0.75,0.9)*glow*0.3;',
+      '  if(stain > 0.0){',
+      '    vec2 rp = blurPx / res;',
+      '    vec3 sc = texture2D(tBg, suv).rgb;',
+      '    for(int i = 0; i < 12; i++){',
+      '      float ang = float(i) * 2.399963;',
+      '      float rr = sqrt((float(i) + 0.5) / 12.0);',
+      '      sc += texture2D(tBg, suv + vec2(cos(ang), sin(ang)) * rp * rr).rgb;',
+      '    }',
+      '    sc = mix(sc / 13.0, tint, frost);',
+      '    float lip = 1.0 - clamp(-sd / max(0.0001, bevelW), 0.0, 1.0);',
+      '    sc += tint * lip * lip * bevel;',
+      '    col = mix(col, sc, stain);',
+      '  }',
       GLASS_TINT_GLSL,
       GLARE_GLSL_CALC,
       '  col+=glareResult;',
@@ -7101,10 +7902,14 @@ function createGlassCircleBtn(circleR) {
 }
 
 function createStarIconOverlay(iconType, circleR) {
-  // Creates a canvas icon overlay for a morphed star button
+  // THE site's icon set — every glass orb's icon is drawn here, in one hand: #c0c8d8 on a 64-unit
+  // grid, round caps and joins, 3-3.5 strokes, the glyph inside the middle ~20 units. animate()
+  // tints it dark at rest and light while its orb is pressed. Drawn at 2x (128 px) so it stays
+  // crisp on the larger corner orbs; the geometry is the same 64-unit drawing.
   var canvas = document.createElement('canvas');
-  canvas.width = 64; canvas.height = 64;
+  canvas.width = 128; canvas.height = 128;
   var ctx = canvas.getContext('2d');
+  ctx.scale(2, 2);
   ctx.strokeStyle = '#c0c8d8'; ctx.fillStyle = '#c0c8d8';
   ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
 
@@ -7117,6 +7922,23 @@ function createStarIconOverlay(iconType, circleR) {
     ctx.lineWidth=2.5;
     ctx.beginPath();ctx.moveTo(48,10);ctx.lineTo(48,22);ctx.stroke();
     ctx.beginPath();ctx.moveTo(42,16);ctx.lineTo(54,16);ctx.stroke();
+  } else if(iconType === 'bag'){
+    // add-to-cart's bag without the +, centred on the glyph box the × uses (22..42)
+    var bs=14, bx=32, by=29.2;
+    ctx.beginPath();
+    ctx.moveTo(bx-bs*0.7,by-bs*0.1);ctx.lineTo(bx-bs*0.8,by+bs*0.9);
+    ctx.lineTo(bx+bs*0.8,by+bs*0.9);ctx.lineTo(bx+bs*0.7,by-bs*0.1);ctx.closePath();ctx.stroke();
+    ctx.beginPath();ctx.arc(bx,by-bs*0.1,bs*0.4,Math.PI,0);ctx.stroke();
+  } else if(iconType === 'menu'){
+    // three bars as wide as the ×, at its weight
+    ctx.lineWidth=3.5;
+    ctx.beginPath();ctx.moveTo(21,23);ctx.lineTo(43,23);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(21,32);ctx.lineTo(43,32);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(21,41);ctx.lineTo(43,41);ctx.stroke();
+  } else if(iconType === 'plus' || iconType === 'minus'){
+    ctx.lineWidth=3.5;
+    ctx.beginPath();ctx.moveTo(21,32);ctx.lineTo(43,32);ctx.stroke();
+    if(iconType === 'plus'){ ctx.beginPath();ctx.moveTo(32,21);ctx.lineTo(32,43);ctx.stroke(); }
   } else if(iconType === 'close'){
     ctx.lineWidth=3.5;
     ctx.beginPath();ctx.moveTo(22,22);ctx.lineTo(42,42);ctx.stroke();
@@ -10644,6 +11466,9 @@ var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null, startX:
 function onTS(e){
   e.preventDefault();
   if(treeUI.open) return;   // skill tree: pointer events drive pan/zoom/tap — keep the joystick out
+  // THE VIEWER (phone): owns every finger while the full-screen image is up, and a two-finger
+  // spread on the product photo opens it.
+  if(VIEWER.touchStart(e)) return;
   // Mini-game: two fingers → pinch-zoom the chase camera (spread = in, pinch = out → top-down).
   if(gameMode.active && !gameMode.exiting && e.touches.length === 2){
     var pdx = e.touches[1].clientX - e.touches[0].clientX, pdy = e.touches[1].clientY - e.touches[0].clientY;
@@ -10753,6 +11578,7 @@ function onTS(e){
 function onTM(e){
   e.preventDefault();
   if(treeUI.open) return;   // skill tree owns touch while open
+  if(VIEWER.touchMove(e)) return;
   // Mini-game: two-finger pinch drives the chase-camera zoom.
   if(gameMode.active && gameMode.camPinch.active && e.touches.length === 2){
     var pdx = e.touches[1].clientX - e.touches[0].clientX, pdy = e.touches[1].clientY - e.touches[0].clientY;
@@ -10994,6 +11820,7 @@ function onTM(e){
 }
 function onTE(e){
   if(treeUI.open) return;   // skill tree owns touch while open
+  if(VIEWER.touchEnd(e)) return;
   // Mini-game: end the pinch-zoom once a finger lifts (under two fingers).
   if(gameMode.camPinch && gameMode.camPinch.active && e.touches.length < 2){ gameMode.camPinch.active = false; }
   // In-game UI touch release — route to pointer up (handles taps + window drag end)
@@ -11116,6 +11943,7 @@ function onTE(e){
 
 function pDown(cx,cy){
   if(czReady && CZ.onPointerDown(cx,cy,false)) return;
+  if(VIEWER.pDown(cx,cy)) return;   // THE VIEWER: drag pans, the × closes
   mouseDownX=cx;mouseDownY=cy;mouseDownTime=performance.now();
   // Detect glass UI press for visual feedback
   mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
@@ -11182,18 +12010,20 @@ function pDown(cx,cy){
     }
     if(!pressedGlassMesh && cart.glassMesh){
       var pdLbCgH = raycaster.intersectObject(cart.glassMesh);
-      if(pdLbCgH.length>0) pressedGlassMesh = cart.glassMesh;
+      if(pdLbCgH.length>0) pressedGlassMesh = cart.panelOpen ? null : cart.orbGlass;
     }
   } else {
-    if(navMenu.glassMesh){
-      var pdGH = raycaster.intersectObject(navMenu.glassMesh);
-      if(pdGH.length>0) pressedGlassMesh = navMenu.glassMesh;
-    }
-    if(!pressedGlassMesh && navMenu.open){
+    // The corner orbs: a press on the nav's seat or track presses its orb — unless it lands on a
+    // section, which is ink, not glass.
+    var pdOnNavLabel = false;
+    if(navMenu.open){
       for(var pdNbi=0;pdNbi<navMenu.buttons.length;pdNbi++){
-        var pdNbH = raycaster.intersectObjects(navMenu.buttons[pdNbi].group.children,true);
-        if(pdNbH.length>0){ pressedGlassMesh = findGlassMeshFromHit(pdNbH[0].object); break; }
+        if(raycaster.intersectObjects(navMenu.buttons[pdNbi].group.children,true).length>0){ pdOnNavLabel = true; break; }
       }
+    }
+    if(!pdOnNavLabel && navMenu.glassMesh){
+      var pdGH = raycaster.intersectObject(navMenu.glassMesh);
+      if(pdGH.length>0) pressedGlassMesh = navMenu.orbGlass;
     }
     if(!pressedGlassMesh){
       for(var pdOi=0;pdOi<cartOverlays.length;pdOi++){
@@ -11201,9 +12031,14 @@ function pDown(cx,cy){
         if(pdOvH.length>0){ pressedGlassMesh = findGlassMeshFromHit(pdOvH[0].object); break; }
       }
     }
-    if(!pressedGlassMesh && cart.glassMesh){
+    // The open panel's own orbs (×, checkout, − / +), then the bag orb while it is shut.
+    if(!pressedGlassMesh && cart.panelOpen && cart.panelGroup){
+      var pdCpH = raycaster.intersectObjects(cart.panelGroup.children,true);
+      for(var pdCpi=0;pdCpi<pdCpH.length && !pressedGlassMesh;pdCpi++) pressedGlassMesh = findGlassMeshFromHit(pdCpH[pdCpi].object);
+    }
+    if(!pressedGlassMesh && !cart.panelOpen && cart.glassMesh){
       var pdCgH = raycaster.intersectObject(cart.glassMesh);
-      if(pdCgH.length>0) pressedGlassMesh = cart.glassMesh;
+      if(pdCgH.length>0) pressedGlassMesh = cart.orbGlass;
     }
     if(!pressedGlassMesh){
       var _szPg = DML.sizeHover(raycaster);
@@ -11330,6 +12165,7 @@ function pDown(cx,cy){
 
 function pMove(cx,cy){
   if(czReady && CZ.onPointerMove(cx,cy,false)) return;
+  if(VIEWER.pMove(cx,cy)) return;
   // The description box watches every move: over the product photo it opens and pans its zoom
   // view to the pointer's spot on the garment (or, in click mode, pans the open box).
   if(DML._desc && DML._desc.img){
@@ -11487,7 +12323,7 @@ function updateCursor(cx,cy){
     if(cart.glassMesh){
       var lbCgh = raycaster.intersectObject(cart.glassMesh);
       if(lbCgh.length>0){
-        hoveredGlassMesh = cart.glassMesh;
+        hoveredGlassMesh = cart.panelOpen ? null : cart.orbGlass;
         el.classList.add('clickable');
         return;
       }
@@ -11506,16 +12342,17 @@ function updateCursor(cx,cy){
     return;
   }
 
-  // Check nav menu (clickable)
-  if(navMenu.glassMesh){
-    var navH=raycaster.intersectObject(navMenu.glassMesh);
-    if(navH.length>0){hoveredGlassMesh = navMenu.glassMesh; el.classList.add('clickable');return;}
-  }
+  // Check nav menu: a section first (it lies on the track), then the seat/track, which is the orb's.
+  navMenu.hoverIdx = -1;
   if(navMenu.open){
     for(var nci=0;nci<navMenu.buttons.length;nci++){
       var nbcH=raycaster.intersectObjects(navMenu.buttons[nci].group.children,true);
-      if(nbcH.length>0){hoveredGlassMesh = findGlassMeshFromHit(nbcH[0].object); el.classList.add('clickable');return;}
+      if(nbcH.length>0){navMenu.hoverIdx = nci; el.classList.add('clickable');return;}
     }
+  }
+  if(navMenu.glassMesh){
+    var navH=raycaster.intersectObject(navMenu.glassMesh);
+    if(navH.length>0){hoveredGlassMesh = navMenu.orbGlass; el.classList.add('clickable');return;}
   }
 
   // Check overlay buttons (clickable)
@@ -11524,30 +12361,26 @@ function updateCursor(cx,cy){
     if(ovH.length>0){hoveredGlassMesh = findGlassMeshFromHit(ovH[0].object); el.classList.add('clickable');return;}
   }
 
-  // Check cart glass mesh (clickable to open/close)
-  if(cart.glassMesh){
-    var cgh=raycaster.intersectObject(cart.glassMesh);
-    if(cgh.length>0){hoveredGlassMesh = cart.glassMesh; el.classList.add('clickable');return;}
-  }
-  
-  // Check cart panel buttons (clickable)
+  // The open panel's buttons first — they sit on its frost
   if(cart.panelGroup&&cart.panelOpen){
     var cph=raycaster.intersectObjects(cart.panelGroup.children,true);
-    if(cph.length>0){
-      // Walk up to find if it's a clickable button
-      for(var ci=0;ci<cph.length;ci++){
-        var check=cph[ci].object;
-        while(check&&check!==cart.panelGroup){
-          if(check.userData.clickable){el.classList.add('clickable');return;}
-          check=check.parent;
-        }
+    for(var ci=0;ci<cph.length;ci++){
+      var check=cph[ci].object;
+      while(check&&check!==cart.panelGroup){
+        if(check.userData.clickable){hoveredGlassMesh = findGlassMeshFromHit(cph[ci].object); el.classList.add('clickable');return;}
+        check=check.parent;
       }
-      // Over cart panel title bar area — grabbable for dragging
-      var hitLocal=cart.panelGroup.worldToLocal(cph[0].point.clone());
-      if(hitLocal.y>1.5){el.classList.add('grabbable');return;}
     }
   }
-  
+  // The cart itself: shut, it is the bag orb; open, its frost is the panel's body, which drags.
+  if(cart.glassMesh){
+    var cgh=raycaster.intersectObject(cart.glassMesh);
+    if(cgh.length>0){
+      if(cart.panelOpen){ el.classList.add('grabbable'); return; }
+      hoveredGlassMesh = cart.orbGlass; el.classList.add('clickable'); return;
+    }
+  }
+
   // The size toggle: the knob is grabbable, the track and the card's × are clickable.
   var _szHv = DML.sizeHover(raycaster);
   if(_szHv){
@@ -11593,6 +12426,7 @@ function updateCursor(cx,cy){
 
 function pUp(cx,cy){
   if(czReady && CZ.isLockingScroll()){ CZ.onPointerUp(); return; }
+  if(VIEWER.pUp(cx,cy)) return;
   pressedGlassMesh = null;
   // Release in-game window drag
   if(gameUI.drag.active){
@@ -11665,6 +12499,9 @@ function pUp(cx,cy){
     if(DML.descHit(raycaster)){ isDragging=false; selectedFloor=null;
       renderer.domElement.parentElement.classList.remove('dragging'); return; }
     if(DML.pick(raycaster)){ isDragging=false; selectedFloor=null;
+      renderer.domElement.parentElement.classList.remove('dragging'); return; }
+    // THE VIEWER: on a phone a tap or click on the product photo opens it full screen.
+    if(VIEWER.tapOpen(raycaster)){ isDragging=false; selectedFloor=null;
       renderer.domElement.parentElement.classList.remove('dragging'); return; }
 
     // ── Double-tap the bottom spinny wheel (gallery floor) to queue the mini-game start. ──
@@ -15237,230 +16074,224 @@ function updateGameWindows(){
 }
 
 // ══════════════════════════════════════════════
-// NAVIGATION MENU (glass button, top-left)
+// THE CORNER ORBS — the nav (top-left) and the bag (top-right)
 // ══════════════════════════════════════════════
-var navMenu = {
-  group: null, glassMesh: null, labelMesh: null,
-  open: false, morphT: 0, targetT: 0, animating: false,
-  buttons: [], // {group, floorIdx, label}
-  physX: 0, physY: 0, initialized: false,
-  // Lightbox bar mode: morphs the icon into a wide glass bar that unfolds to the right
-  // and displays the focused product's name.
-  barMode: false, barP: null, barRW: NAV_RW, barTextMesh: null
-};
+// Cut from the product view's kit rather than a look of their own (THE ACTION COLUMN in DML): one
+// of the site's glass orbs (createGlassCircleBtn) wearing one of the shared icons
+// (createStarIconOverlay), seated in a hole through a pane of the shared frost (DML.frostMaterial)
+// with the size track's margin around it — the same orb, icon, pad, hole and bevel as the ×, bag
+// and → beside the product card, so pressing one darkens it and flips its icon exactly as those do.
+// The orb is the product view's size on screen: P.cornerSize of the height (measured off the
+// action column, 98.5 px of 804), or P.mOrb of the width where that is smaller — the phone
+// stack's own rule. Opening grows the seat, the nav's into a track carrying the sections and the
+// bag's into the cart panel, the way the tracks bud out of the product card.
+// Both live CORNER_DIST in front of the camera, so a world unit there is cornerWpp() pixels.
+var CORNER_DIST = 4.5;
+// PARALLAX: the corners sit far off the view axis, so anything at another depth slides outward
+// against the frost — icons measured 5 px off their orbs. Everything is levelled with the frost at
+// CORNER_Z, and each orb is set forward by its rim's curl (0.04 of its size) so its silhouette is
+// at the frost's depth and the icon, level with that rim, lands dead centre.
+var CORNER_Z = -0.02;
+var CORNER_INK = new THREE.Color(0.05, 0.08, 0.16);          // DML sizeInk: the S/M/L letters
+var CORNER_ACC_TYPE = new THREE.Color(6 / 255, 116 / 255, 106 / 255);   // accent, read as type
+var CORNER_ACC = new THREE.Color(16 / 255, 196 / 255, 178 / 255);       // accent, strokes and fills
+function cornerWpp(){ return 2 * Math.tan(camera.fov * Math.PI / 360) * CORNER_DIST / Math.max(1, window.innerHeight); }
+// The orb's diameter, world units at CORNER_DIST.
+function cornerOrbD(){
+  var P = DML.P;
+  return Math.min(P.cornerSize * window.innerHeight, P.mOrb * window.innerWidth) * cornerWpp();
+}
+// The size track's margin past its knob as a fraction of the orb, so the seat's rim of frost is
+// the track's whatever the product view is tuned to.
+function cornerPadK(){ return DML.P.sizePad / Math.max(1e-3, DML.P.btnScale); }
+function cornerSeatR(d){ return d * (0.5 + cornerPadK()); }
+function cornerInset(d){ return cornerSeatR(d) + DML.P.cornerMargin * d; }   // seat centre from the edges
+function cornerBlend(d){ return Math.max(1e-3, DML.P.uniBlend / Math.max(1e-3, DML.P.btnScale) * d); }
 
-var NAV_CR = 0.25, NAV_RW = 2.2, NAV_RH = 0.55, NAV_SX = 30, NAV_SY = 20;
+// An orb with its icons — the first one showing, the rest at 0 to be crossfaded in.
+function createCornerOrb(types){
+  var g = createGlassCircleBtn(0.5);
+  var m = g.userData.glassMesh;
+  m.material.depthTest = false;      // chrome, drawn by order — as DML does for the product orbs
+  m.renderOrder = 31;
+  g.userData.icons = {};
+  for(var i = 0; i < types.length; i++){
+    var ic = createStarIconOverlay(types[i], 0.5);
+    ic.renderOrder = 32;
+    ic.position.z = -0.04;           // level with the rim (PARALLAX)
+    if(i > 0) ic.material.opacity = 0;
+    g.add(ic);
+    g.userData.icons[types[i]] = ic;
+  }
+  return g;
+}
+// stain: 1 = the frost on the button itself (the corner buttons — P.cornerStain), 0 = the clear
+// bubble (the cart panel's own orbs, as beside the product card).
+function feedCornerOrb(g, stain){
+  var u = g.userData.glassMesh.material.uniforms, P = DML.P;
+  if(glassFBO) u.tBg.value = glassFBO.texture;
+  u.res.value.set(window.innerWidth * renderer.getPixelRatio(), window.innerHeight * renderer.getPixelRatio());
+  u.time.value = performance.now() * 0.001;
+  u.stain.value = stain === undefined ? P.cornerStain : stain;
+  if(u.stain.value > 0){
+    var k = Math.max(1e-4, g.scale.x);           // world units per unit of the orb's own geometry
+    u.blurPx.value = P.plateBlur; u.frost.value = P.plateFrost; u.bevel.value = P.plateBevel;
+    u.tint.value.setRGB(P.plateTint[0], P.plateTint[1], P.plateTint[2]);
+    // The lip is screen pixels like every frost surface's, but never past a fifth of the button.
+    u.bevelW.value = Math.min(P.plateBevelPx * cornerWpp(), 0.2 * k) / k;
+  }
+}
+function createCornerPane(){
+  var m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), DML.frostMaterial());
+  m.material.depthTest = false;
+  m.material.uniforms.tScratch.value = generateScratchTexture();   // the lens's glare, as on the orbs
+  m.material.uniforms.tFrost.value = generateFrostTexture();
+  m.renderOrder = 30;                // under its orbs (31) and their icons (32)
+  m.frustumCulled = false;
+  return m;
+}
+// Fed like DML's ONE BUBBLE: up to four rounded rects melted together and up to four orb holes,
+// all in the PARENT's local units. The quad is fitted to the shapes every frame (these move and
+// grow); k is the parent's world scale, so the edge and the bevel still come out in screen pixels
+// when the parent is scaled (the bag grows with its count). opt: { lens, lensW, band: {x, y, hw, hh, amt} }
+// — lens 1 is clear glass (the surround), 0 the frost (the cart panel); band, in the parent's units.
+function feedCornerPane(mesh, segs, holes, blend, k, opacity, opt){
+  var x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9, i, n = Math.min(4, segs.length);
+  for(i = 0; i < n; i++){
+    var s = segs[i];
+    x0 = Math.min(x0, s.x - s.hw); x1 = Math.max(x1, s.x + s.hw);
+    y0 = Math.min(y0, s.y - s.hh); y1 = Math.max(y1, s.y + s.hh);
+  }
+  var mg = blend * 0.25 + 0.02;      // smin can swell the union past the boxes by up to blend/4
+  x0 -= mg; x1 += mg; y0 -= mg; y1 += mg;
+  var W = x1 - x0, H = y1 - y0, cx = (x0 + x1) * 0.5, cy = (y0 + y1) * 0.5;
+  mesh.position.set(cx, cy, CORNER_Z);
+  mesh.scale.set(W, H, 1);
+  var u = mesh.material.uniforms, P = DML.P;
+  var wpp = cornerWpp() / Math.max(1e-4, k);
+  if(glassFBO) u.tBg.value = glassFBO.texture;
+  u.res.value.set(window.innerWidth * renderer.getPixelRatio(), window.innerHeight * renderer.getPixelRatio());
+  u.hsize.value.set(W * 0.5, H * 0.5);
+  u.aa.value = Math.max(1e-4, P.plateEdgePx * wpp);
+  u.blurPx.value = P.plateBlur; u.frost.value = P.plateFrost; u.dim.value = P.plateDim;
+  u.bevel.value = P.plateBevel; u.bevelW.value = Math.max(1e-4, P.plateBevelPx * wpp);
+  u.tint.value.setRGB(P.plateTint[0], P.plateTint[1], P.plateTint[2]);
+  u.opacity.value = P.plateOpacity * (opacity === undefined ? 1 : opacity);
+  u.segN.value = n;
+  u.blend.value = blend;
+  for(i = 0; i < n; i++){
+    u.segC.value[i].set(segs[i].x - cx, segs[i].y - cy);
+    u.segH.value[i].set(Math.max(1e-3, segs[i].hw), Math.max(1e-3, segs[i].hh));
+    u.segR.value[i] = segs[i].r;
+  }
+  var hn = 0;
+  for(i = 0; i < holes.length && hn < 4; i++){
+    if(!(holes[i].r > 1e-4)) continue;
+    u.holeC.value[hn].set(holes[i].x - cx, holes[i].y - cy);
+    u.holeR.value[hn] = holes[i].r;
+    hn++;
+  }
+  u.holeN.value = hn;
+  u.holeAA.value = u.aa.value;
+  opt = opt || {};
+  u.lens.value = opt.lens || 0;
+  u.lensW.value = Math.max(1e-4, opt.lensW || 0.1);
+  u.time.value = performance.now() * 0.001;
+  var bd = opt.band;
+  if(bd && bd.amt > 0){
+    u.bandC.value.set(bd.x - cx, bd.y - cy); u.bandH.value.set(Math.max(1e-4, bd.hw), Math.max(1e-4, bd.hh)); u.bandAmt.value = bd.amt;
+    u.bandLift.value = bd.lift || 0;
+  } else u.bandAmt.value = 0;
+}
+// Ink for type on the frost: white on the canvas, coloured by material.color, so a label can be
+// moved between ink and accent without a redraw.
+function cornerInkTex(text, weight, fs, spacingPx){
+  var font = (weight || '700') + ' ' + fs + 'px Arial, Helvetica, sans-serif';
+  var c = document.createElement('canvas'), x = c.getContext('2d');
+  x.font = font; try { x.letterSpacing = spacingPx + 'px'; } catch(e){}
+  var w = Math.ceil(x.measureText(text).width) + 16;
+  c.width = w; c.height = Math.ceil(fs * 1.25);
+  x = c.getContext('2d');
+  x.font = font; try { x.letterSpacing = spacingPx + 'px'; } catch(e){}
+  x.fillStyle = '#ffffff'; x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillText(text, w / 2 + spacingPx * 0.5, c.height * 0.53);   // letterSpacing trails the last glyph
+  var t = new THREE.CanvasTexture(c); t.needsUpdate = true;
+  return { tex: t, aspect: c.width / c.height, glyph: fs / c.height };
+}
+function cornerInkMesh(text, weight, fs, spacingPx, renderOrder){
+  var it = cornerInkTex(text, weight, fs, spacingPx);
+  var m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ map: it.tex, color: CORNER_INK.clone(), transparent: true, opacity: 0, depthWrite: false, depthTest: false, side: THREE.DoubleSide }));
+  m.renderOrder = renderOrder || 33;
+  m.userData.inkAspect = it.aspect; m.userData.inkGlyph = it.glyph; m.userData.noTint = true;
+  return m;
+}
+// Size an ink mesh so its text is `h` tall (world), and return its width.
+function cornerInkFit(m, h){
+  var ph = h / m.userData.inkGlyph, pw = ph * m.userData.inkAspect;
+  m.scale.set(pw, ph, 1);
+  return pw;
+}
+function cornerEase(t){ return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+function cornerRamp(e, a, b){ var t = Math.max(0, Math.min(1, (e - a) / Math.max(1e-4, b - a))); return t * t * (3 - 2 * t); }
+
+// ══════════════════════════════════════════════
+// NAVIGATION MENU (corner orb, top-left)
+// ══════════════════════════════════════════════
+// The orb is the toggle and it holds its corner: opening buds its seat out to the right into a
+// track — the size toggle's track lying on its side — carrying the sections as ink, the way S/M/L
+// sit on theirs. The section you are in is set in the accent with a short accent rule under it;
+// a hovered one takes the accent too. The orb's bars turn into the × that closes it. The
+// lightbox's product-name bar (barMode) is the same track with the product's name on it.
+var navMenu = {
+  group: null, glassMesh: null, orb: null, orbGlass: null, mark: null,
+  open: false, morphT: 0, targetT: 0, animating: false,
+  buttons: [], // {group, mesh, hit, floorIdx, label, hoverT}
+  physX: 0, physY: 0, initialized: false, hoverIdx: -1,
+  barMode: false, barTextMesh: null
+};
+var NAV_LABELS = ['HOME', 'SHIRTS', '1 OF 1S', 'GALLERY'];
 var navScrollAnim = { active: false, startY: 0, targetY: 0, progress: 0 };
+var _navOff = new THREE.Vector3(), _navCol = new THREE.Color();
 
 function createNavMenu() {
   navMenu.group = new THREE.Group();
-  var cols=NAV_SX+1, rows=NAV_SY+1;
-  var geo = new THREE.PlaneGeometry(NAV_RW, NAV_RH, NAV_SX, NAV_SY);
-  var pos = geo.attributes.position;
-  var circP = new Float32Array(pos.count*3);
-  var rectP = new Float32Array(pos.count*3);
-  for(var row=0;row<rows;row++){
-    for(var col=0;col<cols;col++){
-      var idx=row*cols+col, u=col/NAV_SX, v=row/NAV_SY;
-      var cx2=(u-0.5)*NAV_RW, cy2=(v-0.5)*NAV_RH;
-      // Circle state
-      var a=Math.atan2(cy2,cx2), d=Math.sqrt(cx2*cx2+cy2*cy2);
-      var cd=Math.min(d,NAV_CR); var cpx=Math.cos(a)*cd, cpy=Math.sin(a)*cd;
-      var rim=cd/NAV_CR; var cz=(rim>.7)?-0.04*((rim-.7)/.3)*((rim-.7)/.3):0;
-      circP[idx*3]=cpx;circP[idx*3+1]=cpy;circP[idx*3+2]=cz;
-      // Rect state
-      var hw=NAV_RW/2,hh=NAV_RH/2,cr=0.08;
-      var rx=cx2,ry=cy2;
-      var de=Math.min(Math.abs(rx)-hw+cr,Math.abs(ry)-hh+cr);
-      var rz=(de>-0.01&&de<cr)?-0.03*(1-Math.max(de,0)/cr):((Math.abs(rx)>hw-cr&&Math.abs(ry)>hh-cr)?-0.03:0);
-      rectP[idx*3]=rx;rectP[idx*3+1]=ry;rectP[idx*3+2]=rz;
-    }
-  }
-  for(var k=0;k<pos.count*3;k++) pos.array[k]=circP[k];
-  pos.needsUpdate=true; geo.computeVertexNormals();
-
-  var navScratchTex = generateScratchTexture();
-  var glassMat = new THREE.ShaderMaterial({
-    uniforms:{
-      tBg:{value:null}, res:{value:new THREE.Vector2(window.innerWidth,window.innerHeight)},
-      morphT:{value:0}, cR:{value:NAV_CR}, rW:{value:NAV_RW}, rH:{value:NAV_RH}, time:{value:0},
-      tScratch:{value:navScratchTex},
-      tFrost:{value:generateFrostTexture()}
-    },
-    vertexShader:[
-      'varying vec3 vN,vV,vLP;',
-      'varying vec2 vUv;',
-      'void main(){',
-      '  vLP=position;',
-      '  vUv=uv;',
-      '  vec4 mv=modelViewMatrix*vec4(position,1.0);',
-      '  vN=normalize(normalMatrix*normal);',
-      '  vV=normalize(-mv.xyz);',
-      '  gl_Position=projectionMatrix*mv;',
-      '}'
-    ].join('\n'),
-    fragmentShader:[
-      'uniform sampler2D tBg,tScratch,tFrost;',
-      'uniform vec2 res;',
-      'uniform float morphT,cR,rW,rH,time;',
-      'varying vec3 vN,vV,vLP;',
-      'varying vec2 vUv;',
-      GLARE_GLSL_FUNCS,
-      'float sdCircle(vec2 p,float r){return length(p)-r;}',
-      'float sdRRect(vec2 p,vec2 b,float r){vec2 d2=abs(p)-b+r;return length(max(d2,0.0))+min(max(d2.x,d2.y),0.0)-r;}',
-      'void main(){',
-      '  vec3 N=normalize(vN); vec3 V=normalize(vV);',
-      '  float sd=mix(sdCircle(vLP.xy,cR),sdRRect(vLP.xy,vec2(rW,rH)*0.5,0.06),morphT);',
-      '  float edge=fwidth(sd)*1.5;',
-      '  float alpha=1.0-smoothstep(-edge,edge,sd);',
-      '  if(alpha<0.01)discard;',
-      '  float glow=smoothstep(edge*4.0,0.0,abs(sd))*0.5;',
-      '  vec2 suv=gl_FragCoord.xy/res;',
-      '  vec2 refr=N.xy*0.15;',
-      '  refr+=0.003*vec2(sin(time*1.5+suv.y*8.0),cos(time*1.2+suv.x*8.0));',
-      '  float ef=1.0-abs(dot(V,N));',
-      '  float ca=0.23*(0.3+ef*2.5);',
-      '  vec2 tx=1.0/res;',
-      '  vec2 ru=suv+refr*(1.0+ca),gu=suv+refr,bu=suv+refr*(1.0-ca);',
-      '  float r=texture2D(tBg,ru).r*.6+texture2D(tBg,ru+tx).r*.2+texture2D(tBg,ru-tx).r*.2;',
-      '  float g=texture2D(tBg,gu).g*.6+texture2D(tBg,gu+tx).g*.2+texture2D(tBg,gu-tx).g*.2;',
-      '  float b=texture2D(tBg,bu).b*.6+texture2D(tBg,bu+tx).b*.2+texture2D(tBg,bu-tx).b*.2;',
-      '  vec3 col=vec3(r,g,b);',
-      '  float fresnel=pow(1.0-max(dot(V,N),0.0),2.0)*0.15;',
-      '  col=mix(col,vec3(0.95,0.96,0.98),fresnel*0.1);',
-      '  col+=vec3(0.7,0.75,0.9)*glow*0.3;',
-      GLASS_TINT_GLSL,
-      GLARE_GLSL_CALC,
-      '  col+=glareResult;',
-      '  gl_FragColor=vec4(col,alpha);',
-      '}'
-    ].join('\n'),
-    transparent:true, side:THREE.DoubleSide, depthWrite:true
-  });
-  navMenu.glassMesh = new THREE.Mesh(geo, glassMat);
-  navMenu.glassMesh.renderOrder=10;
-  navMenu.glassMesh.userData.circP=circP;
-  navMenu.glassMesh.userData.rectP=rectP;
+  navMenu.glassMesh = createCornerPane();          // the seat, and the track it grows into
   navMenu.group.add(navMenu.glassMesh);
-
-  // Hamburger icon (3 lines)
-  var iconCanvas=document.createElement('canvas');iconCanvas.width=64;iconCanvas.height=64;
-  var ictx=iconCanvas.getContext('2d');
-  ictx.strokeStyle='#c0c8d8';ictx.lineWidth=4;ictx.lineCap='round';
-  ictx.beginPath();ictx.moveTo(18,22);ictx.lineTo(46,22);ictx.stroke();
-  ictx.beginPath();ictx.moveTo(18,32);ictx.lineTo(46,32);ictx.stroke();
-  ictx.beginPath();ictx.moveTo(18,42);ictx.lineTo(46,42);ictx.stroke();
-  var iconTex=new THREE.CanvasTexture(iconCanvas);iconTex.needsUpdate=true;
-  navMenu.labelMesh=new THREE.Mesh(
-    new THREE.PlaneGeometry(0.3,0.3),
-    new THREE.MeshBasicMaterial({map:iconTex,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false})
-  );
-  navMenu.labelMesh.renderOrder=20;
-  navMenu.labelMesh.position.z=0.02;
-  navMenu.group.add(navMenu.labelMesh);
-
+  navMenu.orb = createCornerOrb(['menu', 'close']);
+  navMenu.orbGlass = navMenu.orb.userData.glassMesh;
+  navMenu.group.add(navMenu.orb);
+  navMenu.mark = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ color: CORNER_ACC.clone(), transparent: true, opacity: 0, depthWrite: false, depthTest: false }));
+  navMenu.mark.renderOrder = 33;
+  navMenu.mark.raycast = function(){};
+  navMenu.group.add(navMenu.mark);
+  buildNavButtons();
   navMenu.group.layers.enable(1);
-  navMenu.group.traverse(function(c){c.layers.enable(1);});
+  navMenu.group.traverse(function(c){ c.layers.enable(1); });
   scene.add(navMenu.group);
 }
 
-function morphNavMenu(t){
-  var pos=navMenu.glassMesh.geometry.attributes.position;
-  var cp=navMenu.glassMesh.userData.circP;
-  // Pick the morph target: the wide product-name bar in lightbox mode, or the normal
-  // open-menu rect otherwise. Same glass material either way.
-  var rp = (navMenu.barMode && navMenu.barP) ? navMenu.barP : navMenu.glassMesh.userData.rectP;
-  for(var i=0;i<pos.count;i++){
-    var i3=i*3;
-    pos.array[i3]=cp[i3]+(rp[i3]-cp[i3])*t;
-    pos.array[i3+1]=cp[i3+1]+(rp[i3+1]-cp[i3+1])*t;
-    pos.array[i3+2]=cp[i3+2]+(rp[i3+2]-cp[i3+2])*t;
-  }
-  pos.needsUpdate=true;
-  navMenu.glassMesh.geometry.computeVertexNormals();
-  navMenu.glassMesh.material.uniforms.morphT.value=t;
-}
-
-// Build vertex positions for the wide product-name bar based on current screen aspect.
-// Same bevel pattern as the normal rect target so the SDF math behaves identically.
-function computeNavBarP(){
-  if(!navMenu.glassMesh) return;
-  var dist = 4.5;
-  var fovRad = camera.fov * Math.PI / 180;
-  var halfH = Math.tan(fovRad/2) * dist;
-  var halfW = halfH * camera.aspect;
-  // Bar spans most of the screen width, with a small right-side margin so the cart icon
-  // area still has air around it.
-  var barRW = Math.max(2 * halfW - 0.9, NAV_RW);
-  navMenu.barRW = barRW;
-  var cols = NAV_SX + 1, rows = NAV_SY + 1;
-  var n = navMenu.glassMesh.geometry.attributes.position.count;
-  var barP = new Float32Array(n * 3);
-  for(var row = 0; row < rows; row++){
-    for(var col = 0; col < cols; col++){
-      var idx = row * cols + col;
-      var u = col / NAV_SX, v = row / NAV_SY;
-      var rx = (u - 0.5) * barRW, ry = (v - 0.5) * NAV_RH;
-      var hw = barRW/2, hh = NAV_RH/2, cr = 0.08;
-      var de = Math.min(Math.abs(rx)-hw+cr, Math.abs(ry)-hh+cr);
-      var rz = (de>-0.01 && de<cr) ? -0.03*(1-Math.max(de,0)/cr)
-             : ((Math.abs(rx)>hw-cr && Math.abs(ry)>hh-cr) ? -0.03 : 0);
-      barP[idx*3] = rx; barP[idx*3+1] = ry; barP[idx*3+2] = rz;
-    }
-  }
-  navMenu.barP = barP;
-}
-
-// Build / replace the product-name text mesh that floats on top of the glass bar.
+// Product-name bar for the image lightbox: the track carries the name instead of the sections.
 function setNavBarText(name){
   if(navMenu.barTextMesh){
     if(navMenu.barTextMesh.parent) navMenu.barTextMesh.parent.remove(navMenu.barTextMesh);
-    if(navMenu.barTextMesh.material.map) navMenu.barTextMesh.material.map.dispose();
+    navMenu.barTextMesh.material.map.dispose();
     navMenu.barTextMesh.geometry.dispose();
     navMenu.barTextMesh.material.dispose();
     navMenu.barTextMesh = null;
   }
   if(!name) return;
-  var canvas = document.createElement('canvas');
-  var ctx = canvas.getContext('2d');
-  var fs = 64;
-  ctx.font = '700 ' + fs + 'px Arial, sans-serif';
-  var tw = ctx.measureText(name).width;
-  canvas.width = Math.ceil(tw + 80);
-  canvas.height = Math.ceil(fs * 1.5);
-  ctx.font = '700 ' + fs + 'px Arial, sans-serif';
-  ctx.fillStyle = '#c0c8d8';
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(name, canvas.width/2, canvas.height/2);
-  var tex = new THREE.CanvasTexture(canvas); tex.needsUpdate = true;
-  var aspect = canvas.width / canvas.height;
-  var th = NAV_RH * 0.65;
-  var twW = th * aspect;
-  // Don't let the text overflow the bar
-  var maxTextW = navMenu.barRW * 0.7;
-  if(twW > maxTextW){ twW = maxTextW; th = twW / aspect; }
-  var textMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(twW, th),
-    new THREE.MeshBasicMaterial({map:tex, transparent:true, side:THREE.DoubleSide, depthWrite:false, depthTest:false})
-  );
-  textMesh.renderOrder = 20;
-  textMesh.position.z = 0.03;
-  textMesh.layers.enable(1);
-  navMenu.group.add(textMesh);
-  navMenu.barTextMesh = textMesh;
+  navMenu.barTextMesh = cornerInkMesh(String(name).toUpperCase(), '700', 64, 6);
+  navMenu.barTextMesh.raycast = function(){};
+  navMenu.barTextMesh.layers.enable(1);
+  navMenu.group.add(navMenu.barTextMesh);
 }
 
 function enterNavBarMode(productName){
   if(!navMenu.glassMesh) return;
-  computeNavBarP();
   navMenu.barMode = true;
-  // Swap the SDF rect-width uniform so the shape mask matches the new wide bar.
-  navMenu.glassMesh.material.uniforms.rW.value = navMenu.barRW;
-  // Hide nav buttons so they don't sprinkle across the bar
-  for(var nbi = 0; nbi < navMenu.buttons.length; nbi++){
-    navMenu.buttons[nbi].group.visible = false;
-  }
-  // Force the unfold animation toward fully open
+  for(var nbi = 0; nbi < navMenu.buttons.length; nbi++) navMenu.buttons[nbi].group.visible = false;
   navMenu.targetT = 1;
   navMenu.animating = true;
   navMenu.open = false; // stays false so the regular menu-open semantics don't apply
@@ -15469,127 +16300,183 @@ function enterNavBarMode(productName){
 
 function exitNavBarMode(){
   if(!navMenu.glassMesh) return;
-  // Trigger fold-back. The actual barMode/rW reset happens once the animation reaches 0
-  // (handled inside positionNavMenu's completion block).
+  // Fold back; barMode and the name are dropped once the track is home (positionNavMenu).
   navMenu.targetT = 0;
   navMenu.animating = true;
 }
 
 function toggleNavMenu(){
   if(navMenu.animating) return;
-  navMenu.animating=true;
-  navMenu.targetT=navMenu.open?0:1;
-  if(!navMenu.open) buildNavButtons();
+  navMenu.animating = true;
+  navMenu.targetT = navMenu.open ? 0 : 1;
+  navMenu.hoverIdx = -1;
 }
 
+// The section labels: ink on the track, plus an invisible hit slot the full height of the track
+// so a tap anywhere over a section takes it (r128 raycasts ignore visibility, which is the point).
 function buildNavButtons(){
-  // Remove old buttons
-  for(var i=0;i<navMenu.buttons.length;i++){
-    scene.remove(navMenu.buttons[i].group);
+  for(var i = 0; i < navMenu.buttons.length; i++){
+    var ob = navMenu.buttons[i];
+    if(ob.group.parent) ob.group.parent.remove(ob.group);
+    ob.mesh.material.map.dispose(); ob.mesh.material.dispose(); ob.mesh.geometry.dispose();
+    ob.hit.material.dispose(); ob.hit.geometry.dispose();
   }
-  navMenu.buttons=[];
-  var labels=['HOME','SHIRTS','1 OF 1S','GALLERY'];
-  var floorMap=[0,1,2,3];
-  for(var bi=0;bi<labels.length;bi++){
-    var bw=0.38, bh=0.2;
-    var bCanvas=document.createElement('canvas');bCanvas.width=128;bCanvas.height=48;
-    var bCtx=bCanvas.getContext('2d');
-    bCtx.font='500 22px Arial';bCtx.fillStyle='#b0b8c8';
-    bCtx.textAlign='center';bCtx.textBaseline='middle';
-    bCtx.fillText(labels[bi],64,24);
-    var bTex=new THREE.CanvasTexture(bCanvas);bTex.needsUpdate=true;
-    var bMesh=new THREE.Mesh(
-      new THREE.PlaneGeometry(bw,bh),
-      new THREE.MeshBasicMaterial({map:bTex,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false})
-    );
-    bMesh.renderOrder=20;
-    var bGroup=new THREE.Group();
-    bGroup.add(bMesh);
-    bGroup.userData.actionId='nav-'+bi;
-    bGroup.userData.clickable=true;
-    bGroup.userData.floorIdx=floorMap[bi];
-    bGroup.layers.enable(1);
-    bGroup.traverse(function(c){c.layers.enable(1);});
-    bGroup.visible=false;
-    scene.add(bGroup);
-    navMenu.buttons.push({group:bGroup,localX:-(labels.length-1)*0.22+bi*0.44,localY:0,floorIdx:floorMap[bi]});
+  navMenu.buttons = [];
+  for(var bi = 0; bi < NAV_LABELS.length; bi++){
+    var mesh = cornerInkMesh(NAV_LABELS[bi], '700', 64, 6);
+    var hit = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ visible: false }));
+    var g = new THREE.Group();
+    g.add(mesh); g.add(hit);
+    g.userData.actionId = 'nav-' + bi;
+    g.userData.clickable = true;
+    g.userData.floorIdx = bi;
+    g.visible = false;
+    g.traverse(function(c){ c.layers.enable(1); });
+    if(navMenu.group) navMenu.group.add(g);
+    navMenu.buttons.push({ group: g, mesh: mesh, hit: hit, floorIdx: bi, label: NAV_LABELS[bi], hoverT: 0 });
   }
+}
+
+// The section the camera is in — the row whose floor is nearest.
+function navCurrentFloor(){
+  var best = 0, bd = 1e9;
+  for(var i = 0; i < floors.length && i < NAV_LABELS.length; i++){
+    var dy = Math.abs(camera.position.y - floors[i].group.position.y);
+    if(dy < bd){ bd = dy; best = i; }
+  }
+  return best;
 }
 
 function positionNavMenu(){
   if(!navMenu.group) return;
-  var time=performance.now()*0.001;
+  var P = DML.P;
 
-  // Morph animation
-  var sp=0.03;
-  if(navMenu.morphT<navMenu.targetT) navMenu.morphT=Math.min(navMenu.morphT+sp,navMenu.targetT);
-  else if(navMenu.morphT>navMenu.targetT) navMenu.morphT=Math.max(navMenu.morphT-sp,navMenu.targetT);
-  var e=navMenu.morphT<.5?4*navMenu.morphT*navMenu.morphT*navMenu.morphT:1-Math.pow(-2*navMenu.morphT+2,3)/2;
-  morphNavMenu(e);
-
-  if(navMenu.animating && Math.abs(navMenu.morphT-navMenu.targetT)<0.001){
-    navMenu.animating=false;
-    navMenu.open=navMenu.targetT>0.5;
+  // Morph timing kept from the glass this replaced: 0.03 a frame, eased in-out cubic.
+  var sp = 0.03;
+  if(navMenu.morphT < navMenu.targetT) navMenu.morphT = Math.min(navMenu.morphT + sp, navMenu.targetT);
+  else if(navMenu.morphT > navMenu.targetT) navMenu.morphT = Math.max(navMenu.morphT - sp, navMenu.targetT);
+  var e = cornerEase(navMenu.morphT);
+  if(navMenu.animating && Math.abs(navMenu.morphT - navMenu.targetT) < 0.001){
+    navMenu.animating = false;
+    navMenu.open = navMenu.targetT > 0.5;
     if(!navMenu.open){
-      for(var i=0;i<navMenu.buttons.length;i++) navMenu.buttons[i].group.visible=false;
-      // Finished folding back from the lightbox bar — drop bar state + remove product name
-      if(navMenu.barMode){
-        navMenu.barMode = false;
-        navMenu.glassMesh.material.uniforms.rW.value = NAV_RW;
-        setNavBarText(null);
-      }
+      for(var i = 0; i < navMenu.buttons.length; i++) navMenu.buttons[i].group.visible = false;
+      if(navMenu.barMode){ navMenu.barMode = false; setNavBarText(null); }
     }
   }
 
-  // Hide/show hamburger icon
-  if(navMenu.labelMesh) navMenu.labelMesh.visible=e<0.3;
-
-  // Fade in product-name text alongside the bar unfold
-  if(navMenu.barTextMesh){
-    navMenu.barTextMesh.visible = navMenu.barMode && e > 0.4;
-    navMenu.barTextMesh.material.opacity = Math.max(0, Math.min(1, (e - 0.4) / 0.5));
-  }
-
-  // Show nav buttons when expanded — but NOT in lightbox bar mode (it's a product-name bar)
-  for(var bi=0;bi<navMenu.buttons.length;bi++){
-    navMenu.buttons[bi].group.visible = !navMenu.barMode && e>0.6;
-  }
-
-  // Screen position — top-left
-  var dist=4.5;var fovRad=camera.fov*Math.PI/180;
-  var halfH=Math.tan(fovRad/2)*dist;var halfW=halfH*camera.aspect;
-  var iconX=-halfW+0.30, iconY=halfH-0.30;
-  // Shift right as it opens so the LEFT edge stays anchored at the icon position
-  // (the bar unfolds to the right, not symmetrically around the icon)
-  var openShift = navMenu.barMode ? (navMenu.barRW/2 - NAV_CR) : 0.7;
-  var openX=iconX+openShift*e;
-  var targetWorldX=camera.position.x+openX;
-  var targetWorldY=camera.position.y+iconY;
-
-  if(!navMenu.initialized){
-    navMenu.physX=targetWorldX;navMenu.physY=targetWorldY;navMenu.initialized=true;
-  }
-  // Nav menu tether — faster when nav scroll is animating so menu leads the camera
-  var navTetherSpeed=navScrollAnim.active?0.5:0.45;
-  navMenu.physX+=(targetWorldX-navMenu.physX)*navTetherSpeed;
-  navMenu.physY+=(targetWorldY-navMenu.physY)*navTetherSpeed;
-
-  var offset=new THREE.Vector3(navMenu.physX-camera.position.x,navMenu.physY-camera.position.y,-dist);
-  offset.applyQuaternion(camera.quaternion);
-  navMenu.group.position.copy(camera.position).add(offset);
+  // ── the corner ──
+  var d = cornerOrbD(), r = d * 0.5, R = cornerSeatR(d), blend = cornerBlend(d);
+  var dist = CORNER_DIST, halfH = Math.tan(camera.fov * Math.PI / 360) * dist, halfW = halfH * camera.aspect;
+  var ins = cornerInset(d);
+  var targetWorldX = camera.position.x - halfW + ins, targetWorldY = camera.position.y + halfH - ins;
+  if(!navMenu.initialized){ navMenu.physX = targetWorldX; navMenu.physY = targetWorldY; navMenu.initialized = true; }
+  // Tether — faster while a nav scroll is animating, so the menu leads the camera
+  var tether = navScrollAnim.active ? 0.5 : 0.45;
+  navMenu.physX += (targetWorldX - navMenu.physX) * tether;
+  navMenu.physY += (targetWorldY - navMenu.physY) * tether;
+  _navOff.set(navMenu.physX - camera.position.x, navMenu.physY - camera.position.y, -dist).applyQuaternion(camera.quaternion);
+  navMenu.group.position.copy(camera.position).add(_navOff);
   navMenu.group.quaternion.copy(camera.quaternion);
 
-  // Position nav buttons along the expanded bar
-  for(var bi2=0;bi2<navMenu.buttons.length;bi2++){
-    var nb=navMenu.buttons[bi2];
-    var bOffset=new THREE.Vector3(navMenu.physX-camera.position.x+nb.localX,navMenu.physY-camera.position.y+nb.localY,-dist+0.02);
-    bOffset.applyQuaternion(camera.quaternion);
-    nb.group.position.copy(camera.position).add(bOffset);
-    nb.group.quaternion.copy(camera.quaternion);
+  // ── the track's finished layout, local units with the orb at the origin ──
+  var lh = P.navFont * d, gap = P.navGap * d, lead = P.navLead * d;
+  // The open track stops short of the bag's seat across the top. Where the screen is too narrow
+  // for the sections, they shrink together — type, gaps and leads — rather than run under the bag.
+  var avail = (2 * halfW - 2 * ins) - 2 * R - 0.15 * d;   // nav seat's right edge → bag seat's left edge
+  if(!navMenu.barMode && avail > 0){
+    var natural = 2 * lead + gap * (navMenu.buttons.length - 1);
+    for(var fi = 0; fi < navMenu.buttons.length; fi++){
+      var mu = navMenu.buttons[fi].mesh.userData;
+      natural += lh / mu.inkGlyph * mu.inkAspect;
+    }
+    if(natural > avail){ var fit = avail / natural; lh *= fit; gap *= fit; lead *= fit; }
   }
+  var x = R + lead, slots = [];
+  if(navMenu.barMode && navMenu.barTextMesh){
+    var bw = cornerInkFit(navMenu.barTextMesh, lh);
+    var maxW = Math.max(0.1, avail - 2 * lead);                       // the same room
+    if(bw > maxW){ cornerInkFit(navMenu.barTextMesh, lh * maxW / bw); bw = maxW; }
+    slots.push({ x: x + bw * 0.5, w: bw });
+    x += bw;
+  } else {
+    for(var bi = 0; bi < navMenu.buttons.length; bi++){
+      var w = cornerInkFit(navMenu.buttons[bi].mesh, lh);
+      if(bi > 0) x += gap;
+      slots.push({ x: x + w * 0.5, w: w });
+      x += w;
+    }
+  }
+  var end = x + lead;
+  var hwF = (end + R) * 0.5, cxF = (end - R) * 0.5;
 
-  navMenu.glassMesh.material.uniforms.time.value=time;
-  navMenu.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
+  // ── the frost: the seat, and the track budding out of it ──
+  // It leaves the seat as a smaller bubble and swells to the track's full height as it runs out,
+  // ahead of the ink (uniBudLead, as the product card's tracks reach their orbs first).
+  var fb = Math.min(1, e * Math.max(0.1, P.uniBudLead));
+  var segs = [{ x: 0, y: 0, hw: R, hh: R, r: R }];
+  if(e > 0.001){
+    var hh = R * (0.55 + 0.45 * fb);
+    segs.push({ x: cxF * fb, y: 0, hw: Math.max(hh, R * 0.55 + (hwF - R * 0.55) * fb), hh: hh, r: hh });
+  }
+  // The neck belongs to the bud; a finished track is a clean pill (smin swells two coincident
+  // edges by blend/4, which read as the seat bulging out of the track).
+  // The surround is CLEAR glass (P.cornerLens) curling over its outer 30% like the bubble's rim;
+  // the button is the stained one. The bar's band runs from the first section to the last.
+  var band = null;
+  if(slots.length){
+    var bx0 = slots[0].x - slots[0].w * 0.5, bx1 = slots[slots.length - 1].x + slots[slots.length - 1].w * 0.5;
+    band = { x: (bx0 + bx1) * 0.5, y: 0, hw: (bx1 - bx0) * 0.5, hh: lh * P.navBandH, amt: P.navBand * cornerRamp(e, 0.35, 0.8), lift: P.navBandLift };
+  }
+  feedCornerPane(navMenu.glassMesh, segs, [{ x: 0, y: 0, r: r * P.sizeHole }], blend * (1 - 0.9 * fb), 1, 1,
+                 { lens: P.cornerLens, lensW: 0.3 * R, band: band });
+  navMenu.glassMesh.visible = true;
+
+  // ── the orb: menu bars, then the × ──
+  navMenu.orb.position.set(0, 0, CORNER_Z + 0.04 * d);
+  navMenu.orb.scale.setScalar(d);
+  var xs = cornerRamp(e, 0.15, 0.85);
+  navMenu.orb.userData.icons.menu.material.opacity = 1 - xs;
+  navMenu.orb.userData.icons.close.material.opacity = xs;
+  feedCornerOrb(navMenu.orb);
+
+  // ── the ink ──
+  // After 0.6 only: the glass capture restores these to `e > 0.6` every frame, so that is the
+  // threshold. Each section lands 40 ms of morph after the one before, the current one last.
+  var cur = navCurrentFloor(), time = performance.now() * 0.001;
+  for(var li = 0; li < navMenu.buttons.length; li++){
+    var b = navMenu.buttons[li], sl = slots[li];
+    var on = !navMenu.barMode && e > 0.6 && sl;
+    b.group.visible = !!on;
+    if(!sl) continue;
+    var o = cornerRamp(e, 0.6 + li * 0.04, 0.85 + li * 0.04);
+    var hot = (li === navMenu.hoverIdx && navMenu.open) ? 1 : 0;
+    b.hoverT += (hot - b.hoverT) * 0.25;
+    var acc = Math.max(li === cur ? 1 : 0, b.hoverT);
+    _navCol.copy(CORNER_INK).lerp(CORNER_ACC_TYPE, acc);
+    b.mesh.material.color.copy(_navCol);
+    // Opacity, not visibility, keeps them off the name bar: the glass capture resets every
+    // section's visibility to e > 0.6 after this runs, and the bar is open too.
+    b.mesh.material.opacity = navMenu.barMode ? 0 : o;
+    b.mesh.position.set(sl.x, 0, CORNER_Z);
+    b.hit.position.set(sl.x, 0, CORNER_Z);
+    b.hit.scale.set(sl.w + gap, 2 * R, 1);
+    if(li === cur){
+      // "you are here": a short accent rule under the section, the strip's grammar of a mark
+      // that carries a fact. It draws out from the centre once the label has landed.
+      var mw = sl.w * 0.42 * cornerRamp(e, 0.8, 1.0);
+      navMenu.mark.position.set(sl.x, -lh * 0.95, CORNER_Z);
+      navMenu.mark.scale.set(Math.max(1e-4, mw), Math.max(2 * cornerWpp(), 0.05 * d), 1);
+      navMenu.mark.material.opacity = o;
+      navMenu.mark.visible = !!on;
+    }
+  }
+  if(navMenu.barMode || e <= 0.6) navMenu.mark.visible = false;
+  if(navMenu.barTextMesh){
+    navMenu.barTextMesh.visible = navMenu.barMode && e > 0.4 && slots.length > 0;
+    if(slots[0]) navMenu.barTextMesh.position.set(slots[0].x, 0, CORNER_Z);
+    navMenu.barTextMesh.material.opacity = cornerRamp(e, 0.4, 0.9);
+  }
 }
 
 // ══════════════════════════════════════════════
@@ -16861,10 +17748,8 @@ function updateCartShake(dt) {
 
 // Update cart glass shader's degradation uniform every frame (lerp toward target)
 function updateCartDegradation(dt) {
-  if(!cart.glassMesh) return;
-  if(cart.glassMesh.material.uniforms.degradation){
-    cart.glassMesh.material.uniforms.degradation.value = Math.min(cartDegradation, CART_BREAK_THRESHOLD);
-  }
+  if(!cart.crackMesh) return;
+  cart.crackMesh.material.uniforms.degradation.value = Math.min(cartDegradation, CART_BREAK_THRESHOLD);
 }
 
 // Break the cart panel apart: hide it, spawn a bouncy "center-star" ball, then
@@ -17489,8 +18374,9 @@ function updateCartBouncyBalls(dt){
     var cartScale = (cart.iconGroup.scale && cart.iconGroup.scale.x) || 1;
     // Approximate the morphed shape as a rectangle that grows from icon → panel.
     // At cartMorphT=0 it's a small square (≈ icon circle); at cartMorphT=1 it's the full panel.
-    var halfRW = (CART_CR + (CART_RW*0.5 - CART_CR) * cartMorphT) * cartScale;
-    var halfRH = (CART_CR + (CART_RH*0.5 - CART_CR) * cartMorphT) * cartScale;
+    var seatH = cartSeatHalf();
+    var halfRW = (seatH + (CART_RW*0.5 - seatH) * cartMorphT) * cartScale;
+    var halfRH = (seatH + (CART_RH*0.5 - seatH) * cartMorphT) * cartScale;
     cartObstacle = { x: cwp.x, y: cwp.y, halfW: halfRW, halfH: halfRH };
   }
 
@@ -17830,10 +18716,12 @@ function renderGlassFBO() {
   // everything above: they sample this buffer, so they cannot be in it.
   try { DML.setHidden('fbo', true); } catch(_dmlE){}
   STOREFRONT_MODEL.captureHidden(true);
+  VIEWER.fbo(true);
   renderer.setRenderTarget(glassFBO);
   renderer.clear();
   renderer.render(scene,camera);
   renderer.setRenderTarget(null);
+  VIEWER.fbo(false);
   STOREFRONT_MODEL.captureHidden(false);
   try { DML.setHidden('fbo', false); } catch(_dmlE2){}
   if(_chudLbl) _chudLbl.visible = true;
@@ -17918,91 +18806,49 @@ function renderGlassFBO() {
   }}
 }
 
-// ── Cart System (morphable glass circle to rectangle) ──
-var CART_CR = 0.25, CART_RW = 2.1, CART_RH = 3.375, CART_THICK = 0.06;
-var CART_SX = 40, CART_SY = 40, CART_PERIM = 80;
+// ── Cart System (a corner orb whose seat grows into the panel) ──
+// Closed it is the nav's twin: a glass orb wearing the bag, seated in frost (THE CORNER ORBS).
+// Opening grows the seat into the panel — the frost morphs from the seat's circle to the panel's
+// rounded rect while the group glides to wherever the panel lives — and the bag orb dissolves into
+// it the way the size toggle's outer orbs dissolve into their track. The panel then forms its own
+// orbs: × nested in its top corner, → (checkout) nested in its bottom corner, − / + on each line.
+// A title tab melted onto the top edge carries CART and the count, as the description box's bump
+// carries the product's name. Weight, cracks, the fall and the shatter are unchanged; the cracks
+// are a decal over the frost (cart.crackMesh) now that the panel is the shared glass.
+var CART_RW = 2.1, CART_RH = 3.375;
 var cartMorphT = 0, cartTargetT = 0;
+// Panel layout, world units at CORNER_DIST. Kept here so the panel content and the frost cut-outs
+// read one set of numbers.
+var CART_TAB_RISE = 0.40, CART_TAB_H = 0.50, CART_TAB_INSET = 0.26, CART_TITLE_H = 0.15;
+// The panel's orbs: the corner orb's size where it fits, never more than this share of the panel.
+function cartPanelOrbD(){ return Math.min(cornerOrbD(), 0.24 * CART_RW); }
+// The closed seat's half-size — what the bouncing balls collide with when the panel is shut.
+function cartSeatHalf(){ return cornerSeatR(cornerOrbD()); }
 
-function createCartIcon() {
-  cart.iconGroup = new THREE.Group();
-  var cols=CART_SX+1, rows=CART_SY+1;
-  var geo = new THREE.PlaneGeometry(CART_RW, CART_RH, CART_SX, CART_SY);
-  var pos = geo.attributes.position;
-  var circP = new Float32Array(pos.count*3);
-  var rectP = new Float32Array(pos.count*3);
-  for(var row=0;row<rows;row++){
-    for(var col=0;col<cols;col++){
-      var idx=row*cols+col, u=col/CART_SX, v=row/CART_SY;
-      var rx=(u-.5)*CART_RW, ry=(v-.5)*CART_RH;
-      var dE=Math.min(u,1-u,v,1-v);
-      var rz=(dE<.08)?-CART_THICK*(1-dE/.08)*(1-dE/.08):0;
-      rectP[idx*3]=rx;rectP[idx*3+1]=ry;rectP[idx*3+2]=rz;
-      var cx2=(u-.5)*2,cy2=(v-.5)*2,d=Math.sqrt(cx2*cx2+cy2*cy2);
-      var px=0,py=0;
-      if(d>.001){var cl=Math.min(d,1);px=(cx2/d)*cl*CART_CR;py=(cy2/d)*cl*CART_CR;}
-      // Bead bevel (matches nav menu): inner 70% flat, outer 30% curves back to -0.04.
-      var rim=Math.min(d,1);
-      var cz=(rim>.7)?-0.04*((rim-.7)/.3)*((rim-.7)/.3):0;
-      circP[idx*3]=px;circP[idx*3+1]=py;circP[idx*3+2]=cz;
-    }
-  }
-  for(var k=0;k<pos.count*3;k++) pos.array[k]=circP[k];
-  pos.needsUpdate=true; geo.computeVertexNormals();
-
-  // Glass shader - ALWAYS active, SDF handles circle/rect masking
-  var cartScratchTex = generateScratchTexture();
-  var glassMat = new THREE.ShaderMaterial({
-    uniforms:{
-      tBg:{value:null}, res:{value:new THREE.Vector2(window.innerWidth,window.innerHeight)},
-      morphT:{value:0}, cR:{value:CART_CR}, rW:{value:CART_RW}, rH:{value:CART_RH}, time:{value:0},
-      tScratch:{value:cartScratchTex},
-      tFrost:{value:generateFrostTexture()},
-      blurAmt:{value:2.925}, // pixel-radius for the glass blur (0.65× of 4.5)
-      degradation:{value:0.0}, // 0..1 — cracks rise from bottom as cart absorbs impact
-      darkenTop:{value:1.10}, // Y in panel-space — above this is the lighter header zone
-      darkenBot:{value:-1.05}, // Y in panel-space — below this is the lighter footer zone
-      indentDepth:{value:0.06} // Z displacement for the recessed center region
+function cartCrackMaterial(){
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      degradation: { value: 0.0 }, morphT: { value: 0.0 },
+      hsize: { value: new THREE.Vector2(0.5, 0.5) }, rad: { value: 0.2 }, aa: { value: 0.01 }
     },
     vertexShader: [
-      'uniform float morphT, darkenTop, darkenBot, indentDepth;',
-      'varying vec3 vN,vV,vLP;',
       'varying vec2 vUv;',
-      'void main(){',
-      '  vec3 pos = position;',
-      '  // Push the center indent zone back on Z (only when in panel form).',
-      '  // Hard step at the boundary so the indent has a crisp edge, not a fade.',
-      '  float topFade = 1.0 - step(darkenTop, position.y);',
-      '  float botFade = step(darkenBot, position.y);',
-      '  float indentMask = topFade * botFade * morphT;',
-      '  pos.z -= indentMask * indentDepth;',
-      '  vLP = pos;',
-      '  vUv = uv;',
-      '  vec4 mv = modelViewMatrix * vec4(pos, 1.0);',
-      '  vN = normalize(normalMatrix * normal);',
-      '  vV = normalize(-mv.xyz);',
-      '  gl_Position = projectionMatrix * mv;',
-      '}'
+      'void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }'
     ].join('\n'),
     fragmentShader: [
-      'uniform sampler2D tBg,tScratch,tFrost;',
-      'uniform vec2 res;',
-      'uniform float morphT,cR,rW,rH,time,blurAmt,degradation,darkenTop,darkenBot;',
-      'varying vec3 vN,vV,vLP;',
+      'uniform float degradation, morphT, rad, aa;',
+      'uniform vec2 hsize;',
       'varying vec2 vUv;',
-      GLARE_GLSL_FUNCS,
-      'float sdCircle(vec2 p,float r){return length(p)-r;}',
-      'float sdRRect(vec2 p,vec2 b,float r){vec2 d2=abs(p)-b+r;return length(max(d2,0.0))+min(max(d2.x,d2.y),0.0)-r;}',
-      // Procedural crack pattern — cracks emanate from the bottom edge.
-      // Cracks taper from thick at the base to a point at the tip, with sub-branches.
+      'float sdRoundRect(vec2 p, vec2 h, float r){ vec2 d = abs(p) - (h - vec2(r)); return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - r; }',
+      // The glass panel's own crack pattern, unchanged: cracks rise from the bottom edge, taper to
+      // a point, and branch once the damage passes ~0.3.
       'float crackLine(vec2 uv, vec2 origin, float angle, float crackLen){',
       '  vec2 d = uv - origin;',
       '  float c = cos(angle), s = sin(angle);',
-      '  float along  = c * d.x + s * d.y;',
+      '  float along = c * d.x + s * d.y;',
       '  float across = abs(-s * d.x + c * d.y);',
       '  if(along < 0.0 || along > crackLen) return 0.0;',
-      '  // Wobble — gives the line organic, jagged shape',
       '  float wob = sin(along * 32.0) * 0.014 + cos(along * 67.0) * 0.007 + sin(along * 113.0) * 0.003;',
-      '  // Taper: thick near base, sharp point at tip',
       '  float t = along / crackLen;',
       '  float taper = 1.0 - t;',
       '  float thickness = 0.026 * (0.35 + 0.65 * taper);',
@@ -18012,7 +18858,6 @@ function createCartIcon() {
       '  if(deg <= 0.0) return 0.0;',
       '  float maxLen = deg * 1.4;',
       '  float total = 0.0;',
-      '  // Main cracks — all emanate from the bottom edge (vUv.y = 0)',
       '  total = max(total, crackLine(uv, vec2(0.13, 0.0), 1.45, maxLen * 0.95));',
       '  total = max(total, crackLine(uv, vec2(0.24, 0.0), 1.30, maxLen * 0.70));',
       '  total = max(total, crackLine(uv, vec2(0.36, 0.0), 1.85, maxLen * 0.85));',
@@ -18021,7 +18866,6 @@ function createCartIcon() {
       '  total = max(total, crackLine(uv, vec2(0.71, 0.0), 1.70, maxLen * 0.65));',
       '  total = max(total, crackLine(uv, vec2(0.82, 0.0), 1.20, maxLen * 0.78));',
       '  total = max(total, crackLine(uv, vec2(0.91, 0.0), 1.65, maxLen * 0.55));',
-      '  // Sub-branches — shorter cracks branching off the main lines (when degradation > ~0.3)',
       '  float branchLen = maxLen * 0.45;',
       '  if(deg > 0.3){',
       '    total = max(total, crackLine(uv, vec2(0.18, 0.08), 1.10, branchLen));',
@@ -18033,135 +18877,83 @@ function createCartIcon() {
       '  }',
       '  return clamp(total, 0.0, 1.0);',
       '}',
-      // Damage zone at the bottom — the area where cracks originate looks chipped/fractured
       'float damageZone(vec2 uv, float deg){',
       '  if(deg <= 0.0) return 0.0;',
-      '  float bandH = 0.03 + deg * 0.04;', // taller as degradation grows
-      '  float dist = uv.y;',
-      '  if(dist > bandH) return 0.0;',
-      '  // Jagged top edge of the damage band',
+      '  float bandH = 0.03 + deg * 0.04;',
+      '  if(uv.y > bandH) return 0.0;',
       '  float jag = sin(uv.x * 47.0) * 0.008 + cos(uv.x * 91.0) * 0.005;',
-      '  float intensity = smoothstep(bandH + jag, 0.0, dist);',
-      '  return intensity * deg;',
-      '}',
-      // 9-tap weighted blur (Gaussian-ish) — frosted-glass softening on top of refraction
-      'vec3 blurredSample(vec2 uv){',
-      '  vec2 b = blurAmt / res;',
-      '  vec3 c = texture2D(tBg, uv).rgb * 0.20;',
-      '  c += texture2D(tBg, uv + vec2( b.x, 0.0)).rgb * 0.13;',
-      '  c += texture2D(tBg, uv + vec2(-b.x, 0.0)).rgb * 0.13;',
-      '  c += texture2D(tBg, uv + vec2(0.0,  b.y)).rgb * 0.13;',
-      '  c += texture2D(tBg, uv + vec2(0.0, -b.y)).rgb * 0.13;',
-      '  c += texture2D(tBg, uv + vec2( b.x,  b.y)).rgb * 0.07;',
-      '  c += texture2D(tBg, uv + vec2( b.x, -b.y)).rgb * 0.07;',
-      '  c += texture2D(tBg, uv + vec2(-b.x,  b.y)).rgb * 0.07;',
-      '  c += texture2D(tBg, uv + vec2(-b.x, -b.y)).rgb * 0.07;',
-      '  return c;',
+      '  return smoothstep(bandH + jag, 0.0, uv.y) * deg;',
       '}',
       'void main(){',
-      '  vec3 N=normalize(vN); vec3 V=normalize(vV);',
-      '  float sd=mix(sdCircle(vLP.xy,cR),sdRRect(vLP.xy,vec2(rW,rH)*0.5,0.12),morphT);',
-      '  float edge=fwidth(sd)*1.5;',
-      '  float alpha=1.0-smoothstep(-edge,edge,sd);',
-      '  if(alpha<0.01)discard;',
-      '  float glow=smoothstep(edge*4.0,0.0,abs(sd))*0.5;',
-      '  vec2 suv=gl_FragCoord.xy/res;',
-      '  vec2 refr=N.xy*0.15;',
-      '  refr+=0.003*vec2(sin(time*1.5+suv.y*8.0),cos(time*1.2+suv.x*8.0));',
-      '  float ef=1.0-abs(dot(V,N));',
-      '  float ca=0.23*(0.3+ef*2.5);',
-      '  vec2 ru=suv+refr*(1.0+ca),gu=suv+refr,bu=suv+refr*(1.0-ca);',
-      // Blurred refraction — chromatic aberration with frosted-glass softening
-      '  float r=blurredSample(ru).r;',
-      '  float g=blurredSample(gu).g;',
-      '  float b=blurredSample(bu).b;',
-      '  vec3 col=vec3(r,g,b);',
-      // Slight darken to lift contrast against bright backgrounds
-      '  col *= 0.92;',
-      '  float fresnel=pow(1.0-max(dot(V,N),0.0),2.0)*0.15;',
-      '  col=mix(col,vec3(0.95,0.96,0.98),fresnel*0.1);',
-      '  col+=vec3(0.7,0.75,0.9)*glow*0.3;',
-      GLASS_TINT_GLSL,
-      GLARE_GLSL_CALC,
-      '  col+=glareResult;',
-      // Indent zone — hard step at boundary, lighter than before, more frosted.
-      // Mixes toward a cool light blue (frost), with a gentle darken so the
-      // recessed area still reads as different from the borders without
-      // creating a stark contrast.
-      '  float vTopFade = 1.0 - step(darkenTop, vLP.y);',
-      '  float vBotFade = step(darkenBot, vLP.y);',
-      '  float darkMask = vTopFade * vBotFade * morphT;',
-      '  // Frost: heavy mix toward a soft light blue blurs refraction detail',
-      '  col = mix(col, vec3(0.78, 0.84, 0.93), darkMask * 0.45);',
-      '  // Mild darken — just enough to differentiate from the borders',
-      '  col *= mix(1.0, 0.88, darkMask);',
-      // Cracks — only meaningful in panel mode (morphT high)
+      '  if(degradation <= 0.0 || morphT <= 0.0) discard;',
+      '  vec2 p = (vUv - 0.5) * 2.0 * hsize;',
+      '  float inside = clamp(-sdRoundRect(p, hsize, min(rad, min(hsize.x, hsize.y))) / aa, 0.0, 1.0);',
+      '  if(inside <= 0.0) discard;',
       '  float cracks = crackPattern(vUv, degradation) * morphT;',
-      '  // Damage zone at bottom — chipped, darkened band that grows with degradation',
-      '  float dmgZone = damageZone(vUv, degradation) * morphT;',
-      '  // Apply damage band — dark, fractured-looking',
-      '  col = mix(col, vec3(0.04, 0.06, 0.12), dmgZone * 0.85);',
-      '  col += vec3(0.85, 0.92, 1.0) * dmgZone * 0.35;',
-      '  // Dark crevasse inside the crack',
-      '  col = mix(col, vec3(0.01, 0.02, 0.06), cracks * 0.95);',
-      '  // Bright stress edge along the crack (catches simulated light)',
-      '  col += vec3(0.95, 0.97, 1.0) * cracks * 0.85;',
-      '  // Whole-panel darkens as degradation grows',
-      '  col *= mix(1.0, 0.82, degradation * morphT * 0.45);',
-      '  gl_FragColor=vec4(col,alpha);',
+      '  float dmg = damageZone(vUv, degradation) * morphT;',
+      // Over light frost a fracture reads as a thin dark line with a bright stress halo either side
+      // (the glass panel's bright lines vanished against frost). Layered as the glass shader did:
+      // the chipped band first, the cracks over it, then the whole pane greying with the damage —
+      // composited into one colour/alpha so the decal is exact over whatever the frost shows.
+      '  float coreA = smoothstep(0.55, 0.95, cracks) * 0.8;',
+      '  float haloA = smoothstep(0.12, 0.5, cracks) * 0.5 * (1.0 - coreA);',
+      '  float A1 = coreA + haloA;',
+      '  vec3 C1A = vec3(0.10, 0.13, 0.20) * coreA + vec3(1.0) * haloA;',
+      '  float A2 = dmg * 0.85;',
+      '  vec3 C2 = vec3(0.04, 0.06, 0.12) + vec3(0.85, 0.92, 1.0) * 0.412;',
+      '  float g = degradation * morphT * 0.45 * 0.18;',
+      '  float A = 1.0 - (1.0 - A2) * (1.0 - A1) * (1.0 - g);',
+      '  if(A <= 0.001) discard;',
+      '  vec3 CA = (C2 * A2 * (1.0 - A1) + C1A) * (1.0 - g);',
+      '  gl_FragColor = vec4(CA / A, A * inside);',
       '}'
     ].join('\n'),
-    transparent:true, side:THREE.DoubleSide, depthWrite:true
+    transparent: true, depthWrite: false, depthTest: false, side: THREE.DoubleSide
   });
+}
 
-  cart.glassMesh = new THREE.Mesh(geo, glassMat);
-  cart.glassMesh.renderOrder = 10; // render after scene objects so depthWrite occludes them
-  cart.glassMesh.userData.circP = circP;
-  cart.glassMesh.userData.rectP = rectP;
+function createCartIcon() {
+  cart.iconGroup = new THREE.Group();
+  cart.glassMesh = createCornerPane();             // the seat, and the panel it grows into
   cart.iconGroup.add(cart.glassMesh);
-
-  // Bag icon overlay
-  var ic=document.createElement('canvas');ic.width=96;ic.height=96;
-  var ix=ic.getContext('2d');ix.strokeStyle='#4a5268';ix.lineWidth=3;ix.lineCap='round';ix.lineJoin='round';
-  ix.beginPath();ix.moveTo(30,38);ix.lineTo(27,75);ix.lineTo(69,75);ix.lineTo(66,38);ix.closePath();ix.stroke();
-  ix.beginPath();ix.arc(48,38,13,Math.PI,0);ix.stroke();
-  var itx=new THREE.CanvasTexture(ic);itx.needsUpdate=true;
-  cart.iconOverlay=new THREE.Mesh(new THREE.PlaneGeometry(0.22,0.22),new THREE.MeshBasicMaterial({map:itx,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
-  cart.iconOverlay.renderOrder=20;
-  cart.iconOverlay.position.z=0.03;
-  cart.iconGroup.add(cart.iconOverlay);
-
-  cart.countMesh=null;
+  cart.crackMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), cartCrackMaterial());
+  cart.crackMesh.renderOrder = 30.5;
+  cart.crackMesh.frustumCulled = false;
+  cart.crackMesh.raycast = function(){};
+  cart.iconGroup.add(cart.crackMesh);
+  cart.orb = createCornerOrb(['bag']);
+  cart.orbGlass = cart.orb.userData.glassMesh;
+  cart.iconGroup.add(cart.orb);
+  cart.iconOverlay = cart.orb;                     // older code shows/hides the icon by this name
+  cart.countMesh = null;
   cart.iconGroup.layers.enable(1);
-  cart.iconGroup.traverse(function(c){c.layers.enable(1);});
+  cart.iconGroup.traverse(function(c){ c.layers.enable(1); });
   scene.add(cart.iconGroup);
 }
 
-function morphCartShape(eased) {
-  var pos=cart.glassMesh.geometry.attributes.position;
-  var cp=cart.glassMesh.userData.circP, rp=cart.glassMesh.userData.rectP;
-  for(var i=0;i<pos.count;i++){var i3=i*3;
-    pos.array[i3]=cp[i3]+(rp[i3]-cp[i3])*eased;
-    pos.array[i3+1]=cp[i3+1]+(rp[i3+1]-cp[i3+1])*eased;
-    pos.array[i3+2]=cp[i3+2]+(rp[i3+2]-cp[i3+2])*eased;
-  }
-  pos.needsUpdate=true;
-  cart.glassMesh.geometry.computeVertexNormals();
-  cart.glassMesh.material.uniforms.morphT.value=eased;
-}
-
+// The count: a readout, so it is the accent — a teal disc on the orb's rim with the number in it.
 function updateCartIcon() {
-  var count=getCartCount();
-  if(cart.countMesh){cart.iconGroup.remove(cart.countMesh);cart.countMesh.geometry.dispose();cart.countMesh.material.dispose();cart.countMesh=null;}
-  if(count>0){
-    var c=document.createElement('canvas');c.width=48;c.height=48;
-    var x=c.getContext('2d');x.fillStyle='rgba(100,126,234,0.95)';x.beginPath();x.arc(24,24,20,0,Math.PI*2);x.fill();
-    x.fillStyle='#fff';x.font='bold 22px Arial';x.textAlign='center';x.textBaseline='middle';x.fillText(''+count,24,24);
-    var tx=new THREE.CanvasTexture(c);tx.needsUpdate=true;
-    cart.countMesh=new THREE.Mesh(new THREE.PlaneGeometry(0.18,0.18),new THREE.MeshBasicMaterial({map:tx,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
-    cart.countMesh.renderOrder=20;
-    cart.countMesh.userData.noTint = true; // skip icon contrast tinting
-    cart.countMesh.position.set(0.14,0.14,0.04);cart.iconGroup.add(cart.countMesh);
+  var count = getCartCount();
+  if(cart.countMesh){
+    cart.iconGroup.remove(cart.countMesh);
+    cart.countMesh.geometry.dispose(); cart.countMesh.material.map.dispose(); cart.countMesh.material.dispose();
+    cart.countMesh = null;
+  }
+  if(count > 0){
+    var c = document.createElement('canvas'); c.width = c.height = 96;
+    var x = c.getContext('2d');
+    x.fillStyle = 'rgb(16,196,178)'; x.beginPath(); x.arc(48, 48, 44, 0, Math.PI * 2); x.fill();
+    x.strokeStyle = 'rgba(255,255,255,0.85)'; x.lineWidth = 4; x.stroke();
+    x.fillStyle = '#ffffff'; x.font = '700 ' + (count > 9 ? 40 : 50) + 'px Arial, Helvetica, sans-serif';
+    x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText('' + count, 48, 51);
+    var tx = new THREE.CanvasTexture(c); tx.needsUpdate = true;
+    cart.countMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ map: tx, transparent: true, side: THREE.DoubleSide, depthWrite: false, depthTest: false }));
+    cart.countMesh.renderOrder = 33;
+    cart.countMesh.userData.noTint = true;         // skip icon contrast tinting
+    cart.countMesh.raycast = function(){};
+    cart.countMesh.layers.enable(1);
+    cart.iconGroup.add(cart.countMesh);
   }
 }
 
@@ -18173,21 +18965,19 @@ var cartOverlays = []; // {mesh, localOffset, physX, physY, physZ}
 function positionCartIcon() {
   if(!cart.iconGroup) return;
   var time=performance.now()*0.001;
-  
+
   // Morph animation
   var sp=0.025;
   if(cartMorphT<cartTargetT) cartMorphT=Math.min(cartMorphT+sp,cartTargetT);
   else if(cartMorphT>cartTargetT) cartMorphT=Math.max(cartMorphT-sp,cartTargetT);
-  var e=cartMorphT<.5?4*cartMorphT*cartMorphT*cartMorphT:1-Math.pow(-2*cartMorphT+2,3)/2;
-  
-  morphCartShape(e);
-  
+  var e=cornerEase(cartMorphT);
+
   // Check if animation just finished
   if(cart.panelAnimating && Math.abs(cartMorphT-cartTargetT)<0.001){
     cart.panelAnimating=false;
     cart.panelOpen=cart.panelTargetState;
     if(!cart.panelOpen){
-      if(cart.panelGroup){scene.remove(cart.panelGroup);cart.panelGroup=null;}
+      if(cart.panelGroup){scene.remove(cart.panelGroup);disposeCartPanel(cart.panelGroup);cart.panelGroup=null;}
       // Remove overlay buttons
       for(var oi=0;oi<cartOverlays.length;oi++){
         scene.remove(cartOverlays[oi].group);
@@ -18198,11 +18988,12 @@ function positionCartIcon() {
       updateCartIcon();
     }
   }
-  
-  // Position: lerp from top-right corner to center-ish
-  var dist=4.5;var fovRad=camera.fov*Math.PI/180;
-  var halfH=Math.tan(fovRad/2)*dist;var halfW=halfH*camera.aspect;
-  var iconX=halfW-0.30, iconY=halfH-0.30;
+
+  // Position: lerp from the top-right corner (the nav's mirror inset) to the panel's place
+  var d=cornerOrbD(), r=d*0.5, R=cornerSeatR(d);
+  var dist=CORNER_DIST;var halfH=Math.tan(camera.fov*Math.PI/360)*dist;var halfW=halfH*camera.aspect;
+  var ins=cornerInset(d);
+  var iconX=halfW-ins, iconY=halfH-ins;
   var baseX=cart.dragOffsetX||0, baseY=cart.dragOffsetY||0;
   var panelX=baseX*halfW*2, panelY=baseY*halfH*2;
   var finalX=iconX+(panelX-iconX)*e;
@@ -18211,30 +19002,30 @@ function positionCartIcon() {
   if(cartPanelFall && cartPanelFall.y_offset > 0) {
     finalY -= cartPanelFall.y_offset * e;
   }
-  // Clamp expanded panel within viewport bounds
+  // Clamp expanded panel within viewport bounds — the title tab rises above the top edge
   if(e>0.01){
-    var pw=CART_RW*0.5*e, ph=CART_RH*0.5*e;
+    var pw=CART_RW*0.5*e, ph=CART_RH*0.5*e, tab=CART_TAB_RISE*e;
     var margin=0.15;
     if(finalX+pw>halfW-margin) finalX=halfW-margin-pw;
     if(finalX-pw<-halfW+margin) finalX=-halfW+margin+pw;
-    if(finalY+ph>halfH-margin) finalY=halfH-margin-ph;
+    if(finalY+ph+tab>halfH-margin) finalY=halfH-margin-ph-tab;
     if(finalY-ph<-halfH+margin) finalY=-halfH+margin+ph;
   }
-  
+
   // Target world positions
   var targetWorldX = camera.position.x + finalX;
   var targetWorldY = camera.position.y + finalY;
-  
+
   if(!cartPhysics.initialized) {
     cartPhysics.x = targetWorldX;
     cartPhysics.y = targetWorldY;
     cartPhysics.initialized = true;
   }
-  
+
   // Tether on both axes — tight follow with slight float
   cartPhysics.x += (targetWorldX - cartPhysics.x) * 0.45;
   cartPhysics.y += (targetWorldY - cartPhysics.y) * 0.45;
-  
+
   var physicsOffsetX = cartPhysics.x - camera.position.x;
   var physicsOffsetY = cartPhysics.y - camera.position.y;
   // Apply cart impact push-back along the camera's local -Z (toward camera)
@@ -18246,14 +19037,77 @@ function positionCartIcon() {
   // Apply cart impact scale grow
   var impactScale = cart.iconGroup.userData._cartImpactScale || 1;
   cart.iconGroup.scale.set(impactScale, impactScale, impactScale);
-  
+
+  // ── the frost: seat → panel, with the title tab budding onto the top edge ──
+  // Local units of iconGroup; its scale is ~1 once open (updateCartImpact eases it there).
+  var k = impactScale;
+  var cd = cartPanelOrbD(), Rc = cornerSeatR(cd);
+  var hwP = CART_RW * 0.5, hhP = CART_RH * 0.5;
+  var hw = R + (hwP - R) * e, hh = R + (hhP - R) * e, rr = R + (Rc - R) * e;
+  var segs = [{ x: 0, y: 0, hw: hw, hh: hh, r: rr }];
+  var tf = cornerRamp(e, 0.5, 1.0);
+  if(tf > 0.001 && cart.tabW){
+    // It leaves from inside the top edge and rises, as the description box's bumps do.
+    var tabH = CART_TAB_H, tabW = cart.tabW;
+    var tx = -hwP + CART_TAB_INSET + tabW * 0.5;
+    var ty = hhP + CART_TAB_RISE - tabH * 0.5;
+    var ty0 = hhP - tabH * 0.5;
+    segs.push({ x: tx, y: ty0 + (ty - ty0) * tf, hw: tabW * 0.5 * (0.6 + 0.4 * tf), hh: tabH * 0.5, r: tabH * 0.5 * 0.7 });
+  }
+  // The cut-outs: the bag orb while it is there, then the panel's two seated orbs.
+  var bagS = d * (1 - cornerRamp(e, 0.0, 0.5));
+  var holes = [{ x: 0, y: 0, r: bagS * 0.5 * DML.P.sizeHole }];
+  if(cart.panelGroup && cart.panelOrbs){
+    for(var hi = 0; hi < cart.panelOrbs.length; hi++){
+      var po = cart.panelOrbs[hi];
+      if(!po.seated || !po.group.visible) continue;
+      holes.push({ x: po.group.position.x / k, y: po.group.position.y / k, r: po.group.scale.x * 0.5 * DML.P.sizeHole / k });
+    }
+  }
+  // Clear glass round the stained bag while shut; it turns to the frost as it grows into the
+  // panel, which keeps the product card's material so the lines read.
+  feedCornerPane(cart.glassMesh, segs, holes, cornerBlend(cd) * 0.75, k, 1,
+                 { lens: DML.P.cornerLens * (1 - cornerRamp(e, 0.0, 0.6)), lensW: 0.3 * R });
+  cart.glassMesh.visible = true;
+  // The cracks ride the panel's body exactly.
+  var cu = cart.crackMesh.material.uniforms;
+  cart.crackMesh.position.set(0, 0, CORNER_Z);
+  cart.crackMesh.scale.set(2 * hw, 2 * hh, 1);
+  cu.hsize.value.set(hw, hh); cu.rad.value = rr; cu.aa.value = cart.glassMesh.material.uniforms.aa.value;
+  cu.morphT.value = e;
+  cart.crackMesh.visible = cu.degradation.value > 0 && e > 0.01;
+
+  // ── the bag orb dissolves into the panel; its count with it ──
+  cart.orb.position.set(0, 0, CORNER_Z + 0.04 * bagS);
+  cart.orb.scale.setScalar(Math.max(1e-4, bagS));
+  cart.orb.visible = bagS > d * 0.01;
+  feedCornerOrb(cart.orb);
+  if(cart.countMesh){
+    cart.countMesh.position.set(r * 0.74, r * 0.74, CORNER_Z);
+    cart.countMesh.scale.setScalar(Math.max(1e-4, d * 0.36 * (bagS / d)));
+    cart.countMesh.visible = cart.orb.visible;
+  }
+
   // Position panel content to match cart
   if(cart.panelGroup){
     cart.panelGroup.position.copy(cart.iconGroup.position);
     cart.panelGroup.quaternion.copy(cart.iconGroup.quaternion);
     cart.panelGroup.visible=e>0.6;
+    // The panel's orbs form once it has: scale up from nothing, as the action column's do.
+    var pf = cornerRamp(e, 0.6, 1.0);
+    if(cart.panelOrbs){
+      for(var pi = 0; pi < cart.panelOrbs.length; pi++){
+        var pob = cart.panelOrbs[pi];
+        pob.group.scale.setScalar(Math.max(1e-4, pob.d * pf));
+        pob.group.position.z = CORNER_Z + 0.04 * pob.d * pf;   // rim level with the frost (PARALLAX)
+        feedCornerOrb(pob.group, 0);                            // clear, as in the product view's frost
+      }
+    }
+    if(cart.panelInk){
+      for(var ii = 0; ii < cart.panelInk.length; ii++) cart.panelInk[ii].material.opacity = pf * (cart.panelInk[ii].userData.inkAlpha || 1);
+    }
   }
-  
+
   // Position overlay buttons with their own weaker tether (more delay)
   for(var bi=0;bi<cartOverlays.length;bi++){
     var ov=cartOverlays[bi];
@@ -18269,10 +19123,6 @@ function positionCartIcon() {
     ov.group.quaternion.copy(cart.iconGroup.quaternion);
     ov.group.visible=e>0.6;
   }
-  
-  // Update shader
-  cart.glassMesh.material.uniforms.time.value=time;
-  cart.glassMesh.material.uniforms.res.value.set(window.innerWidth*renderer.getPixelRatio(),window.innerHeight*renderer.getPixelRatio());
 }
 
 function toggleCartPanel() {
@@ -18502,187 +19352,81 @@ function updateCartItemGlassUniforms(time){
   });
 }
 
+// Everything the panel builds is its own except the glass textures, which are shared singletons
+// (generateScratchTexture / generateFrostTexture) and must survive the panel.
+function disposeCartPanel(g){
+  if(!g) return;
+  g.traverse(function(o){
+    if(o.geometry) o.geometry.dispose();
+    if(o.material){
+      var m = o.material;
+      if(m.map && !m.uniforms) m.map.dispose();
+      m.dispose();
+    }
+  });
+}
+
 function rebuildCartPanel() {
-  if(cart.panelGroup){scene.remove(cart.panelGroup);cart.panelGroup=null;}
+  if(cart.panelGroup){scene.remove(cart.panelGroup);disposeCartPanel(cart.panelGroup);cart.panelGroup=null;}
   cart.panelGroup=new THREE.Group();
   cart.marqueeMeshes = [];
-  var panelW=CART_RW,panelH=CART_RH;
-  // ── Header row: CART title (left) + X close button (right), both integrated into the panel ──
-  var headerY = panelH/2 - 0.35;
-  var headerH = 0.38;
-  var sideMargin = 0.22;
-  var gap = 0.08;
-  var xBtnW = headerH; // square X button (matches title-box vertical dimension)
-  var titleW = panelW - sideMargin*2 - gap - xBtnW;
-  var titleX = -panelW/2 + sideMargin + titleW/2;
-  var xBtnX = panelW/2 - sideMargin - xBtnW/2;
+  cart.panelOrbs = [];          // {group, d, seated} — sized by positionCartIcon as the panel forms
+  cart.panelInk = [];           // type that fades in with them
+  var panelW=CART_RW,panelH=CART_RH, hw=panelW/2, hh=panelH/2;
+  var cd = cartPanelOrbD(), Rc = cornerSeatR(cd);
+  var count = getCartCount();
 
-  // CART title canvas
-  var titleCanvas=document.createElement('canvas');titleCanvas.width=200;titleCanvas.height=50;
-  var tCtx=titleCanvas.getContext('2d');tCtx.font='600 32px Arial';tCtx.fillStyle='#3a4258';tCtx.textAlign='center';tCtx.textBaseline='middle';tCtx.fillText('CART',100,25);
-  var titleTex=new THREE.CanvasTexture(titleCanvas);titleTex.needsUpdate=true;
-  var titleMesh=new THREE.Mesh(new THREE.PlaneGeometry(titleW*0.8,0.25),new THREE.MeshBasicMaterial({map:titleTex,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false}));
-  titleMesh.renderOrder=20;
-  titleMesh.position.set(titleX,headerY,0.05);cart.panelGroup.add(titleMesh);
-
-  // CART highlight box (behind text)
-  var titleHighlight = createGlassHighlight(titleW, headerH, { opacity: 0.75, cornerRadius: 0.08, blur: 0.025, frost: 0.8 });
-  titleHighlight.position.set(titleX, headerY, 0.02);
-  cart.panelGroup.add(titleHighlight);
-
-  // X close button — same format as CART title (highlight box + canvas text), integrated into panel
-  var xCloseGroup = new THREE.Group();
-  var xCloseHighlight = createGlassHighlight(xBtnW, headerH, { opacity: 0.75, cornerRadius: 0.08, blur: 0.025, frost: 0.8 });
-  xCloseGroup.add(xCloseHighlight);
-  var xBtnCanvas = document.createElement('canvas'); xBtnCanvas.width = 80; xBtnCanvas.height = 80;
-  var xBtnCtx = xBtnCanvas.getContext('2d');
-  xBtnCtx.font = '500 50px Arial'; xBtnCtx.fillStyle = '#3a4258';
-  xBtnCtx.textAlign = 'center'; xBtnCtx.textBaseline = 'middle';
-  xBtnCtx.fillText('✕', 40, 40);
-  var xBtnTex = new THREE.CanvasTexture(xBtnCanvas); xBtnTex.needsUpdate = true;
-  var xBtnLabel = new THREE.Mesh(
-    new THREE.PlaneGeometry(headerH*0.55, headerH*0.55),
-    new THREE.MeshBasicMaterial({map:xBtnTex, transparent:true, side:THREE.DoubleSide, depthWrite:false, depthTest:false})
-  );
-  xBtnLabel.renderOrder = 20;
-  xBtnLabel.position.z = 0.03;
-  xCloseGroup.add(xBtnLabel);
-  xCloseGroup.position.set(xBtnX, headerY, 0.02);
-  xCloseGroup.userData.actionId = 'close-cart';
-  xCloseGroup.userData.clickable = true;
-  cart.panelGroup.add(xCloseGroup);
-  /* removed: floating glass close button has been replaced by the integrated header X button above
-  var closeBtnSize=0.2;
-  var closeBtnGeo=new THREE.PlaneGeometry(closeBtnSize*2,closeBtnSize*2,16,16);
-  var closeBtnPos=closeBtnGeo.attributes.position;
-  for(var cbj=0;cbj<closeBtnPos.count;cbj++){
-    var cbx=closeBtnPos.array[cbj*3],cby=closeBtnPos.array[cbj*3+1];
-    var cbd=Math.min(Math.abs(cbx-closeBtnSize),Math.abs(cbx+closeBtnSize),Math.abs(cby-closeBtnSize),Math.abs(cby+closeBtnSize));
-    if(cbd<0.15) closeBtnPos.array[cbj*3+2]=-0.04*(1-cbd/0.15)*(1-cbd/0.15);
+  function ink(text, weight, fs, spacing, h, x, y, col, alpha){
+    var m = cornerInkMesh(text, weight, fs, spacing, 35);
+    var w = cornerInkFit(m, h);
+    m.position.set(x, y, CORNER_Z);
+    if(col) m.material.color.copy(col);
+    m.userData.inkAlpha = alpha === undefined ? 1 : alpha;
+    m.raycast = function(){};
+    cart.panelGroup.add(m);
+    cart.panelInk.push(m);
+    return { mesh: m, w: w };
   }
-  closeBtnPos.needsUpdate=true;closeBtnGeo.computeVertexNormals();
-  
-  var closeScratchTex = generateScratchTexture();
-  var closeBtnMat=new THREE.ShaderMaterial({
-    uniforms:{
-      tBg:{value:glassFBO?glassFBO.texture:null},
-      res:{value:new THREE.Vector2(window.innerWidth,window.innerHeight)},
-      rW:{value:closeBtnSize},rH:{value:closeBtnSize},time:{value:0},
-      frost:{value:0.35},
-      tScratch:{value:closeScratchTex},
-      tFrost:{value:generateFrostTexture()},
-      hoverPress:{value:0.0}
-    },
-    vertexShader:[
-      'uniform float hoverPress;',
-      'varying vec3 vN,vV,vLP;',
-      'varying vec2 vUv;',
-      'void main(){',
-      '  vec3 transformed = position - normal * hoverPress * 0.04;',
-      '  vLP=transformed;',
-      '  vUv=uv;',
-      '  vec4 mv=modelViewMatrix*vec4(transformed,1.0);',
-      '  vN=normalize(normalMatrix*normal);',
-      '  vV=normalize(-mv.xyz);',
-      '  gl_Position=projectionMatrix*mv;',
-      '}'
-    ].join('\n'),
-    fragmentShader:[
-      'uniform sampler2D tBg,tScratch,tFrost;',
-      'uniform vec2 res;',
-      'uniform float rW,rH,time,frost,hoverPress;',
-      'varying vec3 vN,vV,vLP;',
-      'varying vec2 vUv;',
-      GLARE_GLSL_FUNCS,
-      'float sdRRect(vec2 p,vec2 b,float r){vec2 d2=abs(p)-b+r;return length(max(d2,0.0))+min(max(d2.x,d2.y),0.0)-r;}',
-      'void main(){',
-      '  vec3 N=normalize(vN); vec3 V=normalize(vV);',
-      '  float sd=sdRRect(vLP.xy,vec2(rW,rH),0.06);',
-      '  float edge=fwidth(sd)*1.5;',
-      '  float alpha=1.0-smoothstep(-edge,edge,sd);',
-      '  if(alpha<0.01)discard;',
-      '  float glow=smoothstep(edge*4.0,0.0,abs(sd))*0.5;',
-      '  vec2 suv=gl_FragCoord.xy/res;',
-      '  vec2 refr=N.xy*0.15;',
-      '  refr+=0.003*vec2(sin(time*1.5+suv.y*8.0),cos(time*1.2+suv.x*8.0));',
-      '  float ef=1.0-abs(dot(V,N));',
-      '  float ca=0.23*(0.3+ef*2.5);',
-      '  vec2 tx=1.0/res;',
-      '  vec2 ru=suv+refr*(1.0+ca),gu=suv+refr,bu=suv+refr*(1.0-ca);',
-      '  float r=texture2D(tBg,ru).r*.6+texture2D(tBg,ru+tx).r*.2+texture2D(tBg,ru-tx).r*.2;',
-      '  float g=texture2D(tBg,gu).g*.6+texture2D(tBg,gu+tx).g*.2+texture2D(tBg,gu-tx).g*.2;',
-      '  float b=texture2D(tBg,bu).b*.6+texture2D(tBg,bu+tx).b*.2+texture2D(tBg,bu-tx).b*.2;',
-      '  vec3 col=vec3(r,g,b);',
-      '  float fresnel=pow(1.0-max(dot(V,N),0.0),2.0)*0.15;',
-      '  col=mix(col,vec3(0.95,0.96,0.98),fresnel*0.1);',
-      '  col+=vec3(0.7,0.75,0.9)*glow*0.3;',
-      '  col=mix(col,vec3(0.92,0.93,0.96),frost);',
-      GLASS_TINT_GLSL,
-      GLARE_GLSL_CALC,
-      '  col+=glareResult;',
-      '  col=mix(col,vec3(0.05,0.08,0.18),hoverPress*0.45);',
-      '  gl_FragColor=vec4(col,alpha);',
-      '}'
-    ].join('\n'),
-    transparent:true,side:THREE.DoubleSide,depthWrite:true
-  });
-  
-  var closeBtnMesh=new THREE.Mesh(closeBtnGeo,closeBtnMat);
-  closeBtnMesh.renderOrder=10;
-  
-  // ✕ label on top
-  var xCanvas=document.createElement('canvas');xCanvas.width=64;xCanvas.height=64;
-  var xCtx=xCanvas.getContext('2d');
-  xCtx.font='500 42px Arial';xCtx.fillStyle='#c0c8d8';
-  xCtx.textAlign='center';xCtx.textBaseline='middle';
-  xCtx.fillText('\u2715',32,32);
-  var xTex=new THREE.CanvasTexture(xCanvas);xTex.needsUpdate=true;
-  var xLabel=new THREE.Mesh(
-    new THREE.PlaneGeometry(closeBtnSize*0.8,closeBtnSize*0.8),
-    new THREE.MeshBasicMaterial({map:xTex,transparent:true,side:THREE.DoubleSide,depthWrite:false,depthTest:false})
-  );
-  xLabel.renderOrder=20;xLabel.position.z=0.02;
-  
-  var closeBtnGroup=new THREE.Group();
-  closeBtnGroup.add(closeBtnMesh);closeBtnGroup.add(xLabel);
-  closeBtnGroup.userData.actionId='close-cart';
-  closeBtnGroup.userData.clickable=true;
-  closeBtnGroup.userData.isGlassOverlay=true; // flag for FBO hide
-  closeBtnGroup.userData.glassMesh=closeBtnMesh; // for FBO texture update
-  
-  var closeLocalOffset=new THREE.Vector3(panelW/2-0.25,panelH/2-0.25,0.15);
-  var initX=cart.iconGroup.position.x+closeLocalOffset.x;
-  var initY=cart.iconGroup.position.y+closeLocalOffset.y;
-  var initZ=cart.iconGroup.position.z+closeLocalOffset.z;
-  closeBtnGroup.position.set(initX,initY,initZ);
-  closeBtnGroup.layers.enable(1);
-  closeBtnGroup.traverse(function(c){c.layers.enable(1);});
-  scene.add(closeBtnGroup);
-  cartOverlays.push({
-    group:closeBtnGroup,
-    localOffset:closeLocalOffset,
-    physX:initX,physY:initY,physZ:initZ
-  });
-  */
-  // \u2500\u2500 CHECKOUT footer (no TOTAL \u2014 removed) \u2500\u2500
-  var checkoutCenterY = -panelH/2 + 0.40;
-  var checkoutH = 0.45;
+  function orb(icon, x, y, dd, actionId, seated, parent){
+    var g = createGlassCircleBtn(0.5);
+    var gm = g.userData.glassMesh;
+    gm.renderOrder = 34;
+    var ic = createStarIconOverlay(icon, 0.5);
+    ic.renderOrder = 35;
+    ic.position.z = -0.04;           // level with the rim (PARALLAX)
+    g.add(ic);
+    g.position.set(x, y, CORNER_Z);
+    g.scale.setScalar(1e-4);
+    g.userData.actionId = actionId;
+    g.userData.clickable = true;
+    (parent || cart.panelGroup).add(g);
+    cart.panelOrbs.push({ group: g, d: dd, seated: !!seated });
+    return g;
+  }
 
-  // \u2500\u2500 Indented well boundaries (recessed darker glass between header and checkout) \u2500\u2500
-  var indentTopY = (headerY - headerH/2) - 0.04;
-  var indentBotY = (checkoutCenterY + checkoutH/2) + 0.04;
+  // ── the title tab: CART and the count, on the tab melted onto the top edge ──
+  var tabY = hh + CART_TAB_RISE - CART_TAB_H * 0.5 + 0.03;
+  var title = ink('CART', '700', 64, 8, CART_TITLE_H, 0, tabY, null);
+  var cnt = ink(count < 10 ? '0' + count : '' + count, '700', 64, 4, CART_TITLE_H * 0.62, 0, tabY, CORNER_ACC_TYPE);
+  var tabPad = 0.2, tabGap = 0.12;
+  cart.tabW = tabPad * 2 + title.w + tabGap + cnt.w;
+  var tx0 = -hw + CART_TAB_INSET + tabPad;
+  title.mesh.position.x = tx0 + title.w * 0.5;
+  cnt.mesh.position.x = tx0 + title.w + tabGap + cnt.w * 0.5;
+  cnt.mesh.position.y = tabY - CART_TITLE_H * 0.12;
+
+  // ── × nested in the top corner, concentric with the corner's arc ──
+  orb('close', hw - Rc, hh - Rc, cd, 'close-cart', true);
+
+  // ── the lines, between the × row and the checkout row ──
+  var indentTopY = hh - 2 * Rc - 0.02;
+  var indentBotY = -hh + 2 * Rc + 0.02;
   cart.indentTopY = indentTopY;
   cart.indentBotY = indentBotY;
-  if(cart.glassMesh && cart.glassMesh.material.uniforms.darkenTop){
-    cart.glassMesh.material.uniforms.darkenTop.value = indentTopY;
-    cart.glassMesh.material.uniforms.darkenBot.value = indentBotY;
-  }
-
-  // \u2500\u2500 Items scroll region (inside the indented well) \u2500\u2500
-  var itemsTopY = indentTopY - 0.05;
-  var itemsBottomY = indentBotY + 0.05;
-  var itemHeight = 0.50;
-  var itemSpacing = 0.10;
+  var itemsTopY = indentTopY - 0.03;
+  var itemsBottomY = indentBotY + 0.03;
+  var itemHeight = 0.56;
+  var itemSpacing = 0.06;
 
   cart.itemsGroup = new THREE.Group();
   cart.panelGroup.add(cart.itemsGroup);
@@ -18692,37 +19436,20 @@ function rebuildCartPanel() {
   cart.itemsScrollMax = 0;
 
   if(cart.items.length === 0){
-    var ec = document.createElement('canvas'); ec.width = 300; ec.height = 40;
-    var ex = ec.getContext('2d');
-    ex.font = '400 24px Arial'; ex.fillStyle = '#8890a8';
-    ex.textAlign = 'center'; ex.textBaseline = 'middle';
-    ex.fillText('CART IS EMPTY', 150, 20);
-    var et = new THREE.CanvasTexture(ec); et.needsUpdate = true;
-    var emY = (itemsTopY + itemsBottomY) / 2;
-    var em = new THREE.Mesh(
-      new THREE.PlaneGeometry(1.5, 0.2),
-      new THREE.MeshBasicMaterial({map:et, transparent:true, side:THREE.DoubleSide, depthWrite:false, depthTest:false})
-    );
-    em.renderOrder = 20;
-    em.position.set(0, emY, 0.05);
-    cart.panelGroup.add(em);
+    ink('CART IS EMPTY', '700', 48, 6, 0.085, 0, (itemsTopY + itemsBottomY) / 2, CORNER_INK, 0.55);
     cart.itemsScrollY = 0;
   } else {
-    // Row layout: [ name (marquee) ][ qty box ][ + ]
-    //                                            [ - ]
-    var rowW = panelW - 0.4;
-    var paddingX = 0.08;
-    var btnW = 0.18;
-    var btnH = 0.20;
-    var btnGap = 0.05;
-    var qtyAreaW = 0.34;
-    var innerGap = 0.06;
-    var nameAreaW = rowW - paddingX*2 - btnW - qtyAreaW - innerGap*2;
-    var nameAreaX = -rowW/2 + paddingX + nameAreaW/2;
-    var qtyAreaX = nameAreaX + nameAreaW/2 + innerGap + qtyAreaW/2;
-    var btnsAreaX = qtyAreaX + qtyAreaW/2 + innerGap + btnW/2;
-
-    var firstRowY = itemsTopY - itemHeight/2 - 0.04;
+    // A line is two rows, the product view's order of type: the name across the whole line in
+    // ink, then under it the size and the count as accent readouts with − and + either side of
+    // the count. The name rolls (marquee) only when it is wider than the line.
+    var rowW = panelW - 0.36;
+    var pmD = 0.24, qtyW = 0.24, innerGap = 0.03;
+    var nameFs = 30, namePx = 220, nameH = nameFs * 1.6 / namePx;   // undistorted: the marquee's own px per unit
+    var plusX = rowW / 2 - pmD / 2;
+    var qtyX = plusX - pmD / 2 - innerGap - qtyW / 2;
+    var minusX = qtyX - qtyW / 2 - innerGap - pmD / 2;
+    var row1Y = 0.12, row2Y = -0.12;
+    var firstRowY = itemsTopY - itemHeight/2 - 0.02;
     for(var i = 0; i < cart.items.length; i++){
       var item = cart.items[i];
       var rowY = firstRowY - i * (itemHeight + itemSpacing);
@@ -18731,130 +19458,69 @@ function rebuildCartPanel() {
       itemRowGroup.userData.height = itemHeight;
       cart.itemsGroup.add(itemRowGroup);
 
-      // Row background \u2014 same glass material/lightness as header/checkout borders.
-      // Corner radius shrunk so the rounding still looks right on the shorter box.
-      var rowBg = createPdvGlassPanel(rowW, itemHeight, 0.28, 0.05);
-      rowBg.position.set(0, 0, 0.08);
-      itemRowGroup.add(rowBg);
-
-      // Product name \u2014 infinite-roll marquee if too long. Plane height is set
-      // so the border conforms tightly around the text instead of stretching.
-      // The size rides along: it is what the order will say, so the bag says it too.
-      var nameMesh = createMarqueeTextMesh((item.name + (item.size ? '  \u00b7  ' + item.size : '')).toUpperCase(), {
-        displayW: nameAreaW,
-        displayH: 0.35,
-        fontSize: 34,
-        color: '#3a4258',
-        fontWeight: '600'
+      var nameMesh = createMarqueeTextMesh(String(item.name).toUpperCase(), {
+        displayW: rowW, displayH: nameH, fontSize: nameFs, pxPerUnit: namePx,
+        color: '#0d1429', fontWeight: '700'
       });
-      nameMesh.position.set(nameAreaX, 0, 0.13);
+      nameMesh.position.set(0, row1Y, CORNER_Z);
+      nameMesh.renderOrder = 35;
       itemRowGroup.add(nameMesh);
       if(nameMesh.userData.marquee) cart.marqueeMeshes.push(nameMesh);
 
-      // Quantity badge \u2014 separate "cut-off" glass box showing xN
-      var qtyBg = createPdvGlassPanel(qtyAreaW, 0.40, 0.42, 0.05);
-      qtyBg.position.set(qtyAreaX, 0, 0.10);
-      itemRowGroup.add(qtyBg);
+      // The size rides along: it is what the order will say, so the bag says it too.
+      if(item.size){
+        var sz = cornerInkMesh('SIZE ' + String(item.size).toUpperCase(), '700', 48, 5, 35);
+        var szW = cornerInkFit(sz, 0.085);
+        sz.material.color.copy(CORNER_ACC_TYPE);
+        sz.material.opacity = 1;
+        sz.position.set(-rowW / 2 + szW / 2 - 0.02, row2Y, CORNER_Z);
+        sz.raycast = function(){};
+        itemRowGroup.add(sz);
+      }
 
-      // Canvas aspect must match the label plane aspect or the texture gets
-      // squished horizontally. The qty label plane is ~square, so render onto
-      // a ~square canvas with enough horizontal room for double-digit counts.
-      var qtyCanvas = document.createElement('canvas');
-      qtyCanvas.width = 96; qtyCanvas.height = 96;
-      var qctx = qtyCanvas.getContext('2d');
-      qctx.font = '600 52px Arial'; qctx.fillStyle = '#3a4258';
-      qctx.textAlign = 'center'; qctx.textBaseline = 'middle';
-      qctx.fillText('x' + item.qty, 48, 48);
-      var qtyTex = new THREE.CanvasTexture(qtyCanvas); qtyTex.needsUpdate = true;
-      var qtyLabel = new THREE.Mesh(
-        new THREE.PlaneGeometry(qtyAreaW * 0.8, qtyAreaW * 0.8),
-        new THREE.MeshBasicMaterial({map:qtyTex, transparent:true, side:THREE.DoubleSide, depthWrite:false, depthTest:false})
-      );
-      qtyLabel.renderOrder = 20;
-      qtyLabel.position.set(qtyAreaX, 0, 0.13);
-      itemRowGroup.add(qtyLabel);
+      var qty = cornerInkMesh('\u00d7' + item.qty, '700', 56, 2, 35);
+      cornerInkFit(qty, 0.11);
+      qty.material.color.copy(CORNER_ACC_TYPE);
+      qty.material.opacity = 1;
+      qty.position.set(qtyX, row2Y, CORNER_Z);
+      qty.raycast = function(){};
+      itemRowGroup.add(qty);
 
-      // Stacked + / - buttons (two disconnected parallel rectangles)
-      var plusY = btnH/2 + btnGap/2;
-      var minusY = -btnH/2 - btnGap/2;
+      // − / + : the site's orbs, small
+      orb('minus', minusX, row2Y, pmD, 'dec-cart-' + i, false, itemRowGroup);
+      orb('plus', plusX, row2Y, pmD, 'inc-cart-' + i, false, itemRowGroup);
 
-      var plusBtn = createPdvGlassPanel(btnW, btnH, 0.45, 0.04);
-      plusBtn.position.set(btnsAreaX, plusY, 0.10);
-      plusBtn.userData.actionId = 'inc-cart-' + i;
-      plusBtn.userData.clickable = true;
-      itemRowGroup.add(plusBtn);
-
-      var plusCanvas = document.createElement('canvas');
-      plusCanvas.width = 64; plusCanvas.height = 64;
-      var pctx = plusCanvas.getContext('2d');
-      pctx.strokeStyle = '#3a4258';
-      pctx.lineWidth = 5; pctx.lineCap = 'round';
-      pctx.beginPath(); pctx.moveTo(32, 14); pctx.lineTo(32, 50); pctx.stroke();
-      pctx.beginPath(); pctx.moveTo(14, 32); pctx.lineTo(50, 32); pctx.stroke();
-      var plusTex = new THREE.CanvasTexture(plusCanvas); plusTex.needsUpdate = true;
-      var plusLabel = new THREE.Mesh(
-        new THREE.PlaneGeometry(btnW * 0.6, btnH * 0.75),
-        new THREE.MeshBasicMaterial({map:plusTex, transparent:true, side:THREE.DoubleSide, depthWrite:false, depthTest:false})
-      );
-      plusLabel.renderOrder = 21;
-      plusLabel.position.set(btnsAreaX, plusY, 0.13);
-      itemRowGroup.add(plusLabel);
-
-      var minusBtn = createPdvGlassPanel(btnW, btnH, 0.45, 0.04);
-      minusBtn.position.set(btnsAreaX, minusY, 0.10);
-      minusBtn.userData.actionId = 'dec-cart-' + i;
-      minusBtn.userData.clickable = true;
-      itemRowGroup.add(minusBtn);
-
-      var minusCanvas = document.createElement('canvas');
-      minusCanvas.width = 64; minusCanvas.height = 64;
-      var mctx = minusCanvas.getContext('2d');
-      mctx.strokeStyle = '#3a4258';
-      mctx.lineWidth = 5; mctx.lineCap = 'round';
-      mctx.beginPath(); mctx.moveTo(14, 32); mctx.lineTo(50, 32); mctx.stroke();
-      var minusTex = new THREE.CanvasTexture(minusCanvas); minusTex.needsUpdate = true;
-      var minusLabel = new THREE.Mesh(
-        new THREE.PlaneGeometry(btnW * 0.6, btnH * 0.75),
-        new THREE.MeshBasicMaterial({map:minusTex, transparent:true, side:THREE.DoubleSide, depthWrite:false, depthTest:false})
-      );
-      minusLabel.renderOrder = 21;
-      minusLabel.position.set(btnsAreaX, minusY, 0.13);
-      itemRowGroup.add(minusLabel);
+      // the hairline under the line
+      var rule = new THREE.Mesh(new THREE.PlaneGeometry(rowW, 0.008),
+        new THREE.MeshBasicMaterial({ color: CORNER_INK.clone(), transparent: true, opacity: 0.16, depthWrite: false, depthTest: false }));
+      rule.position.set(0, -itemHeight / 2 - itemSpacing / 2, CORNER_Z);
+      rule.renderOrder = 35;
+      rule.raycast = function(){};
+      itemRowGroup.add(rule);
     }
 
-    // Scroll bounds \u2014 bigger rows mean a few may overflow and require scrolling
-    var contentH = cart.items.length * (itemHeight + itemSpacing) + 0.1;
+    // Scroll bounds
+    var contentH = cart.items.length * (itemHeight + itemSpacing) + 0.06;
     var visibleH = itemsTopY - itemsBottomY;
     cart.itemsScrollMax = Math.max(0, contentH - visibleH);
     if(cart.itemsScrollY > cart.itemsScrollMax) cart.itemsScrollY = cart.itemsScrollMax;
     if(cart.itemsScrollY < 0) cart.itemsScrollY = 0;
 
-    // CHECKOUT button (TOTAL removed)
-    var cbGroup = new THREE.Group();
-    var cbHighlight = createGlassHighlight(panelW - 0.3, checkoutH, {opacity:0.75, cornerRadius:0.08, blur:0.025, frost:0.8});
-    cbGroup.add(cbHighlight);
-    var cbc = document.createElement('canvas');
-    cbc.width = 300; cbc.height = 50;
-    var cbx = cbc.getContext('2d');
-    cbx.font = '700 30px Arial'; cbx.fillStyle = '#3a4258';
-    cbx.textAlign = 'center'; cbx.textBaseline = 'middle';
-    cbx.fillText('CHECKOUT', 150, 25);
-    var cbt = new THREE.CanvasTexture(cbc); cbt.needsUpdate = true;
-    var cbLabel = new THREE.Mesh(
-      new THREE.PlaneGeometry(1.5, 0.25),
-      new THREE.MeshBasicMaterial({map:cbt, transparent:true, side:THREE.DoubleSide, depthWrite:false, depthTest:false})
-    );
-    cbLabel.renderOrder = 20;
-    cbLabel.position.z = 0.02;
-    cbGroup.add(cbLabel);
-    cbGroup.position.set(0, checkoutCenterY, 0.08);
-    cbGroup.userData.actionId = 'checkout';
-    cbGroup.userData.clickable = true;
-    cart.panelGroup.add(cbGroup);
+    // ── checkout: → nested in the bottom corner (the buy-now orb's icon), its word beside it ──
+    var coY = -hh + Rc;
+    var coOrb = orb('expand', hw - Rc, coY, cd, 'checkout', true);
+    var coLabel = ink('CHECKOUT', '700', 64, 8, 0.13, 0, coY, null);
+    coLabel.mesh.position.x = hw - 2 * Rc - 0.06 - coLabel.w * 0.5;
+    // The word is part of the button: a hit slot over it, same action as the orb
+    var coHit = new THREE.Mesh(new THREE.PlaneGeometry(coLabel.w + 0.16, 2 * Rc * 0.8), new THREE.MeshBasicMaterial({ visible: false }));
+    coHit.position.set(coLabel.mesh.position.x, coY, CORNER_Z);
+    coHit.userData.actionId = 'checkout';
+    coHit.userData.clickable = true;
+    coHit.userData.glassMesh = coOrb.userData.glassMesh;   // pressing the word presses the orb
+    cart.panelGroup.add(coHit);
 
-    // Hard-clip every item row at the indent zone boundaries so they cleanly
-    // cut off at the top/bottom edges of the well rather than overlapping
-    // the header/checkout panels.
+    // Hard-clip every line at the region's edges so they cut off cleanly under the × and
+    // checkout rows rather than overlapping them.
     applyCartItemClipping(cart.itemsGroup);
     updateCartItemClipPlanes();
   }
@@ -18862,12 +19528,9 @@ function rebuildCartPanel() {
   cart.panelGroup.layers.enable(1);
   cart.panelGroup.traverse(function(c){c.layers.enable(1);});
   scene.add(cart.panelGroup);
-  // Make all cart panel children render on top of the glass shader
+  // All of it draws over the frost (30) by order, not by depth.
   cart.panelGroup.traverse(function(child) {
-    if(child.material) {
-      child.material.depthTest = false;
-      child.renderOrder = 20;
-    }
+    if(child.material) child.material.depthTest = false;
   });
 }
 
@@ -56316,6 +56979,8 @@ function init(){
       pdv.scrollY -= e.deltaY * pxToWorld * 0.5;
       return;
     }
+    // THE VIEWER: the wheel zooms the full-screen image about the pointer.
+    if(VIEWER.wheel(e)) return;
     // THE STACK (phone layout): an open product scrolls ITSELF. The page — and with it the
     // camera, whose drift off the row is what closes the view on desktop — never sees the event.
     if(DML.mobileLive()){
@@ -95274,6 +95939,7 @@ function animate(){
   });
   if(switchAnim.active)animateSwitch();
   animateImgLightbox(dt);
+  VIEWER.update();
   if(pdv.entering)animateProductDetailEnter();
   if(pdv.exitingToDM)animateProductDetailExit();
   if(pdv.active)updateProductDetailPosition();
@@ -96116,7 +96782,9 @@ function animate(){
     // actually produced it.
     if(typeof worldNearNeeded === 'function') camera.near = worldNearNeeded();
     camera.updateProjectionMatrix(); }
+  VIEWER.beforeMain();   // THE VIEWER: the frame cut down to the sky (or the sky laid over it)
   renderer.render(scene,camera);
+  VIEWER.afterMain();
   // GRASS SLIME refracting skins: copy what just landed in postFBO, then draw the skins over it on
   // their own layer (desktop only; the enemy decides). Must sit here — same camera near/far as the
   // pass that made the depth buffer, and before the sky composites over it.
@@ -96205,7 +96873,9 @@ function animate(){
   var savedBg=scene.background;var savedFog=scene.fog;
   scene.background=null;scene.fog=null;
   camera.layers.set(1);
+  VIEWER.beforeOverlay();   // THE VIEWER: its garment and ×; the nav shrinks away, the bag gives way
   renderer.render(scene,camera);
+  VIEWER.afterOverlay();
   scene.background=savedBg;scene.fog=savedFog;
   camera.layers.enableAll();
   renderMiniMap();   // FACE PLANET holo minimap (M) — own scene, drawn over the finished frame
