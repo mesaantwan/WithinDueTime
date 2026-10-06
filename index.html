@@ -8106,7 +8106,11 @@ var STOREFRONT_MODEL = (function(){
   // HOLO projects into. Rows 0-1 keep their Blender heights, so the page top stays at y 0 and
   // nothing that clamps the camera there has to change. Relative to the SKY it is the top that
   // rises: CSKY.P.anchorT re-centres the cloud deck on the middle of the page (the bay).
-  var HOLO_GAP = 8;
+  // Chosen once at load, by screen shape (every row position and the scroll map derive from it):
+  // portrait = phones, where the camera stands far back (fov 75, ~29 units of height in view), so
+  // the bay is opened until the jeans fill ~2/3 of the screen; landscape cameras sit closer (~19
+  // units), where 18 would push the crystal tips off screen. 8 everywhere until 2026-10-06.
+  var HOLO_GAP = (typeof innerWidth === 'number' && innerHeight > innerWidth) ? 18 : 11;
   DATA.floorY = DATA.floorY.map(function(y, i){ return i >= 2 ? y - HOLO_GAP : y; });
   var KEY = 'chrysolin.storefront-motion.v1';
   var P = {}, defaults = {}, labels = {}, bindings = [], geometries = {};
@@ -8454,12 +8458,24 @@ var HOLO = (function(){
     showBody: true, showSeams: true, showRays: true, showCones: true, showFlares: true,   // layer switches (panel / look-dev)
     // ── fit ── all relative to the live tip-to-tip span
     margin: 0.13,          // share of the span kept clear at EACH end, where the beams show
+    marginPortrait: 0.07,  // the same on a portrait screen (phones): the jeans get more of the bay
+    // The page's post pass fringes colour in from the frame edge (caStrength * smoothstep(0.1, 0.7,
+    // dist)). Ambient texture over a spinning shop; across a garment that fills the screen it is
+    // just fringing on every seam — the detail view pulls it to 0.15 for the same reason (DML caScale).
+    lensScale: 0.15,       // multiplies the page's fringing while the bay is up (eased on power)
     maxWidth: 0.62,        // widest horizontal extent allowed, as a share of the span
     spin: 0.36,            // turntable, rad/s
     bob: 0.008,            // float, as a share of the span
     // ── power ──
     bootTime: 1.6,         // seconds from dark until the hologram is fully drawn (then it shutters to real)
     offTime: 0.6,
+    reTime: 0.15,          // after the first boot: seconds to fade back in when the bay returns
+    // THE PRODUCT VIEW (PANTS): where the jeans go when you open them — on screen, not in the world
+    viewX: -0.44,          // NDC x of the jeans' centre (−1 left edge, 0 centre)
+    viewY: -0.03,          // NDC y
+    viewFill: 0.70,        // their height as a share of the frame's height (the near parts project a little larger)
+    viewMaxW: 0.46,        // …capped so their WIDTH never passes this share of the frame's width
+    viewTime: 0.85,        // seconds for the glide, both ways
     // ── the object: stand-in denim ──
     wash: 0.14,            // 0 raw rinse … 1 light stonewash
     fades: 0.75,           // thigh / knee / seat wear
@@ -8557,7 +8573,8 @@ var HOLO = (function(){
   var S = 0, sL = null, sN = null, sY = null, sAz = null, sW = null, sWN = null;     // samples: local pos/normal, height 0..1, world pos/normal
   var E = [new THREE.Vector3(), new THREE.Vector3()], C = new THREE.Vector3(), Cs = new THREE.Vector3();
   var tipLocal = [null, null], tipGeo = [null, null], tipGem = [null, null];
-  var scaleS = 0, haveFit = false, spanNow = 0, failNote = '', cmK = 1, modelKind = 'none';
+  var pocketMat = null;   // the loaded model's back-pocket material, if it has one
+  var scaleS = 0, scaleFit = 0, haveFit = false, spanNow = 0, failNote = '', cmK = 1, modelKind = 'none';
   var tipRings = null;
   var _v = new THREE.Vector3(), _u = new THREE.Vector3(), _w = new THREE.Vector3(), _a = new THREE.Vector3();
   var col = { ink: new THREE.Color(), acc: new THREE.Color(), glow: new THREE.Color() };
@@ -9460,6 +9477,7 @@ var HOLO = (function(){
         o.castShadow = o.receiveShadow = true; o.frustumCulled = false;
         (Array.isArray(o.material) ? o.material : [o.material]).forEach(function(m){
           if(!m) return;
+          if(/pocket/i.test(m.name || '')) pocketMat = m;   // the embroidered patch — the product view swaps its art
           if('envMapIntensity' in m) m.envMapIntensity = P.envI;
           ['map','normalMap','roughnessMap','metalnessMap','aoMap','emissiveMap'].forEach(function(k){ if(m[k]){ m[k].anisotropy = Math.min(8, aniso); m[k].needsUpdate = true; } });
           m.needsUpdate = true;
@@ -9626,12 +9644,61 @@ var HOLO = (function(){
   // Projector should run: the bay is (nearly) on screen, and nothing else owns the view.
   function wanted(){
     if(!P.on) return false;
+    if(VIEW.on || VIEW.k > 0) return true;   // the product view owns the jeans: powered wherever the bay is
     if(typeof gameMode !== 'undefined' && (gameMode.active || gameMode.entering || gameMode.decelerating)) return false;
     if(typeof dm !== 'undefined' && (dm.active || dm.animating || dm.closing)) return false;
     if(typeof camera === 'undefined') return false;
     var halfH = Math.tan(camera.fov*Math.PI/360) * Math.max(1, Math.abs(camera.position.z));
     return Math.abs(camera.position.y - C.y) < halfH + spanNow*0.5;
   }
+  function marginNow(){ return (typeof camera !== 'undefined' && camera.aspect < 1) ? P.marginPortrait : P.margin; }
+  // called by the post pass right after DML.applyPost (which rewrites caStrength every frame, so this
+  // multiply never compounds); power already eases in and out with the bay, so nothing snaps
+  function lensScale(){ return root && root.visible ? 1 + (P.lensScale - 1) * power : 1; }
+
+  // ── turn it by hand: mouse drag, or a one-finger HORIZONTAL swipe that starts on it ───────────
+  // The page owns the gesture routing (pDown / pMove / pUp, and onTM's direction lock: a vertical
+  // swipe stays a page scroll and cancel()s the grab). Rate: a drag across the jeans' own half-width
+  // is about one radian, so the cloth under the finger roughly keeps up with it.
+  var DRG = { on: false, x: 0, th0: 0, hist: [], vel: 0, resume: 1 };
+  function dragK(){ return 1 / Math.max(40, 0.4 * IMG.cssW); }   // rad per CSS px
+  function hit(cx, cy){
+    if(!built || !IMG.ok || power < 0.6 || !wanted()) return false;
+    var el = renderer.domElement, w = el.clientWidth || innerWidth, h = el.clientHeight || innerHeight;
+    var nx = cx / w * 2 - 1, ny = 1 - cy / h * 2;
+    return nx >= IMG.nx0 && nx <= IMG.nx1 && ny >= IMG.ny0 && ny <= IMG.ny1;
+  }
+  function grab(cx, cy){
+    if(DRG.on || !hit(cx, cy)) return false;
+    DRG.on = true; DRG.x = cx; DRG.y = cy; DRG.th0 = theta; DRG.vel = 0; DRG.t0 = performance.now(); DRG.maxD = 0;
+    DRG.hist = [{ x: cx, t: DRG.t0 }];
+    return true;
+  }
+  function drag(cx, cy){
+    if(!DRG.on) return;
+    if(typeof cy === 'number') DRG.maxD = Math.max(DRG.maxD, Math.hypot(cx - DRG.x, cy - DRG.y));
+    theta = DRG.th0 + (cx - DRG.x) * dragK();
+    var now = performance.now(); DRG.hist.push({ x: cx, t: now }); DRG.moveFrame = _frame;
+    while(DRG.hist.length > 2 && now - DRG.hist[0].t > 90) DRG.hist.shift();   // keep TWO samples minimum
+  }
+  // Returns 'tap' for a press that barely moved and let go quickly (the page opens the product view
+  // on it), 'drag' otherwise, and nothing when there was no grab.
+  function release(){
+    if(!DRG.on) return;
+    var tap = DRG.maxD < 7 && performance.now() - DRG.t0 < 450;
+    DRG.on = false; DRG.resume = 0;
+    var h = DRG.hist, a = h[0], b = h[h.length - 1];
+    // windowed rate over the last ~90 ms of input; a finger that stopped before lifting throws nothing.
+    // "Stopped" needs BOTH a wall-clock gap and frames without a move: touch moves are delivered per
+    // frame, so on a slow device a wall-clock test alone reads every flick as a hold.
+    var held = performance.now() - b.t > 100 && _frame - (DRG.moveFrame || 0) >= 2;
+    DRG.vel = (h.length >= 2 && !held) ? (b.x - a.x) / Math.max(16, b.t - a.t) * 1000 * dragK() : 0;
+    if(tap) DRG.vel = 0;
+    DRG.last = { n: h.length, span: Math.round(b.t - a.t), dx: b.x - a.x, age: Math.round(performance.now() - b.t), frames: _frame - (DRG.moveFrame || 0), held: held };
+    DRG.vel = Math.max(-14, Math.min(14, DRG.vel));
+    return tap ? 'tap' : 'drag';
+  }
+  function cancel(){ if(!DRG.on) return; theta = DRG.th0; DRG.on = false; DRG.vel = 0; }
 
   // ── per-emitter analysis ───────────────────────────────────────────────────────────────────
   var AZ = 24, EL = 12, AZB = 16;
@@ -9678,7 +9745,7 @@ var HOLO = (function(){
       var b = (Math.floor((VIS.az[i] + Math.PI) / (2*Math.PI) * AZ) % AZ) * EL + Math.min(EL-1, Math.floor(VIS.tan[i] / maxT * EL));
       VIS.bin[i] = b; if(VIS.dist[i] < minD[b]) minD[b] = VIS.dist[i];
     }
-    var tol = spanNow * (1 - 2*P.margin) * 0.05, vis = VIS.vis[k];
+    var tol = spanNow * (1 - 2*marginNow()) * 0.05, vis = VIS.vis[k];
     for(i=0;i<S;i++){
       var bb = VIS.bin[i]; if(bb < 0){ vis[i] = 0; continue; }
       var inv = 1 / (VIS.dist[i] || 1);
@@ -9904,6 +9971,14 @@ var HOLO = (function(){
   // ══ the event clock ════════════════════════════════════════════════════════════════════════
   // SH.phase: 'boot' (the virtual version, being drawn) → 'out' (louvres to real) → 'idle' (real)
   // → 'in' → 'hold' → 'out' → 'idle'.  DI: the top distortion, only ever while idle.
+  var VIEW = { on: false, k: 0 };
+  var _vE = new THREE.Vector3(), _vF = new THREE.Vector3(), _vR = new THREE.Vector3(), _vU = new THREE.Vector3(), _vT = new THREE.Vector3(), _vQ = new THREE.Quaternion();
+  function view(on){
+    on = !!on; if(on === VIEW.on) return;
+    VIEW.on = on;
+    // opening mid-event: the product is what you asked for — turn the louvres back, drop the haze
+    if(on){ if(SH.phase === 'in' || SH.phase === 'hold'){ SH.phase = 'out'; SH.t = 0; SH.dirOut = 1; } DI.t = -1; DI.env = 0; }
+  }
   var SH = { phase: 'boot', t: 0, sIn: 1, sOut: 0, dirIn: 1, dirOut: 1, next: 0, flash: 0 };
   var DI = { t: -1, dur: 1.7, next: 0, seed: 0, env: 0 };
   function schedShutter(){ SH.next = P.shutEvery * (0.6 + 0.8*ernd()); }
@@ -9912,13 +9987,20 @@ var HOLO = (function(){
   function shutter(){ if(SH.phase === 'idle'){ SH.phase = 'in'; SH.t = 0; SH.dirIn = ernd() < 0.65 ? 1 : -1; SH.flash = 1; DI.t = -1; } }
   function distort(){ if(DI.t < 0 && SH.phase === 'idle'){ DI.t = 0; DI.dur = P.distDur*(0.75 + 0.5*ernd()); DI.seed = ernd()*100; } }
   var evFrozen = false;   // look-dev: pin SH / DI where they are
+  // The boot (drawn in from both tips, then louvred real) plays ONCE per page. After that the bay
+  // is simply there: scrolled off and back, it fades in on P.reTime as the real object, mid-event
+  // state dropped. (Until 2026-10-06 every return to the bay replayed the whole boot.)
+  var booted = false;
   function events(dt, buildP){
     if(evFrozen) return;
     SH.flash = Math.max(0, SH.flash - dt*5);
-    if(power < 1e-3){ SH.phase = 'boot'; SH.sIn = 1; SH.sOut = 0; DI.t = -1; return; }
+    if(power < 1e-3){
+      if(booted){ SH.phase = 'idle'; SH.t = 0; SH.sIn = SH.sOut = 0; } else { SH.phase = 'boot'; SH.sIn = 1; SH.sOut = 0; }
+      DI.t = -1; return;
+    }
     if(SH.phase === 'boot'){
       SH.sIn = 1; SH.sOut = 0;
-      if(buildP >= 0.999){ SH.t += dt; if(SH.t > 0.25){ SH.phase = 'out'; SH.t = 0; SH.dirOut = 1; } }
+      if(buildP >= 0.999){ SH.t += dt; if(SH.t > 0.25){ SH.phase = 'out'; SH.t = 0; SH.dirOut = 1; booted = true; } }
       else SH.t = 0;
     } else if(SH.phase === 'in'){
       SH.t += dt; SH.sIn = ease(SH.t / P.shutIn); SH.sOut = 0;
@@ -9931,7 +10013,7 @@ var HOLO = (function(){
       if(SH.t >= P.shutOut){ SH.phase = 'idle'; SH.t = 0; SH.sIn = SH.sOut = 0; schedShutter(); schedDist(); }
     } else {   // idle: the real object; count down to the next event
       SH.sIn = SH.sOut = 0;
-      if(power >= 1){
+      if(power >= 1 && !VIEW.on && VIEW.k <= 0){
         SH.next -= dt; if(SH.next <= 0 && P.shutEvery > 0) shutter();
         if(DI.t < 0){ DI.next -= dt; if(DI.next <= 0 && P.distEvery > 0){ distort(); schedDist(); } }
       }
@@ -9968,25 +10050,52 @@ var HOLO = (function(){
     C.addVectors(E[0], E[1]).multiplyScalar(0.5);
     var want = wanted();
     if(!warmed && (!want || power <= 0)) warm();
-    power = sat(power + (want ? dt/Math.max(0.05, P.bootTime) : -dt/Math.max(0.05, P.offTime)));
-    ringsGlow(power);
+    power = sat(power + (want ? dt/Math.max(0.02, booted ? P.reTime : P.bootTime) : -dt/Math.max(0.05, P.offTime)));
+    ringsGlow(power * (1 - VIEW.k));   // the tips go dark as the product view takes the jeans away
     if(power <= 0){ root.visible = false; events(dt, 0); return; }
     if(!warmed){ buildEnv(); warmed = true; }   // seen before the warm-up finished: compile now, once
     root.visible = !hidden.any;
-    rayM.visible = !!P.showRays; cones[0].visible = cones[1].visible = !!P.showCones; flares[0].visible = flares[1].visible = !!P.showFlares;
+    var vOff = 1 - VIEW.k;   // the projector's own light belongs to the bay, not to the product view
+    rayM.visible = !!P.showRays && vOff > 0.01; cones[0].visible = cones[1].visible = !!P.showCones && VIEW.k < 0.04; flares[0].visible = flares[1].visible = !!P.showFlares && vOff > 0.01;
     if(seamM) seamM.visible = !!P.showSeams; if(holoS) holoS.visible = !!P.showSeams;
-    T += dt; theta += P.spin * dt;
+    T += dt;
+    // turntable: held still while a finger/mouse holds it; after a throw the throw coasts out and
+    // the idle spin eases back in, so the hand-off never jerks
+    if(!DRG.on){
+      DRG.resume = Math.min(1, DRG.resume + dt / 1.6);
+      theta += (P.spin * DRG.resume * DRG.resume + DRG.vel) * dt;
+      DRG.vel *= Math.exp(-dt * 1.8);
+    }
     bandY = 0.5 - 0.5*Math.cos(T * 0.55);
 
     // fit the model into the bay
-    var H = spanNow * (1 - 2*P.margin), wMax = Math.max(size.x, size.z);
+    var H = spanNow * (1 - 2*marginNow()), wMax = Math.max(size.x, size.z);
     var sT = Math.min(H / size.y, spanNow * P.maxWidth / Math.max(1e-6, wMax));
     var kf = haveFit ? 1 - Math.exp(-dt*6) : 1;
-    scaleS += (sT - scaleS) * kf;
+    scaleFit += (sT - scaleFit) * kf;   // the bay fit's own eased state; scaleS is what is DRAWN this frame
     Cs.lerp(C, haveFit ? kf : 1); haveFit = true;
-    modelG.position.copy(Cs); modelG.position.y += Math.sin(T*0.9) * P.bob * spanNow;
-    modelG.rotation.set(0, theta, 0); modelG.scale.setScalar(scaleS);
+    // THE PRODUCT VIEW (PANTS): the jeans glide out of the bay to a place fixed on SCREEN (P.viewX/Y
+    // in NDC, P.viewFill of the frame's height), solved off the live camera every frame so they stay
+    // put however the camera breathes. Same depth as the bay, so they come forward by growing, not by
+    // flying at the lens; eased both ways on VIEW.k.
+    VIEW.k = sat(VIEW.k + (VIEW.on ? 1 : -1) * dt / Math.max(0.05, P.viewTime));
+    var ve = VIEW.k * VIEW.k * (3 - 2 * VIEW.k);
+    var bob = Math.sin(T*0.9) * P.bob * spanNow * (1 - ve), sNow = scaleFit;
+    modelG.position.copy(Cs); modelG.position.y += bob;
+    if(ve > 0){
+      camera.updateMatrixWorld();
+      _vE.setFromMatrixPosition(camera.matrixWorld); camera.getWorldQuaternion(_vQ);
+      _vF.set(0, 0, -1).applyQuaternion(_vQ); _vR.set(1, 0, 0).applyQuaternion(_vQ); _vU.set(0, 1, 0).applyQuaternion(_vQ);
+      var vd = Math.max(4, _vT.subVectors(Cs, _vE).dot(_vF));
+      var vh = Math.tan(camera.fov * Math.PI / 360) * vd, vw = vh * camera.aspect;
+      _vT.copy(_vE).addScaledVector(_vF, vd).addScaledVector(_vR, P.viewX * vw).addScaledVector(_vU, P.viewY * vh);
+      var sV = Math.min(P.viewFill * 2 * vh / size.y, P.viewMaxW * 2 * vw / Math.max(1e-6, wMax));
+      modelG.position.lerp(_vT, ve);
+      sNow = scaleFit + (sV - scaleFit) * ve;
+    }
+    modelG.rotation.set(0, theta, 0); modelG.scale.setScalar(sNow);
     modelG.updateMatrixWorld(true);
+    scaleS = sNow;   // the samples, the rays and the photo all read the drawn scale
 
     // samples to world
     var cs = Math.cos(theta), sn = Math.sin(theta), mp = modelG.position;
@@ -10012,12 +10121,12 @@ var HOLO = (function(){
     if(SH.phase === 'boot' && buildP < 0.999){ scanBuckets(0, 1 - buildP*0.5); scanBuckets(1, buildP*0.5); frontW[0] = frontW[1] = 1; }
     else if(fh >= 0){ scanBuckets(0, fh); scanBuckets(1, fh); frontW[0] = sat((fh - 0.35)*3); frontW[1] = sat((0.65 - fh)*3); }
     else { scanBuckets(0, -1); scanBuckets(1, -1); frontW[0] = frontW[1] = 0; }
-    updateRays(dt, rayP, SH.phase === 'boot' ? buildP : 1);
+    updateRays(dt, rayP * vOff, SH.phase === 'boot' ? buildP : 1);
     var nearT0 = updateCone(0), nearT1 = updateCone(1);
 
     for(var f=0; f<2; f++){
       flares[f].position.copy(E[f]); flares[f].quaternion.copy(camera.quaternion);
-      flares[f].scale.setScalar(P.flare * (0.75 + 0.25*flareP) * (1 + 0.35*energy));
+      flares[f].scale.setScalar(Math.max(1e-4, P.flare * (0.75 + 0.25*flareP) * (1 + 0.35*energy) * vOff));
     }
 
     // ── the photograph ──
@@ -10166,7 +10275,7 @@ var HOLO = (function(){
   // ── tuning panel: Shift+Y, or ?holo on the URL ─────────────────────────────────────────────
   var panel = null;
   var SPEC = [
-    ['Fit', [['margin','Beam clearance at each end',0.02,0.4,0.005],['maxWidth','Max width (share of gap)',0.2,1.2,0.01],['spin','Turntable (rad/s)',0,2,0.01],['bob','Float',0,0.05,0.001]]],
+    ['Fit', [['margin','Beam clearance at each end',0.02,0.4,0.005],['marginPortrait','Beam clearance, portrait (phones)',0.02,0.4,0.005],['maxWidth','Max width (share of gap)',0.2,1.2,0.01],['spin','Turntable (rad/s)',0,2,0.01],['bob','Float',0,0.05,0.001]]],
     ['Light', [['expo','Exposure',0.2,2,0.01],['keyI','Key',0,6,0.05],['rimI','Rim',0,5,0.05],['fillI','Fill',0,3,0.05],['envI','Environment',0,3,0.05],['tipI','Emitter spill (teal)',0,4,0.05],['shadows','Shadows',0,1,1]]],
     ['Stand-in denim', [['wash','Wash (rinse → stonewash)',0,1,0.01],['fades','Wear fades',0,2,0.01],['whiskers','Whiskers',0,2,0.01],['honeycombs','Honeycombs',0,2,0.01],
                ['slub','Slub streaks',0,2,0.01],['rope','Seam roping',0,2,0.01],['relief','Crease relief',0,3,0.01],['rough','Roughness',0.2,1,0.01],['sheen','Sheen',0,2,0.01],
@@ -10181,7 +10290,7 @@ var HOLO = (function(){
               ['rayW1','Width at target',0.001,0.08,0.001],['pulse','Pulse rate',0,5,0.05],['rayLife','Dwell (s)',0.1,6,0.05],['facing','Grazing limit',-1,1,0.01]]],
     ['Cones', [['coneA','Brightness',0,1,0.005],['lanes','Light lanes',0,40,1],['conePad','Envelope pad',0.8,1.5,0.005],['coneOver','Carry past contact',0,1,0.01]]],
     ['Emitters', [['flare','Flare size',0,3,0.01],['flareA','Flare brightness',0,2,0.01],['ringGlow','Tip ring glow',0,2,0.01],['beamBoost','Beam boost on shutter',0,4,0.05]]],
-    ['Blend', [['addDay','Beams additive by day',0,1,0.01],['addNightBeam','Beams additive at night',0,1,0.01],['addNight','Picture additive at night',0,1,0.01]]]
+    ['Blend', [['addDay','Beams additive by day',0,1,0.01],['addNightBeam','Beams additive at night',0,1,0.01],['addNight','Picture additive at night',0,1,0.01],['lensScale','Page lens fringing while up',0,1.5,0.01]]]
   ];
   function el(tag, text, parent){ var e = document.createElement(tag); if(text) e.textContent = text; if(parent) parent.appendChild(e); return e; }
   function buildPanel(){
@@ -10235,6 +10344,12 @@ var HOLO = (function(){
   var HOLO = {
     P: P, update: update, setHidden: setHidden, setModel: setModel, loadModel: loadModel, open: open,
     shutter: shutter, distort: distort,
+    // hand rotation, driven by the page's pointer/touch routing (see the hooks build.cjs adds)
+    hit: hit, grab: grab, drag: drag, release: release, cancel: cancel, dragging: function(){ return DRG.on; },
+    lensScale: lensScale,
+    // the product view (PANTS): glide the jeans to their place on screen and back; the pocket's material
+    view: view, viewK: function(){ return VIEW.k; }, viewOn: function(){ return VIEW.on; },
+    pocket: function(){ return pocketMat; }, rect: function(){ return IMG.ok ? { x0: IMG.nx0, x1: IMG.nx1, y0: IMG.ny0, y1: IMG.ny1 } : null; },
     group: function(){ return root; },
     photo: function(){ return rt1; },
     // look-dev handle (no behaviour): the offscreen scene, its rig and the cloth
@@ -10250,13 +10365,547 @@ var HOLO = (function(){
         samples: S, visTop: v0, visBottom: v1, liveRays: live,
         phase: SH.phase, sIn: +SH.sIn.toFixed(3), sOut: +SH.sOut.toFixed(3), nextShutter: +SH.next.toFixed(2), dist: +DI.env.toFixed(3), nextDist: +DI.next.toFixed(2),
         photo: { ok: IMG.ok, px: [IMG.w, IMG.h], rt: [rtW, rtH], virt: !!rt2, y: [+IMG.y0.toFixed(3), +IMG.y1.toFixed(3)] },
-        fail: failNote, stats: HOLO.stats || null, ms: +msAvg.toFixed(3), tipRings: tipRings ? tipRings.length : -1 };
+        fail: failNote, stats: HOLO.stats || null, ms: +msAvg.toFixed(3), tipRings: tipRings ? tipRings.length : -1,
+        drag: { on: DRG.on, vel: +DRG.vel.toFixed(3), resume: +DRG.resume.toFixed(2), k: +dragK().toFixed(5), theta: +theta.toFixed(4), last: DRG.last || null } };
     },
     stats: null
   };
   return HOLO;
 })();
 // END HOLO PROJECTOR
+// BEGIN PANTS VIEW
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE JEANS' PRODUCT VIEW (2026-10-06) — desktop first. Tap the jeans in the hologram bay:
+//   • the tower goes: every row, the brand mark and the bottom scroller fade to nothing — sky only
+//   • the jeans glide out of the bay to the left of the screen (HOLO.view — they still turn by hand)
+//   • on the right, ONE frosted pane in the T-shirt view's language, cut from the site's shared
+//     glass (DML.frostMaterial): a card + an action column joined as one smooth bubble, the column's
+//     glass orbs punched through it (× close, bag+ add to bag) in the T-shirt view's own slots
+//   • on the card, the readouts and the two option sections, drawn as the onboard HUD:
+//       01 SIZE            WAIST / LENGTH, typed — 32 × 32 to start
+//       02 BACK EMBROIDERY tiles, the picked one ringed; the pick is shown on the jeans themselves
+// Source: .holo/pants-view.js, spliced by .holo/build.cjs (with the page hooks) after the HOLO block.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+var PANTS = (function(){
+  'use strict';
+
+  // ── what can be picked ─────────────────────────────────────────────────────────────────────────
+  // BACK EMBROIDERY. To add a design: make its pocket texture (1024² JPG in the pocket's own UV
+  // layout — copy jeans_pocket_plain.jpg and paint on it), put it next to jeans.glb, add a row.
+  //   map:    null = the GLB's own pocket art; a file name = that texture instead
+  //   normal: 'own' = the GLB's raised-thread relief; 'flat' = none (a plain pocket has no thread)
+  //   soon:   listed, not selectable (a placeholder until the art exists)
+  var DESIGNS = [
+    { id: 'mark',  name: 'CHRYSOLIN MARK', map: null,                     normal: 'own'  },
+    { id: 'plain', name: 'NONE',           map: 'jeans_pocket_plain.jpg', normal: 'flat' },
+    { id: 'd03',   name: 'DESIGN 03',      soon: true }
+  ];
+  var DIRS = ['', 'product-images/', 'https://raw.githubusercontent.com/mesaantwan/WithinDueTime/main/'];
+  var PRODUCT_HANDLE = 'ruptured-jeans';   // the Shopify listing the bag line is made from
+  var SIZE = {
+    waist:  { label: 'WAIST',  def: 32, min: 24, max: 48 },
+    length: { label: 'LENGTH', def: 32, min: 26, max: 38 }
+  };
+
+  var P = {
+    minAspect: 1.10,     // landscape only for now — DML's own threshold; a phone keeps the bay as it is
+    depth: 9,            // world units in front of the camera the pane sits at (size is solved, not depth)
+    cardX0: 0.06, cardX1: 0.80, cardY0: -0.84, cardY1: 0.70,   // the card, NDC
+    colX: 0.875,         // the action column's centre, NDC x — the T-shirt view's column
+    closeY: 0.516, bagY: 0.222,   // its two orbs, NDC y — the T-shirt view's × and bag+ slots
+    orb: 0.122,          // orb diameter, share of the frame's height (the T-shirt view's)
+    orbPad: 0.20,        // column wall around the orbs, × orb radius
+    radius: 0.055,       // card corner radius, share of the frame's height
+    blend: 0.05,         // the smooth union's fillet, share of the frame's height
+    formIn: 0.45, formOut: 0.25,   // seconds
+    formAt: 0.55,        // the pane starts to form once the jeans are this far through their glide
+    bgTime: 0.5          // seconds for the tower to go (and come back)
+  };
+  var INK = '#1b2333', GREY = 'rgba(40,52,76,0.62)', ACC = 'rgb(16,196,178)', ACCD = 'rgb(6,116,106)';
+  var FONT = 'Arial, Helvetica, sans-serif';
+
+  // ── state ─────────────────────────────────────────────────────────────────────────────────────
+  var state = 'closed';            // closed → opening → open → closing → closed
+  var formK = 0, bgK = 1, holoReleased = false;
+  var vals = { waist: SIZE.waist.def, length: SIZE.length.def, design: 'mark' };
+  var focus = null, draft = '', note = '', noteT = 0, flashT = 0, caretT = 0;
+  var hoverId = null, pressId = null, savedScroll = -1, chudWas = null;
+  var built = false, pane = null, content = null, cv = null, cx2 = null, tex = null, orbs = {}, inp = null;
+  var regions = [], cardPx = { l: 0, t: 0, w: 0, h: 0 }, lastDrawKey = '';
+  var thumbs = {}, maps = {}, own = { map: null, normal: null }, flatN = null;
+  var _cE = new THREE.Vector3(), _cQ = new THREE.Quaternion(), _w = new THREE.Vector3();
+  var _segC = [new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2()];
+  var _segH = [new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2()];
+  var _segR = [0, 0, 0, 0];
+
+  function sat(x){ return x < 0 ? 0 : x > 1 ? 1 : x; }
+  function ease(x){ x = sat(x); return x * x * (3 - 2 * x); }
+  function landscape(){ return window.innerWidth / Math.max(1, window.innerHeight) >= P.minAspect; }
+  function isOpen(){ return state !== 'closed'; }
+  function design(id){ for(var i = 0; i < DESIGNS.length; i++) if(DESIGNS[i].id === (id || vals.design)) return DESIGNS[i]; return DESIGNS[0]; }
+  function product(){
+    var ps = (typeof SHOP !== 'undefined' && SHOP.products && SHOP.products()) || [];
+    for(var i = 0; i < ps.length; i++) if(ps[i].shopifyHandle === PRODUCT_HANDLE) return ps[i];
+    for(i = 0; i < ps.length; i++) if(/jean/i.test(ps[i].name || '')) return ps[i];
+    return null;
+  }
+
+  // ── the camera's frame at the pane's depth ─────────────────────────────────────────────────────
+  function camBasis(){
+    camera.updateMatrixWorld();
+    _cE.setFromMatrixPosition(camera.matrixWorld); camera.getWorldQuaternion(_cQ);
+  }
+  function halfH(){ return Math.tan(camera.fov * Math.PI / 360) * P.depth; }
+  function ndcWorld(nx, ny, out){
+    var hh = halfH(), hw = hh * camera.aspect;
+    return out.set(nx * hw, ny * hh, -P.depth).applyQuaternion(_cQ).add(_cE);
+  }
+
+  // ── build ─────────────────────────────────────────────────────────────────────────────────────
+  function build(){
+    if(built) return;
+    built = true;
+    pane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), DML.frostMaterial());
+    pane.raycast = function(){}; pane.frustumCulled = false; pane.renderOrder = 3;
+    pane.material.depthTest = false; pane.visible = false;
+    scene.add(pane);
+    cv = document.createElement('canvas'); cv.width = cv.height = 8; cx2 = cv.getContext('2d');
+    tex = new THREE.CanvasTexture(cv); tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
+    content = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false }));
+    content.raycast = function(){}; content.frustumCulled = false; content.renderOrder = 6; content.visible = false;
+    content.userData.noTint = true;
+    scene.add(content);
+    [['close', 'close'], ['bag', 'add-to-cart']].forEach(function(o){
+      var b = createGlassCircleBtn(0.5);
+      b.userData.glassMesh.material.depthTest = false;
+      var ic = createStarIconOverlay(o[1], 0.5); b.add(ic);
+      b.visible = false; scene.add(b);
+      orbs[o[0]] = { grp: b, icon: ic, sx: 0, sy: 0, r: 0 };
+    });
+    // the keyboard: a real (invisible) input owns the typing, so every keyboard — and later a phone's
+    // numeric pad — works, and the value is drawn on the glass
+    inp = document.createElement('input');
+    inp.type = 'text'; inp.inputMode = 'numeric'; inp.autocomplete = 'off'; inp.maxLength = 2;
+    inp.setAttribute('aria-label', 'Jeans size');
+    inp.style.cssText = 'position:fixed;left:-200px;top:40%;width:60px;height:24px;opacity:0;pointer-events:none;';
+    document.body.appendChild(inp);
+    inp.addEventListener('input', function(){
+      draft = inp.value.replace(/\D/g, '').slice(0, 2);
+      if(inp.value !== draft) inp.value = draft;
+    });
+    inp.addEventListener('keydown', function(e){
+      e.stopPropagation();   // digits are a size here, not a site shortcut
+      var k = e.key;
+      if(k === 'Enter' || k === 'Tab'){ e.preventDefault(); var was = focus; commit(); if(was === 'waist' && !e.shiftKey) setFocus('length'); else if(was === 'length' && e.shiftKey && k === 'Tab') setFocus('waist'); else unfocus(); }
+      else if(k === 'Escape'){ e.preventDefault(); draft = ''; focus = null; try { inp.blur(); } catch(_e){} }
+      else if(k === 'ArrowUp' || k === 'ArrowDown'){
+        e.preventDefault();
+        var f = SIZE[focus], v = parseInt(draft, 10); if(!(v > 0)) v = vals[focus];
+        v = Math.max(f.min, Math.min(f.max, v + (k === 'ArrowUp' ? 1 : -1)));
+        draft = String(v); inp.value = draft;
+      }
+    });
+    inp.addEventListener('blur', function(){ if(focus) commit(); focus = null; });
+    window.addEventListener('keydown', function(e){
+      if(e.key === 'Escape' && state === 'open' && document.activeElement !== inp) close();
+    });
+    flatN = new THREE.DataTexture(new Uint8Array([128, 128, 255, 255]), 1, 1, THREE.RGBAFormat);
+    flatN.needsUpdate = true;
+  }
+
+  // ── the fields ────────────────────────────────────────────────────────────────────────────────
+  function setFocus(id){
+    focus = id; draft = String(vals[id]); caretT = 0;
+    inp.value = draft; inp.setAttribute('aria-label', SIZE[id].label.toLowerCase() + ' in inches');
+    try { inp.focus({ preventScroll: true }); inp.select(); } catch(e){ inp.focus(); }
+  }
+  // Leaving a field: commit and clear focus HERE — the input's blur event only fires while the window
+  // itself has focus, so relying on it can leave a field looking edited.
+  function unfocus(){ if(focus) commit(); focus = null; try { inp.blur(); } catch(e){} }
+  function commit(){
+    if(!focus) return;
+    var f = SIZE[focus], v = parseInt(draft, 10);
+    if(v > 0){
+      var c = Math.max(f.min, Math.min(f.max, v));
+      if(c !== v){ note = f.label + ' RUNS ' + f.min + '–' + f.max + ' IN'; noteT = 2.6; }
+      vals[focus] = c;
+    }
+    draft = '';
+  }
+
+  // ── the embroidery, on the jeans themselves ─────────────────────────────────────────────────────
+  function loadMap(file, cb){
+    if(maps[file]){ if(maps[file].tex) cb(maps[file].tex); else maps[file].wait.push(cb); return; }
+    var rec = maps[file] = { tex: null, wait: [cb] };
+    (function tryDir(i){
+      if(i >= DIRS.length){ console.warn('[PANTS] could not load', file); return; }
+      new THREE.TextureLoader().load(DIRS[i] + file, function(t){
+        t.flipY = false; t.encoding = THREE.sRGBEncoding;   // the glTF convention, like the GLB's own
+        t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy ? renderer.capabilities.getMaxAnisotropy() : 1);
+        rec.tex = t; var w = rec.wait; rec.wait = []; w.forEach(function(f){ f(t); }); lastDrawKey = '';
+      }, undefined, function(){ tryDir(i + 1); });
+    })(0);
+  }
+  function applyDesign(){
+    var m = HOLO.pocket && HOLO.pocket(); if(!m) return;
+    if(!own.map){ own.map = m.map; own.normal = m.normalMap; }
+    var d = design();
+    if(d.map){ loadMap(d.map, function(t){ if(design().id !== d.id) return; m.map = t; m.normalMap = d.normal === 'flat' ? flatN : own.normal; m.needsUpdate = false; }); }
+    else { m.map = own.map; m.normalMap = own.normal; }
+  }
+  // A tile shows the pocket's embroidered square, cut from the very texture the jeans wear.
+  // The pocket chart spans 200 mm a side from (-112, -132); the whole mark (spikes and all) fills
+  // roughly u 0.17–0.84, v 0.26–0.96 of it from the top-left — the tile crops that square.
+  function thumbOf(d){
+    if(d.soon) return null;
+    var img = null;
+    if(d.map){ var r = maps[d.map]; if(!r) loadMap(d.map, function(){}); img = r && r.tex && r.tex.image; }
+    else { var m = HOLO.pocket && HOLO.pocket(); img = (own.map || (m && m.map)) ? (own.map || m.map).image : null; }
+    return img || null;
+  }
+
+  // ── the bag ───────────────────────────────────────────────────────────────────────────────────
+  function addToBag(){
+    var p = product();
+    if(!p){ SHOP.notify('The jeans aren’t for sale online yet.'); return; }
+    if(p.sold){ SHOP.notify(p.name + ' is sold out.'); return; }
+    var v = SHOP.variantFor(p, '');
+    if(!v || !v.available){ SHOP.notify(p.name + ' is sold out.'); return; }
+    var price = parseFloat(v.price && v.price.amount);
+    if(!(price > 0)){ SHOP.notify(p.name + ' isn’t for sale yet.'); return; }
+    var d = design(), size = 'W' + vals.waist + ' L' + vals.length;
+    // Waist, length and the embroidery ride to the order as line properties; each combination is
+    // its own bag line.
+    SHOP.addLine({
+      cartId: v.id + '|' + size + '|' + d.id, id: p.id, variantId: v.id, name: p.name, price: price,
+      currency: (v.price && v.price.currencyCode) || 'USD',
+      size: size + (d.id === 'mark' ? '' : ' · ' + d.name),
+      attrs: [{ key: 'Waist', value: vals.waist + ' in' }, { key: 'Length', value: vals.length + ' in' }, { key: 'Back embroidery', value: d.name }]
+    });
+    flashT = 2.4;
+    if(typeof cartImpact !== 'undefined'){ cartImpact.target = 1.0; cartImpact.prog = 1.0; }
+  }
+
+  // ── open / close ──────────────────────────────────────────────────────────────────────────────
+  function open(){
+    if(state !== 'closed' || !landscape()) return false;
+    if(typeof dm !== 'undefined' && (dm.active || dm.animating || dm.closing)) return false;
+    build();
+    state = 'opening'; holoReleased = false;
+    savedScroll = window.pageYOffset;
+    HOLO.view(true);
+    DESIGNS.forEach(function(d){ if(d.map) loadMap(d.map, function(){}); });
+    return true;
+  }
+  function close(){
+    if(state !== 'opening' && state !== 'open') return;
+    unfocus();
+    state = 'closing';
+  }
+  function tapJeans(){ if(state === 'closed') open(); }
+
+  // ── the tower: gone while the view is up ─────────────────────────────────────────────────────────
+  // setFloorAlpha takes a row's panels, rings and crystals down; at ~0 the row is switched off so
+  // nothing at all ghosts through the sky, and switched back on before it fades back in.
+  var bgApplied = 1;
+  function applyBg(k, restoring){
+    if(typeof floors === 'undefined') return;
+    if(!restoring && Math.abs(k - bgApplied) < 1e-4) return;   // nothing to change: leave the rows alone
+    bgApplied = k;
+    for(var i = 0; i < floors.length; i++){
+      var fl = floors[i];
+      fl.group.visible = k > 0.005;
+      if(fl.glassRing) fl.glassRing.visible = k > 0.005;
+      if(typeof introAnim === 'undefined' || introAnim.revealed[i]) setFloorAlpha(fl, k);
+    }
+    if(typeof hero !== 'undefined' && hero.floor && hero.floor.group.userData.centerStar){
+      hero.floor.group.userData.centerStar.traverse(function(o){
+        if(!o.material) return;
+        var ms = Array.isArray(o.material) ? o.material : [o.material];
+        for(var j = 0; j < ms.length; j++){ ms[j].transparent = true; ms[j].opacity = k; }
+      });
+    }
+    if(typeof CHUD !== 'undefined' && CHUD.P){
+      if(!restoring && chudWas === null){ chudWas = CHUD.P.on; CHUD.P.on = false; }
+      if(restoring && chudWas !== null){ CHUD.P.on = chudWas; chudWas = null; }
+    }
+  }
+
+  // ── per frame ─────────────────────────────────────────────────────────────────────────────────
+  function update(dt){
+    if(state === 'closed') return;
+    dt = Math.max(0, Math.min(0.1, dt || 0));
+    if(!landscape() && state !== 'closing') close();   // the window went portrait: hand the jeans back
+    var vk = HOLO.viewK ? HOLO.viewK() : 1;
+    var cartUp = typeof cart !== 'undefined' && cart.panelOpen;
+    var wantForm = (state === 'opening' || state === 'open') && vk >= P.formAt && !cartUp;
+    formK = sat(formK + (wantForm ? dt / P.formIn : -dt / P.formOut));
+    if(state === 'opening' && formK >= 1) state = 'open';
+    if(state === 'closing' && formK <= 0.2 && !holoReleased){ holoReleased = true; HOLO.view(false); }
+    // the tower goes as the jeans leave the bay, and comes back as they return to it
+    var bgT = (state === 'closing' && holoReleased) ? 1 : 0;
+    bgK = sat(bgK + (bgT > bgK ? 1 : -1) * dt / P.bgTime);
+    applyBg(ease(bgK), false);
+    if(state === 'closing' && holoReleased && vk <= 0 && bgK >= 1){
+      applyBg(1, true);
+      state = 'closed'; formK = 0; savedScroll = -1;
+      hideAll(); return;
+    }
+    noteT = Math.max(0, noteT - dt); flashT = Math.max(0, flashT - dt); caretT += dt;
+    layout();
+  }
+
+  function hideAll(){
+    if(!built) return;
+    pane.visible = content.visible = false;
+    for(var k in orbs) orbs[k].grp.visible = false;
+    if(hoveredGlassMesh && orbGlass(hoveredGlassMesh)) hoveredGlassMesh = null;
+    if(pressedGlassMesh && orbGlass(pressedGlassMesh)) pressedGlassMesh = null;
+  }
+  function orbGlass(m){ for(var k in orbs) if(orbs[k].grp.userData.glassMesh === m) return k; return null; }
+
+  // Everything is placed in the camera's frame at P.depth, from NDC: it holds its place on the
+  // screen at any window size, and the frost's pixel-sized edge and bevel are converted at that depth.
+  function layout(){
+    if(!built) return;
+    var f = ease(formK), vis = f > 0.002;
+    pane.visible = content.visible = vis;
+    for(var k0 in orbs) orbs[k0].grp.visible = vis;
+    if(!vis) return;
+    camBasis();
+    var hh = halfH(), hw = hh * camera.aspect, H2 = 2 * hh;
+    var orbR = 0.5 * P.orb * H2, pad = P.orbPad * orbR, DP = DML.P;
+    // the shapes, in world units relative to the screen centre (x right, y up)
+    var cX0 = P.cardX0 * hw, cX1 = P.cardX1 * hw, cY0 = P.cardY0 * hh, cY1 = P.cardY1 * hh;
+    var card = { x: (cX0 + cX1) / 2, y: (cY0 + cY1) / 2, hw: (cX1 - cX0) / 2, hh: (cY1 - cY0) / 2, r: P.radius * H2 };
+    var colX = P.colX * hw, cTop = P.closeY * hh + orbR + pad, cBot = P.bagY * hh - orbR - pad;
+    var col = { x: colX, y: (cTop + cBot) / 2, hw: orbR + pad, hh: (cTop - cBot) / 2, r: orbR + pad };
+    // the column buds out of the card's edge as the pane forms, as the T-shirt view's do
+    var fb = Math.min(1, f * 1.4), budX = cX1 - col.hw * 0.7;
+    var colNow = { x: budX + (col.x - budX) * fb, y: col.y, hw: Math.max(0.01, col.hw * fb), hh: Math.max(0.01, col.hh * fb), r: col.r };
+    var x0 = Math.min(cX0, col.x - col.hw), x1 = Math.max(cX1, col.x + col.hw), y0 = Math.min(cY0, col.y - col.hh), y1 = Math.max(cY1, col.y + col.hh);
+    var m = P.blend * H2 + 0.05; x0 -= m; x1 += m; y0 -= m; y1 += m;
+    var W = x1 - x0, H = y1 - y0, pcx = (x0 + x1) / 2, pcy = (y0 + y1) / 2;
+    ndcWorld(pcx / hw, pcy / hh, pane.position); pane.quaternion.copy(_cQ); pane.scale.set(W, H, 1);
+    var segs = [card, colNow];
+    for(var i = 0; i < segs.length; i++){ _segC[i].set(segs[i].x - pcx, segs[i].y - pcy); _segH[i].set(segs[i].hw, segs[i].hh); _segR[i] = segs[i].r; }
+    var u = pane.material.uniforms, pr = renderer.getPixelRatio();
+    var wpp = H2 / Math.max(1, window.innerHeight);
+    if(typeof glassFBO !== 'undefined' && glassFBO) u.tBg.value = glassFBO.texture;
+    u.res.value.set(window.innerWidth * pr, window.innerHeight * pr);
+    u.hsize.value.set(W / 2, H / 2); u.rad.value = card.r;
+    u.aa.value = Math.max(1e-4, DP.plateEdgePx * wpp); u.blurPx.value = DP.plateBlur; u.frost.value = DP.plateFrost;
+    u.dim.value = DP.plateDim; u.bevel.value = DP.plateBevel; u.bevelW.value = Math.max(1e-4, DP.plateBevelPx * wpp);
+    u.tint.value.setRGB(DP.plateTint[0], DP.plateTint[1], DP.plateTint[2]);
+    u.opacity.value = DP.plateOpacity * f;
+    u.segN.value = 2; u.blend.value = Math.max(1e-3, P.blend * H2);
+    u.segC.value = _segC; u.segH.value = _segH; u.segR.value = _segR;
+    // the orbs, punched through the pane
+    var hn = 0, so = Math.max(1e-4, (orbR / 0.5) * ease(sat(f * 1.25 - 0.25)));
+    [['close', P.closeY], ['bag', P.bagY]].forEach(function(o){
+      var ob = orbs[o[0]], oy = o[1] * hh;
+      ndcWorld(P.colX, o[1], ob.grp.position); ob.grp.quaternion.copy(_cQ); ob.grp.scale.setScalar(so);
+      ob.icon.material.opacity = f;
+      var g = ob.grp.userData.glassMesh, gu = g && g.material.uniforms;
+      if(gu){ if(typeof glassFBO !== 'undefined' && glassFBO) gu.tBg.value = glassFBO.texture; gu.res.value.set(window.innerWidth * pr, window.innerHeight * pr); gu.time.value = performance.now() * 0.001; }
+      u.holeC.value[hn].set(colX - pcx, oy - pcy); u.holeR.value[hn] = 0.5 * so * (DP.sizeHole || 1); hn++;
+      ob.sx = (P.colX + 1) / 2 * window.innerWidth; ob.sy = (1 - o[1]) / 2 * window.innerHeight;
+      ob.r = (0.5 * so / H2) * window.innerHeight;
+    });
+    u.holeN.value = hn; u.holeAA.value = Math.max(1e-4, DP.plateEdgePx * wpp);
+    // the card's content: a canvas over the card, sized to its pixels
+    ndcWorld((cX0 + cX1) / 2 / hw, (cY0 + cY1) / 2 / hh, content.position); content.position.addScaledVector(_w.set(0, 0, 1).applyQuaternion(_cQ), 0.002);
+    content.quaternion.copy(_cQ); content.scale.set(cX1 - cX0, cY1 - cY0, 1);
+    content.material.opacity = sat(f * 1.6 - 0.35);
+    cardPx.l = (P.cardX0 + 1) / 2 * window.innerWidth; cardPx.t = (1 - P.cardY1) / 2 * window.innerHeight;
+    cardPx.w = (P.cardX1 - P.cardX0) / 2 * window.innerWidth; cardPx.h = (P.cardY1 - P.cardY0) / 2 * window.innerHeight;
+    draw(f);
+  }
+
+  // ── the HUD on the card ───────────────────────────────────────────────────────────────────────
+  function rr(x, X, Y, W, H, R){
+    x.beginPath(); x.moveTo(X + R, Y); x.arcTo(X + W, Y, X + W, Y + H, R); x.arcTo(X + W, Y + H, X, Y + H, R);
+    x.arcTo(X, Y + H, X, Y, R); x.arcTo(X, Y, X + W, Y, R); x.closePath();
+  }
+  function track(x, s, X, Y, sp){   // letter-spaced type, left-aligned
+    for(var i = 0; i < s.length; i++){ x.fillText(s[i], X, Y); X += x.measureText(s[i]).width + sp; }
+    return X;
+  }
+  function trackW(x, s, sp){ var w = 0; for(var i = 0; i < s.length; i++) w += x.measureText(s[i]).width + sp; return w - sp; }
+  function draw(f){
+    var dpr = Math.min(2, window.devicePixelRatio || 1);
+    var W = Math.max(64, Math.round(cardPx.w)), H = Math.max(64, Math.round(cardPx.h));
+    var caretOn = focus && (Math.floor(caretT * 1.9) % 2 === 0);
+    var key = [W, H, dpr, vals.waist, vals.length, vals.design, focus, draft, caretOn, hoverId, pressId,
+               noteT > 0 ? note : '', flashT > 0, Math.round(f * 40), !!product(), Object.keys(maps).map(function(k){ return k + (maps[k].tex ? 1 : 0); }).join(),
+               !!(HOLO.pocket && HOLO.pocket())].join('|');
+    if(key === lastDrawKey) return;
+    lastDrawKey = key;
+    if(cv.width !== W * dpr || cv.height !== H * dpr){ cv.width = W * dpr; cv.height = H * dpr; }
+    var x = cx2; x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, W, H);
+    var u = Math.min(H / 100, W / 62), pad = 6 * u, iw = W - 2 * pad;
+    regions = [];
+    // sections arrive in turn, most stable first, the call to action last
+    function rise(i){ var a = sat((f - i * 0.12) / 0.55); x.globalAlpha = a * a * (3 - 2 * a); return (1 - x.globalAlpha) * 2.4 * u; }
+    x.textBaseline = 'alphabetic';
+
+    // ── the header: name + price (readouts — never a slab)
+    var dy = rise(0), p = product();
+    x.fillStyle = INK; x.font = '700 ' + (5.0 * u).toFixed(1) + 'px ' + FONT; x.textAlign = 'left';
+    var name = String((p && p.name) || 'Jeans').toUpperCase();
+    x.fillText(name, pad, 10.5 * u + dy, iw * 0.72);
+    var price = p && SHOP.priceLabel ? SHOP.priceLabel(p) : '';
+    if(price){ x.font = '600 ' + (3.6 * u).toFixed(1) + 'px ' + FONT; x.textAlign = 'right'; x.fillText(price, W - pad, 10.5 * u + dy); x.textAlign = 'left'; }
+    // a dimension rule under it: ticks at the ends, the read-out on it — the garment's own annotation
+    x.strokeStyle = ACC; x.globalAlpha *= 0.85; x.lineWidth = 1;
+    var ry = 14.6 * u + dy;
+    x.beginPath(); x.moveTo(pad, ry); x.lineTo(W - pad, ry); x.moveTo(pad, ry - 1.1 * u); x.lineTo(pad, ry + 1.1 * u); x.moveTo(W - pad, ry - 1.1 * u); x.lineTo(W - pad, ry + 1.1 * u); x.stroke();
+    x.fillStyle = GREY; x.font = '700 ' + (1.75 * u).toFixed(1) + 'px ' + FONT;
+    track(x, 'DENIM · MADE TO YOUR MEASURE', pad, 18.4 * u + dy, 0.28 * u);
+
+    // ── 01 SIZE
+    dy = rise(1);
+    var sy = 26.5 * u + dy;
+    x.fillStyle = ACCD; x.font = '700 ' + (2.2 * u).toFixed(1) + 'px ' + FONT; var sx = track(x, '01', pad, sy, 0.2 * u);
+    x.fillStyle = INK; track(x, 'SIZE', sx + 1.6 * u, sy, 0.38 * u);
+    x.fillStyle = GREY; x.font = '700 ' + (1.6 * u).toFixed(1) + 'px ' + FONT; x.textAlign = 'right'; x.fillText('INCHES', W - pad, sy); x.textAlign = 'left';
+    var gap = 3 * u, fw = (iw - gap) / 2, fh = 14.5 * u, fy = 29.5 * u + dy;
+    ['waist', 'length'].forEach(function(id, i){
+      var fx = pad + i * (fw + gap), on = focus === id, hv = hoverId === 'f:' + id;
+      rr(x, fx, fy, fw, fh, 2.2 * u);
+      x.fillStyle = on ? 'rgba(255,255,255,0.72)' : hv ? 'rgba(255,255,255,0.58)' : 'rgba(255,255,255,0.42)'; x.fill();
+      x.lineWidth = on ? 2 : 1; x.strokeStyle = on ? ACC : hv ? 'rgba(30,42,66,0.42)' : 'rgba(30,42,66,0.20)'; x.stroke();
+      x.fillStyle = on ? ACCD : GREY; x.font = '700 ' + (1.7 * u).toFixed(1) + 'px ' + FONT;
+      track(x, SIZE[id].label, fx + 2.2 * u, fy + 3.9 * u, 0.3 * u);
+      var shown = on ? draft : String(vals[id]);
+      x.fillStyle = INK; x.font = '700 ' + (7.0 * u).toFixed(1) + 'px ' + FONT;
+      var vx = fx + 2.2 * u, vy = fy + fh - 2.8 * u;
+      x.fillText(shown, vx, vy);
+      var vw = x.measureText(shown).width;
+      if(on && caretOn){ x.fillStyle = ACC; x.fillRect(vx + vw + 0.5 * u, vy - 6.0 * u, Math.max(1.5, 0.35 * u), 6.6 * u); }
+      x.fillStyle = GREY; x.font = '700 ' + (2.2 * u).toFixed(1) + 'px ' + FONT;
+      x.fillText('IN', vx + vw + 1.6 * u, vy);
+      regions.push({ id: 'f:' + id, x: fx, y: fy, w: fw, h: fh });
+    });
+    x.font = '700 ' + (1.55 * u).toFixed(1) + 'px ' + FONT;
+    if(noteT > 0){ x.fillStyle = ACCD; track(x, note, pad, fy + fh + 3.6 * u, 0.22 * u); }
+    else { x.fillStyle = GREY; track(x, 'CLICK A NUMBER TO TYPE · STARTS AT 32 × 32', pad, fy + fh + 3.6 * u, 0.22 * u); }
+
+    // ── 02 BACK EMBROIDERY
+    dy = rise(2);
+    var ey = 56 * u + dy;
+    x.fillStyle = ACCD; x.font = '700 ' + (2.2 * u).toFixed(1) + 'px ' + FONT; sx = track(x, '02', pad, ey, 0.2 * u);
+    x.fillStyle = INK; track(x, 'BACK EMBROIDERY', sx + 1.6 * u, ey, 0.38 * u);
+    var n = DESIGNS.length, tg = 3 * u, ts = Math.min(21 * u, (iw - tg * (n - 1)) / n), ty = 59.5 * u + dy;
+    for(var i = 0; i < n; i++){
+      var d = DESIGNS[i], tx = pad + i * (ts + tg), sel = vals.design === d.id, hv2 = hoverId === 't:' + d.id && !d.soon;
+      rr(x, tx, ty, ts, ts, 2.0 * u);
+      x.fillStyle = hv2 ? 'rgba(255,255,255,0.58)' : 'rgba(255,255,255,0.40)'; x.fill();
+      var img = thumbOf(d);
+      if(img){
+        x.save(); rr(x, tx + 1, ty + 1, ts - 2, ts - 2, 1.8 * u); x.clip();
+        var iwd = img.width || 1, iht = img.height || 1, cu = 0.505, cvv = 0.61, hs = 0.37;
+        x.drawImage(img, (cu - hs) * iwd, (cvv - hs) * iht, 2 * hs * iwd, 2 * hs * iht, tx, ty, ts, ts);
+        x.restore();
+      } else if(d.soon){
+        x.save(); x.setLineDash([0.9 * u, 0.9 * u]); rr(x, tx + 1.2 * u, ty + 1.2 * u, ts - 2.4 * u, ts - 2.4 * u, 1.4 * u);
+        x.strokeStyle = 'rgba(30,42,66,0.32)'; x.lineWidth = 1; x.stroke(); x.restore();
+        x.fillStyle = GREY; x.font = '700 ' + (1.6 * u).toFixed(1) + 'px ' + FONT; x.textAlign = 'center';
+        x.fillText('COMING', tx + ts / 2, ty + ts / 2 - 0.4 * u); x.fillText('SOON', tx + ts / 2, ty + ts / 2 + 2.0 * u); x.textAlign = 'left';
+      }
+      x.lineWidth = 1; x.strokeStyle = 'rgba(30,42,66,0.20)'; rr(x, tx, ty, ts, ts, 2.0 * u); x.stroke();
+      if(sel){ x.lineWidth = 2.5; x.strokeStyle = ACC; rr(x, tx - 1.6, ty - 1.6, ts + 3.2, ts + 3.2, 2.0 * u + 1.6); x.stroke(); }
+      x.fillStyle = sel ? ACCD : d.soon ? 'rgba(40,52,76,0.40)' : INK; x.font = '700 ' + (1.6 * u).toFixed(1) + 'px ' + FONT;
+      var lw = trackW(x, d.name, 0.18 * u); track(x, d.name, tx + Math.max(0, (ts - lw) / 2), ty + ts + 3.4 * u, 0.18 * u);
+      if(!d.soon) regions.push({ id: 't:' + d.id, x: tx, y: ty, w: ts, h: ts + 4.5 * u });
+    }
+
+    // ── the read-out of what goes in the bag, last, where the eye lands
+    dy = rise(3);
+    var by = 92 * u + dy;
+    x.strokeStyle = ACC; x.lineWidth = 1; x.globalAlpha *= 0.85;
+    x.beginPath(); x.moveTo(pad, by - 5.2 * u); x.lineTo(W - pad, by - 5.2 * u); x.stroke();
+    x.globalAlpha /= 0.85;
+    x.fillStyle = GREY; x.font = '700 ' + (1.55 * u).toFixed(1) + 'px ' + FONT;
+    track(x, flashT > 0 ? 'ADDED TO BAG' : 'YOUR PAIR', pad, by - 1.6 * u, 0.24 * u);
+    x.fillStyle = ACCD; x.font = '700 ' + (2.6 * u).toFixed(1) + 'px ' + FONT;
+    track(x, 'W' + vals.waist + ' · L' + vals.length + ' · ' + design().name, pad, by + 2.4 * u, 0.2 * u);
+    x.globalAlpha = 1;
+    tex.needsUpdate = true;
+  }
+
+  // ── input ─────────────────────────────────────────────────────────────────────────────────────
+  // What is under the pointer: an orb, a field, a tile — or nothing of ours.
+  function pick(cx, cy){
+    if(!built || formK < 0.5) return null;
+    for(var k in orbs){ var o = orbs[k]; if(Math.hypot(cx - o.sx, cy - o.sy) <= o.r) return 'o:' + k; }
+    var lx = cx - cardPx.l, ly = cy - cardPx.t;
+    for(var i = 0; i < regions.length; i++){ var g = regions[i]; if(lx >= g.x && lx <= g.x + g.w && ly >= g.y && ly <= g.y + g.h) return g.id; }
+    if(lx >= 0 && ly >= 0 && lx <= cardPx.w && ly <= cardPx.h) return 'card';
+    return null;
+  }
+  // Presses while the view is up are ours, except the bag in the corner (the cart still opens over
+  // it) and the jeans (HOLO turns them). Returning true ends the page's pDown.
+  function pDown(cx, cy, rc){
+    if(state === 'closed') return false;
+    if(typeof cart !== 'undefined' && cart.panelOpen) return false;
+    if(rc && typeof cartButtonHit === 'function' && cartButtonHit(rc)) return false;
+    if(state === 'closing'){ pressId = 'none'; return true; }
+    var id = pick(cx, cy);
+    if(!id && HOLO.hit(cx, cy)){ pressId = null; unfocus(); return false; }
+    pressId = id || 'none';
+    if(id && id.indexOf('o:') === 0) pressedGlassMesh = orbs[id.slice(2)].grp.userData.glassMesh;
+    if(focus && id !== 'f:' + focus) unfocus();
+    return true;
+  }
+  function pMove(cx, cy){ return state !== 'closed' && pressId !== null; }
+  function pUp(cx, cy){
+    if(state === 'closed' || pressId === null) return false;
+    var was = pressId; pressId = null;
+    if(pressedGlassMesh && orbGlass(pressedGlassMesh)) pressedGlassMesh = null;
+    var id = pick(cx, cy);
+    if(id !== was) return true;   // let go somewhere else: no click
+    if(id === 'o:close') close();
+    else if(id === 'o:bag') addToBag();
+    else if(id && id.indexOf('f:') === 0) setFocus(id.slice(2));
+    else if(id && id.indexOf('t:') === 0){ vals.design = id.slice(2); applyDesign(); }
+    return true;
+  }
+  function hover(cx, cy, el){
+    if(state === 'closed') return false;
+    if(typeof cart !== 'undefined' && cart.panelOpen) return false;
+    var id = pick(cx, cy);
+    hoverId = id;
+    if(!id && HOLO.hit(cx, cy)) return false;   // the jeans: HOLO's grab hand
+    if(id && id.indexOf('o:') === 0){ hoveredGlassMesh = orbs[id.slice(2)].grp.userData.glassMesh; el.classList.add('clickable'); }
+    else if(id && id !== 'card') el.classList.add('clickable');
+    return true;
+  }
+  function pinScroll(){
+    if(state === 'closed' || savedScroll < 0) return false;
+    if(window.pageYOffset !== savedScroll) window.scrollTo(0, savedScroll);
+    return true;
+  }
+  // The pane, the content and the orbs sample (or sit over) the glass FBO: out of its capture.
+  function fbo(hide){
+    if(!built || state === 'closed') return;
+    var v = !hide && formK > 0.002;
+    pane.visible = content.visible = v;
+    for(var k in orbs) orbs[k].grp.visible = v;
+  }
+
+  return { P: P, DESIGNS: DESIGNS, SIZE: SIZE, open: open, close: close, tapJeans: tapJeans, isOpen: isOpen,
+           update: update, pDown: pDown, pMove: pMove, pUp: pUp, hover: hover, pinScroll: pinScroll, fbo: fbo,
+           values: function(){ return { waist: vals.waist, length: vals.length, design: vals.design, focus: focus }; },
+           debug: function(){ return { state: state, formK: +formK.toFixed(3), bgK: +bgK.toFixed(3), viewK: HOLO.viewK ? +HOLO.viewK().toFixed(3) : null,
+             vals: { waist: vals.waist, length: vals.length, design: vals.design }, focus: focus, draft: draft, hover: hoverId,
+             product: product() ? product().name : null, regions: regions.length,
+             orbs: Object.keys(orbs).map(function(k){ return [k, Math.round(orbs[k].sx), Math.round(orbs[k].sy), Math.round(orbs[k].r)]; }),
+             card: [Math.round(cardPx.l), Math.round(cardPx.t), Math.round(cardPx.w), Math.round(cardPx.h)] }; },
+           _pick: pick };
+})();
+// END PANTS VIEW
 
 
 var STORE_BOOT = { budgetMs:2, pending:0, completed:0, maxUnitMs:0, maxSliceMs:0 };
@@ -12237,6 +12886,7 @@ function eIO(t){return t<0.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;}
 // SCROLL
 // ══════════════════════════════════════════════
 function onScroll(){
+  if(PANTS.pinScroll()) return;   // the jeans' product view holds the page still
   // Pinned while the customizer owns the screen, the same trick the image
   // lightbox uses below. Without it the document keeps scrolling underneath
   // and the camera jumps the moment the lock releases.
@@ -12623,6 +13273,7 @@ function onTM(e){
       if(totalDY > totalDX * 0.8){
         // Predominantly vertical swipe — always page scroll
         touchScroll.locked='scroll';
+        HOLO.cancel();   // a vertical swipe that started on the hologram scrolls the page instead
         // Release any wheel/vwheel drag that pDown started
         if(isDragging){
           isDragging=false; selectedFloor=null; dm.draggingVW=false;
@@ -12632,6 +13283,8 @@ function onTM(e){
         touchScroll.locked='vwheel';
       } else if(isDragging && selectedFloor){
         touchScroll.locked='wheel';
+      } else if(HOLO.dragging()){
+        touchScroll.locked='holo';
       } else {
         touchScroll.locked='scroll';
       }
@@ -12641,7 +13294,7 @@ function onTM(e){
       var dist=4.5; var fovRad=camera.fov*Math.PI/180;
       var halfH=Math.tan(fovRad/2)*dist;
       var scrollAmt=dy*halfH*0.004;
-      targetCameraY+=scrollAmt;
+      if(!PANTS.isOpen()) targetCameraY+=scrollAmt;   // a touch scroll does not move the page under the product view
       var minY=STOREFRONT_MODEL.floorY(TOTAL_FLOORS-1);
       targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
       // Track velocity for momentum
@@ -12786,6 +13439,7 @@ function pDown(cx,cy){
   // Detect glass UI press for visual feedback
   mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
   raycaster.setFromCamera(mouse,camera);
+  if(PANTS.pDown(cx,cy,raycaster)) return;   // the jeans' product view owns presses while it is up
   // Ball drag — top priority once cart is broken (any of the spawned balls)
   if(cartBouncyBalls.length > 0){
     var ballMeshes = [];
@@ -12973,6 +13627,8 @@ function pDown(cx,cy){
       if(ovH.length>0) return;
     }
   }
+  // The hologram between Shirts and 1 of 1s: a press on it turns it (mouse drag / horizontal swipe).
+  if(HOLO.grab(cx,cy)){ isDragging=false; selectedFloor=null; renderer.domElement.parentElement.classList.add('dragging'); return; }
   var hits=raycaster.intersectObjects(scene.children,true);
   if(hits.length>0){
     var valid=null;
@@ -13000,6 +13656,8 @@ function pDown(cx,cy){
 function pMove(cx,cy){
   if(czReady && CZ.onPointerMove(cx,cy,false)) return;
   if(VIEWER.pMove(cx,cy)) return;
+  if(HOLO.dragging()){ HOLO.drag(cx,cy); return; }   // turning the hologram
+  if(PANTS.pMove(cx,cy)) return;   // a press the jeans' product view took
   // The description box watches every move: over the product photo it opens and pans its zoom
   // view to the pointer's spot on the garment (or, in click mode, pans the open box).
   if(DML._desc && DML._desc.img){
@@ -13234,6 +13892,8 @@ function updateCursor(cx,cy){
     }
   }
   
+  if(PANTS.hover(cx,cy,el)) return;   // the jeans' product view: its orbs, fields and tiles
+  if(HOLO.hit(cx,cy)){ el.classList.add('grabbable'); return; }   // the hologram turns under a drag
   // Check scene objects (panels = clickable, floors = grabbable for spin)
   var hits=raycaster.intersectObjects(scene.children,true);
   for(var hi=0;hi<hits.length;hi++){
@@ -13259,6 +13919,8 @@ function updateCursor(cx,cy){
 function pUp(cx,cy){
   if(czReady && CZ.isLockingScroll()){ CZ.onPointerUp(); return; }
   if(VIEWER.pUp(cx,cy)) return;
+  if(HOLO.dragging()){ var _holoRel = HOLO.release(); isDragging=false; renderer.domElement.parentElement.classList.remove('dragging'); if(_holoRel === 'tap') PANTS.tapJeans(); return; }   // let go of the hologram: it coasts — a tap opens its product view
+  if(PANTS.pUp(cx,cy)) return;   // the jeans' product view: its orbs, fields and tiles
   pressedGlassMesh = null;
   // Release in-game window drag
   if(gameUI.drag.active){
@@ -20051,10 +20713,12 @@ function renderGlassFBO() {
   try { DML.setHidden('fbo', true); } catch(_dmlE){}
   STOREFRONT_MODEL.captureHidden(true);
   VIEWER.fbo(true);
+  PANTS.fbo(true);   // its frost and orbs sample this buffer: not in it
   renderer.setRenderTarget(glassFBO);
   renderer.clear();
   renderer.render(scene,camera);
   renderer.setRenderTarget(null);
+  PANTS.fbo(false);
   VIEWER.fbo(false);
   STOREFRONT_MODEL.captureHidden(false);
   try { DML.setHidden('fbo', false); } catch(_dmlE2){}
@@ -58358,6 +59022,7 @@ function init(){
   renderer.domElement.addEventListener('contextmenu',function(e){ if(gameMode.active && !gameMode.exiting) e.preventDefault(); });
   renderer.domElement.addEventListener('touchstart',onTS,{passive:false});renderer.domElement.addEventListener('touchmove',onTM,{passive:false});renderer.domElement.addEventListener('touchend',onTE);
   renderer.domElement.addEventListener('wheel',function(e){
+    if(PANTS.isOpen()){ e.preventDefault(); return; }   // nothing scrolls under the jeans' product view
     // World editor open: the wheel is the editor's (fly speed / orbit dolly), never the chase cam.
     if(typeof editor !== 'undefined' && editor.active){
       e.preventDefault();
@@ -97409,7 +98074,7 @@ function animate(){
   
   // Apply touch scroll momentum with friction
   if(Math.abs(touchScroll.scrollMomentum) > 0.0001){
-    targetCameraY+=touchScroll.scrollMomentum;
+    if(!PANTS.isOpen()) targetCameraY+=touchScroll.scrollMomentum;
     touchScroll.scrollMomentum*=0.88; // friction
     var minY=STOREFRONT_MODEL.floorY(TOTAL_FLOORS-1);
     targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
@@ -98067,6 +98732,7 @@ function animate(){
   updateOrbs(dt);
   STOREFRONT_MODEL.tick(dt);
   HOLO.update(dt);   // the jeans hologram between Shirts and 1 of 1s — fitted to the crystal tips every frame
+  PANTS.update(dt);   // the jeans' product view — after HOLO, it reads where the jeans are
   // Cart shake AFTER updateOrbs so it doesn't get overwritten by orb stage shake
   updateCartShake(dt);
   updateGlowMeshes();
@@ -98276,6 +98942,7 @@ function animate(){
     postQuad.material.uniforms.caStrength.value = _gfx.chroma;
   }
   DML.applyPost(postQuad);   // desktop detail view: pull the lens fringing back. No-op otherwise.
+  try { postQuad.material.uniforms.caStrength.value *= HOLO.lensScale(); } catch(_e){}   // the hologram is a garment to study: no edge fringing across it
   postQuad.material.uniforms.tGodRays.value=godrayBlurFBO?godrayBlurFBO.texture:null;
   postQuad.material.uniforms.godrayStr.value=godrayIntensity;
   postQuad.material.uniforms.resolution.value.set(window.innerWidth,window.innerHeight);
