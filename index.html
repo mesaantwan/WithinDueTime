@@ -8476,6 +8476,8 @@ var HOLO = (function(){
     viewFill: 0.70,        // their height as a share of the frame's height (the near parts project a little larger)
     viewMaxW: 0.46,        // …capped so their WIDTH never passes this share of the frame's width
     viewTime: 0.85,        // seconds for the glide, both ways
+    viewZoomMax: 4,        // the product view's zoom: up to this × the jeans' fitted size
+    viewZoomEase: 12,      // 1/s: how quickly the drawn zoom and pan follow the wheel's (a pinch is 1:1)
     // ── the object: stand-in denim ──
     wash: 0.14,            // 0 raw rinse … 1 light stonewash
     fades: 0.75,           // thigh / knee / seat wear
@@ -9670,7 +9672,7 @@ var HOLO = (function(){
   }
   function grab(cx, cy){
     if(DRG.on || !hit(cx, cy)) return false;
-    DRG.on = true; DRG.x = cx; DRG.y = cy; DRG.th0 = theta; DRG.vel = 0; DRG.t0 = performance.now(); DRG.maxD = 0;
+    DRG.on = true; DRG.x = cx; DRG.y = cy; DRG.ly = cy; DRG.th0 = theta; DRG.vel = 0; DRG.t0 = performance.now(); DRG.maxD = 0;
     DRG.hist = [{ x: cx, t: DRG.t0 }];
     return true;
   }
@@ -9678,6 +9680,10 @@ var HOLO = (function(){
     if(!DRG.on) return;
     if(typeof cy === 'number') DRG.maxD = Math.max(DRG.maxD, Math.hypot(cx - DRG.x, cy - DRG.y));
     theta = DRG.th0 + (cx - DRG.x) * dragK();
+    if(typeof cy === 'number'){   // zoomed in, a drag up or down walks the view along the leg
+      if(VIEW.on && VIEW.zt > 1.02 && typeof DRG.ly === 'number') viewPanBy(0, -(cy - DRG.ly) / Math.max(1, window.innerHeight) * 2);
+      DRG.ly = cy;
+    }
     var now = performance.now(); DRG.hist.push({ x: cx, t: now }); DRG.moveFrame = _frame;
     while(DRG.hist.length > 2 && now - DRG.hist[0].t > 90) DRG.hist.shift();   // keep TWO samples minimum
   }
@@ -9868,6 +9874,15 @@ var HOLO = (function(){
     _w.copy(M).addScaledVector(_rt, a0).addScaledVector(_up, b0).project(camera); var nx0 = _w.x, ny0 = _w.y;
     _w.copy(M).addScaledVector(_rt, a1).addScaledVector(_up, b1).project(camera); var nx1 = _w.x, ny1 = _w.y;
     if(!(nx1 > nx0) || !(ny1 > ny0)) return false;
+    // Only what is on screen is photographed: the plane is affine in NDC, so a clipped rectangle carries
+    // straight back onto the quad below. Zoomed in, the outline runs far past the frame — the rest would
+    // be a render target many screens tall.
+    var cx0 = Math.max(nx0, -1.02), cx1 = Math.min(nx1, 1.02), cy0 = Math.max(ny0, -1.02), cy1 = Math.min(ny1, 1.02);
+    if(!(cx1 > cx0) || !(cy1 > cy0)) return false;
+    var aW = a1 - a0, bH = b1 - b0;
+    a1 = a0 + (cx1 - nx0) / (nx1 - nx0) * aW; a0 = a0 + (cx0 - nx0) / (nx1 - nx0) * aW;
+    b1 = b0 + (cy1 - ny0) / (ny1 - ny0) * bH; b0 = b0 + (cy0 - ny0) / (ny1 - ny0) * bH;
+    nx0 = cx0; nx1 = cx1; ny0 = cy0; ny1 = cy1;
     renderer.getDrawingBufferSize(_sz);
     var W = _sz.x, H = _sz.y;
     var px0 = Math.floor((nx0 + 1)*0.5*W), px1 = Math.ceil((nx1 + 1)*0.5*W), py0 = Math.floor((ny0 + 1)*0.5*H), py1 = Math.ceil((ny1 + 1)*0.5*H);
@@ -9971,11 +9986,42 @@ var HOLO = (function(){
   // ══ the event clock ════════════════════════════════════════════════════════════════════════
   // SH.phase: 'boot' (the virtual version, being drawn) → 'out' (louvres to real) → 'idle' (real)
   // → 'in' → 'hold' → 'out' → 'idle'.  DI: the top distortion, only ever while idle.
-  var VIEW = { on: false, k: 0 };
+  // frame: where on screen the product view puts the jeans — {x, y, fill, maxW} as P.viewX/viewY/
+  // viewFill/viewMaxW mean them; null = those P values. PANTS hands in its phone layout here. cur is
+  // the eased frame, so a change (a rotation, the sheet lifting over a keyboard) glides, never jumps.
+  // z / px / py: the product view's zoom (1 = fitted) and pan (NDC, from the frame's centre), as drawn;
+  // zt / pxt / pyt: where the wheel and the double tap have sent them (a pinch sets both, 1:1).
+  var VIEW = { on: false, k: 0, frame: null, cur: null, z: 1, zt: 1, px: 0, py: 0, pxt: 0, pyt: 0 };
+  function viewFrame(f){ VIEW.frame = f ? { x: +f.x, y: +f.y, fill: +f.fill, maxW: +f.maxW } : null; }
+  // ── the product view's zoom: about a point on screen, so what is under the pointer stays under it ──
+  function vFrame(){ return VIEW.cur || VIEW.frame || { x: P.viewX, y: P.viewY, fill: P.viewFill, maxW: P.viewMaxW }; }
+  function vClampPan(){   // zoomed in, the jeans may move off centre — never so far they leave the screen
+    var mx = 0.75 * (VIEW.zt - 1), my = 0.85 * (VIEW.zt - 1);
+    VIEW.pxt = Math.max(-mx, Math.min(mx, VIEW.pxt)); VIEW.pyt = Math.max(-my, Math.min(my, VIEW.pyt));
+  }
+  function viewZoomAt(f, nx, ny){
+    if(!VIEW.on) return;
+    var z0 = VIEW.zt, z1 = Math.max(1, Math.min(P.viewZoomMax, z0 * f)), fr = vFrame();
+    if(Math.abs(z1 - z0) < 1e-6) return;
+    var cx = fr.x + VIEW.pxt, cy = fr.y + VIEW.pyt, k = z1 / z0;
+    VIEW.zt = z1; VIEW.pxt = nx + (cx - nx) * k - fr.x; VIEW.pyt = ny + (cy - ny) * k - fr.y; vClampPan();
+  }
+  function viewPanBy(dx, dy){ if(!VIEW.on) return; VIEW.pxt += dx; VIEW.pyt += dy; vClampPan(); }
+  // a pinch: the point under the fingers' first midpoint follows their midpoint, scaled 1:1 with them
+  function viewPinchBegin(mx, my){ var fr = vFrame(); return { z0: VIEW.zt, cx: fr.x + VIEW.pxt, cy: fr.y + VIEW.pyt, mx: mx, my: my }; }
+  function viewPinch(st, z, mx, my){
+    if(!VIEW.on || !st) return;
+    var z1 = Math.max(1, Math.min(P.viewZoomMax, z)), k = z1 / st.z0, fr = vFrame();
+    VIEW.zt = z1; VIEW.pxt = mx + (st.cx - st.mx) * k - fr.x; VIEW.pyt = my + (st.cy - st.my) * k - fr.y; vClampPan();
+    VIEW.z = VIEW.zt; VIEW.px = VIEW.pxt; VIEW.py = VIEW.pyt;
+  }
+  function viewZoomReset(){ VIEW.zt = 1; VIEW.pxt = VIEW.pyt = 0; }
   var _vE = new THREE.Vector3(), _vF = new THREE.Vector3(), _vR = new THREE.Vector3(), _vU = new THREE.Vector3(), _vT = new THREE.Vector3(), _vQ = new THREE.Quaternion();
   function view(on){
     on = !!on; if(on === VIEW.on) return;
     VIEW.on = on;
+    VIEW.zt = 1; VIEW.pxt = VIEW.pyt = 0;   // every visit starts fitted; leaving, it eases back out with the glide
+    if(on){ VIEW.z = 1; VIEW.px = VIEW.py = 0; }
     // opening mid-event: the product is what you asked for — turn the louvres back, drop the haze
     if(on){ if(SH.phase === 'in' || SH.phase === 'hold'){ SH.phase = 'out'; SH.t = 0; SH.dirOut = 1; } DI.t = -1; DI.env = 0; }
   }
@@ -10063,7 +10109,7 @@ var HOLO = (function(){
     // the idle spin eases back in, so the hand-off never jerks
     if(!DRG.on){
       DRG.resume = Math.min(1, DRG.resume + dt / 1.6);
-      theta += (P.spin * DRG.resume * DRG.resume + DRG.vel) * dt;
+      theta += (P.spin * DRG.resume * DRG.resume * (1 - VIEW.k) + DRG.vel) * dt;   // in the product view they hold still where you leave them
       DRG.vel *= Math.exp(-dt * 1.8);
     }
     bandY = 0.5 - 0.5*Math.cos(T * 0.55);
@@ -10088,8 +10134,13 @@ var HOLO = (function(){
       _vF.set(0, 0, -1).applyQuaternion(_vQ); _vR.set(1, 0, 0).applyQuaternion(_vQ); _vU.set(0, 1, 0).applyQuaternion(_vQ);
       var vd = Math.max(4, _vT.subVectors(Cs, _vE).dot(_vF));
       var vh = Math.tan(camera.fov * Math.PI / 360) * vd, vw = vh * camera.aspect;
-      _vT.copy(_vE).addScaledVector(_vF, vd).addScaledVector(_vR, P.viewX * vw).addScaledVector(_vU, P.viewY * vh);
-      var sV = Math.min(P.viewFill * 2 * vh / size.y, P.viewMaxW * 2 * vw / Math.max(1e-6, wMax));
+      var vfT = VIEW.frame || { x: P.viewX, y: P.viewY, fill: P.viewFill, maxW: P.viewMaxW }, vf = VIEW.cur;
+      if(!vf || VIEW.k < 1){ vf = VIEW.cur = { x: vfT.x, y: vfT.y, fill: vfT.fill, maxW: vfT.maxW }; }   // gliding in or out: straight to it
+      else { var vk = 1 - Math.exp(-dt * 7); vf.x += (vfT.x - vf.x) * vk; vf.y += (vfT.y - vf.y) * vk; vf.fill += (vfT.fill - vf.fill) * vk; vf.maxW += (vfT.maxW - vf.maxW) * vk; }
+      var zk = 1 - Math.exp(-dt * P.viewZoomEase);
+      VIEW.z += (VIEW.zt - VIEW.z) * zk; VIEW.px += (VIEW.pxt - VIEW.px) * zk; VIEW.py += (VIEW.pyt - VIEW.py) * zk;
+      var sV = Math.min(vf.fill * 2 * vh / size.y, vf.maxW * 2 * vw / Math.max(1e-6, wMax)) * VIEW.z;
+      _vT.copy(_vE).addScaledVector(_vF, vd).addScaledVector(_vR, (vf.x + VIEW.px) * vw).addScaledVector(_vU, (vf.y + VIEW.py) * vh);
       modelG.position.lerp(_vT, ve);
       sNow = scaleFit + (sV - scaleFit) * ve;
     }
@@ -10348,7 +10399,9 @@ var HOLO = (function(){
     hit: hit, grab: grab, drag: drag, release: release, cancel: cancel, dragging: function(){ return DRG.on; },
     lensScale: lensScale,
     // the product view (PANTS): glide the jeans to their place on screen and back; the pocket's material
-    view: view, viewK: function(){ return VIEW.k; }, viewOn: function(){ return VIEW.on; },
+    view: view, viewFrame: viewFrame, viewK: function(){ return VIEW.k; }, viewOn: function(){ return VIEW.on; },
+    viewZoomAt: viewZoomAt, viewPanBy: viewPanBy, viewPinchBegin: viewPinchBegin, viewPinch: viewPinch, viewZoomReset: viewZoomReset,
+    viewZoom: function(){ return { z: VIEW.z, zt: VIEW.zt, px: VIEW.px, py: VIEW.py }; },
     pocket: function(){ return pocketMat; }, rect: function(){ return IMG.ok ? { x0: IMG.nx0, x1: IMG.nx1, y0: IMG.ny0, y1: IMG.ny1 } : null; },
     group: function(){ return root; },
     photo: function(){ return rt1; },
@@ -10375,15 +10428,25 @@ var HOLO = (function(){
 // END HOLO PROJECTOR
 // BEGIN PANTS VIEW
 // ════════════════════════════════════════════════════════════════════════════════════════════════
-// THE JEANS' PRODUCT VIEW (2026-10-06) — desktop first. Tap the jeans in the hologram bay:
+// THE JEANS' PRODUCT VIEW (2026-10-06, rev 6 STEPS 2026-10-07). Tap the jeans in the hologram bay:
 //   • the tower goes: every row, the brand mark and the bottom scroller fade to nothing — sky only
-//   • the jeans glide out of the bay to the left of the screen (HOLO.view — they still turn by hand)
-//   • on the right, ONE frosted pane in the T-shirt view's language, cut from the site's shared
-//     glass (DML.frostMaterial): a card + an action column joined as one smooth bubble, the column's
-//     glass orbs punched through it (× close, bag+ add to bag) in the T-shirt view's own slots
-//   • on the card, the readouts and the two option sections, drawn as the onboard HUD:
-//       01 SIZE            WAIST / LENGTH, typed — 32 × 32 to start
-//       02 BACK EMBROIDERY tiles, the picked one ringed; the pick is shown on the jeans themselves
+//   • the jeans glide out of the bay (HOLO.view — they still turn by hand): left of the screen on the
+//     desk, the top of it on a phone
+//   • ONE frosted pane in the T-shirt view's language, cut from the site's shared glass
+//     (DML.frostMaterial): the card (+ on the desk, a column budding out of it for the × close orb),
+//     and two tabs off its top edge — the T-shirt description box's — the name in one, the price in
+//     the other. No accent colour: black type on the frost.
+//   • the card is the onboard HUD, and its options are STEPS — one page each, the card shows one at a
+//     time and a scroll / swipe locks on to the next:
+//       01 CUT             STRAIGHT / BOOT CUT tiles, each a drawing of the leg
+//       02 SIZE            a half-wheel at each side edge of the card (WAIST left, LENGTH right), the
+//                          inches round its rim; between them just the two numbers, big — 32 × 32
+//       03 BACK EMBROIDERY tiles, the picked one ringed; the pick is shown on the jeans themselves
+//     under the card, outside it, a glass NEXT capsule (DONE on the last step); once done it splits into the
+//     T-shirt view's two action orbs, bag+ (add to bag) and → (buy now) — as liquid, the way the
+//     cart and the menu pour out of their buttons. On the desk, what you have picked sits in its own
+//     small panel under the jeans; on a phone at the foot of the sheet. Left of the card, a thin
+//     bevelled glass rod in three segments says which step you are on.
 // Source: .holo/pants-view.js, spliced by .holo/build.cjs (with the page hooks) after the HOLO block.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 var PANTS = (function(){
@@ -10400,39 +10463,126 @@ var PANTS = (function(){
     { id: 'plain', name: 'NONE',           map: 'jeans_pocket_plain.jpg', normal: 'flat' },
     { id: 'd03',   name: 'DESIGN 03',      soon: true }
   ];
+  // CUT. Rides to the order as a line property, like the size.
+  //   short: what the read-out and the bag line say   order: what the order says
+  //   flare: how far the hem opens past the knee on the tile's drawing (0 = straight down)
+  var CUTS = [
+    { id: 'straight', name: 'STRAIGHT CUT', short: 'STRAIGHT', order: 'Straight cut', flare: 0 },
+    { id: 'boot',     name: 'BOOT CUT',     short: 'BOOT CUT', order: 'Boot cut',     flare: 1 }
+  ];
   var DIRS = ['', 'product-images/', 'https://raw.githubusercontent.com/mesaantwan/WithinDueTime/main/'];
   var PRODUCT_HANDLE = 'ruptured-jeans';   // the Shopify listing the bag line is made from
   var SIZE = {
     waist:  { label: 'WAIST',  def: 32, min: 24, max: 48 },
     length: { label: 'LENGTH', def: 32, min: 26, max: 38 }
   };
+  var STEPS = 3;   // 01 CUT, 02 SIZE, 03 BACK EMBROIDERY — the pages, in order
+  var PG_CUT = 0, PG_SIZE = 1, PG_POCKET = 2;
 
   var P = {
-    minAspect: 1.10,     // landscape only for now — DML's own threshold; a phone keeps the bay as it is
+    minAspect: 1.10,     // DML's own threshold: wider = the desk layout, narrower = the phone's (THE STACK's rule)
     depth: 9,            // world units in front of the camera the pane sits at (size is solved, not depth)
-    cardX0: 0.06, cardX1: 0.80, cardY0: -0.84, cardY1: 0.70,   // the card, NDC
-    colX: 0.875,         // the action column's centre, NDC x — the T-shirt view's column
-    closeY: 0.516, bagY: 0.222,   // its two orbs, NDC y — the T-shirt view's × and bag+ slots
+    cardX0: 0.06, cardX1: 0.80,   // the desk card's width, NDC; its height is cardAspect × that (see deskCard)
+    cardAspect: 0.80,    // the desk card's height / width — the phone sheet's, so every step reads the same on both
+    deskMargin: 0.07,    // the desk stack (tabs, card, NEXT) keeps this × H clear above and below
+    colX: 0.875,         // the action column's centre, NDC x — the T-shirt view's column (the × in it, level with the card's top)
     orb: 0.122,          // orb diameter, share of the frame's height (the T-shirt view's)
-    orbPad: 0.20,        // column wall around the orbs, × orb radius
+    orbPad: 0.20,        // column wall around the orb, × orb radius
     radius: 0.055,       // card corner radius, share of the frame's height
-    blend: 0.05,         // the smooth union's fillet, share of the frame's height
+    blend: 0.03,         // the smooth union's fillet, share of the frame's height (the tabs' neck, the column's)
     formIn: 0.45, formOut: 0.25,   // seconds
     formAt: 0.55,        // the pane starts to form once the jeans are this far through their glide
-    bgTime: 0.5          // seconds for the tower to go (and come back)
+    bgTime: 0.5,         // seconds for the tower to go (and come back)
+    dragPx: 6,           // a press that moves this far vertically drags (a page, a wheel) instead of clicking
+    // ── the steps ──
+    pageEase: 0.22,      // per 60 Hz frame, the page sliding to the one it locked on to
+    pageWheelPx: 40,     // wheel / trackpad px that turn the page (a mouse notch is 100)
+    wGapMs: 200,         // a pause this long between wheel events starts a new gesture
+    pageLockMs: 360,     // after a page turns, the wheel waits this long (the slide) before it can turn the next
+    wSwell: 1.6,         // trackpad: a delta this many × the last few (+4 px) is a new swipe, not the old one's tail
+    pageFlick: 0.18,     // a drag past this share of the page, or a flick, turns it
+    actH: 0.085,         // the NEXT capsule's height (= the bag / buy orbs' size), × screen height (desk)
+    mActH: 0.13,         // …× screen width (phone)
+    nextW: 2.8,          // the capsule's width, × its height
+    actGap: 16,          // px between the card's bottom and the capsule (desk)
+    mActGap: 12,         // px between the sheet's bottom and the capsule (phone)
+    tabGap: 0.02,        // phone: between the jeans' frame and the tops of the tabs, × H
+    doneTime: 0.6,       // s for the capsule to split, as liquid, into the two orbs
+    // ── the desk's info panel: what you have picked, under the jeans ──
+    deskJeansX: -0.44,   // the jeans' centre on the desk, NDC x
+    deskJeansTop: 0.09,  // their frame's top, × H
+    infoHW: 0.38,        // the info panel's half-width, NDC (centred under the jeans)
+    infoH: 0.105,        // its height, × H
+    infoBottom: 0.065,   // its bottom margin, × H
+    infoGap: 0.035,      // between the jeans' frame and the panel, × H
+    rodW: 9, mRodW: 7,   // px: the step rod's thickness (desk / phone)
+    rodOff: 18,          // px between the rod and the card's left edge (desk)
+    rodGap: 7,           // px between its segments
+    // ── THE PHONE (aspect < minAspect): the jeans on top, the card a sheet across the bottom ──
+    mSheetTop: 0.47,     // the sheet's top edge, × screen height
+    mGutter: 14,         // px: the sheet's right and bottom margins
+    mGutterL: 26,        // px: its left margin — the step rod stands in it
+    mRadius: 0.06,       // sheet corner radius, × screen width
+    mSlide: 70,          // px the sheet rises through as it forms
+    mJeansTop: 0.065,    // the jeans' frame starts here, × H (they sit between the menu and bag orbs)
+    mJeansGap: 0.02,     // between the jeans' frame and the sheet, × H
+    mJeansMaxW: 0.80,    // their width never passes this share of the screen's width
+    mOrb: 0.125,         // the × orb's diameter, × screen width — the T-shirt stack's touch size (DML mOrb)
+    mOrbInset: 0.30,     // its inset from the sheet's corner, × its diameter
+    mU: 56,              // THE type unit, desk and phone alike: card width / mU — the same proportions everywhere
+    padU: 3.6,           // the card's side margins, units
+    tileGap: 2.4,        // between picture tiles, units
+    pocketAspect: 1.3,   // a pocket tile's height / width: portrait, so it shows the pocket, not just the mark
+    mMinFont: 10,        // px floor for the small labels on a phone
+    mMinBand: 200,       // px a page keeps at the least: a short phone's sheet starts higher
+    mTopMin: 0.10,       // …but its top never higher than this × H (under the menu / bag orbs)
+    // ── 01 SIZE: two half-wheels — a glass disc (the orbs' own glass) centred ON each side edge of the
+    //    card, so the edge cuts it in half; the inches round its rim ──
+    wheelR: 14,          // a wheel's radius, units
+    wheelNum: 0.74,      // the rim's numbers sit at this × the radius
+    wheelStep: 0.33,     // radians between two inches round the rim (~19°: about nine show on the half)
+    wheelFont: 2.4,      // the rim's numbers at a 13-unit wheel, card units — they grow with the wheel (the set one × 1.3)
+    bigFont: 8.2,        // the two set numbers in the middle, units
+    dialNotchPx: 40,     // a wheel event this big (or in lines / pages) is a mouse notch: one inch
+    dialTrackPx: 26,     // trackpad px per inch
+    dialEase: 0.28,      // per 60 Hz frame, toward where it is heading
+    dialIdle: 0.14,      // s after the last trackpad event before it settles on a whole inch
+    dialCoast: 0.16,     // s of a fling's rate added when you let go (then onto a whole inch)
+    dialRubber: 0.35     // a drag's give past either end
   };
-  var INK = '#1b2333', GREY = 'rgba(40,52,76,0.62)', ACC = 'rgb(16,196,178)', ACCD = 'rgb(6,116,106)';
+  // Black on the frost, no accent colour: ink for type and for what is picked; grey for what is not.
+  var INK = '#121212', GREY = 'rgba(18,18,18,0.52)', ACC = 'rgba(18,18,18,0.82)', ACCD = '#121212';
   var FONT = 'Arial, Helvetica, sans-serif';
+  // the step rod's glass: the step you are on smoked dark, the ones done half way, the rest the card's frost
+  var STEP_ON = [0.12, 0.13, 0.15], STEP_DONE = [0.50, 0.52, 0.55], FROST = [0.80, 0.82, 0.85];
 
   // ── state ─────────────────────────────────────────────────────────────────────────────────────
   var state = 'closed';            // closed → opening → open → closing → closed
   var formK = 0, bgK = 1, holoReleased = false;
-  var vals = { waist: SIZE.waist.def, length: SIZE.length.def, design: 'mark' };
-  var focus = null, draft = '', note = '', noteT = 0, flashT = 0, caretT = 0;
+  var vals = { waist: SIZE.waist.def, length: SIZE.length.def, cut: CUTS[0].id, design: 'mark' };
+  var scr = { top: 0, bot: 0 };    // the page band on the card, card px (between the header and the NEXT row)
+  // the steps. pos: the page shown, continuous (0 = SIZE); t: the page it is locked on to; drag: a press
+  // that may become a page drag (the wheel's gestures: wg, by wheelStep)
+  var pg = { pos: 0, t: 0, drag: null, hist: [] };
+  var done = [false, false, false], complete = false, cK = 0;   // cK: the capsule → two orbs, eased
+  var flashT = 0;
+  // 01 SIZE's wheels. p: where each is, in inches, continuous (the rim's numbers and the glass turn with it);
+  // t: where it is heading; it settles on a whole inch. idle: s since a trackpad last rolled it.
+  var dials = {
+    waist:  { p: SIZE.waist.def,  t: SIZE.waist.def,  idle: 9, hist: [], grp: null, mesh: null, vis: false },
+    length: { p: SIZE.length.def, t: SIZE.length.def, idle: 9, hist: [], grp: null, mesh: null, vis: false }
+  };
+  var dialRect = {}, dialDrag = null;   // dialDrag: { id, y0, y, on, rpx } — a press on a wheel
+  // where the glass wheels are cut: the page band's top and bottom, and the card's two side edges
+  var bandT = new THREE.Plane(), bandB = new THREE.Plane(), edgeL = new THREE.Plane(), edgeR = new THREE.Plane();
+  var _n = new THREE.Vector3(), _q = new THREE.Quaternion(), _az = new THREE.Vector3(0, 0, 1);
+  var pill = null, rod = [], actRect = null, pillHit = null;   // the NEXT capsule; the step rod's segments
+  var liq = null, cKHold = null;   // the capsule → orbs liquid: one pane of the frost's clear lens glass
+  var info = null;                 // the desk's info panel: { pane, content, cv, x, tex, key }
   var hoverId = null, pressId = null, savedScroll = -1, chudWas = null;
-  var built = false, pane = null, content = null, cv = null, cx2 = null, tex = null, orbs = {}, inp = null;
+  var built = false, pane = null, content = null, cv = null, cx2 = null, tex = null, orbs = {};
   var regions = [], cardPx = { l: 0, t: 0, w: 0, h: 0 }, lastDrawKey = '';
-  var thumbs = {}, maps = {}, own = { map: null, normal: null }, flatN = null;
+  var maps = {}, own = { map: null, normal: null }, flatN = null;
   var _cE = new THREE.Vector3(), _cQ = new THREE.Quaternion(), _w = new THREE.Vector3();
   var _segC = [new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2()];
   var _segH = [new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2(), new THREE.Vector2()];
@@ -10441,8 +10591,10 @@ var PANTS = (function(){
   function sat(x){ return x < 0 ? 0 : x > 1 ? 1 : x; }
   function ease(x){ x = sat(x); return x * x * (3 - 2 * x); }
   function landscape(){ return window.innerWidth / Math.max(1, window.innerHeight) >= P.minAspect; }
+  function phone(){ return !landscape(); }
   function isOpen(){ return state !== 'closed'; }
   function design(id){ for(var i = 0; i < DESIGNS.length; i++) if(DESIGNS[i].id === (id || vals.design)) return DESIGNS[i]; return DESIGNS[0]; }
+  function cutOf(id){ for(var i = 0; i < CUTS.length; i++) if(CUTS[i].id === (id || vals.cut)) return CUTS[i]; return CUTS[0]; }
   function product(){
     var ps = (typeof SHOP !== 'undefined' && SHOP.products && SHOP.products()) || [];
     for(var i = 0; i < ps.length; i++) if(ps[i].shopifyHandle === PRODUCT_HANDLE) return ps[i];
@@ -10460,78 +10612,358 @@ var PANTS = (function(){
     var hh = halfH(), hw = hh * camera.aspect;
     return out.set(nx * hw, ny * hh, -P.depth).applyQuaternion(_cQ).add(_cE);
   }
+  function pxWorld(sx, sy, out){ return ndcWorld(sx / window.innerWidth * 2 - 1, 1 - sy / window.innerHeight * 2, out); }
+  function feedGlass(m){   // a glass mesh's per-frame inputs: the scene behind it, the screen, the clock
+    var gu = m.material.uniforms, pr = renderer.getPixelRatio();
+    if(typeof glassFBO !== 'undefined' && glassFBO) gu.tBg.value = glassFBO.texture;
+    gu.res.value.set(window.innerWidth * pr, window.innerHeight * pr); gu.time.value = performance.now() * 0.001;
+  }
+
+  // ── the tabs: the T-shirt description box's two bumps, off the card's top edge ──────────────────
+  // Read from DML.P (descBump*), scaled from that box's width to the card's, so the two stay one design:
+  // the name's tab from the left (inset), the price's after a gap, each overlapping the card by half its
+  // corner radius and melted on by the smooth union. x0 / y1: the card's left / top edge, w its width,
+  // all in one unit (world or px); fm 0..1 grows them out of the edge.
+  function tabsGeom(x0, y1, w, fm){
+    var D = DML.P, k = w / (D.descW || 5.42);
+    var w1 = D.descBumpW1 * k, h1 = Math.max(1e-4, D.descBumpH1 * k * fm), w2 = D.descBumpW2 * k, h2 = Math.max(1e-4, D.descBumpH2 * k * fm);
+    var r1 = Math.min(w1, h1) * 0.5 * D.descBumpRadius, r2 = Math.min(w2, h2) * 0.5 * D.descBumpRadius;
+    var bx1 = x0 + D.descBumpInset * k + w1 / 2, bx2 = bx1 + w1 / 2 + D.descBumpGap * k + w2 / 2;
+    var s1 = { x: bx1, y: y1 + h1 / 2 - r1 / 2, hw: w1 / 2, hh: h1 / 2 + r1 / 4, r: r1 };
+    var s2 = { x: bx2, y: y1 + h2 / 2 - r2 / 2, hw: w2 / 2, hh: h2 / 2 + r2 / 4, r: r2 };
+    return { segs: [s1, s2], rise: Math.max(s1.y + s1.hh, s2.y + s2.hh) - y1,
+             title: D.descTitle * k, price: D.descPrice * k,
+             t1: { x: bx1, w: w1, h: h1 }, t2: { x: bx2, w: w2, h: h2 } };
+  }
+
+  // ── the capsule: the orbs' own glass, stretched ─────────────────────────────────────────────────
+  // createGlassCircleBtn's material with its disc mask widened into a stadium by one uniform (capH, the
+  // straight half-length; 0 = the very disc it was), on a stadium of geometry with the disc's own domed
+  // rim — so its edge bends the scene exactly as the × and bag+ do. No new glass: a capsule of the same.
+  function capsuleMat(){
+    var mat = createGlassCircleBtn(0.5).userData.glassMesh.material, n = 0;
+    function sub(s, a, b){ if(s.indexOf(a) < 0) return s; n++; return s.replace(a, b); }
+    var vs = sub(mat.vertexShader, 'uniform float hoverPress,cR;', 'uniform float hoverPress,cR,capH;');
+    vs = sub(vs, 'length(position.xy) / cR', 'length(vec2(max(abs(position.x) - capH, 0.0), position.y)) / cR');
+    var fs = sub(mat.fragmentShader, 'uniform float cR,time,hoverPress,stain,blurPx,frost,bevel,bevelW;',
+                 'uniform float cR,time,hoverPress,stain,blurPx,frost,bevel,bevelW,capH;');
+    fs = sub(fs, 'float sd=length(vLP.xy)-cR', 'float sd=length(vec2(max(abs(vLP.x)-capH,0.0),vLP.y))-cR');
+    if(n !== 4) console.warn('[PANTS] the orb glass shader changed — capsule patched ' + n + '/4');
+    mat.vertexShader = vs; mat.fragmentShader = fs; mat.uniforms.capH = { value: 0 };
+    mat.depthTest = false; mat.needsUpdate = true;
+    return mat;
+  }
+  // A stadium, radius 0.5, straight half-length H: the plane grid folded onto it the way the disc's is,
+  // its rim sinking like the disc's (the outer 30%) — that slope is the refraction at the edge.
+  function capsuleGeo(H){
+    var R = 0.5, g = new THREE.PlaneGeometry(2 * (H + R), 2 * R, Math.max(20, Math.round(20 * (H + R) / R)), 20), pos = g.attributes.position;
+    for(var i = 0; i < pos.count; i++){
+      var x = pos.getX(i), y = pos.getY(i), cx = Math.max(-H, Math.min(H, x)), dx = x - cx, d = Math.hypot(dx, y), cd = Math.min(d, R);
+      var px = cx, py = 0; if(d > 1e-6){ px = cx + dx / d * cd; py = y / d * cd; }
+      var rim = cd / R;
+      pos.setXYZ(i, px, py, rim > 0.7 ? -0.04 * Math.pow((rim - 0.7) / 0.3, 2) : 0);
+    }
+    pos.needsUpdate = true; g.computeVertexNormals();
+    return g;
+  }
+  // The orb glass with a fade (uniform fade, 1 = as it was): the add / buy orbs crossfade over the liquid's
+  // last drops — the two glasses lay their glare differently, so a cut between them would show.
+  function fadeGlass(mat){
+    var fs = mat.fragmentShader, a = 'uniform float cR,time,hoverPress,stain,blurPx,frost,bevel,bevelW;', b = 'gl_FragColor=vec4(col,alpha);';
+    if(fs.indexOf(a) < 0 || fs.indexOf(b) < 0){ console.warn('[PANTS] the orb glass shader changed — no fade'); mat.uniforms.fade = { value: 1 }; return; }
+    mat.fragmentShader = fs.replace(a, 'uniform float cR,time,hoverPress,stain,blurPx,frost,bevel,bevelW,fade;').replace(b, 'gl_FragColor=vec4(col,alpha*fade);');
+    mat.uniforms.fade = { value: 1 }; mat.needsUpdate = true;
+  }
+  function capsule(order){   // in its own group: the page's hover loop tints a glass mesh's siblings
+    var m = new THREE.Mesh(capsuleGeo(0), capsuleMat());
+    m.renderOrder = order; m.frustumCulled = false; m.raycast = function(){};
+    var g = new THREE.Group(); g.add(m); g.visible = false; scene.add(g);
+    return { grp: g, mesh: m, H: 0 };
+  }
+  function shapeCapsule(c, H){
+    H = Math.max(0, H);
+    if(Math.abs(H - c.H) < 0.02) return;
+    c.mesh.geometry.dispose(); c.mesh.geometry = capsuleGeo(H); c.H = H; c.mesh.material.uniforms.capH.value = H;
+  }
 
   // ── build ─────────────────────────────────────────────────────────────────────────────────────
   function build(){
     if(built) return;
     built = true;
     pane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), DML.frostMaterial());
-    pane.raycast = function(){}; pane.frustumCulled = false; pane.renderOrder = 3;
+    // Draw order: the card is IN FRONT of the jeans, so it comes after HOLO's picture (31) and its
+    // flares (34): pane 40 < the half-wheels and the NEXT capsule 42 (the canvas writes on them)
+    // < content 43 < orb glass and the step rod 45 < icons 50. The nav, the bag and the cart are in
+    // the layer-1 overlay pass and stay on top of all of it.
+    pane.raycast = function(){}; pane.frustumCulled = false; pane.renderOrder = 40;
     pane.material.depthTest = false; pane.visible = false;
     scene.add(pane);
     cv = document.createElement('canvas'); cv.width = cv.height = 8; cx2 = cv.getContext('2d');
     tex = new THREE.CanvasTexture(cv); tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter; tex.generateMipmaps = false;
     content = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
       new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false }));
-    content.raycast = function(){}; content.frustumCulled = false; content.renderOrder = 6; content.visible = false;
+    content.raycast = function(){}; content.frustumCulled = false; content.renderOrder = 43; content.visible = false;
     content.userData.noTint = true;
     scene.add(content);
-    [['close', 'close'], ['bag', 'add-to-cart']].forEach(function(o){
+    // the orbs: × in the column (desk) / the sheet's corner (phone); bag+ and → (buy now) are what the
+    // NEXT capsule splits into — the T-shirt view's own action icons
+    [['close', 'close'], ['add', 'add-to-cart'], ['buy', 'expand']].forEach(function(o){
       var b = createGlassCircleBtn(0.5);
-      b.userData.glassMesh.material.depthTest = false;
-      var ic = createStarIconOverlay(o[1], 0.5); b.add(ic);
+      if(o[0] !== 'close') fadeGlass(b.userData.glassMesh.material);   // they crossfade in over the liquid
+      b.userData.glassMesh.material.depthTest = false; b.userData.glassMesh.renderOrder = 45;
+      var ic = createStarIconOverlay(o[1], 0.5); ic.renderOrder = 50; b.add(ic);
       b.visible = false; scene.add(b);
       orbs[o[0]] = { grp: b, icon: ic, sx: 0, sy: 0, r: 0 };
     });
-    // the keyboard: a real (invisible) input owns the typing, so every keyboard — and later a phone's
-    // numeric pad — works, and the value is drawn on the glass
-    inp = document.createElement('input');
-    inp.type = 'text'; inp.inputMode = 'numeric'; inp.autocomplete = 'off'; inp.maxLength = 2;
-    inp.setAttribute('aria-label', 'Jeans size');
-    inp.style.cssText = 'position:fixed;left:-200px;top:40%;width:60px;height:24px;opacity:0;pointer-events:none;';
-    document.body.appendChild(inp);
-    inp.addEventListener('input', function(){
-      draft = inp.value.replace(/\D/g, '').slice(0, 2);
-      if(inp.value !== draft) inp.value = draft;
+    // 01 SIZE's two half-wheels: a glass disc each, cut by the shader's clipping planes (the cart's lines
+    // use the same) — by the card's side edge, that is the half, and by the page band.
+    ['waist', 'length'].forEach(function(id, i){
+      var g = createGlassCircleBtn(0.5), m = g.userData.glassMesh;
+      m.material.depthTest = false; m.renderOrder = 42; m.raycast = function(){};
+      // clipping: a ShaderMaterial ignores clippingPlanes unless it says it clips (the cart's lines set it too)
+      m.material.clipping = true; m.material.clippingPlanes = [bandT, bandB, i === 0 ? edgeL : edgeR]; m.material.needsUpdate = true;
+      g.visible = false; scene.add(g);
+      dials[id].grp = g; dials[id].mesh = m;
     });
-    inp.addEventListener('keydown', function(e){
-      e.stopPropagation();   // digits are a size here, not a site shortcut
-      var k = e.key;
-      if(k === 'Enter' || k === 'Tab'){ e.preventDefault(); var was = focus; commit(); if(was === 'waist' && !e.shiftKey) setFocus('length'); else if(was === 'length' && e.shiftKey && k === 'Tab') setFocus('waist'); else unfocus(); }
-      else if(k === 'Escape'){ e.preventDefault(); draft = ''; focus = null; try { inp.blur(); } catch(_e){} }
-      else if(k === 'ArrowUp' || k === 'ArrowDown'){
-        e.preventDefault();
-        var f = SIZE[focus], v = parseInt(draft, 10); if(!(v > 0)) v = vals[focus];
-        v = Math.max(f.min, Math.min(f.max, v + (k === 'ArrowUp' ? 1 : -1)));
-        draft = String(v); inp.value = draft;
-      }
-    });
-    inp.addEventListener('blur', function(){ if(focus) commit(); focus = null; });
+    pill = capsule(42);
+    // The liquid: the frost material's LENS (clear glass bent from the shape's own rim curl — the corner
+    // liquid's, the bubble orbs' look on any outline), 2 shape slots + 3 droplets melted together.
+    liq = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), DML.frostMaterial(4, 4));
+    liq.material.depthTest = false; liq.material.uniforms.lens.value = 1;
+    liq.material.uniforms.tScratch.value = generateScratchTexture(); liq.material.uniforms.tFrost.value = generateFrostTexture();
+    liq.renderOrder = 44; liq.frustumCulled = false; liq.raycast = function(){}; liq.visible = false;
+    scene.add(liq);
+    // the desk's info panel: the same frost, its own sheet of type
+    info = { pane: new THREE.Mesh(new THREE.PlaneGeometry(1, 1), DML.frostMaterial()), cv: document.createElement('canvas'), key: '' };
+    info.pane.material.depthTest = false; info.pane.renderOrder = 40; info.pane.frustumCulled = false; info.pane.raycast = function(){}; info.pane.visible = false;
+    info.cv.width = info.cv.height = 8; info.x = info.cv.getContext('2d');
+    info.tex = new THREE.CanvasTexture(info.cv); info.tex.minFilter = THREE.LinearFilter; info.tex.magFilter = THREE.LinearFilter; info.tex.generateMipmaps = false;
+    info.content = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: info.tex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false }));
+    info.content.renderOrder = 43; info.content.frustumCulled = false; info.content.raycast = function(){}; info.content.visible = false;
+    info.content.userData.noTint = true;
+    scene.add(info.pane); scene.add(info.content);
+    for(var k = 0; k < STEPS; k++){   // the step rod: three frosted capsule segments (the glass's stain mode)
+      var sg = capsule(45), u = sg.mesh.material.uniforms;
+      u.stain.value = 1; u.frost.value = 0.55; u.bevel.value = 0.45; u.bevelW.value = 0.16; u.blurPx.value = 6;
+      sg.st = 0; sg.sx = 0; sg.sy = 0; sg.hw = 0; sg.hh = 0;
+      rod.push(sg);
+    }
     window.addEventListener('keydown', function(e){
-      if(e.key === 'Escape' && state === 'open' && document.activeElement !== inp) close();
+      if(state !== 'open') return;
+      if(e.key === 'Escape') close();
+      else if(e.key === 'ArrowDown' || e.key === 'PageDown'){ e.preventDefault(); goTo(pg.t + 1); }
+      else if(e.key === 'ArrowUp' || e.key === 'PageUp'){ e.preventDefault(); goTo(pg.t - 1); }
     });
     flatN = new THREE.DataTexture(new Uint8Array([128, 128, 255, 255]), 1, 1, THREE.RGBAFormat);
     flatN.needsUpdate = true;
   }
 
-  // ── the fields ────────────────────────────────────────────────────────────────────────────────
-  function setFocus(id){
-    focus = id; draft = String(vals[id]); caretT = 0;
-    inp.value = draft; inp.setAttribute('aria-label', SIZE[id].label.toLowerCase() + ' in inches');
-    try { inp.focus({ preventScroll: true }); inp.select(); } catch(e){ inp.focus(); }
+  // ── the steps ─────────────────────────────────────────────────────────────────────────────────
+  function goTo(k){ pg.t = Math.max(0, Math.min(STEPS - 1, Math.round(k))); }
+  // NEXT: this step is done, on to the next; on the last one (DONE) the capsule becomes add / buy
+  function next(){
+    var k = Math.round(pg.t);
+    done[k] = true;
+    if(k < STEPS - 1) goTo(k + 1); else complete = true;
   }
-  // Leaving a field: commit and clear focus HERE — the input's blur event only fires while the window
-  // itself has focus, so relying on it can leave a field looking edited.
-  function unfocus(){ if(focus) commit(); focus = null; try { inp.blur(); } catch(e){} }
-  function commit(){
-    if(!focus) return;
-    var f = SIZE[focus], v = parseInt(draft, 10);
-    if(v > 0){
-      var c = Math.max(f.min, Math.min(f.max, v));
-      if(c !== v){ note = f.label + ' RUNS ' + f.min + '–' + f.max + ' IN'; noteT = 2.6; }
-      vals[focus] = c;
+  function pageTick(dt){
+    if(pg.drag && pg.drag.on) return;   // held: the drag places it
+    pg.pos += (pg.t - pg.pos) * (1 - Math.pow(1 - P.pageEase, dt * 60));
+    if(Math.abs(pg.t - pg.pos) < 0.0015) pg.pos = pg.t;
+  }
+  // The mouse wheel / a trackpad. The stream of events is cut into GESTURES, and each gesture belongs to
+  // the one thing it started over — a half-wheel, or the steps — however the pointer drifts during it
+  // (a browser's scroll latching). For the steps, a gesture turns one page, and only once the last turn
+  // has had P.pageLockMs to slide. A new gesture is:
+  //   • anything after a quiet P.wGapMs,
+  //   • a mouse notch (|Δ| ≥ P.dialNotchPx, or lines / pages) once that lock is over — so spinning the
+  //     wheel walks the steps one by one, never two at once and never stuck,
+  //   • a trackpad delta that SWELLS past the last few (a new swipe) rather than decaying (the old
+  //     swipe's inertial tail), or one that turns round.
+  var wg = { last: 0, target: null, armed: true, acc: 0, dir: 0, hist: [], lockUntil: 0 };
+  function wheelStep(e, overDial){
+    var now = performance.now(), d = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1), ad = Math.abs(d);
+    var notch = e.deltaMode !== 0 || ad >= P.dialNotchPx, h = wg.hist, prev = 0;
+    for(var i = Math.max(0, h.length - 4); i < h.length; i++) prev = Math.max(prev, h[i]);
+    var fresh = now - wg.last > P.wGapMs || (notch && now >= wg.lockUntil) ||
+                (!notch && h.length >= 3 && ad > prev * P.wSwell + 4) || (d && wg.dir && (d > 0 ? 1 : -1) !== wg.dir);
+    wg.last = now; h.push(ad); if(h.length > 12) h.shift();
+    if(fresh){ wg.target = overDial || 'page'; wg.armed = true; wg.acc = 0; if(d) wg.dir = d > 0 ? 1 : -1; }
+    if(!d) return;
+    if(wg.target === 'jeans'){   // zoom toward the pointer: a notch ±~17%, a trackpad pinch (ctrl + wheel) finer
+      HOLO.viewZoomAt(Math.exp(-d * (e.ctrlKey ? 0.01 : 0.0018)), e.clientX / window.innerWidth * 2 - 1, 1 - e.clientY / window.innerHeight * 2);
+      return;
     }
-    draft = '';
+    if(wg.target !== 'page'){ dialWheel(wg.target, e); return; }
+    if(!wg.armed || now < wg.lockUntil) return;
+    wg.acc += d;
+    if(Math.abs(wg.acc) >= P.pageWheelPx){
+      goTo(pg.t + (wg.acc > 0 ? 1 : -1));
+      wg.armed = false; wg.acc = 0; wg.lockUntil = now + P.pageLockMs;
+    }
+  }
+
+  // ── 01 SIZE: the wheels ──────────────────────────────────────────────────────────────────────
+  function clampS(id, v){ var S = SIZE[id]; return Math.max(S.min, Math.min(S.max, v)); }
+  function dialSet(id, v){ var D = dials[id]; D.t = clampS(id, Math.round(v)); D.idle = 9; }
+  function dialsTick(dt){
+    var n = dt * 60;
+    for(var id in dials){
+      var D = dials[id];
+      if(dialDrag && dialDrag.on && dialDrag.id === id) continue;   // held: the drag places it
+      D.idle += dt;
+      if(D.idle > P.dialIdle) D.t = clampS(id, Math.round(D.t));
+      D.p += (D.t - D.p) * (1 - Math.pow(1 - P.dialEase, n));
+      if(Math.abs(D.t - D.p) < 0.002) D.p = D.t;
+      vals[id] = clampS(id, Math.round(D.p));
+    }
+  }
+  // The mouse wheel / a trackpad over a wheel. Down = up an inch: the numbers below the
+  // index are the bigger ones, and scrolling down brings them up to it.
+  function dialWheel(id, e){
+    var D = dials[id], d = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1);
+    if(!d) return;
+    if(e.deltaMode !== 0 || Math.abs(d) >= P.dialNotchPx) dialSet(id, Math.round(D.t) + (d > 0 ? 1 : -1));
+    else { var S = SIZE[id]; D.t = Math.max(S.min - 0.45, Math.min(S.max + 0.45, D.t + d / P.dialTrackPx)); D.idle = 0; }
+  }
+  // Each wheel on its edge of the card, in the camera's frame. Every cut is a plane through the eye, so
+  // it falls exactly where the canvas's edge or band edge is on screen.
+  function placeDials(f, hw, hh, H2){
+    var Wp = window.innerWidth, Hp = window.innerHeight, wpp = H2 / Math.max(1, Hp), Dp = P.depth;
+    var yT = (1 - 2 * (cardPx.t + scr.top) / Hp) * hh, yB = (1 - 2 * (cardPx.t + scr.bot) / Hp) * hh;
+    var xL = (2 * cardPx.l / Wp - 1) * hw, xR = (2 * (cardPx.l + cardPx.w) / Wp - 1) * hw;
+    bandT.setFromNormalAndCoplanarPoint(_n.set(0, -Dp, -yT).normalize().applyQuaternion(_cQ), _cE);
+    bandB.setFromNormalAndCoplanarPoint(_n.set(0, Dp, yB).normalize().applyQuaternion(_cQ), _cE);
+    edgeL.setFromNormalAndCoplanarPoint(_n.set(Dp, 0, xL).normalize().applyQuaternion(_cQ), _cE);
+    edgeR.setFromNormalAndCoplanarPoint(_n.set(-Dp, 0, -xR).normalize().applyQuaternion(_cQ), _cE);
+    var grow = ease(sat((f - 0.12) / 0.55));   // with the page's rise
+    for(var id in dials){
+      var D = dials[id], R = dialRect[id];
+      D.vis = !!R && f > 0.002 && grow > 0.01 && R.top + R.h > scr.top && R.top < scr.bot;
+      D.grp.visible = D.vis;
+      if(!D.vis) continue;
+      pxWorld(cardPx.l + R.x, cardPx.t + R.y, D.grp.position);
+      // facing the screen like the × and bag+, turned about its centre as it rolls (the glass's own
+      // scratches and glare go round with the numbers): the left one anticlockwise for more, the right clockwise
+      D.grp.quaternion.copy(_cQ).multiply(_q.setFromAxisAngle(_az, R.side * D.p * P.wheelStep));
+      D.grp.scale.setScalar(Math.max(1e-4, (R.r * wpp / 0.5) * grow));
+      feedGlass(D.mesh);
+    }
+  }
+  // The NEXT capsule under the card, or — once every step is done — the two orbs it splits into, at
+  // its two ends: bag+ (add to bag) and → (buy now). The split is LIQUID, over P.doneTime: the
+  // capsule's middle drains into its two ends and thins to a thread, the thread breaks in the middle and
+  // each half is drawn back into its drop (a satellite droplet flicks off and evaporates), and the two
+  // drops lurch apart a touch, wobble and settle round — the orbs, whose icons arrive with them. While
+  // it runs the glass is one pane of the frost's lens; at rest it is the capsule before and the orbs
+  // after, the same shapes exactly, so the hand-offs do not show.
+  var LIQ_HAND = 0.58;   // the drops are round from here: the orbs fade in over them
+  function liquidAt(u, cx, cy, D, R){   // the shapes at progress u, screen px: { segs, blobs, blend }
+    var drain = ease(sat(u / 0.45)), brk = ease(sat((u - 0.45) / 0.17)), w = sat((u - 0.55) / 0.45);
+    var midH = u < 0.45 ? R * (1 - 0.88 * drain) : R * 0.12 * (1 - brk);
+    var swell = u < 0.55 ? 0.10 * sat(u / 0.55) : 0.10 * Math.exp(-3.2 * w) * Math.cos(2.6 * Math.PI * w) * (1 - w);
+    var lurch = u < 0.55 ? 0 : 0.07 * Math.sin(Math.PI * Math.min(1, w * 1.6)) * (1 - w);
+    var rd = R * (1 + swell), dx = D * (1 + lurch), k = Math.max(R * 0.005, R * 0.75 * sat(u / 0.12));   // ~no neck at the hand-off, so the rest shape is exact (0 would mean "the default")
+    var segs = [], blobs = [{ x: cx - dx, y: cy, r: rd, k: k }, { x: cx + dx, y: cy, r: rd, k: k }];
+    if(midH > R * 0.02){
+      if(u < 0.45) segs.push({ x: cx, y: cy, hw: D + midH, hh: midH, r: midH });   // its rounded ends centred on the drops: at rest, the capsule exactly
+      else {   // broken: each half of the thread is drawn back into its own drop
+        var g = D * brk, hwh = Math.max(1e-3, (D - g) / 2);
+        segs.push({ x: cx - g - hwh, y: cy, hw: hwh, hh: midH, r: midH }, { x: cx + g + hwh, y: cy, hw: hwh, hh: midH, r: midH });
+      }
+    }
+    var sat2 = null;
+    if(u > 0.42 && u < 0.8){ sat2 = { x: cx, y: cy + R * 0.06 * sat((u - 0.42) / 0.38), r: R * 0.24 * Math.sin(Math.PI * (u - 0.42) / 0.38), k: R * 0.22 }; blobs.push(sat2); }
+    // Past the break the two drops are round: the orbs crossfade in over them, still wobbling (the two
+    // glasses lay their glare differently, so a cut would show), while the pane fades out.
+    var orbK = ease(sat((u - LIQ_HAND) / 0.25));
+    if(!segs.length) segs.push({ x: cx - dx, y: cy, hw: R * 0.02, hh: R * 0.02, r: R * 0.02 });   // a dot inside the left drop: the pane needs one shape
+    return { segs: segs, blobs: blobs, blend: R * 0.28, rd: rd, dx: dx, orbK: orbK, op: 1 - orbK, empty: orbK >= 0.999 };
+  }
+  function feedLiquid(L, R, wpp){   // L in screen px → the lens pane, in the camera's frame
+    var x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9, i;
+    L.segs.forEach(function(q){ x0 = Math.min(x0, q.x - q.hw); x1 = Math.max(x1, q.x + q.hw); y0 = Math.min(y0, q.y - q.hh); y1 = Math.max(y1, q.y + q.hh); });
+    L.blobs.forEach(function(b){ var e = b.r + 0.5 * b.k; x0 = Math.min(x0, b.x - e); x1 = Math.max(x1, b.x + e); y0 = Math.min(y0, b.y - e); y1 = Math.max(y1, b.y + e); });
+    var mg = R * 0.3 + 4; x0 -= mg; x1 += mg; y0 -= mg; y1 += mg;
+    var cxp = (x0 + x1) / 2, cyp = (y0 + y1) / 2, u = liq.material.uniforms, DP = DML.P;
+    pxWorld(cxp, cyp, liq.position); liq.quaternion.copy(_cQ); liq.scale.set((x1 - x0) * wpp, (y1 - y0) * wpp, 1);
+    feedGlass(liq);
+    u.hsize.value.set((x1 - x0) * wpp / 2, (y1 - y0) * wpp / 2);
+    u.aa.value = Math.max(1e-4, DP.plateEdgePx * wpp); u.opacity.value = L.op; u.holeN.value = 0; u.bandAmt.value = 0;
+    u.lens.value = 1; u.lensW.value = Math.max(1e-4, 0.3 * R * wpp);
+    u.segN.value = L.segs.length; u.blend.value = Math.max(1e-4, L.blend * wpp);
+    for(i = 0; i < L.segs.length; i++){
+      var q = L.segs[i];
+      u.segC.value[i].set((q.x - cxp) * wpp, -(q.y - cyp) * wpp); u.segH.value[i].set(Math.max(1e-4, q.hw * wpp), Math.max(1e-4, q.hh * wpp)); u.segR.value[i] = q.r * wpp;
+    }
+    for(i = 0; i < L.blobs.length; i++){ var b = L.blobs[i]; u.blob.value[i].set((b.x - cxp) * wpp, -(b.y - cyp) * wpp, b.r * wpp, b.k * wpp); }
+    u.blobN.value = L.blobs.length; u.blobK.value = Math.max(1e-4, 0.5 * R * wpp);
+  }
+  function placeActions(f, hw, hh, H2){
+    var A = actRect; if(!A) return;
+    var wpp = H2 / Math.max(1, window.innerHeight), grow = ease(sat((f - 0.35) / 0.6));
+    var cx = cardPx.l + A.cx, cy = cardPx.t + A.cy, D = (A.w - A.h) / 2, R = A.h / 2, u = cK;
+    var mid = u > 0 && u < 1;
+    // before: the capsule glass
+    pill.grp.visible = u <= 0 && grow > 0.01;
+    if(pill.grp.visible){
+      shapeCapsule(pill, (A.w - A.h) / (2 * A.h));
+      pxWorld(cx, cy, pill.grp.position); pill.grp.quaternion.copy(_cQ);
+      pill.grp.scale.setScalar(Math.max(1e-4, A.h * wpp * grow));
+      feedGlass(pill.mesh);
+    }
+    pillHit = pill.grp.visible ? { x: cx, y: cy, w: A.w * grow, h: A.h * grow } : null;
+    // between: the liquid
+    var L = mid ? liquidAt(u, cx, cy, D, R) : null;
+    liq.visible = !!L && !L.empty && grow > 0.01;
+    if(liq.visible) feedLiquid(L, R, wpp);
+    // after (and arriving): the orbs — their glass once the liquid has set, their icons as it does
+    ['add', 'buy'].forEach(function(key, i){
+      var ob = orbs[key], g = ob.grp.userData.glassMesh, sx = i ? 1 : -1;
+      var ox = cx + sx * (L ? L.dx : D), r = L ? L.rd : R, ia = u >= 1 ? 1 : ease(sat((u - LIQ_HAND) / (1 - LIQ_HAND)));
+      ob.grp.visible = u >= LIQ_HAND && grow > 0.01;
+      g.visible = true; g.material.uniforms.fade.value = L ? L.orbK : 1;
+      ob.sx = ox; ob.sy = cy; ob.r = r * grow;
+      if(!ob.grp.visible) return;
+      pxWorld(ox, cy, ob.grp.position); ob.grp.quaternion.copy(_cQ);
+      ob.grp.scale.setScalar(Math.max(1e-4, 2 * r * wpp * grow));
+      ob.icon.material.opacity = ia * grow;
+      if(g.visible) feedGlass(g);
+    });
+  }
+  // The step rod: three frosted glass segments the height of the page band — on the desk just left of
+  // the card, on a phone in the sheet's left margin. The step you are on is smoked dark, the ones done
+  // half way, the rest the card's own frost.
+  function placeRod(f, hw, hh, H2, dt){
+    var ph = phone(), wpp = H2 / Math.max(1, window.innerHeight), rw = ph ? P.mRodW : P.rodW;
+    var xs = ph ? P.mGutterL / 2 : cardPx.l - P.rodOff - rw / 2;
+    var y0 = cardPx.t + scr.top + 2, y1 = cardPx.t + scr.bot - 2, L = Math.max(rw, (y1 - y0 - (STEPS - 1) * P.rodGap) / STEPS);
+    var grow = ease(sat((f - 0.2) / 0.6)), cur = Math.round(pg.pos), kk = 1 - Math.pow(0.82, (dt || 0.016) * 60);
+    for(var k = 0; k < STEPS; k++){
+      var sg = rod[k], cy = y0 + k * (L + P.rodGap) + L / 2;
+      sg.grp.visible = grow > 0.01;
+      sg.sx = xs; sg.sy = cy; sg.hw = rw / 2 + 12; sg.hh = L / 2 + P.rodGap / 2;
+      if(!sg.grp.visible) continue;
+      shapeCapsule(sg, (L - rw) / (2 * rw));
+      pxWorld(xs, cy, sg.grp.position);
+      sg.grp.quaternion.copy(_cQ).multiply(_q.setFromAxisAngle(_az, Math.PI / 2));   // standing up
+      sg.grp.scale.setScalar(Math.max(1e-4, rw * wpp * grow));
+      var want = k === cur ? 1 : done[k] ? 0.45 : 0;
+      sg.st += (want - sg.st) * kk;
+      var a = Math.min(1, sg.st * 2), b = Math.max(0, sg.st * 2 - 1), tu = sg.mesh.material.uniforms.tint.value;
+      tu.setRGB(FROST[0] + (STEP_DONE[0] - FROST[0]) * a + (STEP_ON[0] - STEP_DONE[0]) * b,
+                FROST[1] + (STEP_DONE[1] - FROST[1]) * a + (STEP_ON[1] - STEP_DONE[1]) * b,
+                FROST[2] + (STEP_DONE[2] - FROST[2]) * a + (STEP_ON[2] - STEP_DONE[2]) * b);
+      sg.mesh.material.uniforms.frost.value = 0.55 + 0.3 * b;
+      feedGlass(sg.mesh);
+    }
+  }
+  function dialMesh(m){ for(var id in dials) if(dials[id].mesh === m) return id; return null; }
+  function ownGlass(m){
+    if(!m) return false;
+    if(dialMesh(m) || orbGlass(m) || (pill && pill.mesh === m)) return true;
+    for(var k = 0; k < rod.length; k++) if(rod[k].mesh === m) return true;
+    return false;
   }
 
   // ── the embroidery, on the jeans themselves ─────────────────────────────────────────────────────
@@ -10566,44 +10998,87 @@ var PANTS = (function(){
   }
 
   // ── the bag ───────────────────────────────────────────────────────────────────────────────────
-  function addToBag(){
+  function addToBag(){   // true when the line went in
     var p = product();
-    if(!p){ SHOP.notify('The jeans aren’t for sale online yet.'); return; }
-    if(p.sold){ SHOP.notify(p.name + ' is sold out.'); return; }
+    if(!p){ SHOP.notify('The jeans aren’t for sale online yet.'); return false; }
+    if(p.sold){ SHOP.notify(p.name + ' is sold out.'); return false; }
     var v = SHOP.variantFor(p, '');
-    if(!v || !v.available){ SHOP.notify(p.name + ' is sold out.'); return; }
+    if(!v || !v.available){ SHOP.notify(p.name + ' is sold out.'); return false; }
     var price = parseFloat(v.price && v.price.amount);
-    if(!(price > 0)){ SHOP.notify(p.name + ' isn’t for sale yet.'); return; }
-    var d = design(), size = 'W' + vals.waist + ' L' + vals.length;
-    // Waist, length and the embroidery ride to the order as line properties; each combination is
-    // its own bag line.
+    if(!(price > 0)){ SHOP.notify(p.name + ' isn’t for sale yet.'); return false; }
+    var d = design(), c = cutOf(), size = 'W' + vals.waist + ' L' + vals.length;
+    // Waist, length, the cut and the embroidery ride to the order as line properties; each
+    // combination is its own bag line.
     SHOP.addLine({
-      cartId: v.id + '|' + size + '|' + d.id, id: p.id, variantId: v.id, name: p.name, price: price,
+      cartId: v.id + '|' + size + '|' + c.id + '|' + d.id, id: p.id, variantId: v.id, name: p.name, price: price,
       currency: (v.price && v.price.currencyCode) || 'USD',
-      size: size + (d.id === 'mark' ? '' : ' · ' + d.name),
-      attrs: [{ key: 'Waist', value: vals.waist + ' in' }, { key: 'Length', value: vals.length + ' in' }, { key: 'Back embroidery', value: d.name }]
+      size: size + ' · ' + c.short + (d.id === 'mark' ? '' : ' · ' + d.name),
+      attrs: [{ key: 'Waist', value: vals.waist + ' in' }, { key: 'Length', value: vals.length + ' in' },
+              { key: 'Cut', value: c.order }, { key: 'Back embroidery', value: d.name }]
     });
     flashT = 2.4;
     if(typeof cartImpact !== 'undefined'){ cartImpact.target = 1.0; cartImpact.prog = 1.0; }
+    return true;
   }
+  // Buy now = add, then checkout — only if the add went through (the T-shirt view's buyNowAndCheckout).
+  // Runs inside the click: SHOP opens the checkout tab before it asks Shopify for the cart.
+  function buyNow(){ if(addToBag()) SHOP.checkout(); }
 
   // ── open / close ──────────────────────────────────────────────────────────────────────────────
   function open(){
-    if(state !== 'closed' || !landscape()) return false;
+    if(state !== 'closed') return false;
     if(typeof dm !== 'undefined' && (dm.active || dm.animating || dm.closing)) return false;
     build();
     state = 'opening'; holoReleased = false;
     savedScroll = window.pageYOffset;
+    pg.pos = pg.t = 0; pg.drag = null; wg.armed = true; wg.acc = 0; wg.lockUntil = 0;   // every visit starts at step 1
+    done = [false, false, false]; complete = false; cK = 0;
+    for(var id in dials){ dials[id].p = dials[id].t = vals[id]; dials[id].idle = 9; }
+    dialDrag = null;
+    if(HOLO.viewFrame) HOLO.viewFrame(phone() ? jeansFrame() : deskJeansFrame());
     HOLO.view(true);
     DESIGNS.forEach(function(d){ if(d.map) loadMap(d.map, function(){}); });
     return true;
   }
   function close(){
     if(state !== 'opening' && state !== 'open') return;
-    unfocus();
     state = 'closing';
   }
-  function tapJeans(){ if(state === 'closed') open(); }
+  // A tap on the jeans opens the view; in the view, a DOUBLE tap (or click) zooms in there, or back out.
+  var jeansAt = null, lastTap = null;
+  function tapJeans(){
+    if(state === 'closed'){ open(); return; }
+    if(state !== 'open' || !jeansAt) return;
+    var now = performance.now(), t = { x: jeansAt.x, y: jeansAt.y, t: now };
+    if(lastTap && now - lastTap.t < 380 && Math.hypot(t.x - lastTap.x, t.y - lastTap.y) < 40){
+      var z = HOLO.viewZoom().zt;
+      if(z > 1.05) HOLO.viewZoomReset(); else HOLO.viewZoomAt(2.4, t.x / window.innerWidth * 2 - 1, 1 - t.y / window.innerHeight * 2);
+      lastTap = null;
+    } else lastTap = t;
+  }
+  // Two fingers on the jeans (neither on the card): a pinch — zoom about their midpoint, and the
+  // midpoint carries the jeans with it. It holds every touch until the last finger lifts.
+  var pinch = null;
+  function tMid(e){ var a = e.touches[0], b = e.touches[1]; return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2, d: Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY) || 1 }; }
+  function touchStart(e){
+    if(pinch) return true;
+    if(state !== 'open' || !e.touches || e.touches.length !== 2) return false;
+    if(pick(e.touches[0].clientX, e.touches[0].clientY) || pick(e.touches[1].clientX, e.touches[1].clientY)) return false;
+    HOLO.cancel(); dialDrag = null; pg.drag = null; pressId = null;   // the first finger's turn gives way to the pinch
+    var m = tMid(e);
+    pinch = { d0: m.d, st: HOLO.viewPinchBegin(m.x / window.innerWidth * 2 - 1, 1 - m.y / window.innerHeight * 2) };
+    return true;
+  }
+  function touchMove(e){
+    if(!pinch) return false;
+    if(e.touches && e.touches.length >= 2){ var m = tMid(e); HOLO.viewPinch(pinch.st, pinch.st.z0 * m.d / pinch.d0, m.x / window.innerWidth * 2 - 1, 1 - m.y / window.innerHeight * 2); }
+    return true;
+  }
+  function touchEnd(e){
+    if(!pinch) return false;
+    if(!e.touches || e.touches.length === 0) pinch = null;
+    return true;
+  }
 
   // ── the tower: gone while the view is up ─────────────────────────────────────────────────────────
   // setFloorAlpha takes a row's panels, rings and crystals down; at ~0 the row is switched off so
@@ -10633,10 +11108,12 @@ var PANTS = (function(){
   }
 
   // ── per frame ─────────────────────────────────────────────────────────────────────────────────
+  var lastDt = 0.016;
   function update(dt){
     if(state === 'closed') return;
-    dt = Math.max(0, Math.min(0.1, dt || 0));
-    if(!landscape() && state !== 'closing') close();   // the window went portrait: hand the jeans back
+    dt = Math.max(0, Math.min(0.1, dt || 0)); lastDt = dt;
+    // the layout follows the screen's shape live (a phone turned sideways gets the desk layout)
+    if(HOLO.viewFrame) HOLO.viewFrame(phone() ? jeansFrame() : deskJeansFrame());
     var vk = HOLO.viewK ? HOLO.viewK() : 1;
     var cartUp = typeof cart !== 'undefined' && cart.panelOpen;
     var wantForm = (state === 'opening' || state === 'open') && vk >= P.formAt && !cartUp;
@@ -10652,75 +11129,234 @@ var PANTS = (function(){
       state = 'closed'; formK = 0; savedScroll = -1;
       hideAll(); return;
     }
-    noteT = Math.max(0, noteT - dt); flashT = Math.max(0, flashT - dt); caretT += dt;
+    flashT = Math.max(0, flashT - dt);
+    cK = sat(cK + (complete ? 1 : -1) * dt / P.doneTime);
+    if(cKHold !== null) cK = cKHold;   // look-dev: PANTS._liquid(u) holds the split at u (null lets go)
+    pageTick(dt); dialsTick(dt);
     layout();
+  }
+
+  // The page's wheel listener asks first. Returns true when the event is ours (the page is pinned
+  // under the view either way); the bag, open over the view, keeps its own list scroll.
+  function wheel(e){
+    if(state === 'closed') return false;
+    if(typeof cart !== 'undefined' && cart.panelOpen) return cart.itemsScrollMax > 0 ? false : (e.preventDefault(), true);
+    e.preventDefault();
+    if(formK < 0.5) return true;
+    // anywhere on the screen: a gesture that starts over a half-wheel turns it, over the jeans zooms
+    // them, anywhere else turns the steps
+    var wid = pick(e.clientX, e.clientY);
+    wheelStep(e, wid && wid.indexOf('d:') === 0 ? wid.slice(2) : (!wid && HOLO.hit(e.clientX, e.clientY) ? 'jeans' : null));
+    return true;
   }
 
   function hideAll(){
     if(!built) return;
     pane.visible = content.visible = false;
     for(var k in orbs) orbs[k].grp.visible = false;
-    if(hoveredGlassMesh && orbGlass(hoveredGlassMesh)) hoveredGlassMesh = null;
-    if(pressedGlassMesh && orbGlass(pressedGlassMesh)) pressedGlassMesh = null;
+    for(var d in dials){ dials[d].vis = false; dials[d].grp.visible = false; }
+    pill.grp.visible = false; pillHit = null; liq.visible = false;
+    info.pane.visible = info.content.visible = false;
+    for(var s = 0; s < rod.length; s++) rod[s].grp.visible = false;
+    if(ownGlass(hoveredGlassMesh)) hoveredGlassMesh = null;
+    if(ownGlass(pressedGlassMesh)) pressedGlassMesh = null;
+    dialDrag = null; pg.drag = null; pinch = null; jeansAt = null;
   }
   function orbGlass(m){ for(var k in orbs) if(orbs[k].grp.userData.glassMesh === m) return k; return null; }
 
   // Everything is placed in the camera's frame at P.depth, from NDC: it holds its place on the
   // screen at any window size, and the frost's pixel-sized edge and bevel are converted at that depth.
+  // A shape = the frost's segments, the card's rect and the × orb, in world units from the screen's
+  // centre (x right, y up).
+  //   desk:  the T-shirt view's — the card, a short column budding out of its right edge for the ×
+  //   phone: the jeans above, the card a sheet across the bottom that rises into place as it forms,
+  //          the × set into its top-right corner
+  // The desk card, screen px: as wide as P.cardX0..cardX1, as tall as P.cardAspect × that (the phone
+  // sheet's proportions), and the whole stack — its tabs, the card, the NEXT row — centred on the
+  // screen; a short window narrows the card (from its left: the × column keeps its place) until it fits.
+  function deskCard(){
+    var Wp = window.innerWidth, Hp = window.innerHeight, aH = P.actH * Hp;
+    var x1 = (P.cardX1 + 1) / 2 * Wp, w = (P.cardX1 - P.cardX0) / 2 * Wp, riseK = tabsGeom(0, 0, 1, 1).rise;
+    w = Math.min(w, (Hp * (1 - 2 * P.deskMargin) - P.actGap - aH) / (P.cardAspect + riseK));
+    var h = w * P.cardAspect, top = (Hp - (w * riseK + h + P.actGap + aH)) / 2 + w * riseK;
+    return { x0: x1 - w, x1: x1, y0: top, y1: top + h };
+  }
+  function deskShape(f, hw, hh, H2){
+    var C = deskCard(), Wp = window.innerWidth, Hp = window.innerHeight;
+    function wx(px){ return (px / Wp * 2 - 1) * hw; } function wy(py){ return (1 - py / Hp * 2) * hh; }
+    var orbR = 0.5 * P.orb * H2, pad = P.orbPad * orbR;
+    var cX0 = wx(C.x0), cX1 = wx(C.x1), cY0 = wy(C.y1), cY1 = wy(C.y0);
+    var card = { x: (cX0 + cX1) / 2, y: (cY0 + cY1) / 2, hw: (cX1 - cX0) / 2, hh: (cY1 - cY0) / 2, r: P.radius * H2 };
+    var colX = P.colX * hw, oy = cY1 - orbR - pad;   // the ×, level with the card's top
+    var col = { x: colX, y: oy, hw: orbR + pad, hh: orbR + pad, r: orbR + pad };
+    // the column buds out of the card's edge as the pane forms, as the T-shirt view's do
+    var fb = Math.min(1, f * 1.4), budX = cX1 - col.hw * 0.7;
+    var colNow = { x: budX + (col.x - budX) * fb, y: col.y, hw: Math.max(0.01, col.hw * fb), hh: Math.max(0.01, col.hh * fb), r: col.r };
+    // the pane's box is the card's and the WHOLE column's, whatever the bud is doing
+    var box = { x0: Math.min(cX0, col.x - col.hw), x1: Math.max(cX1, col.x + col.hw), y0: Math.min(cY0, col.y - col.hh), y1: Math.max(cY1, col.y + col.hh) };
+    return { segs: [card, colNow], box: box, rect: { x0: cX0, x1: cX1, y0: cY0, y1: cY1 }, orbR: orbR,
+             orbs: [{ k: 'close', x: colX, y: oy }] };
+  }
+  // The desk's info panel, screen px: centred under the jeans, on the bottom margin.
+  function infoRect(){
+    var Wp = window.innerWidth, Hp = window.innerHeight, cx = (P.deskJeansX + 1) / 2 * Wp, hw = P.infoHW / 2 * Wp;
+    var y1 = Hp * (1 - P.infoBottom), y0 = y1 - P.infoH * Hp;
+    return { x0: cx - hw, x1: cx + hw, y0: y0, y1: y1 };
+  }
+  // The jeans' place on the desk, handed to HOLO: left of the card, from P.deskJeansTop down to just
+  // above the info panel — up a little from where the bay's own fit would put them.
+  function deskJeansFrame(){
+    var Hp = window.innerHeight, top = P.deskJeansTop * Hp, bot = infoRect().y0 - P.infoGap * Hp;
+    return { x: P.deskJeansX, y: 1 - (top + bot) / Hp, fill: (bot - top) / Hp, maxW: 0.46 };
+  }
+  // The phone sheet, screen px. Its bottom sits P.mActGap above the NEXT capsule, which sits on the
+  // bottom margin; its top at P.mSheetTop, or higher on a short screen so a page keeps P.mMinBand (the
+  // page's top pad and the read-out take ~17 units of the sheet's type — see draw).
+  function sheetBot0(){ return window.innerHeight - P.mGutter - P.mActH * window.innerWidth - P.mActGap; }
+  function sheetTop0(){
+    var Hp = window.innerHeight, uP = (window.innerWidth - P.mGutterL - P.mGutter) / P.mU;
+    return Math.max(P.mTopMin * Hp, Math.min(P.mSheetTop * Hp, sheetBot0() - P.mMinBand - 16.8 * uP));
+  }
+  function sheetPx(){ return { top: sheetTop0(), bot: sheetBot0() }; }
+  function phoneShape(f, hw, hh, H2){
+    var Wp = window.innerWidth, wpp = H2 / Math.max(1, window.innerHeight);
+    var D = P.mOrb * Wp, I = P.mOrbInset * D, sp = sheetPx(), slide = (1 - f) * P.mSlide;
+    var x0 = -hw + P.mGutterL * wpp, x1 = hw - P.mGutter * wpp;
+    var y1 = hh - (sp.top + slide) * wpp, y0 = hh - (sp.bot + slide) * wpp;
+    var sheet = { x: (x0 + x1) / 2, y: (y0 + y1) / 2, hw: (x1 - x0) / 2, hh: (y1 - y0) / 2, r: P.mRadius * Wp * wpp };
+    return { segs: [sheet], box: { x0: x0, x1: x1, y0: y0, y1: y1 }, rect: { x0: x0, x1: x1, y0: y0, y1: y1 }, orbR: 0.5 * D * wpp,
+             orbs: [{ k: 'close', x: x1 - (I + D / 2) * wpp, y: y1 - (I + D / 2) * wpp }] };
+  }
+  // The jeans' place on a phone, handed to HOLO: centred, from P.mJeansTop down to just above the tabs.
+  function jeansFrame(){
+    var Hp = window.innerHeight, top = P.mJeansTop * Hp;
+    var bot = sheetTop0() - tabsGeom(0, 0, window.innerWidth - P.mGutterL - P.mGutter, 1).rise - P.tabGap * Hp;
+    return { x: 0, y: 1 - (top + bot) / Hp, fill: (bot - top) / Hp, maxW: P.mJeansMaxW };
+  }
   function layout(){
     if(!built) return;
     var f = ease(formK), vis = f > 0.002;
     pane.visible = content.visible = vis;
-    for(var k0 in orbs) orbs[k0].grp.visible = vis;
-    if(!vis) return;
+    orbs.close.grp.visible = vis;
+    if(!vis){ hideAll(); pane.visible = content.visible = false; return; }
     camBasis();
-    var hh = halfH(), hw = hh * camera.aspect, H2 = 2 * hh;
-    var orbR = 0.5 * P.orb * H2, pad = P.orbPad * orbR, DP = DML.P;
-    // the shapes, in world units relative to the screen centre (x right, y up)
-    var cX0 = P.cardX0 * hw, cX1 = P.cardX1 * hw, cY0 = P.cardY0 * hh, cY1 = P.cardY1 * hh;
-    var card = { x: (cX0 + cX1) / 2, y: (cY0 + cY1) / 2, hw: (cX1 - cX0) / 2, hh: (cY1 - cY0) / 2, r: P.radius * H2 };
-    var colX = P.colX * hw, cTop = P.closeY * hh + orbR + pad, cBot = P.bagY * hh - orbR - pad;
-    var col = { x: colX, y: (cTop + cBot) / 2, hw: orbR + pad, hh: (cTop - cBot) / 2, r: orbR + pad };
-    // the column buds out of the card's edge as the pane forms, as the T-shirt view's do
-    var fb = Math.min(1, f * 1.4), budX = cX1 - col.hw * 0.7;
-    var colNow = { x: budX + (col.x - budX) * fb, y: col.y, hw: Math.max(0.01, col.hw * fb), hh: Math.max(0.01, col.hh * fb), r: col.r };
-    var x0 = Math.min(cX0, col.x - col.hw), x1 = Math.max(cX1, col.x + col.hw), y0 = Math.min(cY0, col.y - col.hh), y1 = Math.max(cY1, col.y + col.hh);
-    var m = P.blend * H2 + 0.05; x0 -= m; x1 += m; y0 -= m; y1 += m;
+    var hh = halfH(), hw = hh * camera.aspect, H2 = 2 * hh, DP = DML.P;
+    var L = phone() ? phoneShape(f, hw, hh, H2) : deskShape(f, hw, hh, H2), R = L.rect;
+    // the tabs pop out of the top edge last, as the T-shirt box's do
+    var fmT = ease(sat((f - 0.45) / 0.55)), TB = tabsGeom(R.x0, R.y1, R.x1 - R.x0, fmT), TB1 = tabsGeom(R.x0, R.y1, R.x1 - R.x0, 1);
+    var segs = fmT > 0.02 ? L.segs.concat(TB.segs) : L.segs;
+    var B = L.box, m = P.blend * H2 + 0.05;
+    var x0 = B.x0 - m, x1 = B.x1 + m, y0 = B.y0 - m, y1 = Math.max(B.y1, R.y1 + TB1.rise) + m;
     var W = x1 - x0, H = y1 - y0, pcx = (x0 + x1) / 2, pcy = (y0 + y1) / 2;
     ndcWorld(pcx / hw, pcy / hh, pane.position); pane.quaternion.copy(_cQ); pane.scale.set(W, H, 1);
-    var segs = [card, colNow];
     for(var i = 0; i < segs.length; i++){ _segC[i].set(segs[i].x - pcx, segs[i].y - pcy); _segH[i].set(segs[i].hw, segs[i].hh); _segR[i] = segs[i].r; }
     var u = pane.material.uniforms, pr = renderer.getPixelRatio();
     var wpp = H2 / Math.max(1, window.innerHeight);
     if(typeof glassFBO !== 'undefined' && glassFBO) u.tBg.value = glassFBO.texture;
     u.res.value.set(window.innerWidth * pr, window.innerHeight * pr);
-    u.hsize.value.set(W / 2, H / 2); u.rad.value = card.r;
+    u.hsize.value.set(W / 2, H / 2); u.rad.value = segs[0].r;
     u.aa.value = Math.max(1e-4, DP.plateEdgePx * wpp); u.blurPx.value = DP.plateBlur; u.frost.value = DP.plateFrost;
     u.dim.value = DP.plateDim; u.bevel.value = DP.plateBevel; u.bevelW.value = Math.max(1e-4, DP.plateBevelPx * wpp);
     u.tint.value.setRGB(DP.plateTint[0], DP.plateTint[1], DP.plateTint[2]);
     u.opacity.value = DP.plateOpacity * f;
-    u.segN.value = 2; u.blend.value = Math.max(1e-3, P.blend * H2);
+    u.segN.value = segs.length; u.blend.value = Math.max(1e-3, P.blend * H2);
     u.segC.value = _segC; u.segH.value = _segH; u.segR.value = _segR;
-    // the orbs, punched through the pane
-    var hn = 0, so = Math.max(1e-4, (orbR / 0.5) * ease(sat(f * 1.25 - 0.25)));
-    [['close', P.closeY], ['bag', P.bagY]].forEach(function(o){
-      var ob = orbs[o[0]], oy = o[1] * hh;
-      ndcWorld(P.colX, o[1], ob.grp.position); ob.grp.quaternion.copy(_cQ); ob.grp.scale.setScalar(so);
+    // the × orb, punched through the pane
+    var hn = 0, so = Math.max(1e-4, (L.orbR / 0.5) * ease(sat(f * 1.25 - 0.25)));
+    L.orbs.forEach(function(o){
+      var ob = orbs[o.k], nx = o.x / hw, ny = o.y / hh;
+      ndcWorld(nx, ny, ob.grp.position); ob.grp.quaternion.copy(_cQ); ob.grp.scale.setScalar(so);
       ob.icon.material.opacity = f;
-      var g = ob.grp.userData.glassMesh, gu = g && g.material.uniforms;
-      if(gu){ if(typeof glassFBO !== 'undefined' && glassFBO) gu.tBg.value = glassFBO.texture; gu.res.value.set(window.innerWidth * pr, window.innerHeight * pr); gu.time.value = performance.now() * 0.001; }
-      u.holeC.value[hn].set(colX - pcx, oy - pcy); u.holeR.value[hn] = 0.5 * so * (DP.sizeHole || 1); hn++;
-      ob.sx = (P.colX + 1) / 2 * window.innerWidth; ob.sy = (1 - o[1]) / 2 * window.innerHeight;
+      feedGlass(ob.grp.userData.glassMesh);
+      u.holeC.value[hn].set(o.x - pcx, o.y - pcy); u.holeR.value[hn] = 0.5 * so * (DP.sizeHole || 1); hn++;
+      ob.sx = (nx + 1) / 2 * window.innerWidth; ob.sy = (1 - ny) / 2 * window.innerHeight;
       ob.r = (0.5 * so / H2) * window.innerHeight;
     });
     u.holeN.value = hn; u.holeAA.value = Math.max(1e-4, DP.plateEdgePx * wpp);
-    // the card's content: a canvas over the card, sized to its pixels
-    ndcWorld((cX0 + cX1) / 2 / hw, (cY0 + cY1) / 2 / hh, content.position); content.position.addScaledVector(_w.set(0, 0, 1).applyQuaternion(_cQ), 0.002);
-    content.quaternion.copy(_cQ); content.scale.set(cX1 - cX0, cY1 - cY0, 1);
+    // The canvas: over the tabs, the card, and the capsule's row below it — one sheet of type, in px.
+    // cardPx is that canvas; G says where in it the card is, and where the tabs and the capsule go.
+    var ph = phone(), aH = ph ? P.mActH * window.innerWidth : P.actH * window.innerHeight, gap = ph ? P.mActGap : P.actGap;
+    var cTop = R.y1 + TB1.rise, cBot = R.y0 - (gap + aH + 2) * wpp;
+    ndcWorld((R.x0 + R.x1) / 2 / hw, (cTop + cBot) / 2 / hh, content.position); content.position.addScaledVector(_w.set(0, 0, 1).applyQuaternion(_cQ), 0.002);
+    content.quaternion.copy(_cQ); content.scale.set(R.x1 - R.x0, cTop - cBot, 1);
     content.material.opacity = sat(f * 1.6 - 0.35);
-    cardPx.l = (P.cardX0 + 1) / 2 * window.innerWidth; cardPx.t = (1 - P.cardY1) / 2 * window.innerHeight;
-    cardPx.w = (P.cardX1 - P.cardX0) / 2 * window.innerWidth; cardPx.h = (P.cardY1 - P.cardY0) / 2 * window.innerHeight;
-    draw(f);
+    cardPx.l = (R.x0 / hw + 1) / 2 * window.innerWidth; cardPx.t = (1 - cTop / hh) / 2 * window.innerHeight;
+    cardPx.w = (R.x1 - R.x0) / (2 * hw) * window.innerWidth; cardPx.h = (cTop - cBot) / (2 * hh) * window.innerHeight;
+    var toPx = 1 / wpp;
+    draw(f, { T: TB1.rise * toPx, CH: (R.y1 - R.y0) * toPx, gap: gap, aH: aH, fmT: fmT,
+              tabs: [{ x: (TB1.t1.x - R.x0) * toPx, w: TB1.t1.w * toPx, h: TB1.t1.h * toPx }, { x: (TB1.t2.x - R.x0) * toPx, w: TB1.t2.w * toPx, h: TB1.t2.h * toPx }],
+              title: TB1.title * toPx, price: TB1.price * toPx });
+    // the glass that sits on what draw() just laid out
+    placeDials(f, hw, hh, H2);
+    placeActions(f, hw, hh, H2);
+    placeRod(f, hw, hh, H2, lastDt);
+    layoutInfo(f, hw, hh, H2);
+  }
+  // The desk's info panel: the card's frost, one rounded rect under the jeans, what you have picked on it.
+  function layoutInfo(f, hw, hh, H2){
+    var fi = ease(sat((f - 0.3) / 0.7)), show = !phone() && fi > 0.002;
+    info.pane.visible = info.content.visible = show;
+    if(!show) return;
+    var Wp = window.innerWidth, Hp = window.innerHeight, wpp = H2 / Math.max(1, Hp), R = infoRect(), DP = DML.P;
+    var x0 = (R.x0 / Wp * 2 - 1) * hw, x1 = (R.x1 / Wp * 2 - 1) * hw, y1 = (1 - R.y0 / Hp * 2) * hh, y0 = (1 - R.y1 / Hp * 2) * hh;
+    var m = P.blend * H2 + 0.05, W = x1 - x0 + 2 * m, H = y1 - y0 + 2 * m, cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    ndcWorld(cx / hw, cy / hh, info.pane.position); info.pane.quaternion.copy(_cQ); info.pane.scale.set(W, H, 1);
+    var u = info.pane.material.uniforms, pr = renderer.getPixelRatio();
+    if(typeof glassFBO !== 'undefined' && glassFBO) u.tBg.value = glassFBO.texture;
+    u.res.value.set(Wp * pr, Hp * pr);
+    u.hsize.value.set(W / 2, H / 2);
+    var rad = Math.min(P.radius * H2, (y1 - y0) * 0.45); u.rad.value = rad;
+    u.aa.value = Math.max(1e-4, DP.plateEdgePx * wpp); u.blurPx.value = DP.plateBlur; u.frost.value = DP.plateFrost;
+    u.dim.value = DP.plateDim; u.bevel.value = DP.plateBevel; u.bevelW.value = Math.max(1e-4, DP.plateBevelPx * wpp);
+    u.tint.value.setRGB(DP.plateTint[0], DP.plateTint[1], DP.plateTint[2]);
+    u.opacity.value = DP.plateOpacity * fi; u.holeN.value = 0;
+    u.segN.value = 1; u.blend.value = Math.max(1e-3, P.blend * H2);
+    u.segC.value[0].set(0, 0); u.segH.value[0].set((x1 - x0) / 2, (y1 - y0) / 2); u.segR.value[0] = rad;
+    ndcWorld(cx / hw, cy / hh, info.content.position); info.content.position.addScaledVector(_w.set(0, 0, 1).applyQuaternion(_cQ), 0.002);
+    info.content.quaternion.copy(_cQ); info.content.scale.set(x1 - x0, y1 - y0, 1);
+    info.content.material.opacity = sat(fi * 1.6 - 0.35);
+    drawInfo(R.x1 - R.x0, R.y1 - R.y0);
+  }
+  // What goes in the bag, as four labelled cells in the order you chose them — CUT, WAIST, LENGTH,
+  // BACK EMBROIDERY — fitted to the panel; "ADDED TO BAG" takes its place for a moment after an add.
+  function drawInfo(Wd, Hd){
+    var dpr = Math.min(2, window.devicePixelRatio || 1), W = Math.max(32, Math.round(Wd)), H = Math.max(16, Math.round(Hd));
+    var cells = [['CUT', cutOf().short], ['WAIST', vals.waist + ' IN'], ['LENGTH', vals.length + ' IN'], ['BACK EMBROIDERY', design().name]];
+    var fl = flashT > 0 ? Math.min(1, flashT * 3, (2.4 - flashT) * 4) : 0;
+    var key = [W, H, dpr, cells.map(function(c){ return c[1]; }).join(), Math.round(fl * 20)].join('|');
+    if(key === info.key) return;
+    info.key = key;
+    var c = info.cv, x = info.x;
+    if(c.width !== W * dpr || c.height !== H * dpr){ c.width = W * dpr; c.height = H * dpr; }
+    x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, W, H);
+    var pad = H * 0.26, lf = H * 0.14, vf = H * 0.25, sp = H * 0.03, gapC = H * 0.34;
+    // measure, then shrink every cell together until the row fits, and share out what is left
+    function widths(k){
+      return cells.map(function(cl){
+        x.font = '700 ' + (lf * k).toFixed(1) + 'px ' + FONT; var a = trackW(x, cl[0], sp * k);
+        x.font = '700 ' + (vf * k).toFixed(1) + 'px ' + FONT; var b = trackW(x, cl[1], sp * k * 0.6);
+        return Math.max(a, b);
+      });
+    }
+    var k = 1, ws = widths(1), tot = ws.reduce(function(a, b){ return a + b; }, 0) + gapC * (cells.length - 1), room = W - 2 * pad;
+    if(tot > room){ k = room / tot; ws = widths(k); tot = room; }
+    var extra = (room - tot) / (cells.length - 1), cx0 = pad;
+    x.globalAlpha = 1 - fl;
+    for(var i = 0; i < cells.length; i++){
+      x.fillStyle = GREY; x.font = '700 ' + (lf * k).toFixed(1) + 'px ' + FONT; track(x, cells[i][0], cx0, H * 0.40, sp * k);
+      x.fillStyle = INK; x.font = '700 ' + (vf * k).toFixed(1) + 'px ' + FONT; track(x, cells[i][1], cx0, H * 0.76, sp * k * 0.6);
+      cx0 += ws[i] + gapC * k + extra;
+      if(i < cells.length - 1){   // a hairline between cells
+        var lx = cx0 - (gapC * k + extra) / 2;
+        x.strokeStyle = 'rgba(18,18,18,0.16)'; x.lineWidth = 1; x.beginPath(); x.moveTo(lx, H * 0.24); x.lineTo(lx, H * 0.80); x.stroke();
+      }
+    }
+    if(fl > 0){
+      x.globalAlpha = fl; x.fillStyle = INK; x.font = '700 ' + (vf * 0.9).toFixed(1) + 'px ' + FONT;
+      var t = 'ADDED TO BAG', tw = trackW(x, t, H * 0.06); x.textBaseline = 'middle'; track(x, t, (W - tw) / 2, H * 0.52, H * 0.06); x.textBaseline = 'alphabetic';
+    }
+    x.globalAlpha = 1;
+    info.tex.needsUpdate = true;
   }
 
   // ── the HUD on the card ───────────────────────────────────────────────────────────────────────
@@ -10733,115 +11369,260 @@ var PANTS = (function(){
     return X;
   }
   function trackW(x, s, sp){ var w = 0; for(var i = 0; i < s.length; i++) w += x.measureText(s[i]).width + sp; return w - sp; }
-  function draw(f){
+  // A pair of jeans from the front, waist at (cx, top), h tall — the cut tile's drawing. flare 0:
+  // the leg falls straight from the knee; 1: it opens out to the hem (boot cut).
+  function legs(x, cx, top, h, flare){
+    var ho = 0.265 + 0.06 * flare, hi = 0.075 - 0.032 * flare;   // the hem's outer / inner edge
+    function X(v){ return cx + v * h; } function Y(v){ return top + v * h; }
+    x.beginPath();
+    x.moveTo(X(-0.26), Y(0)); x.lineTo(X(0.26), Y(0));
+    x.quadraticCurveTo(X(0.30), Y(0.10), X(0.30), Y(0.24));       // the hip
+    x.lineTo(X(0.27), Y(0.58)); x.lineTo(X(ho), Y(1));              // knee, hem
+    x.lineTo(X(hi), Y(1)); x.lineTo(X(0.075), Y(0.58));
+    x.quadraticCurveTo(X(0.02), Y(0.38), X(0), Y(0.335));          // up the inseam to the crotch
+    x.quadraticCurveTo(X(-0.02), Y(0.38), X(-0.075), Y(0.58));
+    x.lineTo(X(-hi), Y(1)); x.lineTo(X(-ho), Y(1)); x.lineTo(X(-0.27), Y(0.58)); x.lineTo(X(-0.30), Y(0.24));
+    x.quadraticCurveTo(X(-0.30), Y(0.10), X(-0.26), Y(0));
+    x.closePath();
+  }
+  function draw(f, G){
     var dpr = Math.min(2, window.devicePixelRatio || 1);
     var W = Math.max(64, Math.round(cardPx.w)), H = Math.max(64, Math.round(cardPx.h));
-    var caretOn = focus && (Math.floor(caretT * 1.9) % 2 === 0);
-    var key = [W, H, dpr, vals.waist, vals.length, vals.design, focus, draft, caretOn, hoverId, pressId,
-               noteT > 0 ? note : '', flashT > 0, Math.round(f * 40), !!product(), Object.keys(maps).map(function(k){ return k + (maps[k].tex ? 1 : 0); }).join(),
+    var ph = phone();
+    var key = [ph, W, H, dpr, vals.waist, vals.length, vals.cut, vals.design, hoverId, pressId,
+               Math.round(dials.waist.p * 60), Math.round(dials.length.p * 60), dialDrag && dialDrag.on ? dialDrag.id : '',
+               flashT > 0, Math.round(f * 40), Math.round(G.fmT * 30), Math.round(G.T), Math.round(G.CH), Math.round(pg.pos * 400), pg.t, done.join(), Math.round(cK * 30), !!product(),
+               Object.keys(maps).map(function(k){ return k + (maps[k].tex ? 1 : 0); }).join(),
                !!(HOLO.pocket && HOLO.pocket())].join('|');
     if(key === lastDrawKey) return;
     lastDrawKey = key;
     if(cv.width !== W * dpr || cv.height !== H * dpr){ cv.width = W * dpr; cv.height = H * dpr; }
     var x = cx2; x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, W, H);
-    var u = Math.min(H / 100, W / 62), pad = 6 * u, iw = W - 2 * pad;
+    // the type unit: the desk card's from its box; the phone sheet's from its width
+    var CT = G.T, CB = G.T + G.CH;   // the card's top and bottom in this canvas (the tabs are above, the capsule below)
+    var u = W / P.mU, pad = P.padU * u, iw = W - 2 * pad;   // one unit everywhere: the same proportions on the desk and a phone
+    function fp(k){ return (ph ? Math.max(P.mMinFont, k * u) : k * u).toFixed(1) + 'px '; }   // a font size, floored on a phone
+    // the phone's × sits in the sheet's top-right corner: what it leaves the page's first line
+    var oD = P.mOrb * window.innerWidth, oI = P.mOrbInset * oD, orbL = W - oI - oD;
     regions = [];
-    // sections arrive in turn, most stable first, the call to action last
+    // things arrive in turn, most stable first, the call to action last
     function rise(i){ var a = sat((f - i * 0.12) / 0.55); x.globalAlpha = a * a * (3 - 2 * a); return (1 - x.globalAlpha) * 2.4 * u; }
+    function head(num, title, y){   // a step's number + name, on its baseline; returns where it ends
+      x.fillStyle = ACCD; x.font = '700 ' + fp(2.2) + FONT; var sx = track(x, num, pad, y, 0.2 * u);
+      x.fillStyle = INK; return track(x, title, sx + 1.6 * u, y, 0.38 * u);
+    }
     x.textBaseline = 'alphabetic';
+    // top to bottom: the tabs (the name, the price); the card — its page (and on a phone, the read-out
+    // of the pair under it; on the desk that has its own panel under the jeans); below, the NEXT capsule
+    var aH = G.aH, aW = aH * P.nextW;
+    var rl = CB - 11.6 * u;                                // the phone's read-out rule
+    var vTop = CT + 3 * u, vBot = ph ? rl - 2.2 * u : CB - 3 * u, vh = vBot - vTop;
+    scr.top = vTop; scr.bot = vBot;
+    actRect = { cx: W / 2, cy: CB + G.gap + aH / 2, w: aW, h: aH };
 
-    // ── the header: name + price (readouts — never a slab)
+    // ── the tabs: the name in the first, the price in the second, each centred in its own tab
     var dy = rise(0), p = product();
-    x.fillStyle = INK; x.font = '700 ' + (5.0 * u).toFixed(1) + 'px ' + FONT; x.textAlign = 'left';
-    var name = String((p && p.name) || 'Jeans').toUpperCase();
-    x.fillText(name, pad, 10.5 * u + dy, iw * 0.72);
-    var price = p && SHOP.priceLabel ? SHOP.priceLabel(p) : '';
-    if(price){ x.font = '600 ' + (3.6 * u).toFixed(1) + 'px ' + FONT; x.textAlign = 'right'; x.fillText(price, W - pad, 10.5 * u + dy); x.textAlign = 'left'; }
-    // a dimension rule under it: ticks at the ends, the read-out on it — the garment's own annotation
-    x.strokeStyle = ACC; x.globalAlpha *= 0.85; x.lineWidth = 1;
-    var ry = 14.6 * u + dy;
-    x.beginPath(); x.moveTo(pad, ry); x.lineTo(W - pad, ry); x.moveTo(pad, ry - 1.1 * u); x.lineTo(pad, ry + 1.1 * u); x.moveTo(W - pad, ry - 1.1 * u); x.lineTo(W - pad, ry + 1.1 * u); x.stroke();
-    x.fillStyle = GREY; x.font = '700 ' + (1.75 * u).toFixed(1) + 'px ' + FONT;
-    track(x, 'DENIM · MADE TO YOUR MEASURE', pad, 18.4 * u + dy, 0.28 * u);
+    var name = String((p && p.name) || 'Jeans').toUpperCase(), price = p && SHOP.priceLabel ? SHOP.priceLabel(p) : '';
+    x.globalAlpha *= sat(G.fmT * 1.4 - 0.3);
+    x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillStyle = INK;
+    var T1 = G.tabs[0], T2 = G.tabs[1];
+    x.font = '700 ' + Math.max(ph ? P.mMinFont : 0, G.title).toFixed(1) + 'px ' + FONT;
+    x.fillText(name, T1.x, CT - T1.h * 0.5 + dy, T1.w * 0.9);
+    if(price){ x.font = '600 ' + G.price.toFixed(1) + 'px ' + FONT; x.fillText(price, T2.x, CT - T2.h * 0.5 + dy, T2.w * 0.9); }
+    x.textAlign = 'left'; x.textBaseline = 'alphabetic';
 
-    // ── 01 SIZE
+    // ── the pages: stacked a band apart; the band shows the one pg.pos is on, sliding to the next
     dy = rise(1);
-    var sy = 26.5 * u + dy;
-    x.fillStyle = ACCD; x.font = '700 ' + (2.2 * u).toFixed(1) + 'px ' + FONT; var sx = track(x, '01', pad, sy, 0.2 * u);
-    x.fillStyle = INK; track(x, 'SIZE', sx + 1.6 * u, sy, 0.38 * u);
-    x.fillStyle = GREY; x.font = '700 ' + (1.6 * u).toFixed(1) + 'px ' + FONT; x.textAlign = 'right'; x.fillText('INCHES', W - pad, sy); x.textAlign = 'left';
-    var gap = 3 * u, fw = (iw - gap) / 2, fh = 14.5 * u, fy = 29.5 * u + dy;
-    ['waist', 'length'].forEach(function(id, i){
-      var fx = pad + i * (fw + gap), on = focus === id, hv = hoverId === 'f:' + id;
-      rr(x, fx, fy, fw, fh, 2.2 * u);
-      x.fillStyle = on ? 'rgba(255,255,255,0.72)' : hv ? 'rgba(255,255,255,0.58)' : 'rgba(255,255,255,0.42)'; x.fill();
-      x.lineWidth = on ? 2 : 1; x.strokeStyle = on ? ACC : hv ? 'rgba(30,42,66,0.42)' : 'rgba(30,42,66,0.20)'; x.stroke();
-      x.fillStyle = on ? ACCD : GREY; x.font = '700 ' + (1.7 * u).toFixed(1) + 'px ' + FONT;
-      track(x, SIZE[id].label, fx + 2.2 * u, fy + 3.9 * u, 0.3 * u);
-      var shown = on ? draft : String(vals[id]);
-      x.fillStyle = INK; x.font = '700 ' + (7.0 * u).toFixed(1) + 'px ' + FONT;
-      var vx = fx + 2.2 * u, vy = fy + fh - 2.8 * u;
-      x.fillText(shown, vx, vy);
-      var vw = x.measureText(shown).width;
-      if(on && caretOn){ x.fillStyle = ACC; x.fillRect(vx + vw + 0.5 * u, vy - 6.0 * u, Math.max(1.5, 0.35 * u), 6.6 * u); }
-      x.fillStyle = GREY; x.font = '700 ' + (2.2 * u).toFixed(1) + 'px ' + FONT;
-      x.fillText('IN', vx + vw + 1.6 * u, vy);
-      regions.push({ id: 'f:' + id, x: fx, y: fy, w: fw, h: fh });
-    });
-    x.font = '700 ' + (1.55 * u).toFixed(1) + 'px ' + FONT;
-    if(noteT > 0){ x.fillStyle = ACCD; track(x, note, pad, fy + fh + 3.6 * u, 0.22 * u); }
-    else { x.fillStyle = GREY; track(x, 'CLICK A NUMBER TO TYPE · STARTS AT 32 × 32', pad, fy + fh + 3.6 * u, 0.22 * u); }
-
-    // ── 02 BACK EMBROIDERY
-    dy = rise(2);
-    var ey = 56 * u + dy;
-    x.fillStyle = ACCD; x.font = '700 ' + (2.2 * u).toFixed(1) + 'px ' + FONT; sx = track(x, '02', pad, ey, 0.2 * u);
-    x.fillStyle = INK; track(x, 'BACK EMBROIDERY', sx + 1.6 * u, ey, 0.38 * u);
-    var n = DESIGNS.length, tg = 3 * u, ts = Math.min(21 * u, (iw - tg * (n - 1)) / n), ty = 59.5 * u + dy;
-    for(var i = 0; i < n; i++){
-      var d = DESIGNS[i], tx = pad + i * (ts + tg), sel = vals.design === d.id, hv2 = hoverId === 't:' + d.id && !d.soon;
-      rr(x, tx, ty, ts, ts, 2.0 * u);
-      x.fillStyle = hv2 ? 'rgba(255,255,255,0.58)' : 'rgba(255,255,255,0.40)'; x.fill();
-      var img = thumbOf(d);
-      if(img){
-        x.save(); rr(x, tx + 1, ty + 1, ts - 2, ts - 2, 1.8 * u); x.clip();
-        var iwd = img.width || 1, iht = img.height || 1, cu = 0.505, cvv = 0.61, hs = 0.37;
-        x.drawImage(img, (cu - hs) * iwd, (cvv - hs) * iht, 2 * hs * iwd, 2 * hs * iht, tx, ty, ts, ts);
-        x.restore();
-      } else if(d.soon){
-        x.save(); x.setLineDash([0.9 * u, 0.9 * u]); rr(x, tx + 1.2 * u, ty + 1.2 * u, ts - 2.4 * u, ts - 2.4 * u, 1.4 * u);
-        x.strokeStyle = 'rgba(30,42,66,0.32)'; x.lineWidth = 1; x.stroke(); x.restore();
-        x.fillStyle = GREY; x.font = '700 ' + (1.6 * u).toFixed(1) + 'px ' + FONT; x.textAlign = 'center';
-        x.fillText('COMING', tx + ts / 2, ty + ts / 2 - 0.4 * u); x.fillText('SOON', tx + ts / 2, ty + ts / 2 + 2.0 * u); x.textAlign = 'left';
-      }
-      x.lineWidth = 1; x.strokeStyle = 'rgba(30,42,66,0.20)'; rr(x, tx, ty, ts, ts, 2.0 * u); x.stroke();
-      if(sel){ x.lineWidth = 2.5; x.strokeStyle = ACC; rr(x, tx - 1.6, ty - 1.6, ts + 3.2, ts + 3.2, 2.0 * u + 1.6); x.stroke(); }
-      x.fillStyle = sel ? ACCD : d.soon ? 'rgba(40,52,76,0.40)' : INK; x.font = '700 ' + (1.6 * u).toFixed(1) + 'px ' + FONT;
-      var lw = trackW(x, d.name, 0.18 * u); track(x, d.name, tx + Math.max(0, (ts - lw) / 2), ty + ts + 3.4 * u, 0.18 * u);
-      if(!d.soon) regions.push({ id: 't:' + d.id, x: tx, y: ty, w: ts, h: ts + 4.5 * u });
+    var ga = x.globalAlpha;
+    x.save(); x.beginPath(); x.rect(0, vTop, W, vh); x.clip();
+    var tg = P.tileGap * u;
+    function tileBox(tx, ty, ts, hv, th){
+      rr(x, tx, ty, ts, th || ts, 2.0 * u);
+      x.fillStyle = hv ? 'rgba(255,255,255,0.58)' : 'rgba(255,255,255,0.40)'; x.fill();
+    }
+    function tileEdge(tx, ty, ts, sel, th){
+      th = th || ts;
+      x.lineWidth = 1; x.strokeStyle = 'rgba(30,42,66,0.20)'; rr(x, tx, ty, ts, th, 2.0 * u); x.stroke();
+      if(sel){ x.lineWidth = 2.5; x.strokeStyle = ACC; rr(x, tx - 1.6, ty - 1.6, ts + 3.2, th + 3.2, 2.0 * u + 1.6); x.stroke(); }
+    }
+    function tileName(s, tx, ty, ts, sel, dim, th){
+      x.fillStyle = sel ? ACCD : dim ? 'rgba(40,52,76,0.40)' : INK; x.font = '700 ' + fp(1.6) + FONT;
+      var lw = trackW(x, s, 0.18 * u); track(x, s, tx + (ts - lw) / 2, ty + (th || ts) + 3.4 * u, 0.18 * u);
+    }
+    // a grid of picture tiles centred in what is left of a page under its title, as large as the page
+    // lets them be: up to `per` to a row (more rows as more are added), each asp × as tall as it is wide
+    function grid(n, top, per, asp){
+      var rows = Math.ceil(n / per), cols = Math.min(per, n), avail = vh - 7.5 * u - 1.0 * u;
+      var ts = Math.min((iw - (cols - 1) * tg) / cols, (avail - rows * 4.5 * u - (rows - 1) * tg) / (rows * asp));
+      var th = ts * asp, gh = rows * (th + 4.5 * u) + (rows - 1) * tg, gy = top + 7.5 * u + Math.max(0, (avail - gh) / 2);
+      return { ts: ts, th: th, cell: function(i){
+        var row = Math.floor(i / per), inRow = Math.min(per, n - row * per), rw = inRow * ts + (inRow - 1) * tg;
+        return { x: (W - rw) / 2 + (i % per) * (ts + tg), y: gy + row * (th + 4.5 * u + tg) };
+      } };
     }
 
-    // ── the read-out of what goes in the bag, last, where the eye lands
+    // 02 SIZE — a half-wheel on each side edge of the card (the glass disc is placed after this draw,
+    // centred ON the edge, so the edge cuts it in half): the inches round its rim, the one at the inner
+    // point is the set one, its neighbours fading away above and below. Between the two wheels, only
+    // the two numbers they are set to. Its geometry is laid out even when the page is off the band, so
+    // the glass knows it is gone.
+    var t0 = vTop + (PG_SIZE - pg.pos) * vh + dy;
+    var on0 = t0 < vBot && t0 + vh > vTop;
+    if(on0){
+      var hx = head('02', 'SIZE', t0 + 4.5 * u);
+      // the unit: at the right on the desk; on a phone the × has that corner, so it follows the title
+      x.fillStyle = GREY; x.font = '700 ' + fp(1.6) + FONT;
+      if(ph) track(x, 'INCHES', hx + 1.6 * u, t0 + 4.5 * u, 0.2 * u);
+      else { x.textAlign = 'right'; x.fillText('INCHES', W - pad, t0 + 4.5 * u); x.textAlign = 'left'; }
+    }
+    var avail0 = vh - 7.5 * u;
+    var wR = Math.min(P.wheelR * u, (avail0 - 1.0 * u) / 2), wRn = P.wheelNum * wR, wcy = t0 + 7.5 * u + avail0 / 2;
+    var bigF = P.bigFont * u, inX0 = wR + 1.5 * u, inX1 = W - wR - 1.5 * u;
+    x.textBaseline = 'middle';
+    ['waist', 'length'].forEach(function(id, i){
+      var D = dials[id], S = SIZE[id], left = i === 0, wcx = left ? 0 : W, side = left ? 1 : -1;
+      var act = (dialDrag && dialDrag.id === id) || hoverId === 'd:' + id || hoverId === 'r:' + id;
+      dialRect[id] = { x: wcx, y: wcy, r: wR, rn: wRn, top: wcy - wR, h: 2 * wR, side: side };
+      if(!on0) return;
+      regions.push({ id: 'd:' + id, x: left ? 0 : W - wR, y: wcy - wR, w: wR, h: 2 * wR, body: true });
+      x.textAlign = 'center';
+      for(var nn = Math.round(D.p) - 5; nn <= Math.round(D.p) + 5; nn++){
+        if(nn < S.min || nn > S.max) continue;
+        var a = (nn - D.p) * P.wheelStep; if(Math.abs(a) > 1.48) continue;
+        var c = Math.cos(a), cur = Math.abs(nn - D.p) < 0.5;
+        var fs = P.wheelFont * (wR / 13) * (cur ? 1.3 : 0.8 + 0.2 * c);
+        x.globalAlpha = ga * (cur ? 1 : 0.85 * Math.pow(c, 1.5));
+        x.fillStyle = cur ? ACCD : GREY; x.font = '700 ' + fs.toFixed(1) + 'px ' + FONT;
+        x.fillText(String(nn), wcx + side * c * wRn, wcy + Math.sin(a) * wRn);
+      }
+      x.globalAlpha = ga;
+      // the number it is set to, big, in its half of the middle — a small name under it
+      var bx = inX0 + (inX1 - inX0) * (left ? 0.23 : 0.77);
+      x.fillStyle = INK; x.font = '700 ' + bigF.toFixed(1) + 'px ' + FONT;
+      x.fillText(String(vals[id]), bx, wcy - 0.6 * u);
+      x.textAlign = 'left'; x.fillStyle = act ? ACCD : GREY; x.font = '700 ' + fp(1.5) + FONT;
+      var lw = trackW(x, S.label, 0.3 * u); track(x, S.label, bx - lw / 2, wcy + bigF * 0.5 + 1.4 * u, 0.3 * u);
+      regions.push({ id: 'r:' + id, x: bx - (inX1 - inX0) * 0.24, y: wcy - wR, w: (inX1 - inX0) * 0.48, h: 2 * wR, body: true });
+    });
+    x.textAlign = 'left'; x.textBaseline = 'alphabetic';
+
+    // 01 CUT — each tile draws its leg; the boot cut shows the straight leg it opens out from
+    var t1 = vTop + (PG_CUT - pg.pos) * vh + dy;
+    if(t1 < vBot && t1 + vh > vTop){
+      head('01', 'CUT', t1 + 4.5 * u);
+      var G1 = grid(CUTS.length, t1, 2, 1), ts1 = G1.ts;
+      for(var ci = 0; ci < CUTS.length; ci++){
+        var c = CUTS[ci], cc = G1.cell(ci), csel = vals.cut === c.id, chv = hoverId === 'c:' + c.id;
+        tileBox(cc.x, cc.y, ts1, chv);
+        var lh = ts1 * 0.72, lt = cc.y + (ts1 - lh) / 2, lcx = cc.x + ts1 / 2;
+        legs(x, lcx, lt, lh, c.flare);
+        x.fillStyle = 'rgba(255,255,255,0.62)'; x.fill();
+        if(c.flare > 0){   // the straight leg, ghosted inside the flare
+          x.save(); x.setLineDash([0.7 * u, 0.7 * u]); legs(x, lcx, lt, lh, 0);
+          x.strokeStyle = 'rgba(40,52,76,0.30)'; x.lineWidth = 1; x.stroke(); x.restore();
+        }
+        legs(x, lcx, lt, lh, c.flare);
+        x.lineJoin = 'round'; x.strokeStyle = csel ? ACCD : 'rgba(27,35,51,0.72)'; x.lineWidth = Math.max(1.3, 0.22 * u); x.stroke();
+        // the waistband, and the knee the cut is measured from
+        x.beginPath(); x.moveTo(lcx - 0.262 * lh, lt + 0.075 * lh); x.lineTo(lcx + 0.262 * lh, lt + 0.075 * lh);
+        x.lineWidth = 1; x.stroke();
+        x.save(); x.setLineDash([0.5 * u, 0.6 * u]); x.strokeStyle = ACC; x.globalAlpha *= 0.7;
+        x.beginPath(); x.moveTo(lcx - 0.40 * lh, lt + 0.58 * lh); x.lineTo(lcx + 0.40 * lh, lt + 0.58 * lh); x.stroke(); x.restore();
+        tileEdge(cc.x, cc.y, ts1, csel);
+        tileName(c.name, cc.x, cc.y, ts1, csel, false);
+        regions.push({ id: 'c:' + c.id, x: cc.x, y: cc.y, w: ts1, h: ts1 + 4.5 * u, body: true });
+      }
+    }
+
+    // 03 BACK EMBROIDERY
+    var t2 = vTop + (PG_POCKET - pg.pos) * vh + dy;
+    if(t2 < vBot && t2 + vh > vTop){
+      head('03', 'BACK EMBROIDERY', t2 + 4.5 * u);
+      var G2 = grid(DESIGNS.length, t2, 3, P.pocketAspect), ts2 = G2.ts, th2 = G2.th;
+      for(var i = 0; i < DESIGNS.length; i++){
+        var d = DESIGNS[i], tc = G2.cell(i), sel = vals.design === d.id, hv2 = hoverId === 't:' + d.id && !d.soon;
+        tileBox(tc.x, tc.y, ts2, hv2, th2);
+        var img = thumbOf(d);
+        if(img){   // the pocket, cropped portrait round the mark: the pocket's shape, not just the art
+          x.save(); rr(x, tc.x + 1, tc.y + 1, ts2 - 2, th2 - 2, 1.8 * u); x.clip();
+          var iwd = img.width || 1, iht = img.height || 1, cu = 0.505, cvv = 0.63, hs = 0.37, hv = Math.min(0.5, hs * P.pocketAspect);
+          x.drawImage(img, (cu - hs) * iwd, Math.max(0, cvv - hv) * iht, 2 * hs * iwd, 2 * hv * iht, tc.x, tc.y, ts2, th2);
+          x.restore();
+        } else if(d.soon){
+          x.save(); x.setLineDash([0.9 * u, 0.9 * u]); rr(x, tc.x + 1.2 * u, tc.y + 1.2 * u, ts2 - 2.4 * u, th2 - 2.4 * u, 1.4 * u);
+          x.strokeStyle = 'rgba(30,42,66,0.32)'; x.lineWidth = 1; x.stroke(); x.restore();
+          x.fillStyle = GREY; x.font = '700 ' + fp(1.6) + FONT; x.textAlign = 'center';
+          x.fillText('COMING', tc.x + ts2 / 2, tc.y + th2 / 2 - 0.4 * u); x.fillText('SOON', tc.x + ts2 / 2, tc.y + th2 / 2 + 2.0 * u); x.textAlign = 'left';
+        }
+        tileEdge(tc.x, tc.y, ts2, sel, th2);
+        tileName(d.name, tc.x, tc.y, ts2, sel, d.soon, th2);
+        if(!d.soon) regions.push({ id: 't:' + d.id, x: tc.x, y: tc.y, w: ts2, h: th2 + 4.5 * u, body: true });
+      }
+    }
+    x.restore();
+    // between pages, the one leaving and the one arriving fade into the glass at the band's edges
+    var fk = sat(Math.abs(pg.pos - Math.round(pg.pos)) * 6), fdH = 5 * u, g;
+    if(fk > 0){
+      x.globalAlpha = 1; x.globalCompositeOperation = 'destination-out';
+      g = x.createLinearGradient(0, vTop, 0, vTop + fdH); g.addColorStop(0, 'rgba(0,0,0,' + fk.toFixed(3) + ')'); g.addColorStop(1, 'rgba(0,0,0,0)'); x.fillStyle = g; x.fillRect(0, vTop, W, fdH);
+      g = x.createLinearGradient(0, vBot, 0, vBot - fdH); g.addColorStop(0, 'rgba(0,0,0,' + fk.toFixed(3) + ')'); g.addColorStop(1, 'rgba(0,0,0,0)'); x.fillStyle = g; x.fillRect(0, vBot - fdH, W, fdH);
+      x.globalCompositeOperation = 'source-over';
+    }
+
+    // ── the NEXT capsule's word, written on its glass below the card (the capsule is placed after this draw)
     dy = rise(3);
-    var by = 92 * u + dy;
+    if(cK < 0.25){
+      var word = Math.round(pg.t) >= STEPS - 1 ? 'DONE' : 'NEXT';
+      x.globalAlpha *= 1 - sat(cK / 0.2);
+      x.fillStyle = pressId === 'a:next' ? '#ffffff' : INK; x.font = '700 ' + fp(ph ? 2.3 : 2.2) + FONT;
+      var ww = trackW(x, word, 0.45 * u);
+      x.textBaseline = 'middle'; track(x, word, W / 2 - ww / 2, actRect.cy + dy, 0.45 * u); x.textBaseline = 'alphabetic';
+    }
+
+    // ── a phone's read-out of what goes in the bag, last, where the eye lands (the desk's is its own panel)
+    dy = rise(4);
+    if(ph){
+    var c0 = cutOf(), d0 = design(), by = CB - 8 * u;
     x.strokeStyle = ACC; x.lineWidth = 1; x.globalAlpha *= 0.85;
-    x.beginPath(); x.moveTo(pad, by - 5.2 * u); x.lineTo(W - pad, by - 5.2 * u); x.stroke();
+    x.beginPath(); x.moveTo(pad, rl + dy); x.lineTo(W - pad, rl + dy); x.stroke();
     x.globalAlpha /= 0.85;
-    x.fillStyle = GREY; x.font = '700 ' + (1.55 * u).toFixed(1) + 'px ' + FONT;
-    track(x, flashT > 0 ? 'ADDED TO BAG' : 'YOUR PAIR', pad, by - 1.6 * u, 0.24 * u);
-    x.fillStyle = ACCD; x.font = '700 ' + (2.6 * u).toFixed(1) + 'px ' + FONT;
-    track(x, 'W' + vals.waist + ' · L' + vals.length + ' · ' + design().name, pad, by + 2.4 * u, 0.2 * u);
+    x.fillStyle = GREY; x.font = '700 ' + fp(1.55) + FONT;
+    track(x, flashT > 0 ? 'ADDED TO BAG' : 'YOUR PAIR', pad, (ph ? CB - 8.5 * u : by - 1.6 * u) + dy, 0.24 * u);
+    // one line on the desk; two on a phone — each shrunk to fit its room
+    var lines = [c0.short + ' · W' + vals.waist + ' · L' + vals.length, d0.name];
+    var base = 2.4, ys = [CB - 5.2 * u, CB - 2.1 * u];
+    x.fillStyle = ACCD;
+    for(var li = 0; li < lines.length; li++){
+      var pfs = ph ? Math.max(P.mMinFont, base * u) : base * u;
+      x.font = '700 ' + pfs.toFixed(1) + 'px ' + FONT;
+      var pw = trackW(x, lines[li], 0.2 * u);
+      if(pw > iw){ pfs *= iw / pw; x.font = '700 ' + pfs.toFixed(1) + 'px ' + FONT; }
+      track(x, lines[li], pad, ys[li] + dy, 0.2 * u * pfs / (base * u));
+    }
+    }
     x.globalAlpha = 1;
     tex.needsUpdate = true;
   }
 
   // ── input ─────────────────────────────────────────────────────────────────────────────────────
-  // What is under the pointer: an orb, a field, a tile — or nothing of ours.
+  // What is under the pointer: an orb, the NEXT capsule, a step of the rod, a wheel, a tile — or the
+  // card, or nothing of ours.
   function pick(cx, cy){
     if(!built || formK < 0.5) return null;
-    for(var k in orbs){ var o = orbs[k]; if(Math.hypot(cx - o.sx, cy - o.sy) <= o.r) return 'o:' + k; }
+    var oc = orbs.close; if(Math.hypot(cx - oc.sx, cy - oc.sy) <= oc.r) return 'o:close';
+    if(cK > 0.5){ var ks = ['add', 'buy']; for(var j = 0; j < 2; j++){ var o = orbs[ks[j]]; if(Math.hypot(cx - o.sx, cy - o.sy) <= o.r) return 'o:' + ks[j]; } }
+    else if(pillHit){   // the capsule: a stadium
+      var hx = Math.max(0, Math.abs(cx - pillHit.x) - (pillHit.w - pillHit.h) / 2);
+      if(Math.hypot(hx, cy - pillHit.y) <= pillHit.h / 2) return 'a:next';
+    }
+    for(var s = 0; s < rod.length; s++){ var sg = rod[s]; if(sg.grp.visible && Math.abs(cx - sg.sx) <= sg.hw && Math.abs(cy - sg.sy) <= sg.hh) return 'g:' + s; }
     var lx = cx - cardPx.l, ly = cy - cardPx.t;
-    for(var i = 0; i < regions.length; i++){ var g = regions[i]; if(lx >= g.x && lx <= g.x + g.w && ly >= g.y && ly <= g.y + g.h) return g.id; }
+    var inBand = ly >= scr.top && ly <= scr.bot;   // page controls slid under the header / the NEXT row are not there
+    for(var i = 0; i < regions.length; i++){
+      var g = regions[i];
+      if(g.body && !inBand) continue;
+      if(lx >= g.x && lx <= g.x + g.w && ly >= g.y && ly <= g.y + g.h) return g.id;
+    }
     if(lx >= 0 && ly >= 0 && lx <= cardPx.w && ly <= cardPx.h) return 'card';
     return null;
   }
@@ -10853,33 +11634,105 @@ var PANTS = (function(){
     if(rc && typeof cartButtonHit === 'function' && cartButtonHit(rc)) return false;
     if(state === 'closing'){ pressId = 'none'; return true; }
     var id = pick(cx, cy);
-    if(!id && HOLO.hit(cx, cy)){ pressId = null; unfocus(); return false; }
+    if(!id && HOLO.hit(cx, cy)){ pressId = null; jeansAt = { x: cx, y: cy }; return false; }
     pressId = id || 'none';
     if(id && id.indexOf('o:') === 0) pressedGlassMesh = orbs[id.slice(2)].grp.userData.glassMesh;
-    if(focus && id !== 'f:' + focus) unfocus();
+    if(id === 'a:next') pressedGlassMesh = pill.mesh;
+    // a press on a wheel turns it once it moves (a tap picks the number under it); it never turns the page
+    if(id && id.indexOf('d:') === 0){
+      var did = id.slice(2);
+      dialDrag = { id: did, y0: cy, y: cy, on: false, rpx: dialRect[did] ? dialRect[did].rn : 40 };
+      pg.drag = null;   // (no press darkening: the rim's numbers sit on that glass)
+      return true;
+    }
+    // a press anywhere on the page (a tile, a number, bare glass) may become a page drag
+    var ly = cy - cardPx.t, onPage = id && id.indexOf('o:') !== 0 && id !== 'a:next' && id.indexOf('g:') !== 0 && ly >= scr.top && ly <= scr.bot;
+    pg.drag = onPage ? { y0: cy, on: false, pos0: pg.pos, from: Math.round(pg.pos) } : null;
     return true;
   }
-  function pMove(cx, cy){ return state !== 'closed' && pressId !== null; }
+  // Moving with a press down: past P.dragPx vertically the press is a drag — of a wheel, or of the
+  // page (1:1, the page under the finger, with give past the first and last) — and no longer a click.
+  function pMove(cx, cy){
+    if(state === 'closed' || pressId === null) return false;
+    var now = performance.now(), g = dialDrag;
+    if(g){
+      var D = dials[g.id], S = SIZE[g.id];
+      if(!g.on && Math.abs(cy - g.y0) >= P.dragPx){ g.on = true; g.y = g.y0; pressId = 'dial'; D.hist.length = 0; D.hist.push({ p: D.p, t: now }); }
+      if(g.on){   // the numbers under the pointer move with it: px / (their radius px × radians an inch)
+        var dp = -(cy - g.y) / (Math.max(8, g.rpx) * P.wheelStep); g.y = cy;
+        if((D.p < S.min && dp < 0) || (D.p > S.max && dp > 0)) dp *= P.dialRubber;
+        D.p = D.t = Math.max(S.min - 1.2, Math.min(S.max + 1.2, D.p + dp));
+        vals[g.id] = clampS(g.id, Math.round(D.p));
+        D.hist.push({ p: D.p, t: now });
+        while(D.hist.length > 2 && now - D.hist[0].t > 90) D.hist.shift();
+      }
+      return true;
+    }
+    var d = pg.drag, vh = Math.max(1, scr.bot - scr.top);
+    if(d && !d.on && Math.abs(cy - d.y0) >= P.dragPx){
+      d.on = true; pressId = 'page';
+      if(pressedGlassMesh && ownGlass(pressedGlassMesh)) pressedGlassMesh = null;
+      pg.hist.length = 0; pg.hist.push({ p: pg.pos, t: now });
+    }
+    if(d && d.on){
+      var pos = d.pos0 - (cy - d.y0) / vh, lo = 0, hi = STEPS - 1;
+      if(pos < lo) pos = lo - (lo - pos) * 0.35; else if(pos > hi) pos = hi + (pos - hi) * 0.35;
+      pg.pos = pos;
+      pg.hist.push({ p: pos, t: now });
+      while(pg.hist.length > 2 && now - pg.hist[0].t > 90) pg.hist.shift();   // two samples minimum
+    }
+    return true;
+  }
   function pUp(cx, cy){
     if(state === 'closed' || pressId === null) return false;
     var was = pressId; pressId = null;
-    if(pressedGlassMesh && orbGlass(pressedGlassMesh)) pressedGlassMesh = null;
+    if(pressedGlassMesh && ownGlass(pressedGlassMesh)) pressedGlassMesh = null;
+    var pd = pg.drag; pg.drag = null;
+    if(pd && pd.on){   // let go of a page: it locks on to the next one if dragged far enough or flicked
+      var h = pg.hist, now = performance.now(), v = 0;
+      if(h.length >= 2 && now - h[h.length - 1].t < 80) v = (h[h.length - 1].p - h[0].p) / Math.max(8, h[h.length - 1].t - h[0].t) * 1000;
+      var dpos = pg.pos - pd.from, to = pd.from;
+      if(dpos > P.pageFlick || v > 1.2) to = pd.from + 1; else if(dpos < -P.pageFlick || v < -1.2) to = pd.from - 1;
+      goTo(to);
+      return true;
+    }
+    var g = dialDrag; dialDrag = null;
+    if(g){
+      var D = dials[g.id];
+      if(g.on){   // the fling: the rate over the last ~90 ms, coasted P.dialCoast s, onto a whole inch
+        var hh = D.hist, nowU = performance.now(), vv = 0;
+        if(hh.length >= 2 && nowU - hh[hh.length - 1].t < 80) vv = (hh[hh.length - 1].p - hh[0].p) / Math.max(8, hh[hh.length - 1].t - hh[0].t) * 1000;
+        dialSet(g.id, D.p + vv * P.dialCoast);
+      } else {   // a tap on a number round the rim: that number (the hub itself does nothing)
+        var Rr = dialRect[g.id], lx = cx - (cardPx.l + Rr.x), ly = cy - (cardPx.t + Rr.y);
+        if(Math.hypot(lx, ly) > Rr.rn * 0.45) dialSet(g.id, D.p + Math.atan2(ly, lx * Rr.side) / P.wheelStep);
+      }
+      return true;
+    }
     var id = pick(cx, cy);
     if(id !== was) return true;   // let go somewhere else: no click
     if(id === 'o:close') close();
-    else if(id === 'o:bag') addToBag();
-    else if(id && id.indexOf('f:') === 0) setFocus(id.slice(2));
+    else if(id === 'o:add') addToBag();
+    else if(id === 'o:buy') buyNow();
+    else if(id === 'a:next') next();
+    else if(id && id.indexOf('g:') === 0) goTo(+id.slice(2));
+    else if(id && id.indexOf('c:') === 0) vals.cut = id.slice(2);
     else if(id && id.indexOf('t:') === 0){ vals.design = id.slice(2); applyDesign(); }
     return true;
   }
+  function pressing(){ return state !== 'closed' && pressId !== null; }
   function hover(cx, cy, el){
     if(state === 'closed') return false;
     if(typeof cart !== 'undefined' && cart.panelOpen) return false;
+    if((pg.drag && pg.drag.on) || (dialDrag && dialDrag.on)){ hoverId = null; return true; }   // mid-drag: nothing lights up
     var id = pick(cx, cy);
     hoverId = id;
     if(!id && HOLO.hit(cx, cy)) return false;   // the jeans: HOLO's grab hand
     if(id && id.indexOf('o:') === 0){ hoveredGlassMesh = orbs[id.slice(2)].grp.userData.glassMesh; el.classList.add('clickable'); }
-    else if(id && id !== 'card') el.classList.add('clickable');
+    else if(id === 'a:next'){ hoveredGlassMesh = pill.mesh; el.classList.add('clickable'); }
+    else if(id && id.indexOf('g:') === 0){ hoveredGlassMesh = rod[+id.slice(2)].mesh; el.classList.add('clickable'); }
+    else if(id && id.indexOf('d:') === 0){ hoveredGlassMesh = dials[id.slice(2)].mesh; el.classList.add('grabbable'); }
+    else if(id && id !== 'card' && id.indexOf('r:') !== 0) el.classList.add('clickable');
     return true;
   }
   function pinScroll(){
@@ -10887,23 +11740,32 @@ var PANTS = (function(){
     if(window.pageYOffset !== savedScroll) window.scrollTo(0, savedScroll);
     return true;
   }
-  // The pane, the content and the orbs sample (or sit over) the glass FBO: out of its capture.
+  // Everything of ours that samples (or sits over) the glass FBO stays out of its capture.
+  var fboWas = [];
   function fbo(hide){
     if(!built || state === 'closed') return;
-    var v = !hide && formK > 0.002;
-    pane.visible = content.visible = v;
-    for(var k in orbs) orbs[k].grp.visible = v;
+    var all = [pane, content, pill.grp, liq, info.pane, info.content];
+    for(var k in orbs) all.push(orbs[k].grp);
+    for(var d in dials) all.push(dials[d].grp);
+    for(var s = 0; s < rod.length; s++) all.push(rod[s].grp);
+    if(hide){ fboWas = all.map(function(o){ return o.visible; }); all.forEach(function(o){ o.visible = false; }); }
+    else all.forEach(function(o, i){ o.visible = !!fboWas[i]; });
   }
 
-  return { P: P, DESIGNS: DESIGNS, SIZE: SIZE, open: open, close: close, tapJeans: tapJeans, isOpen: isOpen,
-           update: update, pDown: pDown, pMove: pMove, pUp: pUp, hover: hover, pinScroll: pinScroll, fbo: fbo,
-           values: function(){ return { waist: vals.waist, length: vals.length, design: vals.design, focus: focus }; },
+  return { P: P, DESIGNS: DESIGNS, CUTS: CUTS, SIZE: SIZE, open: open, close: close, tapJeans: tapJeans, isOpen: isOpen,
+           update: update, pDown: pDown, pMove: pMove, pUp: pUp, pressing: pressing, hover: hover, wheel: wheel,
+           pinScroll: pinScroll, fbo: fbo, goTo: goTo, next: next, touchStart: touchStart, touchMove: touchMove, touchEnd: touchEnd,
+           values: function(){ return { waist: vals.waist, length: vals.length, cut: vals.cut, design: vals.design }; },
            debug: function(){ return { state: state, formK: +formK.toFixed(3), bgK: +bgK.toFixed(3), viewK: HOLO.viewK ? +HOLO.viewK().toFixed(3) : null,
-             vals: { waist: vals.waist, length: vals.length, design: vals.design }, focus: focus, draft: draft, hover: hoverId,
+             vals: { waist: vals.waist, length: vals.length, cut: vals.cut, design: vals.design }, hover: hoverId,
+             page: { pos: +pg.pos.toFixed(3), t: pg.t, done: done.slice(), complete: complete, cK: +cK.toFixed(2), drag: pg.drag ? (pg.drag.on ? 'on' : 'armed') : null },
+             band: [Math.round(scr.top), Math.round(scr.bot)], act: actRect, pill: pillHit,
+             rod: rod.map(function(r){ return [Math.round(r.sx), Math.round(r.sy), Math.round(r.hh * 2), +r.st.toFixed(2)]; }),
+             dials: { waist: { p: +dials.waist.p.toFixed(3), vis: dials.waist.vis }, length: { p: +dials.length.p.toFixed(3), vis: dials.length.vis }, rect: dialRect },
              product: product() ? product().name : null, regions: regions.length,
-             orbs: Object.keys(orbs).map(function(k){ return [k, Math.round(orbs[k].sx), Math.round(orbs[k].sy), Math.round(orbs[k].r)]; }),
+             orbs: Object.keys(orbs).map(function(k){ return [k, Math.round(orbs[k].sx), Math.round(orbs[k].sy), Math.round(orbs[k].r), orbs[k].grp.visible]; }),
              card: [Math.round(cardPx.l), Math.round(cardPx.t), Math.round(cardPx.w), Math.round(cardPx.h)] }; },
-           _pick: pick };
+           _pick: pick, _regions: function(){ return regions; }, _liquid: function(v){ cKHold = (v === null || v === undefined) ? null : +v; } };
 })();
 // END PANTS VIEW
 
@@ -12957,6 +13819,7 @@ function onTS(e){
   // THE VIEWER (phone): owns every finger while the full-screen image is up, and a two-finger
   // spread on the product photo opens it.
   if(VIEWER.touchStart(e)) return;
+  if(PANTS.touchStart(e)) return;   // the jeans product view: two fingers on the jeans zoom them
   // Mini-game: two fingers → pinch-zoom the chase camera (spread = in, pinch = out → top-down).
   if(gameMode.active && !gameMode.exiting && e.touches.length === 2){
     var pdx = e.touches[1].clientX - e.touches[0].clientX, pdy = e.touches[1].clientY - e.touches[0].clientY;
@@ -13067,6 +13930,7 @@ function onTM(e){
   e.preventDefault();
   if(treeUI.open) return;   // skill tree owns touch while open
   if(VIEWER.touchMove(e)) return;
+  if(PANTS.touchMove(e)) return;
   // Mini-game: two-finger pinch drives the chase-camera zoom.
   if(gameMode.active && gameMode.camPinch.active && e.touches.length === 2){
     var pdx = e.touches[1].clientX - e.touches[0].clientX, pdy = e.touches[1].clientY - e.touches[0].clientY;
@@ -13270,7 +14134,9 @@ function onTM(e){
       hoveredPanel=null; // release tap hover once swiping starts
       var totalDX = Math.abs(tx - touchScroll.startX);
       var totalDY = Math.abs(ty - touchScroll.startY);
-      if(totalDY > totalDX * 0.8){
+      if(PANTS.pressing()){
+        touchScroll.locked='pants';   // a finger on the jeans' product view: its card scrolls, the page stays
+      } else if(totalDY > totalDX * 0.8){
         // Predominantly vertical swipe — always page scroll
         touchScroll.locked='scroll';
         HOLO.cancel();   // a vertical swipe that started on the hologram scrolls the page instead
@@ -13312,6 +14178,7 @@ function onTM(e){
 function onTE(e){
   if(treeUI.open) return;   // skill tree owns touch while open
   if(VIEWER.touchEnd(e)) return;
+  if(PANTS.touchEnd(e)) return;
   // Mini-game: end the pinch-zoom once a finger lifts (under two fingers).
   if(gameMode.camPinch && gameMode.camPinch.active && e.touches.length < 2){ gameMode.camPinch.active = false; }
   // In-game UI touch release — route to pointer up (handles taps + window drag end)
@@ -59022,7 +59889,7 @@ function init(){
   renderer.domElement.addEventListener('contextmenu',function(e){ if(gameMode.active && !gameMode.exiting) e.preventDefault(); });
   renderer.domElement.addEventListener('touchstart',onTS,{passive:false});renderer.domElement.addEventListener('touchmove',onTM,{passive:false});renderer.domElement.addEventListener('touchend',onTE);
   renderer.domElement.addEventListener('wheel',function(e){
-    if(PANTS.isOpen()){ e.preventDefault(); return; }   // nothing scrolls under the jeans' product view
+    if(PANTS.wheel(e)) return;   // the jeans' product view: its card scrolls, nothing under it does
     // World editor open: the wheel is the editor's (fly speed / orbit dolly), never the chase cam.
     if(typeof editor !== 'undefined' && editor.active){
       e.preventDefault();
