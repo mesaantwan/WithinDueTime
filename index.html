@@ -2610,7 +2610,10 @@ var SHIRT = (function(){
       // Ride the panel's own fade. setFloorAlpha caps panel opacity at 0.7, so that is full
       // strength here — this is what keeps a projection from arriving over an unrevealed row.
       var pmat = r.panel.mesh.material;
-      m.material.uniforms.uOpacity.value = pmat ? Math.max(0, Math.min(1, pmat.opacity / 0.7)) : 1;
+      // …unless the product view is handing this shirt over to the photo (panel.holoFade, set by
+      // the split): then it fades on its own, not with the panel, whose halves are dissolving.
+      m.material.uniforms.uOpacity.value = (r.panel.holoFade !== undefined) ? r.panel.holoFade
+        : (pmat ? Math.max(0, Math.min(1, pmat.opacity / 0.7)) : 1);
 
       // The wheels stretch their panels in X while you hold them (the `expand` block in
       // animate) and a child inherits it, which makes the shirt fat. The panel's Y never
@@ -3082,6 +3085,28 @@ var DML = (function(){
     panelRotZ:   0,
     imgRot:      1.00,   // 0 = the product image upright with the panel, 1 = turned a quarter
                          // turn, which is what keeps it readable on a wheel lying on its side
+
+    // ── the snake: how the OTHER panels get to the wheel and back (SNAKE) ────
+    // Off = the old trip, where the whole row slid across as one bundle.
+    snakeOn:        true,
+    snakeOpenDur:   1.5,    // seconds, row -> wheel
+    snakeCloseDur:  1.3,    // seconds, wheel -> row (starts once the card has dissolved)
+    snakeStrip:     1.12,   // spacing on the straight, in panel widths (1 = edge to edge)
+    snakeTurnRow:   3.0,    // radius of the turn leaving (and rejoining) the row, world units
+    snakeTurnWheel: 1.9,    // radius of the turn into (and out of) the wheel
+    snakeLead:      80,     // degrees the head may run on round the row before it peels off
+    snakeEndOpen:   0.30,   // arrival speed at the wheel: 0 = eases to a stop, more = the wheel
+                            //   inherits the body's momentum and spins down from it
+    snakeEndClose:  0.20,   // the same for landing back on the row
+    snakeSizeAt:    0.50,   // where along the trip the panels change size: 0 at the row, 1 at the wheel
+
+    // ── opening a product: it flies in, splits open, the glass bubbles up behind it (2026-10-08) ──
+    openFly:      0.65,   // seconds — the product's flight from the row to where it stands
+    openSplit:    0.45,   // seconds — the panel parting top and bottom (and closing again)
+    splitTravel:  0.35,   // how far each half moves off, × the panel's height
+    bubT:         0.75,   // the glass's liquid time, seconds: bigger is slower, same character
+    bubLead:      0.55,   // when the glass starts, as a share of the split (0 = with it, 1 = after)
+    descLead:     0.35,   // when the description box's stream starts, as a share of the glass setting
 
     // ── the product half ─────────────────────────────────────────────────────
     prodDepth:   16.3,
@@ -3570,6 +3595,20 @@ var DML = (function(){
   function settleProduct(fp, floorData, panelIdx){
     return placeAt(fp, productAt(floorData, panelIdx, 1));
   }
+  // WHERE THE OPEN FLIES THE PRODUCT (2026-10-08): its SETTLED pose, at its own UNIFORM fit. It
+  // used to fly to prodDepth and only then be pushed prodForward nearer and stretched to fill its
+  // half (the old split phase) — a second move after it had arrived, which is what made the
+  // product swell on screen. Now the panel lands once, as itself (not stretched), and splits open
+  // where it lands. The garment inside is the same size either way: applyBackdrop scales the image
+  // off the plane's actual scale.
+  function flyTarget(fp, floorData, panelIdx){
+    if(!live) return false;
+    var r = productAt(floorData, panelIdx, 1);
+    if(!r) return false;
+    fp.position.set(r.x, r.y, r.z);
+    fp.scale.set(r.k, r.k, 1);
+    return true;
+  }
 
   // A point (px, py) on the photo's plane at faceZ, moved to depth cz so that it PROJECTS to the
   // same place — against the settled camera (0, floorY, camZ), which is the frame every solve
@@ -3768,6 +3807,9 @@ var DML = (function(){
       return out;
     }
     if(!floorData || typeof dm === 'undefined' || dm.selIdx < 0) return null;
+    // THE SETTLED CARD is exact and known from the click (see settledCard), and the open now flies
+    // straight to it — so the prediction is no longer a guess from the last card's memory.
+    if(t >= 1 || t === undefined) return settledCard(floorData, dm.selIdx, out);
     var r = productAt(floorData, dm.selIdx, t);
     var pm = floorData.panels && floorData.panels[dm.selIdx] && floorData.panels[dm.selIdx].mesh;
     if(!r || !pm) return null;
@@ -4179,6 +4221,57 @@ var DML = (function(){
     u.time.value = performance.now() * 0.001;
   }
 
+  // ── THE BUBBLE (2026-10-08) ─────────────────────────────────────────────────────────────────
+  // The product view's glass is no longer faded and budded in: it is the cart's LIQUID (see
+  // LIQUID). Once the panel has split open around the photo (bubLead of the way through), liquid
+  // comes out from BEHIND the photo, runs over the card and out into the two tracks and the strip,
+  // and sets into the one-bubble shape — clear water while it runs, frost as it sets, exactly the
+  // cart's trade. Then a stream leaves the bubble's nearest edge for the description box and
+  // puddles into it (descLead). The orbs, the letters, the tiles and the text appear as their glass
+  // sets (bubbleForm). Closing is the same liquid going home: the description box drains back
+  // into the bubble, the bubble drains back behind the photo, and only then do the panel's halves
+  // come back over it (glassGone → THE SPLIT's unsplit).
+  // Everything is in the CARD'S PLANE — x/y from the card's centre, world units at its depth. The
+  // pane and the description box share that plane, so one coordinate system carries both liquids,
+  // and the layout is the SETTLED one (settledCard), so nothing the liquid grows into ever moves.
+  var bub = { L: null, Ld: null, lay: null, layD: null };
+  var _bubBlobs = [], _bubBlobsD = [];
+  var _dsQi = new THREE.Quaternion();
+  function bubLiquids(){ if(!bub.L){ bub.L = liqNew(); bub.Ld = liqNew(); } }
+  function bubWant(){
+    if(!live || typeof dm === 'undefined' || !dm.active || dm.closing || dm.animating) return false;
+    if(typeof switchAnim !== 'undefined' && switchAnim.active) return false;
+    if(typeof displayAnim === 'undefined') return false;
+    var ph = displayAnim.phase;
+    if(ph === 'drain' || ph === 'unsplit' || ph === 'unflatten' || ph === 'retract') return false;
+    if(ph === 'split') return (displayAnim.splitP || 0) >= P.bubLead;
+    return !!displayAnim.flatOK;
+  }
+  function bubLayout(c, us){
+    var lay = bub.lay || (bub.lay = {kind: 'union', rects: [], body: null, src: {x: 0, y: 0}, R: 0.3, T: 1, drain: false});
+    var rs = lay.rects; rs.length = 0;
+    rs.push({x: 0, y: 0, hw: c.w * 0.5, hh: c.h * 0.5, r: us.cardR});
+    rs.push({x: us.szX, y: us.ty, hw: us.tw * 0.5, hh: us.th * 0.5, r: us.r + us.pad});
+    if(P.actOn !== false) rs.push({x: us.acX, y: us.ty, hw: us.tw * 0.5, hh: us.gap + us.r + us.pad, r: us.r + us.pad});
+    if(us.swW > 0) rs.push({x: us.swX, y: us.swY, hw: us.swW * 0.5, hh: us.swH * 0.5, r: us.swR});
+    lay.body = rs[0];
+    lay.R = Math.max(0.05, us.r);          // the droplets' scale: the orbs' own radius, on the pane
+    lay.T = Math.max(0.15, P.bubT);
+    lay.src.x = 0; lay.src.y = 0;          // the photo's centre IS the card's (cardCentre)
+    return lay;
+  }
+  function bubbleTick(c, us){
+    bubLiquids();
+    if(!c || !us) return;
+    var lay = bubLayout(c, us), want = bubWant(), Ld = bub.Ld;
+    // On a close the description box drains first; the bubble holds until it has come home.
+    var dBusy = Ld.open || Ld.F > 0.15 || Ld.con > 0.05;
+    liqSet(bub.L, want || (dBusy && bub.L.open));
+    liqAdvance(bub.L, lay);
+  }
+  // How far the glass has SET, 0..1 — what the orbs, the letters and the tiles ride.
+  function bubbleForm(){ return bub.L ? cornerRamp(bub.L.con, 0.3, 1.0) : 0; }
+
   function updateSize(dt){
     var open = sizeMode() && typeof dm !== 'undefined' && dm.active && !dm.closing && dm.floor
                && dm.starTemps && dm.starTemps.length === 3;
@@ -4216,23 +4309,22 @@ var DML = (function(){
     var lbP = (typeof imgLightbox !== 'undefined') ? imgLightbox.prog : 0;
     var lb = (typeof imgLightbox !== 'undefined') && (imgLightbox.active || imgLightbox.entering || imgLightbox.exiting);
     var da = (typeof displayAnim !== 'undefined') ? displayAnim : null;
-    var closing = da && da.active && (da.phase === 'retract' || da.phase === 'unsplit' || da.phase === 'unflatten');
+    var closing = da && da.active && (da.phase === 'retract' || da.phase === 'unsplit' || da.phase === 'unflatten' || da.phase === 'drain');
     // A wheel switch empties dmButtons for its duration and refills them at the end; the toggle
     // stays formed across it, so the knob glides to the new product's default instead of the
     // whole control dissolving and re-forming around a product swap.
     var landed = !dm.animating && ((dm.dmButtons && dm.dmButtons.length === 3)
                  || (typeof switchAnim !== 'undefined' && switchAnim.active));
-    // ONE BUBBLE: nothing forms until the open has finished — the card is there, the product has
-    // stopped moving and the card has settled onto it. Then the tracks bud and the orbs dock.
-    var want = (landed && !lb && !closing && prodPanel && cardFadeT > 0.25 && !(da && da.active)) ? 1 : 0;
-    sz.form += (want - sz.form) * P.sizeFormSpeed;
-    if(Math.abs(want - sz.form) < 0.002) sz.form = want;
-    var f = sz.form * sz.form * (3 - 2 * sz.form);
+    // THE BUBBLE: the liquid decides how far the glass has set, and everything on it rides that —
+    // the outer orbs dissolving into the track, the knob, the letters, the action orbs, the tiles.
+    var c = uniCard(dm.floor, 1, _uniC), us = c ? uniSolve(c, _uniS) : null;
+    bubbleTick(c, us);
+    var f = lb ? 0 : bubbleForm();
+    sz.form = f;
     var n = sz.sizes.length, n1 = n - 1;
 
     // ONE BUBBLE: the outer orbs are carried onto the size track's end slots as the pane forms,
     // and lie flat with it. Written BEFORE slotFrame, which reads the column off them.
-    var c = uniCard(dm.floor, 1, _uniC), us = c ? uniSolve(c, _uniS) : null;
     // On a close they do not glide anywhere: they stay on their slots while the frost retracts
     // around them, and the reverse animation carries them back with the card (its unsplit
     // re-solves them through buttonPos, which is the same slot). Only the scale and the ink
@@ -4466,8 +4558,15 @@ var DML = (function(){
   var _segR = [0, 0, 0, 0];
   function updateUni(f, c, us){
     if(!c || !us || !prodPanel){ dropUni(); return; }
+    var L = bub.L, lay = bub.lay;
+    // THE BUBBLE draws it: nothing until the liquid is out, and gone again once it is home.
+    if(!L || !lay || !(L.busy || L.open || L.con > 0.001)){
+      if(uni.pane){ uni.pane.visible = false; uni.occ.visible = false; }
+      return;
+    }
     if(!uni.pane){
-      uni.pane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), frostMaterial());
+      // 48 droplet slots (the corner panes' count): at rest blobN is 0 and the loop costs nothing.
+      uni.pane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), frostMaterial(4, 48));
       uni.pane.raycast = function(){};          // the orbs and the tiles take the clicks
       uni.pane.frustumCulled = false;
       uni.pane.renderOrder = 3;                 // where the card was: over the wheel, under the garment
@@ -4481,62 +4580,71 @@ var DML = (function(){
     }
     prodPanel.visible = false;                  // the rect is kept; the pane draws it
 
-    // The finished rectangles, card-relative.
-    var segs = [
-      {x: 0, y: 0, hw: c.w * 0.5, hh: c.h * 0.5, r: us.cardR, bud: null},
-      {x: us.szX, y: us.ty, hw: us.tw * 0.5, hh: us.th * 0.5, r: us.r + us.pad, bud: [us.szSide, 0]},
-      {x: us.acX, y: us.ty, hw: us.tw * 0.5, hh: us.gap + us.r + us.pad, r: us.r + us.pad, bud: [us.acSide, 0]}
-    ];
-    if(P.actOn === false) segs.splice(2, 1);
-    if(us.swW > 0) segs.push({x: us.swX, y: us.swY, hw: us.swW * 0.5, hh: us.swH * 0.5, r: us.swR, bud: [0, -1]});
+    // The pane covers the FINISHED rects (so the quad never resizes under the liquid) and wherever
+    // the droplets reach past them; segments and droplets are relative to its centre.
+    var i, con = L.con, blobs = liqBlobs(L, lay.R, _bubBlobs);
+    var kBlend = lay.R * 0.9 * (1 - con) + P.uniBlend * uS() * con;   // gooey necks while it runs, the bubble's own as it sets
     var x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
-    for(var i = 0; i < segs.length; i++){
-      var g = segs[i];
+    for(i = 0; i < lay.rects.length; i++){
+      var g = lay.rects[i];
       x0 = Math.min(x0, g.x - g.hw); x1 = Math.max(x1, g.x + g.hw);
       y0 = Math.min(y0, g.y - g.hh); y1 = Math.max(y1, g.y + g.hh);
     }
-    var m = P.uniBlend * uS() + 0.05;
+    for(i = 0; i < blobs.length; i++){
+      var br = blobs[i].r + 0.5 * (blobs[i].k || 0);
+      x0 = Math.min(x0, blobs[i].x - br); x1 = Math.max(x1, blobs[i].x + br);
+      y0 = Math.min(y0, blobs[i].y - br); y1 = Math.max(y1, blobs[i].y + br);
+    }
+    var m = Math.max(kBlend, lay.R * 0.3) * 0.25 + 0.05;
     x0 -= m; x1 += m; y0 -= m; y1 += m;
     var W = x1 - x0, H = y1 - y0, cx = (x0 + x1) * 0.5, cy = (y0 + y1) * 0.5;
-
     uniWorld(c, cx, cy, 0, uni.pane.position);
     uni.pane.quaternion.copy(_uniQ);
     uni.pane.scale.set(W, H, 1);
     uni.pane.updateMatrixWorld(true);
 
-    // Budding: a segment at f sits between its start (inside the card's edge) and its place.
-    // Ahead of the orbs by uniBudLead, so the frost has reached them before they are fully there.
-    var fb = Math.min(1, f * Math.max(0.1, P.uniBudLead));
-    for(var k = 0; k < segs.length; k++){
-      var sg = segs[k], sx = sg.x, sy = sg.y, hw = sg.hw, hh = sg.hh;
-      if(sg.bud){
-        var bx = sg.bud[0] * (c.w * 0.5 - hw * P.uniBud), by = sg.bud[1] * (c.h * 0.5 - hh * P.uniBud);
-        if(sg.bud[0] === 0) bx = sg.x; else by = sg.y;
-        sx = bx + (sg.x - bx) * fb; sy = by + (sg.y - by) * fb;
-        hw = Math.max(0.01, hw * fb); hh = Math.max(0.01, hh * fb);
-      }
-      _segC[k].set(sx - cx, sy - cy); _segH[k].set(hw, hh); _segR[k] = sg.r;
+    // What has SET: every rect grown out of its own middle by the liquid's consolidation.
+    var bodies = liqBodies(L, lay), nS = 0;
+    if(bodies) for(i = 0; i < bodies.length && nS < 4; i++){
+      var b = bodies[i];
+      _segC[nS].set(b.x - cx, b.y - cy); _segH[nS].set(b.hw, b.hh); _segR[nS] = b.r; nS++;
     }
+    var nSet = nS;
+    if(!nS){ _segC[0].set(-cx, -cy); _segH[0].set(1e-3, 1e-3); _segR[0] = 1e-3; nS = 1; }   // only droplets yet
     var u = uni.pane.material.uniforms;
     feedFrost(uni.pane, W, H, us.cardR);
-    u.segN.value = segs.length;
-    u.blend.value = Math.max(1e-3, P.uniBlend * uS());
+    u.segN.value = nS;
+    u.blend.value = Math.max(1e-3, kBlend);
     u.segC.value = _segC; u.segH.value = _segH; u.segR.value = _segR;
-    u.opacity.value = P.plateOpacity * cardFadeT;
-    // The occluder rides the pane exactly: same place, same silhouette.
+    u.opacity.value = P.plateOpacity;
+    // Clear water while it runs — the scene bends through it like drops on a window — setting into
+    // the frost as it pulls into its shape (the cart's cornerMaterials trade).
+    u.lens.value = 1 - cornerRamp(con, 0.1, 0.8);
+    u.lensW.value = Math.max(1e-4, 0.3 * lay.R);
+    u.time.value = performance.now() * 0.001;
+    var bn = 0, cap = u.blob.value.length;
+    for(i = 0; i < blobs.length && bn < cap; i++){
+      var bb = blobs[i];
+      if(!(bb.r > 1e-4)) continue;
+      u.blob.value[bn].set(bb.x - cx, bb.y - cy, bb.r, bb.k || 0); bn++;
+    }
+    u.blobN.value = bn;
+    u.blobK.value = Math.max(1e-3, lay.R * 0.3);
+    // The occluder rides the SET glass only — it clips the site behind the bubble to its borders;
+    // the droplets are water, and a cut-out in their shape would only flicker.
     uni.occ.position.copy(uni.pane.position); uni.occ.quaternion.copy(uni.pane.quaternion); uni.occ.scale.copy(uni.pane.scale);
     var uo = uni.occ.material.uniforms;
     uo.hsize.value.set(W * 0.5, H * 0.5); uo.aa.value = u.aa.value;
-    uo.segN.value = segs.length; uo.blend.value = u.blend.value;
+    uo.segN.value = nSet; uo.blend.value = u.blend.value;
     uo.segC.value = _segC; uo.segH.value = _segH; uo.segR.value = _segR;
-    uni.occ.visible = !hideMask.cube && cardFadeT > 0.05;
+    uni.occ.visible = !hideMask.cube && nSet > 0 && con > 0.5;
 
     // The holes: the knob, then the action orbs — each where it actually is this frame, in the
     // pane's own units, at its own current size.
     var hn = 0, hc = u.holeC.value, hr = u.holeR.value;
     if(sz.knob && f > 0.001){
       _acP.copy(sz.knob.position); uni.pane.worldToLocal(_acP);
-      hc[hn].set(_acP.x * W, _acP.y * H); hr[hn] = 0.5 * orbScale() * P.sizeHole; hn++;
+      hc[hn].set(_acP.x * W, _acP.y * H); hr[hn] = 0.5 * orbScale() * P.sizeHole * f; hn++;
     }
     for(var a = 0; a < ac.btns.length && hn < 4; a++){
       if(!ac.btns[a].visible) continue;
@@ -4550,6 +4658,7 @@ var DML = (function(){
   }
 
   function dropUni(){
+    if(bub.L) bub.L = liqNew();                 // a fresh liquid for the next open (THE BUBBLE)
     if(uni.occ){
       if(uni.occ.parent) uni.occ.parent.remove(uni.occ);
       uni.occ.geometry.dispose(); uni.occ.material.dispose();
@@ -4745,7 +4854,7 @@ var DML = (function(){
   function updateDesc(){
     var on = live && P.descOn && typeof dm !== 'undefined' && dm.active && dm.floor && prodPanel;
     var da = (typeof displayAnim !== 'undefined') ? displayAnim : null;
-    var closing = da && da.active && (da.phase === 'retract' || da.phase === 'unsplit' || da.phase === 'unflatten');
+    var closing = da && da.active && (da.phase === 'retract' || da.phase === 'unsplit' || da.phase === 'unflatten' || da.phase === 'drain');
     var want = on && !closing && !dm.animating && cardFadeT > 0.25 && !(da && da.active);
     if(!on){ dropDesc(); return; }
     desc.form += ((want ? 1 : 0) - desc.form) * P.descSpeed;
@@ -5219,7 +5328,12 @@ var DML = (function(){
   // its VHS treatment. The stand-in art is that panel's own garment texture, so the display
   // matches the projection it flew out of; a real Shopify image would go in the same slot.
   function applyFlat(){
-    var on = live && typeof dm !== 'undefined' && dm.active && P.flatProduct;
+    // NOT FROM THE CLICK any more: the panel stays itself — its screen and its floating shirt —
+    // while it flies in and splits open, and only goes over to the flat (invisible) photo card once
+    // its halves have gone (displayAnim.flatOK, set by the split, cleared by the unsplit). Flat
+    // from the first frame is what made the clicked panel simply vanish under the cursor.
+    var on = live && typeof dm !== 'undefined' && dm.active && P.flatProduct
+             && (typeof displayAnim === 'undefined' || displayAnim.flatOK);
     var p = (on && dm.floor && dm.floor.panels) ? dm.floor.panels[dm.selIdx] : null;
     if(flatPanel && !p) flatPanel.mesh.material.depthWrite = true;   // the view closed: give the wheel panel its depth back
     if(flatPanel && flatPanel !== p){
@@ -5254,6 +5368,12 @@ var DML = (function(){
   }
 
   function cardMode(){ return live && P.cardFill; }
+  // Has the product view's glass drained away? (THE BUBBLE — the close waits on this before the
+  // panel's halves come back over the photo.)
+  function glassGone(){
+    if(!bub.L) return true;
+    return !bub.L.busy && !bub.L.open && !bub.Ld.busy && !bub.Ld.open;
+  }
 
   // ── ONE SLAB BEHIND ALL THREE ───────────────────────────────────────────────────────────
   // createGlassRect returns a Group carrying userData.glassMesh / .outline, which is the site's
@@ -5566,294 +5686,102 @@ var DML = (function(){
     }
     artExtW = w; artExtH = h; artExtN = set.length;
   }
+  // ── THE SETTLED CARD (2026-10-08) ──────────────────────────────────────────────────────────
+  // Where the card ends up and how big it is — a pure function of the params and the garment at
+  // the END of the open (productAt(1)), so it is known the moment a product is clicked. The card
+  // used to be sized off the LIVE product: it waited for the flight to stop, latched what it
+  // measured, then eased toward a re-measure — and the first latch was taken while the product
+  // was still magnifying on its way in, so the card was built oversized and shrank a beat later
+  // ("it gets really big for a second, then it sets"). The open now flies the product straight
+  // to this pose and the glass grows into this rect: nothing to chase, so nothing moves.
+  // Same sums as before — the content box (the widest and tallest garment in the set, or this
+  // garment's own), cardPad quoted at prodDepth, grown to cardAspect, times cardScale — taken at
+  // the settled fit instead of read off a moving mesh.
+  function artAspectOf(floorData, idx){
+    var pn = floorData.panels[idx];
+    var da = displayArt(pn);
+    if(da && da.aspect > 0) return da.aspect;
+    if(pn && pn._productBox && pn._productBox.aspect > 0) return pn._productBox.aspect;
+    var ud = pn && pn.mesh.material && pn.mesh.material.userData;
+    if(ud && ud.hasProductTex && ud.hasProductTex.value > 0.5 && ud.productTexAspect) return ud.productTexAspect.value;
+    return 0;
+  }
+  function settledCard(floorData, idx, out){
+    if(!floorData || !floorData.panels || !floorData.panels[idx]) return null;
+    var pm = floorData.panels[idx].mesh;
+    var r = productAt(floorData, idx, 1);
+    if(!r) return null;
+    var flatZ = (pm.material.userData.flattenZ ? pm.material.userData.flattenZ.value : 0);
+    var S = PLANE_WIDTH * 0.95 * r.k * P.cardImgScale;          // the garment's square, world units
+    var pWf = pm.userData.pWflat || PLANE_WIDTH, pH = pm.userData.pH || PLANE_WIDTH;
+    var panelW = r.k * pWf, panelH = r.k * pH;
+    var cw = 0, ch = 0, a = artAspectOf(floorData, idx);
+    if(a > 0.0001){ cw = S * Math.min(a, 1); ch = S * Math.min(1 / a, 1); }
+    if(P.cardUniform){
+      artExtremes(performance.now());
+      if(artExtW > 0.0001) cw = Math.max(cw, S * artExtW);
+      if(artExtH > 0.0001) ch = Math.max(ch, S * artExtH);
+      if(!(cw > 0.0001)){ cw = S * Math.min(P.cardAspect, 1); ch = S * Math.min(1 / P.cardAspect, 1); }
+    }
+    if(!(cw > 0.0001) || !(ch > 0.0001)){ cw = S * 0.92; ch = S; }
+    var baseW = panelW + (cw - panelW) * P.cardFit, baseH = panelH + (ch - panelH) * P.cardFit;
+    var f = frustum(), oz = r.z, dO = Math.max(0.1, f.camZ - oz);
+    var pad = P.cardPad * uS() * (P.prodDepth > 0.0001 ? dO / P.prodDepth : 1);
+    var w = baseW * P.cardWMul + 2 * pad, h = baseH * P.cardHMul + 2 * pad;
+    if(P.cardUniform && P.cardAspect > 0.0001){ if(w < h * P.cardAspect) w = h * P.cardAspect; else h = w / P.cardAspect; }
+    w *= P.cardScale; h *= P.cardScale;
+    var cz = oz + flatZ - P.cardBack;
+    if(cz > f.camZ - 1.0) cz = f.camZ - 1.0;
+    var cc = cardCentre(r.x, r.y, oz + flatZ + 0.005, cz, floorData.group.position.y);
+    out.x = cc.x; out.y = cc.y; out.z = cz; out.w = w; out.h = h;
+    out.cw = cw; out.ch = ch; out.S = S; out.pad = pad; out.k = r.k;
+    return out;
+  }
+  var _pcC = {x: 0, y: 0, z: 0, w: 0, h: 0};
   function updateProdPanel(){
     var want = live && P.cardGlass && typeof dm !== 'undefined' && dm.active
                && dm.floor && dm.floor.panels && dm.floor.panels[dm.selIdx];
     if(!want){ dropProdPanel(); return; }
-    // THE PANEL'S ORIGIN IS ITS WHEEL CENTRE, not its face: the visible surface sits `flattenZ`
-    // (the arc radius, ~6.3 units) further along local +Z. Place the card at the origin's depth
-    // and it projects narrower and lands visibly left of the garment.
-    //
-    // `dm.displayTemp` is NOT a safe gate — it is only set at the very end of animateDM and is
-    // cleared again on the way out, so keying the card's existence on it made the card blink out
-    // for long stretches and read as no background at all. Prefer it when it is there, because it
-    // tracks the open animation exactly; fall back to the solve when it is not.
-    var pl = dm.displayTemp && dm.displayTemp.plane;
-    var pmSel = dm.floor.panels[dm.selIdx].mesh;
-    var flatZ = (pmSel.material.userData.flattenZ ? pmSel.material.userData.flattenZ.value : 0);
-    var sol = pl ? null : productSolve(dm.floor, dm.selIdx, P.prodDepth);
-    if(!pl && !sol){ dropProdPanel(); return; }
-    // WAIT FOR THE PRODUCT TO SETTLE before the card exists at all. Two separate faults made the
-    // box look like it inflated, and this one guard removes both:
-    //   • sizing off the panel first and switching to the garment when the backdrop appeared
-    //     swapped size AND depth in a single frame — a snap from 582 px to 480 px;
-    //   • the open animation flies the panel ~5 units at the camera while shrinking it only 0.7x,
-    //     so the garment — and anything sized from it — magnifies ~23% on the way in.
-    // Neither is worth chasing frame by frame: the card is furniture, and the product can settle
-    // into it. Once idle, the live values ARE the settled values, so the latch below is exact.
-    var _da = (typeof displayAnim !== 'undefined') ? displayAnim : null;
-    // Gate on the GARMENT existing, and nothing else. Two stricter tests were tried and both
-    // failed silently: `phase === 'idle'` is true before the animation has run as well as after
-    // (it is the initial value), and adding `origPos` never matched at all because the display
-    // animation clears it on the way to idle — the card simply never appeared. The size is a pure
-    // function of the params and the garment now, so there is nothing to protect against: it
-    // tracks the product in, and lands deterministically wherever the params say.
-    var _settled = true;
-    var _imWait = _da && _da.backdrop && _da.backdrop.userData.imgMesh;
-    if(!prodPanel && (!_settled || (P.cardFit > 0 && !_imWait))) return;
+    var c = settledCard(dm.floor, dm.selIdx, _pcC);
+    if(!c){ dropProdPanel(); return; }
     if(!prodPanel){
       prodPanel = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), frostMaterial());
       prodPanel.raycast = function(){};
       prodPanel.frustumCulled = false;
-      // renderOrder 3, NOT 0. At 0 the card sits in the transparent pass alongside the cloud
-      // composite, which is a camera-facing quad — and among equal renderOrders three sorts
-      // transparents back-to-front, so the near quad drew LAST and painted the card out. Forced
-      // to pure black the card still measured 210,223,229: present in the scene, positioned
-      // correctly, and completely overwritten. 3 clears the clouds and the wheel panels (1) while
-      // staying under the button slab (4) and the garment image (5).
-      //
-      // depthTest off with it: the display panel DOES write depth at its face, 0.45 nearer, so a
-      // depth-tested card would then be rejected everywhere the panel covers — which is exactly
-      // where it is needed. Draw order alone puts it in the right place.
+      // renderOrder 3, NOT 0: at 0 the card sits in the transparent pass with the cloud composite,
+      // a camera-facing quad that three sorts LAST among equal orders — it painted the card out
+      // (forced to pure black, the card still measured 210,223,229). 3 clears the clouds and the
+      // wheel panels (1) and stays under the button slab (4) and the garment image (5).
+      // depthTest off with it: the display panel writes depth at its face, nearer than the card.
       prodPanel.renderOrder = 3;
       prodPanel.material.depthTest = false;
       scene.add(prodPanel);
     }
-    var pWf = pmSel.userData.pWflat || PLANE_WIDTH, pH = pmSel.userData.pH || PLANE_WIDTH;
-    var sx = pl ? pl.scale.x : (P.cardFill ? sol.kx : sol.k);
-    var sy = pl ? pl.scale.y : (P.cardFill ? sol.ky : sol.k);
-    var ox = pl ? pl.position.x : sol.x;
-    var oy = pl ? pl.position.y : sol.y;
-    var oz = pl ? pl.position.z : sol.z;
-    // The garment's own drawn extent. imgMesh is a SQUARE quad (PLANE_WIDTH*0.95) that the
-    // cutout is contain-fitted into, and applyBackdrop's counter-scale leaves it uniform in
-    // world space — so one axis of its world scale is the whole story, and the texture's aspect
-    // says how much of that square the garment actually covers.
-    var panelW = sx * pWf, panelH = sy * pH;
-    var baseW = panelW, baseH = panelH;
-    var _im = (typeof displayAnim !== 'undefined') && displayAnim.backdrop
-              && displayAnim.backdrop.userData.imgMesh;
-    // Measured off the LIVE garment — but the stillness gate below means this is only ever read
-    // once the panel has stopped, so the live value IS the settled value and it does not move
-    // again. Deriving it from productSolve instead looked cleaner and was wrong: the split phase
-    // leaves the panel at 0.7x, so the solver's k overstated the real settled scale by ~54%
-    // (card 6.914 against a true 4.741). The animation's own constants are not worth re-deriving.
-    var _gok = false;
-    if(_im && P.cardFit > 0){
-      _im.updateWorldMatrix(true, false);
-      _im.getWorldScale(_fv2);
-      var _S = PLANE_WIDTH * 0.95 * Math.abs(_fv2.x);
-      // THE STACK sizes the card off the SETTLED garment, not the live one. Its solve is exactly
-      // where the open ends (productAt(1) is what the split drives the panel to), and the live
-      // garment is twice that in world units at the start of the flight — held at a constant
-      // APPARENT size while it comes from twice as far. Measured live, the card latched 5.38
-      // and eased down to 2.97 on every open. The depth is put back below, at the draw.
-      if(mob.on){ var _r1 = productAt(dm.floor, dm.selIdx, 1); if(_r1) _S = PLANE_WIDTH * 0.95 * _r1.k * P.cardImgScale; }
-      // The garment's own aspect is used ONLY when cardUniform is off. _S is already identical
-      // for every product on a row (it is productSolve's k, a pure function of the params), so
-      // fixing the aspect too makes the whole frame identical product to product.
-      var _aReal = (_im.material.uniforms && _im.material.uniforms.productTexAspect)
-                   ? _im.material.uniforms.productTexAspect.value : 0;
-      // WHAT THE CARD HAS TO CLEAR is the garment's CONTENT, which is not the same as its file.
-      // productTexAspect now carries the content aspect and the material samples a sub-rectangle
-      // (see artBox / contentBox), so these two are the garment's real drawn extent in world
-      // units — the transparent crop margin is no longer part of it.
-      var cw = 0, ch = 0;
-      if(_aReal > 0.0001){ cw = _S * Math.min(_aReal, 1); ch = _S * Math.min(1 / _aReal, 1); }
-      if(P.cardUniform){
-        // WORST CASE ACROSS THE SET, not this garment. One frame for every product and cardPad
-        // as a real margin pull in opposite directions: a fixed frame around garments of
-        // different shapes cannot hold the same margin on both axes. Sizing to the widest and
-        // the tallest content in the set settles it — cardPad becomes the GUARANTEED MINIMUM
-        // clear space on all four sides, exact on whichever colourway binds and more on the
-        // rest, and the frame is still identical product to product.
-        artExtremes(performance.now());
-        if(artExtW > 0.0001) cw = Math.max(cw, _S * artExtW);
-        if(artExtH > 0.0001) ch = Math.max(ch, _S * artExtH);
-        // STILL NO GATE ON THE ART in uniform mode, deliberately — see the note above. If nothing
-        // has been measured yet, fall back to the frame's own declared shape so a card exists.
-        if(!(cw > 0.0001)){
-          cw = _S * Math.min(P.cardAspect, 1);
-          ch = _S * Math.min(1 / P.cardAspect, 1);
-        }
-      }
-      if(_S > 0.0001 && cw > 0.0001 && ch > 0.0001){
-        baseW = panelW + (cw - panelW) * P.cardFit;
-        baseH = panelH + (ch - panelH) * P.cardFit;
-        cardContentW = cw; cardContentH = ch;
-        _gok = true;
-      }
-    }
-    // NO PANEL-BOX FALLBACK once cardFit is on. The panel is stretched to fill its half, so
-    // sizing from it gives a card ~2.4x too big (measured 11.539 against a correct 4.741), and
-    // the garment is not measurable for a window on every open — the mesh exists before its world
-    // scale is real. Drawing the wrong size and correcting later is what read as "open another
-    // panel and it's way bigger". Draw nothing until the garment can actually be measured.
-    if(P.cardFit > 0 && !_gok){ if(prodPanel) prodPanel.visible = false; return; }
-
-    // AND WAIT FOR THE PANEL TO STOP MOVING. Its depth changes as it flies in, so even a
-    // constant world size still sweeps on screen. Every attempt to read this off displayAnim's
-    // own flags failed — `phase === 'idle'` is also its value before anything has run, and
-    // `origPos` is cleared on the way there — so ask the panel directly: hold the card back until
-    // its position and scale have been unchanged for a few frames.
-    // The key includes the GARMENT's measured size, not just the panel's transform. Keying on the
-    // panel alone failed because the backdrop phase holds the panel still while it fades the
-    // garment in and its scale is still climbing — the card saw a settled panel and resized
-    // straight through a 46% swell. Key on the quantity actually being measured.
-    // THE ONE GATE THAT MATTERS: `displayAnim.active`. It is set true by startDisplayAnim and
-    // false when the open finishes — an explicit "something is moving" flag that was in the file
-    // the whole time. Everything before this tried to INFER that from phases and from transforms
-    // holding still, and each inference had a hole: 'idle' is also the pre-animation value,
-    // 'origPos' is cleared on the way there, and a low frame rate makes the eased fly-in plateau
-    // long enough to look settled. While this is true the card is neither built nor resized, so
-    // it CANNOT sample a moving target. The stillness count stays as a second belt for the frames
-    // just after the flag drops.
-    var _busy = (typeof displayAnim !== 'undefined') && displayAnim.active;
-    var _k = (_S || 0).toFixed(4) + ',' + ox.toFixed(3) + ',' + oz.toFixed(3) + ',' + sx.toFixed(3);
-    if(_k === cardKey && !_busy) cardStill++; else { cardKey = _k; cardStill = 0; }
-    if(!prodPanel && (_busy || cardStill < 3)) return;
-
-    // cardScale multiplies the finished box, border included, so it resizes the frame as a whole
-    // rather than restretching it around the art.
-    // cardPad IS QUOTED AT A REFERENCE DEPTH, and the reference is prodDepth.
-    // Everything else in this box is depth-proportional — _S is measured live, so the garment's
-    // apparent size does not depend on how far away it sits — but a fixed world-unit margin is
-    // not. The same 0.35 subtends 48.5% more screen at prodDepth-minus-prodForward than it does
-    // at prodDepth, which is the 21% fatter border the open used to show. Referencing it makes
-    // the margin you tuned the margin you see, wherever the product actually ended up.
-    //
-    // THIS IS NOT THE `cardSteady` FACTOR THAT WAS REMOVED, and the difference is the whole
-    // reason that one was harmful: it divided by a buildDepth LATCHED when the mesh was created,
-    // so editing prodDepth moved the numerator while the denominator stayed dead and every other
-    // size slider came out multiplied by a stale ratio. Both terms here are live — the numerator
-    // is measured this frame off the panel, the denominator is the parameter itself.
-    var _dNow = frustum().camZ - oz;
-    var _pad = P.cardPad * uS() * ((P.prodDepth > 0.0001 && _dNow > 0.0001) ? (_dNow / P.prodDepth) : 1);
-    if(mob.on) _pad = P.cardPad * uS() * (Math.max(0.1, P.prodDepth - P.prodForward) / Math.max(1e-4, P.prodDepth));   // settled, like _S
-    // Pad goes on FIRST, in world units, against the content box — that is what makes it a
-    // margin you can measure rather than a number to dial by eye.
-    var w = baseW * P.cardWMul + 2 * _pad;
-    var h = baseH * P.cardHMul + 2 * _pad;
-    // Then cardAspect sets the frame's shape. GROW the short axis, never shrink the long one:
-    // shrinking would eat back into the margin that was just added, which is the whole point of
-    // adding it. The finished card is exactly cardAspect either way.
-    if(P.cardUniform && P.cardAspect > 0.0001){
-      if(w < h * P.cardAspect) w = h * P.cardAspect; else h = w / P.cardAspect;
-    }
-    w *= P.cardScale; h *= P.cardScale;
-
-    // HOLD THE SIZE WHILE ANYTHING IS MOVING — and this has to come AFTER w/h exist. It sat above
-    // this line at first, where `var` hoisting made it read undefined and the real assignment
-    // below simply overwrote it: two full verification runs came back byte-identical and the
-    // swell never budged. Recomputes the moment the garment stops changing, so the params stay
-    // live whenever anyone is actually looking at it.
-    if((!_busy && cardStill >= 3) || cardW0 <= 0){ cardW0 = w; cardH0 = h; }
-    // EASED to the latch, not snapped: the size held through the open is the garment's
-    // pre-split size, ~30% wider than settled, and the re-latch used to land in one frame. As
-    // furniture on its own that read as the card settling; as the body of the one bubble it moved
-    // every orb and track with it. A few frames of ease and it is the bubble breathing in.
-    if(cardWe <= 0){ cardWe = cardW0; cardHe = cardH0; }
-    cardWe += (cardW0 - cardWe) * P.cardEase; cardHe += (cardH0 - cardHe) * P.cardEase;
-    if(Math.abs(cardW0 - cardWe) < 1e-4) cardWe = cardW0;
-    if(Math.abs(cardH0 - cardHe) < 1e-4) cardHe = cardH0;
-    w = cardWe; h = cardHe;
-    // Clamped in front of the near plane: flattenZ is a fixed ~6.3 forward push that does NOT
-    // scale with the fit, so at a shallow prodDepth it walks the card straight past the camera.
-    var cz = oz + flatZ * (pl ? pl.scale.z : 1) - P.cardBack;
-    var minGap = 1.0;
-    if(cz > frustum().camZ - minGap) cz = frustum().camZ - minGap;
-    // THE CARD IS cardBack BEHIND THE PHOTO, AND OFF-AXIS THAT SHOWS. The same world x at a
-    // greater depth projects nearer the screen's centre — 21px on a 1582-wide frame here — so
-    // the garment read as sitting right of centre in its own frame, and the whole bubble, which
-    // is built off the card, sat off-centre with it. Solved in screen space instead: the card's
-    // centre goes where the photo's centre projects, whatever cardBack is.
-    var _cc = cardCentre(ox, oy, oz + flatZ * (pl ? pl.scale.z : 1) + 0.005, cz, dm.floor.group.position.y);
-    ox = _cc.x; oy = _cc.y;
-    // NO DEPTH COMPENSATION HERE, deliberately. There used to be a `cardSteady` factor of
-    // currentDepth / buildDepth. It was redundant once the card waits for the product to settle,
-    // and it was actively harmful: buildDepth was latched per card and survived as long as the
-    // mesh did, so editing `prodDepth` moved the numerator and not the denominator, and every
-    // other size slider came out multiplied by a stale ratio. "The changes don't match what it
-    // actually ends up being" was exactly that. The size is now a pure function of the params
-    // and the garment, identical on every open.
-    // THE STACK: the settled size, carried at a constant apparent size wherever the flight has
-    // the card right now — exactly 1 once it has landed.
-    if(mob.on){ var _dk = Math.max(0.1, frustum().camZ - cz) / mobCardDepth(); w *= _dk; h *= _dk; }
-    prodPanel.scale.set(w, h, 1);
-    prodPanel.position.set(ox, oy, cz);
-    if(pl) prodPanel.quaternion.copy(pl.quaternion);
-    feedFrost(prodPanel, w, h, Math.min(w, h) * 0.5 * P.cardRadius);
-    // ONE LINE PER OPEN, on purpose. This layout could not be reproduced off the user's machine,
-    // so it reports itself: every number that decides the product's size, printed where it can be
-    // read and compared between two opens that look different. Delete once it stops earning it.
-    // Reports on every CHANGE, not once per open. A single line per open cannot show a card that
-    // settles correctly and then grows a second later — which is exactly the report being chased.
-    if(cardStill >= 3 && Math.abs(w - cardLoggedW) > Math.max(0.01, cardLoggedW * 0.01)){
-      var _was = cardLoggedW;
-      cardLoggedW = w;
-      var _lg = dm.floor.panels[dm.selIdx];
-      var _lgA = (_im && _im.material.uniforms && _im.material.uniforms.productTexAspect)
-                 ? _im.material.uniforms.productTexAspect.value : -1;
-      console.log('%cDML ' + (_was > 0 ? 'RESIZED ' + _was.toFixed(3) + ' -> ' + w.toFixed(3) : 'open')
-        + '  panel ' + dm.selIdx + '  colourway ' + (_lg.shirt ? _lg.shirt.idx : '?')
-        + '  contentAspect ' + (+_lgA).toFixed(4),   // the GARMENT's aspect now, not the file's
+    prodPanel.scale.set(c.w, c.h, 1);
+    prodPanel.position.set(c.x, c.y, c.z);
+    // The card faces where the product WILL face (the flight's target), not wherever the flight
+    // has it this frame — the pane and everything on it are built off this quaternion.
+    if(dm.displayPlane) prodPanel.quaternion.copy(dm.displayPlane.quaternion); else prodPanel.quaternion.identity();
+    feedFrost(prodPanel, c.w, c.h, Math.min(c.w, c.h) * 0.5 * P.cardRadius);
+    cardContentW = c.cw; cardContentH = c.ch;
+    // ONE LINE whenever the card's size CHANGES (another shape of product, a slider, a resize) —
+    // with no chase there is no settling to report; a second line only when it really changes.
+    if(Math.abs(c.w - cardLoggedW) > Math.max(0.01, cardLoggedW * 0.01)){
+      var _was = cardLoggedW; cardLoggedW = c.w;
+      var _sv = (typeof window.__dmlSaved === 'function') ? window.__dmlSaved() : {}, _nSv = Object.keys(_sv).length;
+      console.log('%cDML card ' + (_was > 0 ? 'RESIZED ' + _was.toFixed(3) + ' -> ' : '') + c.w.toFixed(3) + ' x ' + c.h.toFixed(3) +
+        '   garment ' + c.S.toFixed(3) + '   content ' + c.cw.toFixed(3) + ' x ' + c.ch.toFixed(3) + '   pad ' + c.pad.toFixed(3) +
+        '   depth ' + (frustum().camZ - c.z).toFixed(2) +
+        (mob.on ? '   [STACK (phone) layout]' : (aspect() >= P.minAspect ? '   [split ARMED]' : '   [!! SPLIT OFF — aspect under minAspect ' + P.minAspect + ' !!]')) +
+        (_nSv ? '   [' + _nSv + ' SAVED slider values in effect — not the file\'s]' : ''),
         _was > 0 ? 'color:#ff9c3d;font-weight:700' : 'color:#5aa9ff;font-weight:700');
-      console.log('   card ' + w.toFixed(3) + ' x ' + h.toFixed(3)
-        + '   garment ' + (baseW).toFixed(3) + ' x ' + (baseH).toFixed(3)
-        + '   margin ' + ((w - baseW) / 2).toFixed(3));
-      // WHAT cardPad ACTUALLY BOUGHT, per axis, against the garment on screen right now. This is
-      // the line that says whether the number means world units: `min` is the tightest of the
-      // four sides and should read cardPad exactly on whichever colourway binds the frame.
-      // `set` is the worst-case content the one frame was sized to clear.
-      var _sS = (typeof _S === 'number' && _S > 0) ? _S : 0;
-      var _bx = (_lg && _lg.shirt) ? artBox(_lg.shirt.idx, _lgA) : null;
-      var _thisW = _sS * Math.min(_lgA, 1), _thisH = _sS * Math.min(1 / _lgA, 1);
-      var _mW = (w - _thisW) / 2, _mH = (h - _thisH) / 2;
-      console.log('   content ' + _thisW.toFixed(3) + ' x ' + _thisH.toFixed(3)
-        + '   set ' + cardContentW.toFixed(3) + ' x ' + cardContentH.toFixed(3)
-        + '   margin h ' + _mW.toFixed(3) + '  v ' + _mH.toFixed(3)
-        + '   min ' + Math.min(_mW, _mH).toFixed(3)
-        + ' (pad ' + _pad.toFixed(3) + ' = cardPad ' + P.cardPad + ' at depth ' + _dNow.toFixed(1)
-        + ' ref ' + P.prodDepth + ')'
-        + (_bx && _bx.ok ? '' : '  [box UNMEASURED — using the file box]'));
-      // WHERE THE PRODUCT ACTUALLY IS, versus the two depths the code solves for. The open
-      // animation ends at productAt(t=1) — prodDepth MINUS prodForward — while the param
-      // window's reflow() re-places it with placeProduct(), which solves at prodDepth flat.
-      // Those are 5 units apart at the shipped values, so a slider nudge MOVES THE PRODUCT.
-      // Everything here is depth-proportional except the 2*cardPad addend, so this line is what
-      // says whether a size difference is the depth, the latch, or the garment measurement.
-      var _fz = frustum().camZ;
-      console.log('   depth now ' + (_fz - oz).toFixed(2)
-        + '   openEndsAt ' + (P.prodDepth - P.prodForward).toFixed(2)
-        + '   reflowPutsAt ' + P.prodDepth.toFixed(2)
-        + '   _S ' + _sS.toFixed(3) + '   planeScale ' + sx.toFixed(3)
-        + '   latch ' + (cardW0 > 0 ? cardW0.toFixed(3) : 'fresh')
-        + '   busy ' + (_busy ? 'YES' : 'no') + '  still ' + cardStill);
-      var _asp = window.innerWidth / window.innerHeight;
-      console.log('   prodDepth ' + P.prodDepth + '  prodFill ' + P.prodFill + '  prodX ' + P.prodX
-        + '  cardPad ' + P.cardPad + '  cardScale ' + P.cardScale
-        + '  aspect(screen) ' + _asp.toFixed(3)
-        + (mob.on ? '  [STACK (phone) layout — aspect under minAspect ' + P.minAspect + ']'
-           : _asp >= P.minAspect ? '  [split ARMED]'
-                                 : '  [!! SPLIT OFF — aspect under minAspect ' + P.minAspect + ' !!]'));
-      // ONE BUBBLE's numbers, so a pasted readout carries them — and whether any of these are
-      // saved slider values rather than the file's (see the N window's SAVED ACROSS RELOADS).
-      var _sv = (typeof window.__dmlSaved === 'function') ? window.__dmlSaved() : {};
-      var _svK = Object.keys(_sv), _nSaved = _svK.length;
-      var _svList = _svK.map(function(k){ var v = _sv[k]; return k + ' ' + (Array.isArray(v) ? '[' + v.map(function(x){ return +x.toFixed(3); }).join(',') + ']' : v); }).join(', ');
-      console.log('   whole: scale ' + P.uniScale + '  x ' + P.uniX + '  y ' + P.uniY
-        + '   bubble: neck ' + P.uniBlend + '  trackGap ' + P.uniTrackGap + '  trackY ' + P.uniTrackY
-        + '   strip: x ' + P.swX + '  y ' + P.swY + '  cell ' + P.swCell
-        + '   orbs: btnScale ' + P.btnScale + '  sizePad ' + P.sizePad + '  btnGap ' + P.btnGap
-        + (_nSaved ? '   [' + _nSaved + ' SAVED, not the file\'s: ' + _svList + ']' : '   [all file values]'));
     }
+    // The card's own fade only matters when there is no pane to draw it (the size toggle off):
+    // with a pane, the card is the pane's segment 0 and the liquid forms it (THE BUBBLE).
     cardFadeT += (1 - cardFadeT) * Math.max(0.02, P.fadeSpeed * 1.6);
     prodPanel.material.uniforms.opacity.value = P.plateOpacity * cardFadeT;
-    // ONE BUBBLE: the pane draws the card; this mesh is the rect. (Without a pane — the toggle
-    // switched off — it draws itself as before.) Remember the settled size so the next open's
-    // fly-in can aim the orbs at the slot they will end up on.
     if(uni.pane) prodPanel.visible = false;
-    if(cardStill >= 3){ uniCardW = w; uniCardH = h; uniCardD = frustum().camZ - cz; uniCardS = uS(); uniCardM = mob.on; }
+    uniCardW = c.w; uniCardH = c.h; uniCardD = frustum().camZ - c.z; uniCardS = uS(); uniCardM = mob.on;
   }
   function dropProdPanel(){
     if(!prodPanel) return;
@@ -5952,14 +5880,16 @@ var DML = (function(){
 
     // The card is scaled NON-uniformly to fill its half, and these are its children — so without
     // the inverse they stretch with it. Skipped while the lightbox owns the image's scale.
-    if(!cardMode()) return;
     if(typeof imgLightbox !== 'undefined' && imgLightbox.active) return;
-    var r = productSolve(dm.floor, dm.selIdx, P.prodDepth);
-    if(!r || !r.kx || !r.ky) return;
-    // Guarded: a zero or absent kx/ky makes this Infinity, and an Infinity scale puts NaN through
-    // the panel's world matrix — after which every measurement taken off it is NaN and the card
+    // The garment's world size is the settled uniform fit × cardImgScale, whatever the plane it
+    // rides is scaled to — so divide by the plane's ACTUAL scale. (It used to assume the old
+    // stretched kx/ky; the open now lands the plane at a uniform k.)
+    var pl = bd.parent, r = (typeof dm !== 'undefined' && dm.floor) ? productAt(dm.floor, dm.selIdx, 1) : null;
+    if(!pl || !r || !(pl.scale.x > 1e-6) || !(pl.scale.y > 1e-6)) return;
+    // Guarded: a zero scale makes this Infinity, and an Infinity scale puts NaN through the
+    // panel's world matrix — after which every measurement taken off it is NaN and the card
     // silently vanishes or lands on a fallback size. Non-finite means leave the scale alone.
-    var sx = r.k * P.cardImgScale / r.kx, sy = r.k * P.cardImgScale / r.ky;
+    var sx = r.k * P.cardImgScale / pl.scale.x, sy = r.k * P.cardImgScale / pl.scale.y;
     if(!isFinite(sx) || !isFinite(sy) || sx <= 0 || sy <= 0) return;
     if(u.imgMesh) u.imgMesh.scale.set(sx, sy, 1);
     if(u.shadowMesh && P.showShadow) u.shadowMesh.scale.set(sx, sy, 1);
@@ -6174,7 +6104,9 @@ var DML = (function(){
   function shirtVisible(rec){
     if(!live || typeof dm === 'undefined' || !dm.active || !dm.floor) return true;
     if(!dm.floor.panels) return true;
-    if(rec.panel === dm.floor.panels[dm.selIdx]) return P.holoProduct;
+    // The open product's own shirt stays while its panel flies in and splits open — it is what
+    // "stands independently" — and fades into the photo as the halves part (holoFade, the split's).
+    if(rec.panel === dm.floor.panels[dm.selIdx]) return P.holoProduct || (rec.panel.holoFade > 0.001);
     if(dm.floor.panels.indexOf(rec.panel) >= 0) return P.holoWheel;
     return true;
   }
@@ -6197,7 +6129,7 @@ var DML = (function(){
           // fastest way to see whether the calibration has real numbers or fell back to the file.
           swArt:swArt, artBox:artBox,
           placeProduct:placeProduct, productAt:productAt,
-          settleProduct:settleProduct,
+          settleProduct:settleProduct, flyTarget:flyTarget, settledCard:settledCard, glassGone:glassGone,
           buttonPos:buttonPos, starTarget:starTarget, makeScrim:makeScrim, dropScrim:dropScrim,
           update:update, setHidden:setHidden, shirtVisible:shirtVisible,
           // the size toggle + the card's close button
@@ -7033,6 +6965,23 @@ SHIRT.setFilter(DML.shirtVisible);
       note('Applied to every panel on top of its own slot: -90 on X lays the cylinder along the wheel, and Y is its position around the rim. All three are offsets, so 0 is untouched.') +
       row('Image turn', 'imgRot', 0, 1, 0.01) +
       note('0 leaves the product image upright with its panel; 1 turns it a quarter turn, which is what keeps it readable once the wheel is lying on its side.') +
+
+      hd('THE SNAKE (THE OTHER PANELS’ TRIP)') +
+      chk('Snake on', 'snakeOn') +
+      note('The panels you did not click ride ONE path, like segments of one body: round the row, out through a turn, along a straight, through a turn into the wheel, and round the wheel until the head is one slot short of its own tail again. Closing runs the same body back. Off = the old trip, the whole row sliding over as one bundle. Takes effect on the next open or close.') +
+      row('Open (s)', 'snakeOpenDur', 0.3, 4, 0.05) +
+      row('Close (s)', 'snakeCloseDur', 0.3, 4, 0.05) +
+      row('Spacing on the straight (× panel)', 'snakeStrip', 0.9, 3, 0.01) +
+      note('How far apart the panels ride while the body is straight, in panel widths: 1 is edge to edge, a film strip. They spread back out to the row’s and the wheel’s own spacing as they reach each.') +
+      row('Turn out of the row', 'snakeTurnRow', 0.5, 8, 0.1) +
+      row('Turn into the wheel', 'snakeTurnWheel', 0.3, 6, 0.1) +
+      note('Radii of the two bends, in world units. Bigger is lazier; it shortens the straight to make room, and shrinks itself if the two would overlap.') +
+      row('Lead round the row (deg)', 'snakeLead', 0, 180, 1) +
+      note('How far the head may carry on round the row before it peels off, if that gives a cleaner line. The route is picked fresh on every trip from the camera’s point of view.') +
+      row('Arrival speed — open', 'snakeEndOpen', 0, 1.5, 0.01) +
+      row('Arrival speed — close', 'snakeEndClose', 0, 1.5, 0.01) +
+      note('0 eases to a dead stop. Above 0 the body is still moving when it closes up, and the wheel (or the row) takes that speed over and spins down from it.') +
+      row('Changes size at (0 row → 1 wheel)', 'snakeSizeAt', 0.05, 0.95, 0.01) +
 
       hd('PRODUCT HALF') +
       row('Depth', 'prodDepth', 4, 30, 0.1) +
@@ -14468,7 +14417,7 @@ function pDown(cx,cy){
     }
   }
   
-  if(dm.active&&dm.vWheel){
+  if(dm.active&&dm.vWheel&&!SNAKE.holdsReel(dm.floor)){   // not while the snake is still landing panels on it
     var vi=raycaster.intersectObjects(dm.vWheel.children,true);
     if(vi.length>0){isDragging=true;selectedFloor=null;dm.draggingVW=true;previousMouseY=cy;previousMouseX=cx;previousTime=performance.now();renderer.domElement.parentElement.classList.add('dragging');return;}
   }
@@ -15135,7 +15084,7 @@ function pUp(cx,cy){
     var hits=raycaster.intersectObjects(scene.children,true).filter(function(h){return h.object.visible;});
     
     // ── Check vertical wheel clicks first via direct raycast against wheel children ──
-    if(dm.active && dm.vWheel && !dm.animating && !dm.closing && !switchAnim.active) {
+    if(dm.active && dm.vWheel && !dm.animating && !dm.closing && !switchAnim.active && !SNAKE.holdsReel(dm.floor)) {
       var vwHits = raycaster.intersectObjects(dm.vWheel.children, true);
       for(var vi=0; vi<vwHits.length; vi++){
         var hitObj = vwHits[vi].object;
@@ -15193,7 +15142,7 @@ function pUp(cx,cy){
       }
       if(tgt){
         var fg=tgt.parent;
-        if(dm.active&&fg===dm.vWheel&&!dm.animating&&!dm.closing&&!switchAnim.active){
+        if(dm.active&&fg===dm.vWheel&&!dm.animating&&!dm.closing&&!switchAnim.active&&!SNAKE.holdsReel(dm.floor)){
           var ci=tgt.userData.vwIdx;
           if(ci!==undefined&&ci!==dm.selIdx)switchPanel(ci);
         }else{
@@ -15214,6 +15163,723 @@ function pUp(cx,cy){
   isDragging=false;selectedFloor=null;renderer.domElement.parentElement.classList.remove('dragging');
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// SNAKE — how the OTHER panels travel between the row and the detail wheel (2026-10-08)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// The brief: the panels you did NOT click used to lerp over to the wheel as one bundle. They
+// should "unfurl and become a straight line, kinda like following the body of an invisible
+// snake — it unwinds, then goes back to its ouroboros curl-up".
+//
+// So there is ONE path, and every panel rides it like a segment of the same body:
+//     the row's ring -> a turn out of it -> a straight -> a turn into the wheel -> the wheel's ring
+// The ring is the ouroboros with its tail let go (the gap is the panel you clicked). The head
+// peels off, the body follows through exactly the same turns, straightens on the strand, and the
+// head winds round the wheel until it is one slot short of its own tail again. A close is the
+// same body run back the other way.
+//
+// EVERYTHING IS REBUILT FROM LIVE TRANSFORMS EVERY FRAME. The row keeps spinning while you shop,
+// the phone stack re-places the wheel every frame, a resize or an N-window slider re-solves it —
+// so nothing about the path is a world constant. What is chosen once, at the start of a trip, is
+// only its topology: which way round the body travels, how far the head runs on round the row
+// before it peels off, and (on an open, where the wheel has no spin yet) which slot of the wheel
+// the tail comes to rest in. The wheel's spin is then SET to that, so the landing is exact.
+//
+// Each panel is laid ONTO the path, not placed beside it: its vertex columns go at their own arc
+// lengths along the curve, so a panel on the ring is exactly the ring's curve, a panel on the
+// straight is flat, and one going through a turn bends with it — a ribbon on a body, not a card
+// pinned to a point. That replaces morphTo for these panels; at either end it reproduces the
+// row's and the wheel's own shapes (floorPos / vertPos), so the hand-offs do not pop.
+//
+// The host keeps its own animations for everything else (the clicked panel, the buttons, the
+// glass ring); it only has to skip the temps this module marks (`userData.snake`), not remove
+// them when its own clock runs out, and keep their real panels hidden until the body lands.
+var SNAKE = (function(){
+  var D2R = Math.PI / 180;
+  var V3 = THREE.Vector3;
+  var H = 0.16;        // path sample step, world units
+  var SMOOTH = 14;     // [1 4 1] passes over the joints — takes the step out of the curvature
+  var BAND = 5;        // how many samples past each junction the smoothing may reach into a ring
+  // A panel resting at either end has to lie WHOLLY on its ring, clear of the smoothed joint, or
+  // its far half is bent along the incoming turn and the hand-off to the real panel pops (measured
+  // 0.21 world units before this). So each junction sits at least half a panel plus the band
+  // beyond the last resting panel: the head travels this far round the row before it can peel
+  // off, and the tail this far round the wheel after it arrives.
+  // (+2 samples: the interval straddling the band's last sample is a lerp, not the ring)
+  function clearAngle(run, rg){ return (0.55 * run.arcW * rg.k + (BAND + 2) * H) / rg.R; }
+  function P(k, d){ var v = (typeof DML !== 'undefined' && DML.P) ? DML.P[k] : undefined; return (typeof v === 'number' || typeof v === 'boolean') ? v : d; }
+
+  // ── RINGS ────────────────────────────────────────────────────────────────────────────────
+  // A ring is the circle the panels' FACE CENTRES sit on: centre C, in-plane axes E1/E2, axis A
+  // (which is also each panel's own up), face radius R, and the world scale k of a panel on it.
+  // Slot j sits at angle j*as, P = C + R(cos E1 + sin E2), and a panel's local +X runs toward
+  // increasing angle — true of the row AND the wheel (E1 x E2 = A for both), so one travel sign
+  // means the same thing on either.
+  function ring(){ return {C: new V3(), E1: new V3(), E2: new V3(), A: new V3(), R: 1, k: 1}; }
+  function copyRing(a, b){ b.C.copy(a.C); b.E1.copy(a.E1); b.E2.copy(a.E2); b.A.copy(a.A); b.R = a.R; b.k = a.k; return b; }
+  function floorRing(fd, r){
+    var g = fd.group; g.updateMatrixWorld(true);
+    var e = g.matrixWorld.elements;
+    r.C.set(e[12], e[13], e[14]);
+    r.E2.set(e[0], e[1], e[2]).normalize();
+    r.A.set(e[4], e[5], e[6]).normalize();
+    r.E1.set(e[8], e[9], e[10]).normalize();
+    r.k = 1; r.R = fd.radius;
+    return r;
+  }
+  // The wheel: buildVW seats slot a at Rx(-90) * Ry(a + 180), which puts its face at
+  // (-sin a, -cos a, 0) * vRadius in the group and its up along group -Z. Spin is about group Z.
+  function reelRing(pos, quat, k, vR, r){
+    r.C.copy(pos);
+    r.E1.set(0, -1, 0).applyQuaternion(quat);
+    r.E2.set(-1, 0, 0).applyQuaternion(quat);
+    r.A.set(0, 0, -1).applyQuaternion(quat);
+    r.k = k; r.R = vR * k;
+    return r;
+  }
+  function rPoint(rg, a, out){ var c = Math.cos(a), s = Math.sin(a);
+    return out.set(rg.C.x + rg.R * (c * rg.E1.x + s * rg.E2.x), rg.C.y + rg.R * (c * rg.E1.y + s * rg.E2.y), rg.C.z + rg.R * (c * rg.E1.z + s * rg.E2.z)); }
+  function rTan(rg, a, out){ var c = Math.cos(a), s = Math.sin(a);   // unit, toward increasing angle
+    return out.set(-s * rg.E1.x + c * rg.E2.x, -s * rg.E1.y + c * rg.E2.y, -s * rg.E1.z + c * rg.E2.z); }
+
+  // ── THE PATH ─────────────────────────────────────────────────────────────────────────────
+  // One shared set of buffers: a trip's path is rebuilt and consumed inside its own step.
+  var MAXN = 9000;
+  var PP = new Float64Array(MAXN * 3), PT = new Float64Array(MAXN * 3), PY = new Float64Array(MAXN * 3);
+  var PS = new Float64Array(MAXN), PU = new Float64Array(MAXN), PW = new Float64Array(MAXN), PK = new Float64Array(MAXN);
+  var SMx = new Float64Array(MAXN * 3);
+  // Where a sample lies ON one of the two rings (PR 0 = the row, 1 = the wheel, -1 = neither) and
+  // at what angle (PA). Ring samples are measured and read back as the circle itself rather than
+  // as a polyline: chord lengths summed through the smoothed joint had every resting panel land
+  // about a degree along from its slot, which a position nudge cannot take out of its rotation.
+  var PA = new Float64Array(MAXN), PR = new Int8Array(MAXN);
+  var NP = 0, iJF = 0, iJR = 0, RF = null, RR = null, SG = 1;
+  function push(x, y, z, rid, ang){ if(NP >= MAXN) return; var o = NP * 3; PP[o] = x; PP[o + 1] = y; PP[o + 2] = z; PR[NP] = rid; PA[NP] = ang; NP++; }
+  var _q = new V3(), _c = new V3();
+  // returns the angle step, so a slot's fractional sample index can be found from its angle
+  function pushArc(rg, rid, a0, sweep, first){
+    var n = Math.max(1, Math.ceil(Math.abs(sweep) * rg.R / H));
+    for(var i = first ? 0 : 1; i <= n; i++){ var a = a0 + sweep * i / n; rPoint(rg, a, _q); push(_q.x, _q.y, _q.z, rid, a); }
+    return Math.abs(sweep) / n;
+  }
+  // Circular turn starting at S with tangent T, bending by `ang` toward the unit perpendicular n.
+  function pushTurn(S, T, n, r, ang){
+    if(ang < 1e-4 || r < 1e-4) return;
+    _c.copy(S).addScaledVector(n, r);
+    var m = Math.max(1, Math.ceil(ang * r / H));
+    for(var i = 1; i <= m; i++){
+      var th = ang * i / m, c = Math.cos(th), s = Math.sin(th);
+      push(_c.x + r * (-n.x * c + T.x * s), _c.y + r * (-n.y * c + T.y * s), _c.z + r * (-n.z * c + T.z * s), -1, 0);
+    }
+  }
+  function pushLine(A, B){
+    var m = Math.max(1, Math.ceil(A.distanceTo(B) / H));
+    for(var i = 1; i <= m; i++){ var t = i / m; push(A.x + (B.x - A.x) * t, A.y + (B.y - A.y) * t, A.z + (B.z - A.z) * t, -1, 0); }
+  }
+
+  // Turn-straight-turn between two oriented points: a Dubins-style link in 3-D. The straight's
+  // direction depends on the turns and the turns on the straight, so it is iterated to a fixed
+  // point. Each turn starts AT its junction on the ring, so nothing a ring holds ever moves; if
+  // the two turns would overlap, both radii shrink until the straight is long enough.
+  var csc = {L: new V3(), M: new V3(), N: new V3(), aM: 0, aN: 0, tM: 0, tN: 0, rM: 0, rN: 0,
+             nM: new V3(), nN: new V3(), FM: new V3(), GN: new V3(), straight: 0, ok: true};
+  var _t = new V3();
+  function solveLink(JF, TF, JR, TR, rM, rN){
+    var o = csc;
+    for(var tries = 0; tries < 6; tries++){
+      o.L.subVectors(JR, JF).normalize();
+      for(var it = 0; it < 16; it++){
+        o.aM = Math.acos(Math.max(-1, Math.min(1, TF.dot(o.L))));
+        o.tM = rM * Math.tan(Math.min(o.aM, 2.7) / 2);
+        o.M.copy(JF).addScaledVector(TF, o.tM);
+        o.aN = Math.acos(Math.max(-1, Math.min(1, o.L.dot(TR))));
+        o.tN = rN * Math.tan(Math.min(o.aN, 2.7) / 2);
+        o.N.copy(JR).addScaledVector(TR, -o.tN);
+        _t.subVectors(o.N, o.M);
+        if(_t.lengthSq() < 1e-10) break;
+        _t.normalize();
+        var d = _t.distanceToSquared(o.L);
+        o.L.copy(_t);
+        if(d < 1e-12) break;
+      }
+      o.straight = o.M.distanceTo(o.N) - o.tM - o.tN;
+      o.rM = rM; o.rN = rN;
+      o.ok = o.straight >= 0;
+      if(o.ok) break;
+      rM *= 0.7; rN *= 0.7;
+    }
+    o.nM.copy(o.L).addScaledVector(TF, -o.L.dot(TF));
+    if(o.nM.lengthSq() < 1e-10) o.aM = 0; else o.nM.normalize();
+    o.nN.copy(TR).addScaledVector(o.L, -TR.dot(o.L));
+    if(o.nN.lengthSq() < 1e-10) o.aN = 0; else o.nN.normalize();
+    o.FM.copy(o.M).addScaledVector(o.L, o.tM);
+    o.GN.copy(o.N).addScaledVector(o.L, -o.tN);
+    return o;
+  }
+  function smooth01(x){ x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); }
+
+  // The whole curve for a trip at this instant, plus everything the beads read off it: arc
+  // length PS, tangent PT, panel-up PY, how far from row to wheel PW, panel scale PK, and the
+  // BEAD COORDINATE PU — one unit per panel spacing, so bead k always sits at U - k. The spacing
+  // is the row's own on the row, the wheel's own on the wheel, and `snakeStrip` panel widths on
+  // the straight, so the body bunches up as it leaves the big ring and spreads again on the wheel.
+  var _JF = new V3(), _TF = new V3(), _JR = new V3(), _TR = new V3();
+  function buildPath(run, rF, rR){
+    var sg = run.sg, as = run.as, n = run.n;
+    NP = 0; RF = rF; RR = rR; SG = sg;
+    var aHeadF = run.slot[0] * as, aJF = aHeadF + sg * run.lamF;
+    var mF = (0.6 * run.arcW * rF.k + 4 * H) / rF.R;
+    var stepF = pushArc(rF, 0, aHeadF - sg * ((n - 1) * as + mF), sg * ((n - 1) * as + mF + run.lamF), true);
+    iJF = NP - 1;
+    rPoint(rF, aJF, _JF); rTan(rF, aJF, _TF).multiplyScalar(sg);
+    var aJR = run.slot[n - 1] * as - sg * run.lamR;
+    rPoint(rR, aJR, _JR); rTan(rR, aJR, _TR).multiplyScalar(sg);
+    var o = solveLink(_JF, _TF, _JR, _TR, P('snakeTurnRow', 3.0), P('snakeTurnWheel', 1.9));
+    pushTurn(_JF, _TF, o.nM, o.rM, o.aM);
+    pushLine(o.FM, o.GN);
+    pushTurn(o.GN, o.L, o.nN, o.rN, o.aN);
+    var lo = (NP - 1) * 3; PP[lo] = _JR.x; PP[lo + 1] = _JR.y; PP[lo + 2] = _JR.z;   // land exactly on the junction
+    iJR = NP - 1; PR[iJR] = 1; PA[iJR] = aJR;
+    var mR = (0.6 * run.arcW * rR.k + 4 * H) / rR.R;
+    var stepR = pushArc(rR, 1, aJR, sg * (run.lamR + (n - 1) * as + mR), false);
+
+    // Smooth the joints only: the rings stay exact away from them, the turns lose their steps.
+    var i0 = Math.max(1, iJF - BAND), i1 = Math.min(NP - 2, iJR + BAND);
+    for(var pass = 0; pass < SMOOTH; pass++){
+      for(var i = i0; i <= i1; i++){
+        var o3 = i * 3;
+        SMx[o3] = (PP[o3 - 3] + 4 * PP[o3] + PP[o3 + 3]) / 6;
+        SMx[o3 + 1] = (PP[o3 - 2] + 4 * PP[o3 + 1] + PP[o3 + 4]) / 6;
+        SMx[o3 + 2] = (PP[o3 - 1] + 4 * PP[o3 + 2] + PP[o3 + 5]) / 6;
+      }
+      for(var j = i0 * 3; j <= i1 * 3 + 2; j++) PP[j] = SMx[j];
+    }
+    for(var ib = i0; ib <= i1; ib++) PR[ib] = -1;   // smoothed: no longer on a ring
+
+    PS[0] = 0;
+    for(var i2 = 1; i2 < NP; i2++){
+      if(PR[i2] >= 0 && PR[i2] === PR[i2 - 1]){ PS[i2] = PS[i2 - 1] + (PR[i2] ? rR.R : rF.R) * Math.abs(PA[i2] - PA[i2 - 1]); continue; }
+      var dx = PP[i2 * 3] - PP[i2 * 3 - 3], dy = PP[i2 * 3 + 1] - PP[i2 * 3 - 2], dz = PP[i2 * 3 + 2] - PP[i2 * 3 - 1];
+      PS[i2] = PS[i2 - 1] + Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    for(var i3 = 0; i3 < NP; i3++){
+      if(PR[i3] >= 0){ rTan(PR[i3] ? rR : rF, PA[i3], _q).multiplyScalar(sg); PT[i3 * 3] = _q.x; PT[i3 * 3 + 1] = _q.y; PT[i3 * 3 + 2] = _q.z; continue; }
+      var a = Math.max(0, i3 - 1), b = Math.min(NP - 1, i3 + 1);
+      var tx = PP[b * 3] - PP[a * 3], ty = PP[b * 3 + 1] - PP[a * 3 + 1], tz = PP[b * 3 + 2] - PP[a * 3 + 2];
+      var tl = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+      PT[i3 * 3] = tx / tl; PT[i3 * 3 + 1] = ty / tl; PT[i3 * 3 + 2] = tz / tl;
+    }
+    var sJF = PS[iJF], sJR = PS[iJR], span = Math.max(1e-6, sJR - sJF);
+    var ds0 = rF.R * as, ds1 = rR.R * as, Lb0 = ds0, Lb1 = 1.5 * ds1;
+    var strip = P('snakeStrip', 1.12) * run.arcW;
+    var gam = Math.log(0.5) / Math.log(Math.max(0.02, Math.min(0.98, P('snakeSizeAt', 0.5))));
+    var angA = Math.acos(Math.max(-1, Math.min(1, rF.A.dot(rR.A)))), sinA = Math.sin(angA);
+    var px = rF.A.x, py = rF.A.y, pz = rF.A.z, prevSp = ds0;
+    PU[0] = 0;
+    for(var i4 = 0; i4 < NP; i4++){
+      var s = PS[i4], w = (i4 <= iJF) ? 0 : (i4 >= iJR) ? 1 : smooth01((s - sJF) / span);
+      PW[i4] = w;
+      // panel-up: slerp the two rings' axes, then square it off against the tangent
+      var ax, ay, az;
+      if(sinA < 1e-4){ ax = rF.A.x; ay = rF.A.y; az = rF.A.z; }
+      else { var f0 = Math.sin((1 - w) * angA) / sinA, f1 = Math.sin(w * angA) / sinA;
+             ax = rF.A.x * f0 + rR.A.x * f1; ay = rF.A.y * f0 + rR.A.y * f1; az = rF.A.z * f0 + rR.A.z * f1; }
+      var o4 = i4 * 3, d = ax * PT[o4] + ay * PT[o4 + 1] + az * PT[o4 + 2];
+      ax -= d * PT[o4]; ay -= d * PT[o4 + 1]; az -= d * PT[o4 + 2];
+      var al = Math.sqrt(ax * ax + ay * ay + az * az);
+      if(al < 1e-5){ ax = px; ay = py; az = pz; } else { ax /= al; ay /= al; az /= al; }
+      PY[o4] = ax; PY[o4 + 1] = ay; PY[o4 + 2] = az; px = ax; py = ay; pz = az;
+      PK[i4] = rF.k + (rR.k - rF.k) * smooth01(Math.pow(w, gam));
+      var sp;
+      if(i4 <= iJF) sp = ds0;
+      else if(i4 >= iJR) sp = ds1;
+      else {
+        sp = strip * PK[i4];
+        sp = ds0 + (sp - ds0) * smooth01((s - sJF) / Lb0);
+        sp = ds1 + (sp - ds1) * smooth01((sJR - s) / Lb1);
+      }
+      if(i4 > 0) PU[i4] = PU[i4 - 1] + (PS[i4] - PS[i4 - 1]) * 2 / (sp + prevSp);
+      prevSp = sp;
+    }
+    // Anchor both ends by ANGLE: the head's row slot and the tail's wheel slot, as fractional
+    // sample indices on the exact arcs. Every panel at UA is on its row slot, every one at UB on
+    // its wheel slot, whatever the joint between did to the arc length.
+    run.UA = puAt(((n - 1) * as + mF) / stepF);
+    run.UB = puAt(iJR + run.lamR / stepR) + (n - 1);
+    run.link = o;
+  }
+
+  function puAt(fi){ var i = Math.max(0, Math.min(NP - 2, Math.floor(fi))), f = fi - i; return PU[i] + (PU[i + 1] - PU[i]) * f; }
+  function findS(s){ var lo = 0, hi = NP - 1; if(s <= PS[0]) return 0; if(s >= PS[hi]) return hi - 1;
+    while(hi - lo > 1){ var m = (lo + hi) >> 1; if(PS[m] <= s) lo = m; else hi = m; } return lo; }
+  function sOfU(u){ var lo = 0, hi = NP - 1;
+    if(u <= PU[0]) return PS[0] + (u - PU[0]) * (PS[1] - PS[0]) / Math.max(1e-9, PU[1] - PU[0]);
+    if(u >= PU[hi]) return PS[hi] + (u - PU[hi]) * (PS[hi] - PS[hi - 1]) / Math.max(1e-9, PU[hi] - PU[hi - 1]);
+    while(hi - lo > 1){ var m = (lo + hi) >> 1; if(PU[m] <= u) lo = m; else hi = m; }
+    return PS[lo] + (PS[lo + 1] - PS[lo]) * (u - PU[lo]) / Math.max(1e-12, PU[lo + 1] - PU[lo]); }
+  var smp = {P: new V3(), T: new V3(), Y: new V3(), K: 1, W: 0};
+  function onRing(rid, a){   // the ring itself, not the polyline through it
+    var rg = rid ? RR : RF;
+    rPoint(rg, a, smp.P); rTan(rg, a, smp.T).multiplyScalar(SG); smp.Y.copy(rg.A);
+    smp.K = rg.k; smp.W = rid; return smp;
+  }
+  function sampleAt(s){
+    var i = findS(s), f = (s - PS[i]) / Math.max(1e-12, PS[i + 1] - PS[i]), o = i * 3, p = o + 3;
+    if(PR[i] >= 0 && PR[i] === PR[i + 1]) return onRing(PR[i], PA[i] + (PA[i + 1] - PA[i]) * f);
+    if(f < 0 && PR[0] >= 0) return onRing(PR[0], PA[0] + SG * (s - PS[0]) / (PR[0] ? RR.R : RF.R));
+    if(f > 1 && PR[NP - 1] >= 0) return onRing(PR[NP - 1], PA[NP - 1] + SG * (s - PS[NP - 1]) / (PR[NP - 1] ? RR.R : RF.R));
+    if(f < 0 || f > 1){   // past an end: carry on along the end tangent
+      var e = (f < 0) ? 0 : NP - 1, eo = e * 3, ds = s - PS[e];
+      smp.P.set(PP[eo] + PT[eo] * ds, PP[eo + 1] + PT[eo + 1] * ds, PP[eo + 2] + PT[eo + 2] * ds);
+      smp.T.set(PT[eo], PT[eo + 1], PT[eo + 2]); smp.Y.set(PY[eo], PY[eo + 1], PY[eo + 2]);
+      smp.K = PK[e]; smp.W = PW[e]; return smp;
+    }
+    smp.P.set(PP[o] + (PP[p] - PP[o]) * f, PP[o + 1] + (PP[p + 1] - PP[o + 1]) * f, PP[o + 2] + (PP[p + 2] - PP[o + 2]) * f);
+    smp.T.set(PT[o] + (PT[p] - PT[o]) * f, PT[o + 1] + (PT[p + 1] - PT[o + 1]) * f, PT[o + 2] + (PT[p + 2] - PT[o + 2]) * f).normalize();
+    smp.Y.set(PY[o] + (PY[p] - PY[o]) * f, PY[o + 1] + (PY[p + 1] - PY[o + 1]) * f, PY[o + 2] + (PY[p + 2] - PY[o + 2]) * f).normalize();
+    smp.K = PK[i] + (PK[i + 1] - PK[i]) * f; smp.W = PW[i] + (PW[i + 1] - PW[i]) * f;
+    return smp;
+  }
+  function faceAtU(u, out){ return out.copy(sampleAt(sOfU(u)).P); }
+
+  // ── PANELS ───────────────────────────────────────────────────────────────────────────────
+  // A panel's geometry, unrolled once from its row shape: the arc position of every column, and
+  // per vertex its height and its bevel inset. Laying it on the path is the reverse.
+  function unroll(mesh){
+    var fp = mesh.userData.floorPos, R = mesh.userData.baseRadius || 1;
+    if(!fp) return null;
+    var cnt = fp.length / 3, cols = SEG_X + 1, rows = Math.round(cnt / cols);
+    if(rows * cols !== cnt) return null;
+    var colS = new Float64Array(cols), yv = new Float64Array(cnt), dv = new Float64Array(cnt);
+    for(var i = 0; i < cnt; i++){
+      var x = fp[i * 3], y = fp[i * 3 + 1], z = fp[i * 3 + 2], cr = Math.sqrt(x * x + z * z);
+      if(i < cols) colS[i] = R * Math.atan2(x, z);
+      yv[i] = y; dv[i] = cr - R;
+    }
+    return {cols: cols, rows: rows, colS: colS, yv: yv, dv: dv, arcW: colS[cols - 1] - colS[0]};
+  }
+
+  var _X = new V3(), _Y = new V3(), _Z = new V3(), _O = new V3(), _m = new THREE.Matrix4();
+  var _Xq = new V3(), _Yq = new V3(), _Zq = new V3(), _Pq = new V3();
+  function layBead(run, b, sc, corr){
+    var mesh = b.mesh, un = b.un, sg = run.sg;
+    var c = sampleAt(sc), kb = c.K, mt = c.W;
+    _X.copy(c.T).multiplyScalar(sg);
+    _Y.copy(c.Y).addScaledVector(_X, -c.Y.dot(_X)).normalize();
+    _Z.crossVectors(_X, _Y);
+    // the face sits where SHIRT expects it: floorR..vertR out from the origin as morphT runs 0..1
+    var fR = b.fR, vR = b.vR, Zc = fR + (vR - fR) * mt;
+    var Pcx = c.P.x, Pcy = c.P.y, Pcz = c.P.z;
+    _O.set(Pcx - _Z.x * Zc * kb, Pcy - _Z.y * Zc * kb, Pcz - _Z.z * Zc * kb);
+    var Xx = _X.x, Xy = _X.y, Xz = _X.z, Yx = _Y.x, Yy = _Y.y, Yz = _Y.z, Zx = _Z.x, Zy = _Z.y, Zz = _Z.z;
+    var Ox = _O.x, Oy = _O.y, Oz = _O.z, ik = 1 / kb;
+    var pos = mesh.geometry.attributes.position, arr = pos.array;
+    for(var col = 0; col < un.cols; col++){
+      var q = sampleAt(sc + sg * un.colS[col] * kb);
+      _Xq.copy(q.T).multiplyScalar(sg);
+      _Yq.copy(q.Y).addScaledVector(_Xq, -q.Y.dot(_Xq)).normalize();
+      _Zq.crossVectors(_Xq, _Yq);
+      _Pq.copy(q.P);
+      for(var row = 0; row < un.rows; row++){
+        var vi = row * un.cols + col, yy = un.yv[vi] * kb, dd = un.dv[vi] * kb;
+        var wx = _Pq.x + _Yq.x * yy + _Zq.x * dd - Ox, wy = _Pq.y + _Yq.y * yy + _Zq.y * dd - Oy, wz = _Pq.z + _Yq.z * yy + _Zq.z * dd - Oz;
+        arr[vi * 3] = (wx * Xx + wy * Xy + wz * Xz) * ik;
+        arr[vi * 3 + 1] = (wx * Yx + wy * Yy + wz * Yz) * ik;
+        arr[vi * 3 + 2] = (wx * Zx + wy * Zy + wz * Zz) * ik;
+      }
+    }
+    pos.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+    mesh.userData.morphT = mt;
+    syncOutline(mesh);
+    _m.makeBasis(_X, _Y, _Z);
+    mesh.quaternion.setFromRotationMatrix(_m);
+    mesh.position.copy(_O);
+    if(corr) mesh.position.add(corr);
+    mesh.scale.setScalar(kb);
+    if(b.edge){ b.edge.position.copy(mesh.position); b.edge.quaternion.copy(mesh.quaternion); b.edge.scale.copy(mesh.scale); }
+  }
+
+  // ── PLANNING ─────────────────────────────────────────────────────────────────────────────
+  // A trip is scored by how hard it turns, how far it goes, whether panels on the straight show
+  // their faces to the camera or their edges, whether it would cut through the row's own crystal,
+  // and whether it leaves the frame or brushes the lens. Both directions round, a range of
+  // lead-offs and a ring of wheel slots are tried; it costs well under a millisecond.
+  var _cam = new V3(), _ndc = new V3(), _vp = new V3(), _d = new V3();
+  function camSetup(){ camera.updateMatrixWorld(true); camera.matrixWorldInverse.copy(camera.matrixWorld).invert(); _cam.setFromMatrixPosition(camera.matrixWorld); }
+  function score(run, rF, rR, dbg){
+    var sg = run.sg, as = run.as, n = run.n;
+    var aJF = run.slot[0] * as + sg * run.lamF;
+    rPoint(rF, aJF, _JF); rTan(rF, aJF, _TF).multiplyScalar(sg);
+    var aJR = run.slot[n - 1] * as - sg * run.lamR;
+    rPoint(rR, aJR, _JR); rTan(rR, aJR, _TR).multiplyScalar(sg);
+    var o = solveLink(_JF, _TF, _JR, _TR, P('snakeTurnRow', 3.0), P('snakeTurnWheel', 1.9));
+    var turn = o.aM * o.aM + o.aN * o.aN;
+    var len = o.M.distanceTo(o.N) + o.aM * o.rM + o.aN * o.rN + run.lamF * rF.R + run.lamR * rR.R;
+    // Faces: on the straight only, which is where the body is a line of panels side by side.
+    var vis = 0, inside = 0, off = 0, nv = 0, np = 0;
+    _Y.addVectors(rF.A, rR.A).normalize();
+    _X.copy(o.L).multiplyScalar(sg); _Z.crossVectors(_X, _Y);
+    var zOk = _Z.lengthSq() > 1e-8; if(zOk) _Z.normalize();
+    for(var i = 0; i <= 6; i++){
+      if(!zOk) break;
+      _vp.copy(o.FM).lerp(o.GN, i / 6);
+      _d.subVectors(_cam, _vp).normalize(); var v = _Z.dot(_d); vis += Math.abs(v) - 0.5 * Math.max(0, -v); nv++;
+    }
+    vis = nv ? vis / nv : 0;
+    // Frame and crystal: over the WHOLE link, both turns included. On a phone the row is wider
+    // than the screen, and a link judged by its straight alone happily ran down the very edge.
+    for(var j = 0; j <= 12; j++){
+      linkPoint(o, j / 12, _vp);
+      _d.subVectors(_vp, rF.C); var h = _d.dot(rF.A); _d.addScaledVector(rF.A, -h);
+      if(_d.length() < rF.R * 0.82 && Math.abs(h) < 3) inside++;
+      _ndc.copy(_vp).project(camera);
+      // soft: a panel centred near the edge is already half out of the frame
+      if(_ndc.z > 1) off++; else off += Math.max(smooth01((Math.abs(_ndc.x) - 0.6) / 0.4), smooth01((Math.abs(_ndc.y) - 0.8) / 0.25));
+      if(_vp.distanceTo(_cam) < 2.2) off++;
+      np++;
+    }
+    inside /= np; off /= np;
+    var cost = turn + 0.45 * len / rF.R + 1.2 * (1 - vis) + 6 * inside + 8 * off + (o.ok ? 0 : 3);
+    if(dbg) return {turnM: Math.round(o.aM / D2R), turnN: Math.round(o.aN / D2R), straight: +o.straight.toFixed(2), vis: +vis.toFixed(2), cost: +cost.toFixed(3)};
+    return cost;
+  }
+  // A point a fraction t of the way along the link (first turn, straight, second turn), by length.
+  var _lc = new V3();
+  function linkPoint(o, t, out){
+    var l1 = o.aM * o.rM, l2 = Math.max(0, o.FM.distanceTo(o.GN)), l3 = o.aN * o.rN, d = t * (l1 + l2 + l3);
+    if(d <= l1 && l1 > 0){ var th = d / o.rM; _lc.copy(_JF).addScaledVector(o.nM, o.rM);
+      return out.copy(_lc).addScaledVector(o.nM, -o.rM * Math.cos(th)).addScaledVector(_TF, o.rM * Math.sin(th)); }
+    d -= l1;
+    if(d <= l2 || l3 <= 0) return out.copy(o.FM).lerp(o.GN, l2 > 0 ? Math.min(1, d / l2) : 0);
+    d -= l2;
+    var th2 = d / o.rN; _lc.copy(o.GN).addScaledVector(o.nN, o.rN);
+    return out.copy(_lc).addScaledVector(o.nN, -o.rN * Math.cos(th2)).addScaledVector(o.L, o.rN * Math.sin(th2));
+  }
+  function setOrder(run){
+    // bead k = panel (gap - sg*(1+k)): the head is the panel whose next slot along the travel is the gap
+    run.slot.length = 0;
+    for(var k = 0; k < run.n; k++) run.slot.push(((run.sel - run.sg * (1 + k)) % run.np + run.np) % run.np);
+  }
+  // reelAt(run, a) puts the trip's wheel end at angle a (and refills _rR)
+  function plan(run, rF, reelAt){
+    camSetup();
+    var best = null, bestC = 1e9, leadN = 9, leadMax = Math.max(0, P('snakeLead', 80)) * D2R;
+    var lam0 = clearAngle(run, rF);
+    for(var sgi = 0; sgi < 2; sgi++){
+      run.sg = sgi ? -1 : 1; setOrder(run);
+      for(var li = 0; li < leadN; li++){
+        run.lamF = lam0 + leadMax * li / (leadN - 1);
+        for(var ai = 0; ai < 48; ai++){
+          var a = Math.PI * 2 * ai / 48;
+          reelAt(run, a);
+          var c = score(run, rF, _rR);
+          if(c < bestC){ bestC = c; best = {sg: run.sg, lamF: run.lamF, a: a}; }
+        }
+      }
+    }
+    run.sg = best.sg; setOrder(run); run.lamF = best.lamF; reelAt(run, best.a);
+    run.why = score(run, rF, _rR, true);
+  }
+
+  // ── TRIPS ────────────────────────────────────────────────────────────────────────────────
+  var runs = [], dtAvg = 1 / 60;
+  var _rF = ring(), _rR = ring();
+  var _qz = new THREE.Quaternion(), _az = new V3(0, 0, 1), _v = new V3();
+
+  function make(fd, sel){
+    var np = fd && fd.panels ? fd.panels.length : 0, n = np - 1;
+    if(n < 1 || sel < 0 || sel >= np) return null;
+    var un0 = unroll(fd.panels[(sel + 1) % np].mesh);
+    if(!un0) return null;
+    return {fd: fd, sel: sel, np: np, n: n, as: Math.PI * 2 / np, sg: 1, slot: [], beads: [],
+            lamF: 0, lamR: 0, s0: 0, phase: 0, arcW: un0.arcW, t: 0, dur: 1, p: 0, p0: 0, p1: 1, endSlope: 0,
+            UA: 0, UB: 1, mode: 'open', reel: null, frozen: null, done: false, cfg: null};
+  }
+  function adopt(run, temps){
+    run.beads.length = 0;
+    for(var k = 0; k < run.n; k++){
+      var j = run.slot[k], t = temps[j], pm = run.fd.panels[j].mesh;
+      if(!t || !t.plane) continue;
+      var un = unroll(pm); if(!un) continue;
+      t.plane.userData.snake = run;
+      t.plane.frustumCulled = false;            // its geometry is rewritten every frame — a cached bound lies
+      t.plane.raycast = function(){};           // in flight it is scenery, never a click target
+      if(t.edge){ t.edge.raycast = function(){}; t.edge.frustumCulled = false; }
+      shirtsUnderGlass(t.plane);
+      run.beads.push({k: k, j: j, panel: run.fd.panels[j], mesh: t.plane, edge: t.edge, un: un,
+                      fR: pm.userData.baseRadius, vR: pm.userData.vRadius, dF: new V3(), dR: new V3()});
+    }
+  }
+  // The garments riding a travelling panel draw at 2 instead of SHIRT's 6: after the sky (-10000)
+  // and the panels (1), but UNDER the product card's frost (3). The body crosses behind the card
+  // while it forms, and its panels already go under the glass; drawn at 6 the shirts alone sat
+  // crisp on top of the frost. On the wheel and the row (and once landed) they are back at 6.
+  function shirtsUnderGlass(m){ for(var i = 0; i < m.children.length; i++) m.children[i].renderOrder = 2; }
+  function drop(run){
+    for(var i = 0; i < run.beads.length; i++){
+      var b = run.beads[i];
+      if(b.mesh && b.mesh.parent) b.mesh.parent.remove(b.mesh);
+      if(b.edge && b.edge.parent) b.edge.parent.remove(b.edge);
+      if(b.mesh && b.mesh.userData.snake === run) b.mesh.userData.snake = null;
+    }
+  }
+  var _qp = new THREE.Quaternion();
+  function plannedReel(run, out){
+    _qp.copy(run.cfg.quat).multiply(_qz.setFromAxisAngle(_az, run.s0 + run.phase));
+    return reelRing(run.cfg.pos, _qp, run.cfg.scale.x, run.fd.vRadius, out);
+  }
+  function reelNow(run, out){
+    if(run.frozen) return copyRing(run.frozen, out);
+    if(run.reel && run.reel.parent){
+      run.reel.updateMatrixWorld(true);
+      return reelRing(run.reel.position, run.reel.quaternion, run.reel.scale.x, run.fd.vRadius, out);
+    }
+    return plannedReel(run, out);
+  }
+  function faceOf(obj, R, out){   // a panel's face centre, from its own world transform
+    obj.updateMatrixWorld(true);
+    return out.set(0, 0, R).applyMatrix4(obj.matrixWorld);
+  }
+  function wheelIdleSign(){
+    var r = (typeof STOREFRONT_MODEL !== 'undefined' && STOREFRONT_MODEL.rate) ? STOREFRONT_MODEL.rate('detail.wheel') : 0.0025;
+    return r < 0 ? -1 : 1;
+  }
+  function log(run, what){
+    try {
+      console.log('%c[SNAKE] ' + what + ' — ' + (run.sg > 0 ? 'anticlockwise' : 'clockwise') + ', head runs ' + Math.round(run.lamF / D2R) +
+                  '° before peeling off, turns ' + run.why.turnM + '°/' + run.why.turnN + '°, straight ' + run.why.straight +
+                  ', ' + run.dur.toFixed(2) + 's' + (run.endSlope > 0 ? ', hands its momentum on' : ''), 'color:#5aa9ff');
+    } catch(e){}
+  }
+
+  // An OPEN: the wheel is not built yet, only planned (dm._vwConfig), and it has no spin — so the
+  // search picks where the tail should come to rest on it, and reelBuilt() sets the spin to match.
+  function open(fd, sel, temps, cfg){
+    if(!P('snakeOn', true) || !fd || !temps || !cfg) return null;
+    var run = make(fd, sel); if(!run) return null;
+    run.mode = 'open';
+    run.cfg = {pos: cfg.pos.clone(), scale: cfg.scale.clone(),
+               quat: cfg.quat ? cfg.quat.clone() : new THREE.Quaternion().setFromEuler(cfg.rot || new THREE.Euler(0, cfg.rotY || 0, 0))};
+    run.phase = (typeof DML !== 'undefined' && DML.isLive && DML.isLive()) ? (DML.P.spinPhase || 0) * D2R : 0;
+    floorRing(fd, _rF);
+    plan(run, _rF, function(r, a){
+      r.s0 = r.slot[r.n - 1] * r.as - a;   // in the base frame slot j sits at j*as - spin: tail -> a
+      plannedReel(r, _rR);
+      r.lamR = clearAngle(r, _rR);         // the tail comes to rest this far past the junction
+    });
+    adopt(run, temps);
+    if(!run.beads.length) return null;
+    // Where each panel really is vs. where the path says its slot is (the row's bob, ±0.03): a
+    // correction that fades out over the first quarter, so the first frame is exact.
+    floorRing(fd, _rF); reelNow(run, _rR); buildPath(run, _rF, _rR);
+    for(var i = 0; i < run.beads.length; i++){
+      var b = run.beads[i];
+      faceOf(b.mesh, b.fR, b.dF).sub(faceAtU(run.UA - b.k, _v));
+    }
+    run.dur = Math.max(0.2, P('snakeOpenDur', 1.5));
+    // The wheel idles one way only. Arrive moving that way and it inherits the momentum; the other
+    // way it would have to stop and reverse, so ease to a stop instead.
+    run.endSlope = (-run.sg === wheelIdleSign()) ? Math.max(0, Math.min(2.5, P('snakeEndOpen', 0.3))) : 0;
+    run.p0 = 0; run.p1 = 1; run.p = 0; run.t = 0;
+    runs.push(run);
+    log(run, 'open');
+    return run;
+  }
+
+  // Right after buildVW: the real wheel exists. Give it the spin the plan assumed, hold it there
+  // until the body lands, and keep the real panels hidden behind their travelling copies.
+  function reelBuilt(fd, vg){
+    var run = find(fd, 'open'); if(!run || !vg) return;
+    run.reel = vg;
+    if(typeof dm !== 'undefined'){ dm.vwSpin = run.s0; dm.vwVel = 0; }
+    if(typeof DML !== 'undefined' && DML.applyWheelRot) DML.applyWheelRot();
+    for(var i = 0; i < run.beads.length; i++){
+      var b = run.beads[i], ud = b.panel.mesh.material.userData;
+      b.panel.mesh.visible = false; b.panel.edges.visible = false;
+      // buildVW turned the product image a quarter for the wheel — hold that until it lands, or
+      // the photos spin round mid-flight
+      if(ud && ud.imgRotation && ud.imgRotationTarget !== undefined){ b.imgT = ud.imgRotationTarget; ud.imgRotationTarget = ud.imgRotation.value; }
+    }
+  }
+
+  // A CLOSE. Started from exitDMImmediate once its closing temps exist. If the open's body is
+  // still travelling it simply turns round from where it is — same path, run backwards — and
+  // takes over the fresh temps; otherwise a new trip is planned from the wheel's present spin.
+  function close(fd, sel, temps){
+    if(!fd || !temps) return null;
+    var run = find(fd, 'open'), rev = !!run, carry = [];
+    if(rev){
+      // freeze the wheel where it is: it is hidden now and leaves the scene when the close ends
+      run.frozen = reelNow(run, ring());
+      for(var c0 = 0; c0 < run.beads.length; c0++) carry.push({panel: run.beads[c0].panel, dF: run.beads[c0].dF, dR: run.beads[c0].dR});
+      drop(run);
+      run.mode = 'close'; run.done = false;
+      run.p0 = run.p; run.p1 = 0; run.t = 0;
+      run.dur = Math.max(0.2, P('snakeCloseDur', 1.3) * Math.max(0.35, run.p));
+    } else {
+      if(!P('snakeOn', true) || typeof dm === 'undefined' || !dm.vWheel) return null;
+      run = make(fd, sel); if(!run) return null;
+      run.mode = 'close';
+      dm.vWheel.updateMatrixWorld(true);
+      run.frozen = reelRing(dm.vWheel.position, dm.vWheel.quaternion, dm.vWheel.scale.x, fd.vRadius, ring());
+      floorRing(fd, _rF);
+      // the wheel's spin is fixed now, so the search is over how far the tail unwinds round it
+      plan(run, _rF, function(r, a){ r.lamR = clearAngle(r, r.frozen) + a; copyRing(r.frozen, _rR); });
+      run.p0 = 1; run.p1 = 0; run.p = 1; run.t = 0;
+      run.dur = Math.max(0.2, P('snakeCloseDur', 1.3));
+      runs.push(run);
+    }
+    adopt(run, temps);
+    if(!run.beads.length){ var ri = runs.indexOf(run); if(ri >= 0) runs.splice(ri, 1); return null; }
+    if(!rev){ floorRing(fd, _rF); copyRing(run.frozen, _rR); buildPath(run, _rF, _rR); }
+    for(var i = 0; i < run.beads.length; i++){
+      var b = run.beads[i];
+      if(typeof SHIRT !== 'undefined' && SHIRT.cloneOnto) SHIRT.cloneOnto(b.panel, b.mesh);   // the garment rides home too
+      shirtsUnderGlass(b.mesh);
+      if(rev){   // keep the corrections it was flying with, so turning round does not twitch
+        for(var c1 = 0; c1 < carry.length; c1++) if(carry[c1].panel === b.panel){ b.dF.copy(carry[c1].dF); b.dR.copy(carry[c1].dR); }
+      } else {   // the temp starts exactly on its wheel slot (wheel-shaped, so its face is at vR)
+        faceOf(b.mesh, b.vR, b.dR).sub(faceAtU(run.UB - b.k, _v));
+      }
+    }
+    // On a close the body lands moving -sg round the row. Hand that on only if the row turns that
+    // way anyway; the other way it would have to stop and reverse, so ease to a stop instead.
+    var spin = fd.group.userData.rotationSpeed || 0;
+    run.endSlope = (spin !== 0 && -run.sg === (spin < 0 ? -1 : 1)) ? Math.max(0, Math.min(2.5, P('snakeEndClose', 0.2))) : 0;
+    log(run, rev ? 'close (turned round mid-open)' : 'close');
+    return run;
+  }
+
+  function ease(t, m){ return (m - 2) * t * t * t + (3 - m) * t * t; }   // f'(0)=0, f'(1)=m
+
+  var _corr = new V3();
+  function step(run, dt){
+    run.t += dt;
+    var tau = Math.min(1, run.t / run.dur);
+    run.p = run.p0 + (run.p1 - run.p0) * ease(tau, run.endSlope);
+    floorRing(run.fd, _rF);
+    reelNow(run, _rR);
+    buildPath(run, _rF, _rR);
+    var U = run.UA + (run.UB - run.UA) * run.p;
+    var fa = 1 - smooth01(run.p / 0.25), fb = smooth01((run.p - 0.75) / 0.25);
+    for(var i = 0; i < run.beads.length; i++){
+      var b = run.beads[i];
+      // live corrections where the real panel is available to measure against
+      if(run.mode === 'close' && fa > 0) faceOf(b.panel.mesh, b.fR, b.dF).sub(faceAtU(run.UA - b.k, _v));
+      if(run.mode === 'open' && fb > 0){
+        if(run.reel && b.panel.mesh.parent === run.reel) faceOf(b.panel.mesh, b.vR, b.dR).sub(faceAtU(run.UB - b.k, _v));
+        else b.dR.set(0, 0, 0);
+      }
+      _corr.copy(b.dF).multiplyScalar(fa).addScaledVector(b.dR, fb);
+      layBead(run, b, sOfU(U - b.k), _corr);
+    }
+    if(tau >= 1) run.done = true;
+  }
+
+  // How far each travelling copy is from the real panel it hands over to, in world units, over a
+  // spread of its vertices — the size of any pop at the hand-off. Kept on SNAKE.lastLand.
+  var lastLand = null, _w1 = new V3(), _w2 = new V3();
+  function measureLand(run){
+    var worst = 0;
+    for(var i = 0; i < run.beads.length; i++){
+      var b = run.beads[i], ga = b.mesh.geometry.attributes.position, gb = b.panel.mesh.geometry.attributes.position;
+      if(!ga || !gb || ga.count !== gb.count) continue;
+      b.mesh.updateMatrixWorld(true); b.panel.mesh.updateMatrixWorld(true);
+      for(var v = 0; v < ga.count; v += 37){
+        _w1.fromBufferAttribute(ga, v).applyMatrix4(b.mesh.matrixWorld);
+        _w2.fromBufferAttribute(gb, v).applyMatrix4(b.panel.mesh.matrixWorld);
+        worst = Math.max(worst, _w1.distanceTo(_w2));
+      }
+    }
+    lastLand = {mode: run.mode, worst: +worst.toFixed(5), at: Math.round(performance.now())};
+  }
+
+  // The body has arrived: hand over to the real panels and pass the momentum on.
+  function land(run){
+    if(run.mode === 'close' || run.reel) measureLand(run);
+    var as = run.as, span = Math.abs(run.UB - run.UA);
+    var omega = span * run.endSlope / run.dur * as;   // rad/s along the ring at arrival
+    var dmOpen = (typeof dm !== 'undefined' && dm.active && dm.floor === run.fd);
+    if(run.mode === 'open'){
+      if(!run.reel) return false;                     // the wheel is not built yet: wait on the slot
+      for(var i = 0; i < run.beads.length; i++){
+        var b = run.beads[i], ud = b.panel.mesh.material.userData;
+        if(dmOpen && dm.vWheel === run.reel && b.panel.mesh.parent === run.reel){
+          b.panel.mesh.visible = (b.j !== dm.selIdx); b.panel.edges.visible = (b.j !== dm.selIdx);
+        }
+        if(b.imgT !== undefined && ud) ud.imgRotationTarget = b.imgT;
+      }
+      // the wheel carries on at the speed the body arrived with, and the idle spin-down takes it from there
+      if(dmOpen && dm.vWheel === run.reel) dm.vwVel = -run.sg * omega * dtAvg;
+    } else {
+      for(var j = 0; j < run.beads.length; j++){
+        var c = run.beads[j];
+        if(!dmOpen && c.panel.mesh.parent === run.fd.group){ c.panel.mesh.visible = true; c.panel.edges.visible = true; }
+      }
+      if(!dmOpen && run.fd.group && omega > 0) run.fd.group.userData.velocity += -run.sg * omega * dtAvg;
+    }
+    drop(run);
+    runs.splice(runs.indexOf(run), 1);
+    return true;
+  }
+
+  function find(fd, mode){ for(var i = 0; i < runs.length; i++) if(runs[i].fd === fd && (!mode || runs[i].mode === mode)) return runs[i]; return null; }
+
+  var lastMs = 0;
+  function update(dt){
+    if(!runs.length) return;
+    var t0 = performance.now();
+    dt = Math.min(0.05, Math.max(0, dt || 0));
+    if(dt > 0) dtAvg += (dt - dtAvg) * 0.1;
+    for(var i = runs.length - 1; i >= 0; i--){
+      var run = runs[i];
+      if(!run.fd || !run.fd.group || !run.fd.group.parent){ drop(run); runs.splice(i, 1); continue; }
+      if(!run.done) step(run, dt);
+      if(run.done) land(run);
+    }
+    lastMs = performance.now() - t0;
+  }
+
+  // Snap every trip on this row to its end (a re-open of the same row while its close is still
+  // landing — the new open has to start from panels that are really on their slots).
+  function finishFloor(fd){
+    for(var i = runs.length - 1; i >= 0; i--){
+      var run = runs[i]; if(run.fd !== fd) continue;
+      if(!run.done){ run.t = run.dur; step(run, 0); }
+      if(!land(run)){ drop(run); runs.splice(runs.indexOf(run), 1); }
+    }
+  }
+
+  // Host checks
+  function holdsReel(fd){ var r = find(fd, 'open'); return !!r; }              // wheel spin + input wait
+  function busy(fd){ return !!find(fd); }
+  function keepsHidden(panel){
+    for(var i = 0; i < runs.length; i++) for(var j = 0; j < runs[i].beads.length; j++) if(runs[i].beads[j].panel === panel) return true;
+    return false;
+  }
+
+  // ── DEBUG ────────────────────────────────────────────────────────────────────────────────
+  var dbgLine = null;
+  function debugPath(on){
+    if(dbgLine){ scene.remove(dbgLine); dbgLine.geometry.dispose(); dbgLine = null; }
+    if(!on || !NP) return;
+    var g = new THREE.BufferGeometry(), a = new Float32Array(NP * 3);
+    for(var i = 0; i < NP * 3; i++) a[i] = PP[i];
+    g.setAttribute('position', new THREE.BufferAttribute(a, 3));
+    dbgLine = new THREE.Line(g, new THREE.LineBasicMaterial({color: 0xff2266, depthTest: false}));
+    dbgLine.renderOrder = 999; scene.add(dbgLine);
+  }
+  function info(){
+    return runs.map(function(r){ return {mode: r.mode, row: floors.indexOf(r.fd), sel: r.sel, dir: r.sg > 0 ? 'ccw' : 'cw',
+      lead: Math.round(r.lamF / D2R), unwind: Math.round(r.lamR / D2R), spin0: +(r.s0 / D2R).toFixed(1), p: +r.p.toFixed(3),
+      t: +r.t.toFixed(2), dur: r.dur, why: r.why, ms: +lastMs.toFixed(2), beads: r.beads.map(function(b){ return b.j; })}; });
+  }
+
+  return {open: open, close: close, reelBuilt: reelBuilt, update: update, finishFloor: finishFloor,
+          holdsReel: holdsReel, busy: busy, keepsHidden: keepsHidden, runs: runs, info: info, debugPath: debugPath,
+          lastLand: function(){ return lastLand; }};
+})();
+
 // ══════════════════════════════════════════════
 // DISPLAY MODE
 // ══════════════════════════════════════════════
@@ -15224,6 +15890,9 @@ function enterDM(floorData, panelIdx, floorIdx) {
     if(dm.active && !dm.closing) exitDMImmediate(true);
     extractClosingToPending();
   }
+  // A close of this same row may still be landing its panels (SNAKE outlives the close's own
+  // clock). The open below captures where the panels ARE, so they have to be home first.
+  SNAKE.finishFloor(floorData);
   dm.active=true; dm.floorIdx=floorIdx; dm.floor=floorData; dm.selIdx=panelIdx;
 
   // Smooth scroll camera to center on this floor's wheel
@@ -15333,7 +16002,10 @@ function enterDM(floorData, panelIdx, floorIdx) {
     tm.userData.borderIndices = panel.mesh.userData.borderIndices;
     // Carry the garment projection onto the clone, or every shirt on the row blinks out the
     // instant you click one — while a pixel-identical panel stays exactly where it was.
-    SHIRT.cloneOnto(panel, tm);
+    var _holo = SHIRT.cloneOnto(panel, tm);
+    // The clicked panel's own shirt rides it in and is what is left standing when it splits open
+    // (startDisplayAnim / the split): kept by handle, and marked to fade on its own (holoFade).
+    if(idx === panelIdx && DML.isLive()){ tm.userData.holo = _holo; panel.holoFade = 1; }
     // Create outline for temp mesh
     var tempLineGeo = new THREE.BufferGeometry();
     var tempLinePos = new Float32Array(panel.mesh.userData.borderIndices.length * 3);
@@ -15382,7 +16054,8 @@ function enterDM(floorData, panelIdx, floorIdx) {
       var yOff = (1 - si2) * btnSpacing;
       var targetPos = new THREE.Vector3(btnX, floorY + yOff, 5.0);
       // Desktop split: out of a centre column and into the product half's own corners.
-      var _dmlB = DML.buttonPos(si2, floorData);
+      // …and the SETTLED slots (t = 1): the product lands once now, so the orbs aim where they stay.
+      var _dmlB = DML.buttonPos(si2, floorData, 1);
       if(_dmlB) targetPos.copy(_dmlB);
       var tempLook = new THREE.Object3D();
       tempLook.position.copy(targetPos);
@@ -15411,6 +16084,11 @@ function enterDM(floorData, panelIdx, floorIdx) {
     floorData.rings.bottom.forEach(function(r){dm.origState.rbp.push(r.position.clone());dm.origState.rbs.push(r.scale.clone());});
   }
 
+  // The panels you did not click ride one path to the wheel, like one body (SNAKE). It marks the
+  // temps it takes, and everything below skips those; with the snake off nothing is marked and
+  // the old straight-line trip runs untouched.
+  SNAKE.open(floorData, panelIdx, dm.tempMeshes, dm._vwConfig);
+
   dm.animating=true; dm.animProg=0;
 }
 
@@ -15423,21 +16101,31 @@ function createDP(floorData, floorIdx) {
   // Invisible position target for the selected panel
   var fp=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({visible:false}));
   fp.position.set(isLeft?3:-3,floorData.group.position.y,-1.5);fp.scale.set(1.4,1.4,1);
-  DML.placeProduct(fp, floorData, dm.selIdx);   // desktop split: fill the other half. No-op otherwise.
+  // Desktop split / phone stack: the settled pose, so the panel lands once and splits open there.
+  // No-op otherwise (the old portrait layout keeps its hardcoded place).
+  if(!DML.flyTarget(fp, floorData, dm.selIdx)) DML.placeProduct(fp, floorData, dm.selIdx);
   dm.displayPlane=fp;dm.displayEdges=null;scene.add(fp);
 }
 
-function animateDM() {
+function animateDM(dt) {
   if(!dm.animating) return;
-  dm.animProg+=0.03;
+  // Real seconds on the split / stack layouts (DML.P.openFly), so the open is the same length at
+  // 60, 120 or 144 Hz; the old portrait layout keeps its per-frame step.
+  if(DML.isLive()) dm.animProg += Math.min(0.05, dt > 0 ? dt : 1 / 60) / Math.max(0.1, DML.P.openFly);
+  else dm.animProg+=0.03;
   if(dm.animProg>=1) dm.animProg=1;
   var p=eIO(dm.animProg);
   var fd=dm.floor;if(!fd)return;
   
   dm.animData.forEach(function(ad,idx){
     var t=dm.tempMeshes[idx];if(!t||!t.plane)return;
+    if(t.plane.userData.snake) return;   // riding the snake — SNAKE.update lays it on the path
     t.plane.position.lerpVectors(ad.startPos,ad.targetPos,p);
-    var spin=new THREE.Quaternion();spin.setFromAxisAngle(new THREE.Vector3(0,1,0),Math.sin(p*Math.PI)*Math.PI*0.5);
+    // THE PRODUCT ITSELF flies in as itself: no quarter-turn spin (it stays visible now, and a
+    // spin takes it edge-on mid-flight), flattening as it comes so it lands as a flat screen.
+    var _hero = idx === dm.selIdx && DML.isLive();
+    var spin=new THREE.Quaternion();if(!_hero)spin.setFromAxisAngle(new THREE.Vector3(0,1,0),Math.sin(p*Math.PI)*Math.PI*0.5);
+    if(_hero && t.plane.material.userData.flatten) t.plane.material.userData.flatten.value = Math.max(0, Math.min(1, (p - 0.3) / 0.7));
     var sq=new THREE.Quaternion();sq.slerpQuaternions(ad.startQuat,ad.targetQuat,p);
     t.plane.quaternion.copy(sq.multiply(spin));
     t.plane.scale.lerpVectors(ad.startScale,ad.targetScale,p);
@@ -15483,7 +16171,7 @@ function animateDM() {
       if(idx===dm.selIdx) {
         // This becomes the display — keep it visible
         dm.displayTemp = t;
-      } else {
+      } else if(!(t.plane && t.plane.userData.snake)) {   // the snake's own are still on their way
         if(t.plane)scene.remove(t.plane);if(t.edge)scene.remove(t.edge);
       }
     });
@@ -15491,6 +16179,7 @@ function animateDM() {
 
     // Build real vertical wheel
     buildVW();
+    SNAKE.reelBuilt(fd, dm.vWheel);   // sets the spin the snake planned for and hides the real panels until it lands
 
     // Selected panel is displayed upright, not on VW — reset its image rotation
     fd.panels[dm.selIdx].mesh.material.userData.imgRotationTarget = 0.0;
@@ -15695,6 +16384,15 @@ function extractClosingToPending() {
     } else {
       pc.dispAnim.phase = 'unflatten';
     }
+    // THE SPLIT (split / stack layouts): the display is CUT here, not reversed — the product's own
+    // closing copy is already flying home with its row, and the card standing in place reversing
+    // its split as well would show it twice. (Its glass goes with DML's teardown for the new open.)
+    if(DML.isLive()){
+      if(pc.dispAnim.plane){ splitReset(pc.dispAnim.plane); pc.dispAnim.plane.visible = false; }
+      pc.dispAnim.phase = 'unflatten'; pc.dispAnim.prog = 1;
+      var _pcSel = dm.floor && dm.floor.panels && dm.floor.panels[dm.selIdx];
+      if(_pcSel) delete _pcSel.holoFade;
+    }
     // Backdrop stays as child of plane — it tracks automatically during reverse animation
     // Clear from main displayAnim so it doesn't conflict
     displayAnim.backdrop = null;
@@ -15743,6 +16441,7 @@ function animatePendingCloses() {
 
     pc.closingAnimData.forEach(function(ad, idx) {
       var t = pc.closingTemps[idx]; if(!t||!t.plane) return;
+      if(t.plane.userData.snake) return;   // riding the snake home
       t.plane.position.lerpVectors(ad.startPos, ad.targetPos, p);
       t.plane.quaternion.slerpQuaternions(ad.startQuat, ad.targetQuat, p);
       t.plane.scale.lerpVectors(ad.startScale, ad.targetScale, p);
@@ -15870,7 +16569,7 @@ function animatePendingCloses() {
 
     // Completion
     if(pc.prog >= 1 && !pc.dispAnim) {
-      pc.closingTemps.forEach(function(t){if(t.plane)scene.remove(t.plane);if(t.edge)scene.remove(t.edge);});
+      pc.closingTemps.forEach(function(t){if(t.plane&&t.plane.userData.snake)return;if(t.plane)scene.remove(t.plane);if(t.edge)scene.remove(t.edge);});
       if(pc.closingStarTemps && fd.glassRing) {
         var rr = fd.glassRing.userData.ringRadius || 1.8;
         pc.closingStarTemps.forEach(function(cst2, ci) {
@@ -15900,6 +16599,7 @@ function animatePendingCloses() {
       }
       pc.origPanelData.forEach(function(data) {
         data.panel.mesh.visible = data.vis; data.panel.edges.visible = data.eVis;
+        if(SNAKE.keepsHidden(data.panel)){ data.panel.mesh.visible = false; data.panel.edges.visible = false; }   // still on the snake
         data.panel.mesh.position.copy(data.pos);data.panel.mesh.rotation.copy(data.rot);data.panel.mesh.scale.copy(data.scl);
         data.panel.edges.position.copy(data.ePos);data.panel.edges.rotation.copy(data.eRot);data.panel.edges.scale.copy(data.eScl);
         morphTo(data.panel.mesh, 0);
@@ -15911,7 +16611,7 @@ function animatePendingCloses() {
       if(pc.displayPlane){scene.remove(pc.displayPlane);}
       if(pc.displayEdges){scene.remove(pc.displayEdges);}
       if(pc.vWheel){scene.remove(pc.vWheel);}
-      if(fd&&fd.group){var pf=0.015;fd.group.userData.velocity+=((pc.floorIdx===1||pc.floorIdx===3)?-pf:pf);}
+      if(fd&&fd.group&&!SNAKE.busy(fd)){var pf=0.015;fd.group.userData.velocity+=((pc.floorIdx===1||pc.floorIdx===3)?-pf:pf);}
       pendingCloses.splice(pci, 1);
     }
   }
@@ -15920,7 +16620,7 @@ function animatePendingCloses() {
 function exitDM() {
   if(!dm.active)return;
   // If already reversing, just make sure pendingExit is set
-  if(displayAnim.active && (displayAnim.phase === 'retract' || displayAnim.phase === 'unsplit' || displayAnim.phase === 'unflatten')) {
+  if(displayAnim.active && (displayAnim.phase === 'retract' || displayAnim.phase === 'unsplit' || displayAnim.phase === 'unflatten' || displayAnim.phase === 'drain')) {
     displayAnim.pendingExit = true;
     return;
   }
@@ -16091,7 +16791,11 @@ function exitDMImmediate(skipDisplayCleanup) {
     var closingLinePos=new Float32Array(panel.mesh.userData.borderIndices.length*3);
     closingLineGeo.setAttribute('position',new THREE.BufferAttribute(closingLinePos,3));
     tm.userData.lineGeo=closingLineGeo;
-    morphTo(tm,1); // start at vertical radius — also syncs outline
+    // The product itself leaves as it stands — row-shaped (it un-flattened in place) and wearing its
+    // shirt home; every other panel starts on the wheel.
+    var _heroC = idx === dm.selIdx && DML.isLive();
+    morphTo(tm, _heroC ? 0 : 1); // start at vertical radius — also syncs outline
+    if(_heroC){ delete panel.holoFade; SHIRT.cloneOnto(panel, tm); }
     var te=new THREE.Line(closingLineGeo, new THREE.LineBasicMaterial({color:0x667788,transparent:true,opacity:0.35}));
     
     tm.position.copy(startData[idx].startPos);tm.quaternion.copy(startData[idx].startQuat);tm.scale.copy(startData[idx].startScale);tm.visible=true;
@@ -16103,7 +16807,11 @@ function exitDMImmediate(skipDisplayCleanup) {
       targetPos:targetData[idx].targetPos, targetQuat:targetData[idx].targetQuat, targetScale:targetData[idx].targetScale
     });
   });
-  
+
+  // The other panels go home the way they came: one body, unwinding off the wheel and curling
+  // back round the row (SNAKE). If the open's body was still travelling it just turns round.
+  SNAKE.close(fd, dm.selIdx, dm.closingTemps);
+
   dm.closing=true; dm.closingProg=0;
 }
 
@@ -16125,13 +16833,14 @@ function animateClosing(){
   
   dm.closingAnimData.forEach(function(ad,idx){
     var t=dm.closingTemps[idx];if(!t||!t.plane)return;
+    if(t.plane.userData.snake) return;   // riding the snake home
     t.plane.position.lerpVectors(ad.startPos,ad.targetPos,p);
     t.plane.quaternion.slerpQuaternions(ad.startQuat,ad.targetQuat,p);
     t.plane.scale.lerpVectors(ad.startScale,ad.targetScale,p);
     t.edge.position.copy(t.plane.position);t.edge.quaternion.copy(t.plane.quaternion);t.edge.scale.copy(t.plane.scale);
-    
-    // Morph back to floor radius
-    morphTo(t.plane,1-p);
+
+    // Morph back to floor radius (the product itself is already row-shaped — see exitDMImmediate)
+    morphTo(t.plane, (idx === dm.selIdx && DML.isLive()) ? 0 : 1-p);
   });
   
   // Animate button closing (shrink back toward ring in first half)
@@ -16180,8 +16889,8 @@ function animateClosing(){
 
   if(dm.closingProg>=1){
     dm.closing=false;
-    // Clean panel temps
-    dm.closingTemps.forEach(function(t){if(t.plane)scene.remove(t.plane);if(t.edge)scene.remove(t.edge);});
+    // Clean panel temps — not the snake's, which land on their own clock
+    dm.closingTemps.forEach(function(t){if(t.plane&&t.plane.userData.snake)return;if(t.plane)scene.remove(t.plane);if(t.edge)scene.remove(t.edge);});
     dm.closingTemps=[];dm.closingAnimData=[];
 
     // Re-attach nodes back to ring and restore
@@ -16219,6 +16928,8 @@ function animateClosing(){
     // Show originals and force-reset positions/scales
     dm.origPanelData.forEach(function(data){
       data.panel.mesh.visible=data.vis;data.panel.edges.visible=data.eVis;
+      // still out on the snake: SNAKE shows it the moment its travelling copy lands on the slot
+      if(SNAKE.keepsHidden(data.panel)){data.panel.mesh.visible=false;data.panel.edges.visible=false;}
       data.panel.mesh.position.copy(data.pos);data.panel.mesh.rotation.copy(data.rot);data.panel.mesh.scale.copy(data.scl);
       data.panel.edges.position.copy(data.ePos);data.panel.edges.rotation.copy(data.eRot);data.panel.edges.scale.copy(data.eScl);
       morphTo(data.panel.mesh, 0);
@@ -16231,7 +16942,9 @@ function animateClosing(){
     if(dm.displayPlane){scene.remove(dm.displayPlane);dm.displayPlane=null;}
     if(dm.displayEdges){scene.remove(dm.displayEdges);dm.displayEdges=null;}
     if(dm.vWheel){scene.remove(dm.vWheel);dm.vWheel=null;}
-    if(fd&&fd.group){var pf=0.015;fd.group.userData.velocity+=((dm.floorIdx===1||dm.floorIdx===3)?-pf:pf);}
+    // The old close kicked the row into a spin here. With the snake still winding home, the row
+    // instead takes over the body's own speed when it lands (SNAKE), so no kick on top of it.
+    if(fd&&fd.group&&!SNAKE.busy(fd)){var pf=0.015;fd.group.userData.velocity+=((dm.floorIdx===1||dm.floorIdx===3)?-pf:pf);}
 
     dm.active=false;dm.floorIdx=-1;dm.floor=null;dm.selIdx=-1;
     dm.animProg=0;dm.animating=false;dm.vwVel=0.0025;dm.draggingVW=false;dm.vwSide=null;
@@ -17029,6 +17742,90 @@ function classifyLightboxTouch(cx, cy){
   return 'pan';
 }
 
+// ══ THE SPLIT (2026-10-08) ════════════════════════════════════════════════════════════════════
+// The clicked panel lands as itself — its screen and its floating shirt — and opens along its
+// middle: the top half lifts, the bottom half drops, both dissolving as they go. What is left
+// standing is the shirt, which resolves into the product photo in the same place at the same
+// size; then the glass bubbles up behind it (DML, THE BUBBLE). Closing runs it backward: the glass
+// drains back behind the photo, the halves close over it, and it is the panel's shirt again.
+// The halves are the panel's OWN geometry, cut at its middle row, wearing its own material — so
+// they are exactly the panel. The panel itself draws nothing while they are out (drawRange 0); it
+// cannot simply be hidden, because the photo and the shirt are its children.
+function splitHalves(plane){
+  if(plane.userData.halves) return plane.userData.halves;
+  var src = plane.geometry, idx = src.index && src.index.array;
+  if(!idx) return null;
+  var cols = SEG_X + 1, mid = SEG_Y / 2, out = [];   // CylinderGeometry: row-major, row 0 at the top
+  for(var h = 0; h < 2; h++){
+    var g = new THREE.BufferGeometry(), keep = [];
+    for(var k in src.attributes) g.setAttribute(k, src.attributes[k]);   // shared, not copied
+    for(var i = 0; i < idx.length; i += 3){
+      var r0 = Math.floor(idx[i] / cols), r1 = Math.floor(idx[i + 1] / cols), r2 = Math.floor(idx[i + 2] / cols);
+      if(h === 0 ? Math.max(r0, r1, r2) <= mid : Math.min(r0, r1, r2) >= mid) keep.push(idx[i], idx[i + 1], idx[i + 2]);
+    }
+    g.setIndex(keep);
+    var m = new THREE.Mesh(g, plane.material);
+    m.renderOrder = plane.renderOrder; m.frustumCulled = false; m.raycast = function(){};
+    m.visible = false;
+    plane.add(m);
+    out.push(m);
+  }
+  plane.userData.halves = out;
+  return out;
+}
+// The shirt moved onto the photo — the same garment, the same place, the same size — so the hand
+// over between them is a cross-fade, not a jump. w = 0 leaves SHIRT's own pose (bobbing, swaying,
+// floating proud of the screen); w = 1 lies exactly over the photo's garment. The photo shows its
+// garment's CONTENT box contain-fitted in its square; the shirt shows the whole file, so the two
+// are matched through the measured box (SHIRT.contentBox) rather than by their quads.
+function holoOntoPhoto(plane, w){
+  var holo = plane.userData.holo, bd = displayAnim.backdrop, im = bd && bd.userData.imgMesh;
+  if(!holo || !im || !(w > 0) || typeof SHIRT === 'undefined') return;
+  var rec = null;
+  for(var i = 0; i < SHIRT.list.length; i++) if(SHIRT.list[i].mesh === holo){ rec = SHIRT.list[i]; break; }
+  if(!rec || !(rec.h > 0)) return;
+  var a = im.material.uniforms.productTexAspect.value || 1;
+  var S = PLANE_WIDTH * 0.95 * im.scale.y;                          // the photo's square, plane units
+  var gh = S * Math.min(1, 1 / a);                                   // …its garment's height
+  var box = SHIRT.contentBox(rec.idx), bh = box.ok ? box.h : 1;
+  var s = gh / Math.max(1e-6, rec.h * bh);
+  var ox = box.ok ? ((box.x + box.w * 0.5) - 0.5) * rec.w : 0, oy = box.ok ? (0.5 - (box.y + box.h * 0.5)) * rec.h : 0;
+  var tx = -ox * s, ty = -oy * s, tz = im.position.z + 0.004;
+  holo.position.set(holo.position.x + (tx - holo.position.x) * w, holo.position.y + (ty - holo.position.y) * w,
+                    holo.position.z + (tz - holo.position.z) * w);
+  holo.rotation.set(holo.rotation.x * (1 - w), holo.rotation.y * (1 - w), holo.rotation.z * (1 - w));
+  holo.scale.set(holo.scale.x + (rec.w * s - holo.scale.x) * w, holo.scale.y + (rec.h * s - holo.scale.y) * w, 1);
+}
+// The pose at s: 0 = the whole panel, 1 = open and gone (the photo alone).
+function splitPose(plane, s){
+  var P = DML.P, halves = splitHalves(plane), e = s * s * (3 - 2 * s), open = s > 0.0005;
+  plane.geometry.setDrawRange(0, open ? 0 : Infinity);
+  var travel = (P.splitTravel || 0.35) * (plane.userData.splitPH || PLANE_WIDTH);
+  if(halves) for(var h = 0; h < 2; h++){
+    halves[h].material = plane.material;            // the plane's material can be swapped under it (a pending close)
+    halves[h].visible = open && s < 0.999;
+    halves[h].position.set(0, (h === 0 ? 1 : -1) * e * travel, 0);
+  }
+  // the halves dissolve as they go: the shared material, from its own opacity to nothing — and
+  // back again on a close, where s returns to 0 and this restores it exactly
+  if(plane.userData.splitOp0 === undefined) plane.userData.splitOp0 = plane.material.opacity;
+  plane.material.opacity = plane.userData.splitOp0 * (1 - cornerRamp(s, 0.12, 0.9));
+  var bd = displayAnim.backdrop, im = bd && bd.userData.imgMesh;
+  if(im){ im.visible = s > 0.001; im.material.uniforms.opacity.value = cornerRamp(s, 0.2, 0.7); }
+  var pn = (dm.floor && dm.floor.panels) ? dm.floor.panels[dm.selIdx] : null;
+  if(pn) pn.holoFade = 1 - cornerRamp(s, 0.3, 0.85);
+  holoOntoPhoto(plane, cornerRamp(s, 0.0, 0.45));
+  displayAnim.splitP = s;
+}
+// Put the panel back to a plain panel (a teardown mid-split must not leave it invisible or faded).
+function splitReset(plane){
+  if(!plane) return;
+  plane.geometry.setDrawRange(0, Infinity);
+  if(plane.userData.halves) for(var h = 0; h < 2; h++) plane.userData.halves[h].visible = false;
+  if(plane.userData.splitOp0 !== undefined){ plane.material.opacity = plane.userData.splitOp0; plane.userData.splitOp0 = undefined; }
+  displayAnim.splitP = 0; displayAnim.flatOK = false;
+}
+
 function startDisplayAnim() {
   if(!dm.displayTemp || !dm.displayTemp.plane) return;
   var mat = dm.displayTemp.plane.material;
@@ -17037,6 +17834,16 @@ function startDisplayAnim() {
   displayAnim.active = true;
   displayAnim.phase = 'flatten';
   displayAnim.prog = 0;
+  displayAnim.t = 0; displayAnim.splitP = 0; displayAnim.flatOK = false;
+  if(DML.isLive()){
+    // It flattened on the way in (animateDM / animateSwitch) and landed at its settled pose: the
+    // next thing is the split, where it stands.
+    mat.userData.flatten.value = 1.0;
+    displayAnim.phase = 'split';
+    var _spm = dm.floor && dm.floor.panels && dm.floor.panels[dm.selIdx];
+    dm.displayTemp.plane.userData.splitPH = (_spm && _spm.mesh.userData.pH) || PLANE_WIDTH;
+    dm.displayTemp.plane.userData.splitOp0 = undefined;
+  }
 
   // Save original positions for panel and edge
   displayAnim.origPos = dm.displayTemp.plane.position.clone();
@@ -17212,6 +18019,8 @@ function createProductOverlayMaterial(productTex, productTexAspect, isShadow) {
 }
 
 function cleanupDisplayAnim() {
+  // A teardown mid-split must not leave the panel invisible (drawRange 0) or faded (THE SPLIT).
+  if(dm.displayTemp && dm.displayTemp.plane) splitReset(dm.displayTemp.plane);
   // Restore original positions
   if(dm.displayTemp && dm.displayTemp.plane && displayAnim.origPos) {
     dm.displayTemp.plane.position.copy(displayAnim.origPos);
@@ -17224,7 +18033,7 @@ function cleanupDisplayAnim() {
   // Restore star button positions — re-solved under the split (see the unsplit branch).
   if(DML.isLive() && dm.starTemps && dm.floor){
     for(var ri2 = 0; ri2 < dm.starTemps.length; ri2++){
-      var rsp = DML.buttonPos(ri2, dm.floor, 0);
+      var rsp = DML.buttonPos(ri2, dm.floor, 1);   // the settled slots: the product lands once now
       if(rsp) dm.starTemps[ri2].position.copy(rsp);
     }
   } else if(dm.starTemps && displayAnim.btnOrigPositions.length > 0) {
@@ -17423,6 +18232,9 @@ function reverseDisplayAnim() {
   if(!displayAnim.active && !displayAnim.backdrop && !displayAnim.origPos) return;
   displayAnim.active = true;
   displayAnim.prog = 0;
+  // Split / stack: the glass drains back behind the photo first (DML), then the halves close over
+  // it (unsplit), then it un-flattens and flies home — the open, run backward.
+  if(DML.isLive()){ displayAnim.phase = 'drain'; displayAnim.t = 0; return; }
   // Start at the appropriate reverse phase based on how far we got
   if(displayAnim.backdrop && displayAnim.backdrop.visible) {
     displayAnim.phase = 'retract'; // has backdrop, retract it first
@@ -17452,7 +18264,7 @@ function switchPanel(newIdx){
     displayAnim.queuedSwitchIdx = newIdx;
     // Only kick off reverse if not already reversing
     var ph = displayAnim.phase;
-    if(ph !== 'retract' && ph !== 'unsplit' && ph !== 'unflatten') {
+    if(ph !== 'retract' && ph !== 'unsplit' && ph !== 'unflatten' && ph !== 'drain') {
       reverseDisplayAnim();
     }
     return;
@@ -17509,6 +18321,9 @@ function performSwitchPanel(newIdx){
   oldTempEdge.visible=true;
   scene.add(oldTempMesh);scene.add(oldTempEdge);
   switchAnim.oldTemp = {plane:oldTempMesh, edge:oldTempEdge};
+  // Both travelling copies wear their shirts (the switch used to fly them bare and pop the shirts
+  // back on at the end); the outgoing product is an ordinary wheel panel again.
+  delete oldPanel.holoFade; SHIRT.cloneOnto(oldPanel, oldTempMesh);
   
   // Hide the display temp
   dm.displayTemp.plane.visible = false;
@@ -17543,6 +18358,8 @@ function performSwitchPanel(newIdx){
   newTempEdge.visible=true;
   scene.add(newTempMesh);scene.add(newTempEdge);
   switchAnim.newTemp = {plane:newTempMesh, edge:newTempEdge};
+  var _nHolo = SHIRT.cloneOnto(newPanel, newTempMesh);
+  if(DML.isLive()){ newTempMesh.userData.holo = _nHolo; newPanel.holoFade = 1; }
   
   // Hide new panel on vertical wheel
   newPanel.mesh.visible = false;
@@ -17595,8 +18412,10 @@ function animateSwitch(){
     nt.plane.scale.lerpVectors(switchAnim.newStart.scale, switchAnim.newTarget.scale, p);
     nt.edge.position.copy(nt.plane.position);nt.edge.quaternion.copy(nt.plane.quaternion);nt.edge.scale.copy(nt.plane.scale);
     
-    // Morph from vertical (1) to floor (0)
+    // Morph from vertical (1) to floor (0) — and flatten as it lands, like an open's fly-in, so the
+    // split starts on a flat panel
     morphTo(nt.plane, 1 - p);
+    if(DML.isLive() && nt.plane.material.userData.flatten) nt.plane.material.userData.flatten.value = Math.max(0, Math.min(1, (p - 0.3) / 0.7));
   }
   
   if(switchAnim.prog >= 1){
@@ -18787,6 +19606,86 @@ function liqPlanPanel(lay, rnd, budget){
   return { kind: 'panel', flow: flow, dew: dew };
 }
 
+// ── THE UNION (2026-10-08) — the product view's glass: several rounded rects at once (the card, its
+// two tracks, the strip under it), filled by one liquid that comes out from behind the photo. The
+// puddle's sites are spread over every rect by area and fed outward from the source, so the card
+// fills first and the tracks and the strip last; consolidation then grows EVERY rect out of its own
+// middle (liqBodies). Stored per rect (shares of its half-sizes), so a resize carries it. The menu's
+// bar and the cart's panel are untouched: they never take this branch.
+function liqBodies(L, lay){
+  if(!(L.con > 0.001)) return null;
+  var out = [], w = L.wob * lay.R;
+  for(var i = 0; i < lay.rects.length; i++){
+    var b = lay.rects[i], m = Math.min(b.hw, b.hh) * 1.02 * (1 - L.con);
+    var hw = b.hw - m + w * 0.25, hh = b.hh - m - w * 0.25;
+    if(hw < 1e-3 || hh < 1e-3) continue;
+    out.push({ x: b.x, y: b.y, hw: hw, hh: hh, r: Math.max(1e-3, Math.min(b.r - m, hh, hw)) });
+  }
+  return out.length ? out : null;
+}
+// The consolidated shape for the hit tests in liqStep / liqWet: one rect (the bar, the panel) or a
+// union of them (the product view). Signed distance to whichever it is.
+function liqShape(L, lay){ return lay.kind === 'union' ? liqBodies(L, lay) : liqBody(L, lay); }
+function liqSdShape(x, y, sh){
+  if(!sh) return 1e9;
+  if(!sh.length) return liqSdBox(x, y, sh);
+  var d = 1e9; for(var i = 0; i < sh.length; i++) d = Math.min(d, liqSdBox(x, y, sh[i]));
+  return d;
+}
+function liqPlanUnion(lay, rnd, budget){
+  var P = DML.P, R = lay.R, rs = lay.rects, E = liqEntry(lay), s = lay.src, i, j;
+  var run = Math.sqrt((E.x - s.x) * (E.x - s.x) + (E.y - s.y) * (E.y - s.y));
+  var flow = [];
+  var ns = Math.max(1, Math.round(Math.max(0, run - 0.6 * R) / (0.6 * R))), nsCap = Math.max(2, Math.round(budget * 0.25));
+  var sr = P.liqStream * 0.8;
+  if(ns > nsCap){ ns = nsCap; sr = Math.max(sr, 0.65 * Math.max(0, run - 0.45 * R) / ns / R); }
+  for(j = 0; j < ns; j++)
+    flow.push({ stream: true, s: (j + 1) / ns, j: (rnd() - 0.5) * 0.3, nr: sr * (0.9 + 0.2 * rnd()), parent: j - 1 });
+  var areas = [], tot = 0;
+  for(i = 0; i < rs.length; i++){ areas.push(4 * rs[i].hw * rs[i].hh); tot += areas[i]; }
+  var npTot = Math.max(8, Math.min(36, Math.round(budget * 0.62) - ns)), pts = [];
+  for(i = 0; i < rs.length; i++){
+    var b = rs[i], n = Math.max(2, Math.round(npTot * areas[i] / Math.max(1e-6, tot)));
+    var rAvg = Math.min(Math.sqrt(areas[i] * 1.6 / (Math.PI * n)), 0.8 * Math.min(b.hw, b.hh));
+    var sp = liqScatter(rnd, b.x, b.y, 2 * b.hw, 2 * b.hh, rAvg * 0.75, rAvg * 1.25, n, 0.62, 1.0);
+    for(j = 0; j < sp.length; j++){ sp[j].seg = i; sp[j].ra = rAvg; pts.push(sp[j]); }
+  }
+  for(i = 0; i < pts.length; i++)
+    pts[i].key = Math.sqrt((pts[i].x - E.x) * (pts[i].x - E.x) + (pts[i].y - E.y) * (pts[i].y - E.y)) + (rnd() - 0.5) * 2.2 * pts[i].ra;
+  pts.sort(function(a, c){ return a.key - c.key; });
+  for(i = 0; i < pts.length; i++){
+    var best = ns - 1, bd = 1e9;                    // fed from the nearest wet site, or the stream's mouth
+    for(j = 0; j < i; j++){
+      var d2 = (pts[i].x - pts[j].x) * (pts[i].x - pts[j].x) + (pts[i].y - pts[j].y) * (pts[i].y - pts[j].y);
+      if(d2 < bd){ bd = d2; best = ns + j; }
+    }
+    if(i === 0) best = ns - 1;
+    var rb = rs[pts[i].seg];
+    flow.push({ seg: pts[i].seg, u: (pts[i].x - rb.x) / rb.hw, v: (pts[i].y - rb.y) / rb.hh, nr: pts[i].r / R, parent: best });
+  }
+  var vt = 0, cum = 0;
+  for(i = 0; i < flow.length; i++) vt += flow[i].nr * flow[i].nr;
+  for(i = 0; i < flow.length; i++){ cum += flow[i].nr * flow[i].nr; flow[i].F = 0.01 + 0.97 * cum / vt; }
+  var dew = [], nd = budget - flow.length;
+  if(nd > 0 && P.liqDew > 0){
+    var rMin = 0.14 * P.liqDewSize, rMax = 0.46 * P.liqDewSize, ra = rMin + (rMax - rMin) * 0.35;
+    var far = 0;
+    for(i = 0; i < rs.length; i++) far = Math.max(far, Math.abs(rs[i].x - E.x) + rs[i].hw, Math.abs(rs[i].y - E.y) + rs[i].hh);
+    far = Math.max(1e-3, far * 1.6);
+    for(i = 0; i < rs.length && dew.length < nd; i++){
+      var b2 = rs[i];
+      var want = Math.min(nd - dew.length, Math.round(P.liqDew * areas[i] / (R * R) / (Math.PI * ra * ra) * 0.22));
+      var dp = liqScatter(rnd, b2.x / R, b2.y / R, 2 * b2.hw / R, 2 * b2.hh / R, rMin, rMax, want, 0.8, 1.05);
+      for(j = 0; j < dp.length; j++){
+        var dE = Math.sqrt((dp[j].x * R - E.x) * (dp[j].x * R - E.x) + (dp[j].y * R - E.y) * (dp[j].y * R - E.y)) / far;
+        dew.push({ seg: i, u: (dp[j].x * R - b2.x) / b2.hw, v: (dp[j].y * R - b2.y) / b2.hh, nr: dp[j].r, st: 0, g: 0, d: null,
+                   tb: 0.24 * (0.45 * Math.min(1, dE) + 0.55 * rnd()), tg: 0.15 + 0.17 * rnd() });
+      }
+    }
+  }
+  return { kind: 'union', flow: flow, dew: dew };
+}
+
 // Where a site is NOW (layouts move: a resize, a drag, the stream between a moving pair).
 function liqSite(L, lay, q, out){
   var b = lay.body, R = lay.R;
@@ -18798,7 +19697,8 @@ function liqSite(L, lay, q, out){
     var ux = dx / l, uy = dy / l, a = Math.min(0.45 * R, l);
     var sx = s.x + ux * a, sy = s.y + uy * a;
     out.x = sx + (E.x - sx) * q.s - uy * q.j * R; out.y = sy + (E.y - sy) * q.s + ux * q.j * R;
-  } else { out.x = b.x + q.u * b.hw; out.y = b.y + q.v * b.hh; }
+  } else if(q.seg !== undefined && lay.rects){ var rr = lay.rects[q.seg] || b; out.x = rr.x + q.u * rr.hw; out.y = rr.y + q.v * rr.hh; }
+  else { out.x = b.x + q.u * b.hw; out.y = b.y + q.v * b.hh; }
   return out;
 }
 
@@ -18849,7 +19749,8 @@ function liqStep(L, lay, h){
   L.t += h;
   if(L.open && !L.plan){
     L.rnd = cornerRng((Math.random() * 4294967296) >>> 0);
-    L.plan = lay.kind === 'bar' ? liqPlanBar(lay, L.rnd, liqBudget()) : liqPlanPanel(lay, L.rnd, liqBudget());
+    L.plan = lay.kind === 'bar' ? liqPlanBar(lay, L.rnd, liqBudget())
+           : lay.kind === 'union' ? liqPlanUnion(lay, L.rnd, liqBudget()) : liqPlanPanel(lay, L.rnd, liqBudget());
     L.site = new Array(L.plan.flow.length);
     L.drops = []; L.F = 0; L.tFull = 0;
   }
@@ -18886,7 +19787,7 @@ function liqStep(L, lay, h){
   S.vx += (-ws * ws * S.x - 2 * zs * ws * S.vx) * h; S.x += S.vx * h;
   S.vy += (-ws * ws * S.y - 2 * zs * ws * S.vy) * h; S.y += S.vy * h;
 
-  var body = liqBody(L, lay);
+  var body = liqShape(L, lay);
   if(plan){
     // ── the flow: a droplet per site once F has reached it; back into its feeder when F falls
     // below it; shrunk away in place once the consolidated shape has covered it ──
@@ -18897,7 +19798,7 @@ function liqStep(L, lay, h){
       q = plan.flow[j];
       var pos = liqSite(L, lay, q, _liqA);
       var on = L.F >= q.F, wgt = q.stream ? streamW : 1;
-      var covered = !!body && liqSdBox(pos.x, pos.y, body) < -0.95 * q.nr * R;
+      var covered = !!body && liqSdShape(pos.x, pos.y, body) < -0.95 * q.nr * R;
       d = L.site[j];
       if(d && d.dead) d = L.site[j] = null;
       if(on && !covered && wgt > 0.02 && !d) d = liqSpawnFlow(L, lay, j, pos);
@@ -18971,7 +19872,7 @@ function liqStep(L, lay, h){
   }
   if(body) for(i = 0; i < nD; i++){
     d = drops[i];
-    if(!d.dead && !d.cap && d.kind === LIQ_DEW && liqSdBox(d.x, d.y, body) < 0.35 * d.r) liqCapture(d, 'body', lay);
+    if(!d.dead && !d.cap && d.kind === LIQ_DEW && liqSdShape(d.x, d.y, body) < 0.35 * d.r) liqCapture(d, 'body', lay);
   }
 
   // ── integrate: every droplet a damped spring in position and in radius ──
@@ -19054,8 +19955,8 @@ function liqBlobs(L, R, out){
 }
 // How far under the liquid a point is, 0..1 — what the menu's sections wait for.
 function liqWet(L, lay, x, y){
-  var best = 0, body = liqBody(L, lay), i, d;
-  if(body){ var sd = liqSdBox(x, y, body); if(sd < 0) best = Math.min(1, -sd / (0.5 * lay.R)); }
+  var best = 0, body = liqShape(L, lay), i, d;
+  if(body){ var sd = liqSdShape(x, y, body); if(sd < 0) best = Math.min(1, -sd / (0.5 * lay.R)); }
   for(i = 0; i < L.drops.length; i++){
     d = L.drops[i];
     if(d.kind !== LIQ_FLOW || d.dead || d.r < 1e-4) continue;
@@ -98863,7 +99764,7 @@ function animate(){
   if(dm.active&&dm.floor&&!dm.animating&&!dm.closing&&!switchAnim.active){
     if(Math.abs(targetCameraY-dm.floor.group.position.y)>FLOOR_SPACING*0.5)exitDM();
   }
-  if(dm.animating)animateDM();
+  if(dm.animating)animateDM(dt);
   if(dm.closing)animateClosing();
   if(pendingCloses.length > 0) animatePendingCloses();
   if(pendingReverses.length > 0) animatePendingReverses();
@@ -99293,7 +100194,32 @@ function animate(){
     if(displayAnim.prog > 1) displayAnim.prog = 1;
     var dap = eIO(displayAnim.prog);
 
-    if(displayAnim.phase === 'flatten') {
+    // THE SPLIT, the DRAIN and the UNSPLIT on the split / stack layouts (2026-10-08) — real time,
+    // see THE SPLIT at startDisplayAnim. The product never moves here: it landed where it stays.
+    var _liveDA = DML.isLive() && (displayAnim.phase === 'split' || displayAnim.phase === 'unsplit' || displayAnim.phase === 'drain');
+    if(_liveDA){
+      var _dS = Math.min(0.05, dt > 0 ? dt : 1 / 60);
+      if(displayAnim.phase === 'drain'){
+        // the glass drains back behind the photo (DML's liquid); once it has, the halves return
+        displayAnim.t += _dS;
+        if(DML.glassGone() || displayAnim.t > 3.0){
+          displayAnim.phase = 'unsplit';
+          displayAnim.t = 1 - (displayAnim.splitP || 0);    // from however far it had opened
+          displayAnim.flatOK = false;                        // the panel is itself again under its halves
+        }
+      } else {
+        var _open = displayAnim.phase === 'split';
+        displayAnim.t = Math.min(1, displayAnim.t + _dS / Math.max(0.05, DML.P.openSplit));
+        splitPose(dm.displayTemp.plane, _open ? displayAnim.t : 1 - displayAnim.t);
+        if(displayAnim.t >= 1){
+          if(_open){ displayAnim.flatOK = true; displayAnim.phase = 'idle'; displayAnim.active = false; }
+          else { displayAnim.phase = 'unflatten'; displayAnim.prog = 0; }
+        }
+      }
+    }
+
+    if(_liveDA) {
+    } else if(displayAnim.phase === 'flatten') {
       daMat.userData.flatten.value = dap;
       if(displayAnim.prog >= 1) {
         daMat.userData.flatten.value = 1.0;
@@ -99562,13 +100488,20 @@ function animate(){
   // Backdrop is a child of displayTemp.plane — tracks automatically
 
   if(dm.active&&dm.vWheel&&!dm.closing&&!dm.animating){
-    var _vwIdle=STOREFRONT_MODEL.rate('detail.wheel')*Math.min(dt,0.1);
-    if(Math.abs(dm.vwVel)>Math.abs(_vwIdle))dm.vwVel*=0.995;else dm.vwVel=_vwIdle;
-    dm.vwSpin+=dm.vwVel;
+    // Held still while the snake is still winding panels onto it: the spin it lands on was
+    // planned, and it inherits the body's speed (dm.vwVel) the moment the last one is home.
+    if(!SNAKE.holdsReel(dm.floor)){
+      var _vwIdle=STOREFRONT_MODEL.rate('detail.wheel')*Math.min(dt,0.1);
+      if(Math.abs(dm.vwVel)>Math.abs(_vwIdle))dm.vwVel*=0.995;else dm.vwVel=_vwIdle;
+      dm.vwSpin+=dm.vwVel;
+    }
     DML.applyWheelRot();   // composes orientation * spin — never writes an Euler on the wheel
     var fd=dm.floor;
     if(fd&&fd.group.userData.centerStar){fd.group.userData.centerStar.rotation.y=-(dm.vwSpin||0);fd.group.userData.centerStar.rotation.x+=dm.vwVel*0.5;}
   }
+  // The other panels' trip between the row and the wheel — after every row and the wheel have
+  // moved this frame, because it lays them on a path built from where those are now.
+  SNAKE.update(dt);
   
   // Update quick view panels to face camera
   if(dm.active && !dm.animating && !dm.closing) updateQuickViewPanels();
