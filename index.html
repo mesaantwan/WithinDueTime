@@ -1329,6 +1329,41 @@ var CAM_FOV = 75;
 // scene.background, the FogExp2 colour distant geometry fades INTO, and `bgBase` in updateOrbs
 // — which the whole spin crescendo is derived from (it multiplies this down to black and back).
 // The clouds read it live off scene.background, so they follow for free.
+// ══ RELATIVE FOG (2026-10-13) ════════════════════════════════════════════════════════════════
+// The storefront's haze used to be FogExp2 from the camera, so pulling the camera back (N → CAMERA,
+// distance ×2.5 on a phone) put the wheels twice as deep in it — 11% fogged became 53%, the site
+// washed out. Fog is now measured from where the camera NORMALLY stands: it starts CAM_FOG_START in
+// front of the lens (= how far the distance multiplier pulled it back), so the rows keep exactly the
+// haze they had at ×1 — a little, deepening from their front to their back — wherever the camera is.
+// three's FogExp2 uploads only a density, so the storefront fog is a THREE.Fog whose linear branch is
+// re-purposed below: fogNear = where the haze starts, fogFar = its density (fog.density aliases it,
+// so everything that reads .density keeps working). Nothing on the site used linear fog before. In the
+// game the start is held at 0, which is FogExp2's formula exactly.
+(function(){
+  var src = THREE.ShaderChunk.fog_fragment, lin = 'float fogFactor = smoothstep( fogNear, fogFar, fogDepth );';
+  if(src.indexOf(lin) < 0){ console.warn('[FOG] chunk not as expected — relative fog off'); return; }
+  THREE.ShaderChunk.fog_fragment = src.replace(lin,
+    'float fogD = max( 0.0, fogDepth - fogNear ); float fogFactor = 1.0 - exp( - fogFar * fogFar * fogD * fogD );');
+})();
+var SITE_FOG_D = 0.018;        // the haze's density (as it always was); DML.P.siteFog tunes it on the storefront
+var CAM_FOG_START = 0;         // set by updateCamRadius: how far the profile pulled the camera back
+function makeSiteFog(color, density){
+  var fg = new THREE.Fog(color, 0, density);
+  Object.defineProperty(fg, 'density', { get: function(){ return this.far; }, set: function(v){ this.far = v; }, configurable: true });
+  fg.isSiteFog = true;
+  return fg;
+}
+// Every frame: the start and the density, the storefront's own while the shop is up, FogExp2's in the game.
+function siteFogTick(){
+  var fg = (typeof scene !== 'undefined' && scene) ? scene.fog : null;
+  if(!fg || !fg.isSiteFog) return;
+  var inGame = typeof gameMode !== 'undefined' && (gameMode.active || gameMode.entering || gameMode.decelerating);
+  fg.near = inGame ? 0 : CAM_FOG_START;
+  fg.far = (!inGame && typeof DML !== 'undefined' && DML.P && DML.P.siteFog >= 0) ? DML.P.siteFog : SITE_FOG_D;
+}
+// What the hand-fogged shaders (the shirts, the jeans' picture) subtract from their depth.
+function siteFogStart(){ var fg = (typeof scene !== 'undefined' && scene) ? scene.fog : null; return (fg && fg.isSiteFog) ? fg.near : 0; }
+
 var SITE_BG = 0x6fb8e0;   // open sky. Bright enough to stay a light theme, dark enough that a
                           // white cloud deck reads as WHITE against it and not as pale grey —
                           // the clouds sit at ~1.0 and this is 0.65 luminance, so there is a
@@ -1355,6 +1390,22 @@ function updateCamRadius() {
     CAM_ORBIT_RADIUS = (landscapeBase - wideT * 3.5) * 1.495;
     CAM_FOV = CAM_FOV_BASE * 0.81;
   }
+  // THE CAMERA PROFILES (2026-10-13, N window → CAMERA): a portrait screen (a phone) and a landscape
+  // one each have their own field of view and a distance multiplier on top of the automatic
+  // distance above — at the defaults (75° / 60.75°, ×1) exactly the camera this always was. Read
+  // every frame by the storefront camera, and by DML's frustum, so the detail view is solved against
+  // whatever is set here.
+  var C = camProfile(aspect < 1.0), R0 = CAM_ORBIT_RADIUS;
+  if(C){
+    if(C.fov > 1 && C.fov < 179) CAM_FOV = C.fov;
+    if(C.dist > 0.05) CAM_ORBIT_RADIUS *= C.dist;
+  }
+  CAM_FOG_START = Math.max(0, CAM_ORBIT_RADIUS - R0);   // RELATIVE FOG: the haze starts this far out
+}
+function camProfile(phone){
+  var P = (typeof DML !== 'undefined' && DML.P) ? DML.P : null;
+  if(!P) return null;
+  return phone ? { fov: P.camPhoneFov, dist: P.camPhoneDist } : { fov: P.camDeskFov, dist: P.camDeskDist };
 }
 
 // Face tracking (webcam head-tilt) was REMOVED for the public store: no button reached it, and a
@@ -2344,7 +2395,7 @@ var SHIRT = (function(){
     uRim:{value:0}, uRimW:{value:0}, uRimCol:{value:new THREE.Color()},
     uTint:{value:new THREE.Color()}, uTintMix:{value:0}, uInk:{value:0}, uCone:{value:0},
     uGrain:{value:0}, uFlicker:{value:0}, uAlpha:{value:0},
-    uFogColor:{value:new THREE.Color(0xffffff)}, uFogDensity:{value:0}
+    uFogColor:{value:new THREE.Color(0xffffff)}, uFogDensity:{value:0}, uFogStart:{value:0}
   };
 
   function sync(){
@@ -2377,7 +2428,7 @@ var SHIRT = (function(){
     'uniform float uPix, uBlocky, uCA, uCAPulse, uFringe, uGlitch;',
     'uniform float uScanFreq, uScanDepth, uScanScroll, uBar, uRefresh;',
     'uniform float uRim, uRimW, uTintMix, uInk, uCone, uGrain, uFlicker;',
-    'uniform float uFogDensity;',
+    'uniform float uFogDensity, uFogStart;',
     'uniform vec3 uTint, uRimCol, uFogColor;',
     'varying vec2 vUv;',
     'varying float vDepth;',
@@ -2474,7 +2525,8 @@ var SHIRT = (function(){
     '',
     '  // Fog by hand rather than through three\'s chunks: the panels are fogged and a shirt',
     '  // floating half a unit in front of one must not read as a different distance.',
-    '  float fg = 1.0 - exp(-uFogDensity * uFogDensity * vDepth * vDepth);',
+    '  float fgD = max(0.0, vDepth - uFogStart);   // RELATIVE FOG: from where the haze starts',
+    '  float fg = 1.0 - exp(-uFogDensity * uFogDensity * fgD * fgD);',
     '  col = mix(col, uFogColor, clamp(fg, 0.0, 1.0));',
     '',
     '  gl_FragColor = vec4(col, a);',
@@ -2614,6 +2666,7 @@ var SHIRT = (function(){
     if(typeof scene !== 'undefined' && scene && scene.fog){
       U.uFogColor.value.copy(scene.fog.color);
       U.uFogDensity.value = scene.fog.density || 0;
+      U.uFogStart.value = (typeof siteFogStart === 'function') ? siteFogStart() : 0;
     } else U.uFogDensity.value = 0;
 
     var sway = P.sway * Math.PI / 180;
@@ -3122,10 +3175,21 @@ var DML = (function(){
     bubT:         0.333,  // the glass's liquid time, seconds: bigger is slower, same character (10-13: was 0.75 — 2.25x faster)
     bubLead:      0.55,   // when the glass starts, as a share of the split (0 = with it, 1 = after)
     descLead:     0.35,   // when the description box's stream starts, as a share of the glass setting
+    // ── THE CAMERA (2026-10-13): the storefront camera — a portrait screen (phones) and a landscape one ──
+    camPhoneFov:  38,     // phone (portrait): vertical field of view, degrees — the zoom (wider = more fits, more perspective)
+    camPhoneDist: 3.06,   // phone: distance, × the automatic one (bigger = further back, more fits on screen)
+    camDeskFov:   51.5,  // desktop (landscape): vertical field of view, degrees
+    camDeskDist:  1.13,   // desktop: distance, × the automatic one
+    camDolly:     false,  // DOLLY ZOOM: changing a field of view moves the camera to keep the wheels the same size
+    siteFog:      0.018,  // the storefront's haze (density), measured from where the camera normally stands
     // ── THE ROW PANELS (2026-10-13): the storefront wheels' own panels, not the detail view ──
     rowPanelH:    1.14,   // panel height as a multiple of its width (1 = the original square); the rings move apart with it
     rowHoloGap:   1,   // how far each panel's shirt hologram floats in front of it, world units (was 0.28)
     rowHoloSize:  1.59,   // the hologram's size against its panel; it also grows with the panel's height
+    // …and the PHONE's own (a portrait screen — the same split as the camera's profiles)
+    rowPanelHPhone:   1.38,
+    rowHoloGapPhone:  1.12,
+    rowHoloSizePhone: 1.98,
 
     // ── the product half ─────────────────────────────────────────────────────
     prodDepth:   16.3,
@@ -3330,7 +3394,7 @@ var DML = (function(){
     swScale:     1.00,
     swCellA:     0,      // how solid a tile is where its garment is transparent
     swSelGlow:   0.44,   // how hard the active tile is marked
-    swSel:       2,      // which slot is showing. Live state, but useful as a starting value.
+    swSel:       3,      // which slot is showing. Live state, but useful as a starting value.
     heroFade:    0.15,   // the brand mark at the top of the tower, which sits high enough to
                          // stay fully in frame behind an open product
     hideScroller: true,  // the bottom scroll strip, while a product is open
@@ -7022,37 +7086,54 @@ SHIRT.setFilter(DML.shirtVisible);
   window.__dmlSaved = diff;
 
   function fmt(v, step){ var d = (String(step).split('.')[1] || '').length; return (+v).toFixed(d); }
-  function hd(t){ return '<div style="font:700 10px Arial;letter-spacing:1.2px;color:#9fd0ff;margin:11px 0 5px;' +
+  function attr(t){ return String(t).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+  function hd(t){ return '<div class="dml-hd" data-hd="' + attr(t) + '" style="font:700 10px Arial;letter-spacing:1.2px;color:#9fd0ff;margin:11px 0 5px;' +
                          'border-bottom:1px solid rgba(120,180,255,0.25);padding-bottom:3px">' + t + '</div>'; }
-  function note(t){ return '<div style="font:10px/1.45 Arial;color:#8496ab;margin:3px 0 7px">' + t + '</div>'; }
+  function note(t){ return '<div class="dml-note" style="font:10px/1.45 Arial;color:#8496ab;margin:3px 0 7px">' + t + '</div>'; }
+  function rowTag(k, label, style){ return '<div class="dml-row" data-k="' + k + '" data-label="' + attr(label) + '" style="' + style + '">'; }
   function row(label, k, lo, hi, step){
-    return '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">' +
+    return rowTag(k, label, 'display:flex;align-items:center;gap:6px;margin:2px 0;border-radius:4px') +
       '<label style="flex:0 0 122px;font:10px Arial;color:#a8bdd4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + label + '</label>' +
       '<input type="range" data-dk="' + k + '" min="' + lo + '" max="' + hi + '" step="' + step + '" value="' + DML.P[k] + '" style="flex:1;height:12px;accent-color:#5aa9ff;min-width:0">' +
       '<span data-dv="' + k + '" style="flex:0 0 46px;text-align:right;font:10px Arial;color:#e2eeff">' + fmt(DML.P[k], step) + '</span></div>';
   }
   function chk(label, k){
-    return '<div style="display:flex;align-items:center;gap:6px;margin:4px 0">' +
+    return rowTag(k, label, 'display:flex;align-items:center;gap:6px;margin:4px 0;border-radius:4px') +
       '<input type="checkbox" data-db="' + k + '"' + (DML.P[k] ? ' checked' : '') + '>' +
       '<label style="font:10px Arial;color:#a8bdd4">' + label + '</label></div>';
   }
   function esc(t){ return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
   function txt(label, k, rows){
-    return '<div style="margin:4px 0"><label style="display:block;font:10px Arial;color:#a8bdd4;margin-bottom:2px">' + label + '</label>' +
+    return rowTag(k, label, 'margin:4px 0;border-radius:4px') + '<label style="display:block;font:10px Arial;color:#a8bdd4;margin-bottom:2px">' + label + '</label>' +
       '<textarea data-dt="' + k + '" rows="' + (rows || 3) + '" style="width:100%;box-sizing:border-box;font:10px/1.35 Arial;color:#e2eeff;' +
       'background:rgba(255,255,255,0.06);border:1px solid rgba(120,180,255,0.25);border-radius:5px;padding:4px 6px;resize:vertical">' + esc(DML.P[k] || '') + '</textarea></div>';
   }
   function rgbHex(a){ return '#' + [0,1,2].map(function(i){ return ('0' + Math.round(Math.max(0, Math.min(1, a[i])) * 255).toString(16)).slice(-2); }).join(''); }
   function hexRgb(h){ var n = parseInt(h.slice(1), 16); return [((n>>16)&255)/255, ((n>>8)&255)/255, (n&255)/255]; }
   function col(label, k){
-    return '<div style="display:flex;align-items:center;gap:6px;margin:3px 0">' +
+    return rowTag(k, label, 'display:flex;align-items:center;gap:6px;margin:3px 0;border-radius:4px') +
       '<label style="flex:0 0 122px;font:10px Arial;color:#a8bdd4">' + label + '</label>' +
       '<input type="color" data-dc="' + k + '" value="' + rgbHex(DML.P[k]) + '" style="flex:1;height:18px;padding:0;border:0;background:none;min-width:0"></div>';
   }
 
   function build(){
-    return '<div style="font:700 11px Arial;letter-spacing:1.6px;color:#5aa9ff;margin-bottom:2px">DETAIL LAYOUT</div>' +
-      '<div id="dml-state" style="font:9px Arial;color:#7f93a8;margin-bottom:8px"></div>' +
+    return '<div class="dml-top" style="position:sticky;top:-11px;z-index:3;margin:-11px -13px 4px;padding:11px 13px 8px;' +
+      'background:rgba(6,13,22,0.98);border-bottom:1px solid rgba(90,169,255,0.2)">' +
+      '<div style="display:flex;align-items:center;gap:8px">' +
+        '<div style="flex:1;font:700 11px Arial;letter-spacing:1.6px;color:#5aa9ff">DETAIL LAYOUT</div>' +
+        '<button id="dml-x" title="Close (N)" style="width:28px;height:28px;border-radius:14px;border:1px solid rgba(90,169,255,0.45);' +
+        'background:rgba(20,40,70,0.9);color:#cfe6ff;font:15px Arial;cursor:pointer">×</button>' +
+      '</div>' +
+      '<div id="dml-state" style="font:9px Arial;color:#7f93a8;margin:2px 0 7px"></div>' +
+      '<select id="dml-cat" style="width:100%;font:700 11px Arial;color:#e2eeff;background:#10233a;border:1px solid rgba(90,169,255,0.45);' +
+      'border-radius:6px;padding:6px;margin-bottom:6px;cursor:pointer"></select>' +
+      '<div style="display:flex;gap:8px;align-items:center">' +
+        '<input id="dml-q" type="search" placeholder="Search every setting…" autocomplete="off" style="flex:1;min-width:0;font:11px Arial;color:#e2eeff;' +
+        'background:rgba(255,255,255,0.06);border:1px solid rgba(120,180,255,0.3);border-radius:6px;padding:5px 7px">' +
+        '<label style="font:10px Arial;color:#a8bdd4;white-space:nowrap;cursor:pointer"><input id="dml-notes" type="checkbox"> Notes</label>' +
+      '</div>' +
+      '<div style="font:9px Arial;color:#6f8397;margin-top:5px">Gold = changed from the file · double-click a name to put it back</div>' +
+      '</div>' +
 
       hd('THE SPLIT') +
       chk('Split layout on', 'on') +
@@ -7169,12 +7250,16 @@ SHIRT.setFilter(DML.shirtVisible);
       hd('BUTTONS') +
       row('Depth', 'btnDepth', 3, 20, 0.1) +
       row('Nudge across', 'btnX', -1, 1, 0.01) +
+      note('Measured in from the PRODUCT half’s own edges, not the screen’s, so the close button never lands over the wheel.') +
       row('Column spacing', 'btnGap', 0.05, 1, 0.005) +
       chk('One glass slab behind them', 'btnPlate') +
       row('Slab depth behind', 'plateBack', 0, 3, 0.01) +
       row('Margin past buttons', 'platePad', 0, 1, 0.005) +
       note('The slab is measured off the buttons: its corner radius is the button radius plus this margin, so the top arc IS the top button\u2019s upper half and the bottom arc the bottom one\u2019s lower half. Change btnScale or the column spacing and it re-contours itself.') +
       row('Corner radius', 'plateRadiusMul', 0, 1.5, 0.01) +
+
+      hd('GLASS LOOK (EVERY FROST PANE)') +
+      note('One material for the card, the bubble, the tracks, the strip, the description box and the corner seats — these knobs move all of them.') +
       col('Frost tint', 'plateTint') +
       row('Frost amount', 'plateFrost', 0, 1, 0.01) +
       row('Darken', 'plateDim', 0, 0.7, 0.01) +
@@ -7186,7 +7271,8 @@ SHIRT.setFilter(DML.shirtVisible);
       row('Edge softness (px)', 'plateEdgePx', 0.25, 12, 0.25) +
       note('Both in SCREEN pixels, converted per mesh through its own depth — so the big product card and the small button slab come out equally crisp. As fractions of the mesh they could not: the card is five times wider, so the same fraction was five times softer.') +
       row('Opacity', 'plateOpacity', 0, 1, 0.01) +
-      note('Measured in from the PRODUCT half’s own edges, not the screen’s, so the close button never lands over the wheel.') +
+
+      hd('ORBS') +
       row('Scale', 'btnScale', 0.3, 2.5, 0.01) +
       note('ONE BUBBLE: the orbs land at the card\u2019s depth (Depth and Across above no longer place them \u2014 the size track does), so this is their world size there.') +
       row('Opens forward by', 'btnForward', 0, 6, 0.05) +
@@ -7234,6 +7320,7 @@ SHIRT.setFilter(DML.shirtVisible);
       row('Bar: band behind the sections', 'navBand', 0, 1, 0.01) +
       row('Bar: band height (\u00d7 type)', 'navBandH', 0.5, 4, 0.05) +
       row('Bar: band lift toward white', 'navBandLift', 0, 1, 0.01) +
+      hd('LIQUID (MENU · CART · THE GLASS POUR)') +
       note('LIQUID: a small simulated liquid. The button\u2019s seat lets a stream out toward the menu (the cart\u2019s panel) while dew condenses over that area; the stream takes each drop it touches, and surface tension pulls it all into shape. Closing drains it back into the button. Tap again mid-way and it turns round.') +
       row('Menu open time (s)', 'liquidNavDur', 0.2, 2.5, 0.01) +
       row('Cart open time (s)', 'liquidCartDur', 0.2, 2.5, 0.01) +
@@ -7311,11 +7398,25 @@ SHIRT.setFilter(DML.shirtVisible);
       row('Glass starts at (share of the split)', 'bubLead', 0, 1, 0.01) +
       row('Description starts at (share of the glass set)', 'descLead', 0, 1, 0.01) +
 
+      hd('CAMERA') +
+      note('The storefront camera. A PORTRAIT screen (a phone) uses the first pair, a LANDSCAPE one the second — this screen is ' + ((window.innerWidth < window.innerHeight) ? 'PORTRAIT' : 'LANDSCAPE') + '. Field of view is the zoom: wider fits more and exaggerates the perspective; narrower flattens it. Distance pulls the camera back (more fits) or in. On a phone, open this window with ?dmlayout on the address.') +
+      row('Phone: field of view', 'camPhoneFov', 20, 120, 0.5) +
+      row('Phone: distance (×)', 'camPhoneDist', 0.4, 5, 0.01) +
+      row('Desktop: field of view', 'camDeskFov', 20, 120, 0.5) +
+      row('Desktop: distance (×)', 'camDeskDist', 0.4, 5, 0.01) +
+      chk('Dolly zoom (keep the framing)', 'camDolly') +
+      row('Fog (haze over the rows)', 'siteFog', 0, 0.06, 0.001) +
+      note('The haze is measured from where the camera NORMALLY stands, so pulling the camera back no longer drowns the rows — they keep a little haze from their front to their back. 0 = none; 0.018 is the original.') +
+      note('With dolly zoom on, a field-of-view change moves the camera to keep the wheels the same size on screen — the Vertigo effect: only the perspective changes. Off, the two are independent.') +
+
       hd('ROW PANELS (THE STOREFRONT WHEELS)') +
-      row('Panel height (× width)', 'rowPanelH', 1, 2.5, 0.01) +
-      note('1 is the original square. The rings above and below the panels move apart with it; the crystal and the hologram bay stay put. Applied once no product is open.') +
-      row('Shirt distance', 'rowHoloGap', 0, 2, 0.01) +
-      row('Shirt size', 'rowHoloSize', 0.2, 3.5, 0.01) +
+      note('A PORTRAIT screen (a phone) uses the Phone set, a LANDSCAPE one the Desktop set — the same split as the camera. Panel height: 1 is the original square; the rings above and below move apart with it, the crystal and the hologram bay stay put. Applied once no product is open.') +
+      row('Phone: panel height (× width)', 'rowPanelHPhone', 1, 2.5, 0.01) +
+      row('Phone: shirt distance', 'rowHoloGapPhone', 0, 3, 0.01) +
+      row('Phone: shirt size', 'rowHoloSizePhone', 0.2, 3.5, 0.01) +
+      row('Desktop: panel height (× width)', 'rowPanelH', 1, 2.5, 0.01) +
+      row('Desktop: shirt distance', 'rowHoloGap', 0, 3, 0.01) +
+      row('Desktop: shirt size', 'rowHoloSize', 0.2, 3.5, 0.01) +
       note('The floating shirt in front of each panel: how far out it floats, and its size against the panel. It also grows with the panel height, so a taller panel keeps the same proportions.') +
 
       hd('THE REST OF THE PAGE') +
@@ -7380,15 +7481,149 @@ SHIRT.setFilter(DML.shirtVisible);
       chk('Over the product', 'holoProduct') +
       note('Two of them stacked in the same half is the version most likely to read as clutter, which is why the product side is off by default. The wheel keeps its own.') +
 
-      '<div style="margin-top:11px"><button id="dml-dump" style="width:100%;font:700 10px Arial;color:#d6ffe8;' +
+      '<div class="dml-foot"><div style="margin-top:11px"><button id="dml-dump" style="width:100%;font:700 10px Arial;color:#d6ffe8;' +
       'background:rgba(40,180,110,0.18);border:1px solid rgba(61,220,132,0.45);border-radius:6px;padding:7px;cursor:pointer">' +
       'Log what I changed (paste-ready, also copied)</button></div>' +
       '<div style="margin-top:5px"><button id="dml-reset" style="width:100%;font:700 10px Arial;color:#ffd9d9;' +
       'background:rgba(180,60,60,0.16);border:1px solid rgba(220,90,90,0.40);border-radius:6px;padding:6px;cursor:pointer">' +
       'Reset to the values in the file (forgets what was saved)</button></div>' +
-      note('Every change here is saved in this browser and restored on reload, until Reset.');
+      '<div style="font:10px/1.45 Arial;color:#8496ab;margin:6px 0 0">Every change here is saved in this browser and restored on reload, until Reset.</div></div>';
   }
 
+  // ── THE ORGANISER (2026-10-13) ──────────────────────────────────────────────────────────────
+  // ~200 settings in 25 sections were one long scroll. Now a dropdown picks WHAT you are editing
+  // (a handful of groups), search finds any setting by name across all of them, the explanations
+  // hide behind "Notes", and every value that differs from the file is gold — double-click its
+  // name to put it back. The markup is still the one list above; this only shows and hides it.
+  var CATS = [
+    ['store',  'Storefront: camera & rows',     /^(CAMERA|ROW PANELS)/],
+    ['open',   'Opening & closing a product',   /^(THE OPEN|THE SNAKE)/],
+    ['desk',   'Desktop layout',                /^(THE SPLIT|PRODUCT HALF|WHEEL HALF|THE PANELS ON IT|THE WHOLE OBJECT|CONTRAST SCRIM)/],
+    ['phone',  'Phone layout',                  /^(THE STACK|THE VIEWER)/],
+    ['card',   'Product card & images',         /^(THE DISPLAY SIDE|ONE BUBBLE|IMAGE SWITCHER|GARMENT PROJECTIONS)/],
+    ['ctrl',   'Sizes & buttons',               /^(THE SIZE TOGGLE|THE ACTION COLUMN|THE CLOSE BUTTON|ORBS|BUTTONS)/],
+    ['desc',   'Description box',               /^THE DESCRIPTION BOX/],
+    ['glass',  'Glass look (every frost pane)', /^GLASS LOOK/],
+    ['corner', 'Corner menu & bag · liquid',    /^(THE CORNER ORBS|LIQUID)/],
+    ['page',   'Rest of the page',              /^THE REST OF THE PAGE/]
+  ];
+  var UIKEY = 'dml.ui.v1', ui = {cat: 'store', notes: false};
+  try { var _u = JSON.parse(localStorage.getItem(UIKEY) || 'null'); if(_u) ui = {cat: _u.cat || 'store', notes: !!_u.notes}; } catch(e){}
+  function uiSave(){ try { localStorage.setItem(UIKEY, JSON.stringify(ui)); } catch(e){} }
+  function catOf(sec){ for(var i = 0; i < CATS.length; i++) if(CATS[i][2].test(sec)) return CATS[i][0]; return 'other'; }
+  function isChanged(k){ return base.hasOwnProperty(k) && DML.P.hasOwnProperty(k) && !sameVal(DML.P[k], base[k]); }
+  // Tag every element after a section header with that section, then fill the dropdown.
+  function organise(){
+    if(!el) return;
+    var sec = null, kids = el.children;
+    for(var i = 0; i < kids.length; i++){
+      var c = kids[i];
+      if(c.classList.contains('dml-top') || c.classList.contains('dml-foot')) continue;
+      if(c.classList.contains('dml-hd')) sec = c.getAttribute('data-hd');
+      if(sec) c.setAttribute('data-sec', sec);
+    }
+    var nEl = el.querySelector('#dml-notes'); if(nEl) nEl.checked = ui.notes;
+    marks();
+    filter();
+  }
+  // Gold rows, and the dropdown's per-group count of changes.
+  function marks(){
+    if(!el) return;
+    var counts = {}, total = 0, rows = el.querySelectorAll('.dml-row');
+    for(var i = 0; i < rows.length; i++){
+      var r = rows[i], k = r.getAttribute('data-k'), ch = isChanged(k), lb = r.querySelector('label');
+      r.style.background = ch ? 'rgba(255,196,90,0.09)' : '';
+      if(lb) lb.style.color = ch ? '#ffd27a' : '#a8bdd4';
+      if(ch){ var ct = catOf(r.getAttribute('data-sec') || ''); counts[ct] = (counts[ct] || 0) + 1; total++; }
+    }
+    var sel = el.querySelector('#dml-cat');
+    if(!sel) return;
+    var html = '', present = {};
+    for(var j = 0; j < rows.length; j++) present[catOf(rows[j].getAttribute('data-sec') || '')] = true;
+    CATS.forEach(function(c){
+      if(!present[c[0]]) return;
+      html += '<option value="' + c[0] + '">' + c[1] + (counts[c[0]] ? '   •' + counts[c[0]] + ' changed' : '') + '</option>';
+    });
+    if(present.other) html += '<option value="other">Other' + (counts.other ? '   •' + counts.other + ' changed' : '') + '</option>';
+    html += '<option value="all">Everything' + (total ? '   •' + total + ' changed' : '') + '</option>';
+    if(sel.innerHTML !== html){ sel.innerHTML = html; }
+    sel.value = ui.cat;
+    if(sel.value !== ui.cat){ ui.cat = sel.value || 'all'; }
+  }
+  function filter(){
+    if(!el) return;
+    var qEl = el.querySelector('#dml-q'), q = qEl ? (qEl.value || '').trim().toLowerCase() : '';
+    var kids = el.children, shown = {}, i, c, sec;
+    for(i = 0; i < kids.length; i++){
+      c = kids[i]; sec = c.getAttribute('data-sec');
+      if(!sec || c.classList.contains('dml-hd')) continue;
+      var inCat = ui.cat === 'all' || catOf(sec) === ui.cat;
+      if(c.classList.contains('dml-row')){
+        var vis = q ? ((c.getAttribute('data-label') || '').toLowerCase().indexOf(q) >= 0 ||
+                       (c.getAttribute('data-k') || '').toLowerCase().indexOf(q) >= 0 ||
+                       sec.toLowerCase().indexOf(q) >= 0)
+                    : inCat;
+        // a CLASS, not style.display: clearing display wiped the rows' own inline display:flex
+        c.classList.toggle('dml-off', !vis);
+        if(vis) shown[sec] = true;
+      } else {
+        c.classList.toggle('dml-off', !(!q && inCat && ui.notes));   // the notes
+      }
+    }
+    for(i = 0; i < kids.length; i++){
+      c = kids[i];
+      if(!c.classList.contains('dml-hd')) continue;
+      sec = c.getAttribute('data-hd');
+      c.classList.toggle('dml-off', !(q ? !!shown[sec] : (ui.cat === 'all' || catOf(sec) === ui.cat)));
+    }
+  }
+  // Double-click a name: that one value back to the file's, wherever its control is.
+  function resetOne(k){
+    if(!base.hasOwnProperty(k)) return;
+    DML.P[k] = Array.isArray(base[k]) ? base[k].slice() : base[k];
+    var r = el.querySelector('.dml-row[data-k="' + k + '"]');
+    if(r){
+      var sl = r.querySelector('[data-dk]'), dv = r.querySelector('[data-dv]'), cb = r.querySelector('[data-db]'),
+          cc = r.querySelector('[data-dc]'), ta = r.querySelector('[data-dt]');
+      if(sl){ sl.value = DML.P[k]; if(dv) dv.textContent = fmt(DML.P[k], sl.getAttribute('step')); }
+      if(cb) cb.checked = !!DML.P[k];
+      if(cc) cc.value = rgbHex(DML.P[k]);
+      if(ta) ta.value = DML.P[k] || '';
+    }
+    if(k.indexOf('cam') === 0 && typeof updateCamRadius === 'function') updateCamRadius();
+    reflow(); save(); marks();
+  }
+
+  // ON A PHONE (2026-10-13) the window is a sheet along the bottom, under half the screen high, so the
+  // page it is tuning stays in view; × closes it (there is no N key on a phone) and leaves a small
+  // pill in the corner that brings it back.
+  var pill = null;
+  function place(){
+    if(!el) return;
+    var portrait = window.innerWidth < window.innerHeight;
+    el.style.top = portrait ? 'auto' : '14px';
+    el.style.bottom = portrait ? '10px' : 'auto';
+    el.style.right = portrait ? '8px' : '14px';
+    el.style.left = portrait ? '8px' : 'auto';
+    el.style.width = portrait ? 'auto' : '300px';
+    el.style.maxHeight = portrait ? '42vh' : '88vh';
+  }
+  function showPill(on){
+    if(!pill){
+      pill = document.createElement('button');
+      pill.textContent = 'N';
+      pill.title = 'Detail layout';
+      pill.style.cssText = 'position:fixed;right:10px;bottom:10px;width:36px;height:36px;border-radius:18px;z-index:2147483000;' +
+        'border:1px solid rgba(90,169,255,0.5);background:rgba(6,13,22,0.85);color:#5aa9ff;font:700 13px Arial;cursor:pointer';
+      pill.onclick = function(e){ e.stopPropagation(); toggle(); };
+      ['pointerdown','pointerup','mousedown','touchstart','touchend'].forEach(function(t){
+        pill.addEventListener(t, function(e){ e.stopPropagation(); }, {passive: true});
+      });
+      document.body.appendChild(pill);
+    }
+    pill.style.display = on ? '' : 'none';
+  }
+  window.addEventListener('resize', place);
   function make(){
     el = document.createElement('div');
     el.style.cssText = 'position:fixed;top:14px;right:14px;width:300px;z-index:2147483000;background:rgba(6,13,22,0.94);' +
@@ -7396,13 +7631,49 @@ SHIRT.setFilter(DML.shirtVisible);
       'box-shadow:0 10px 40px rgba(0,0,0,0.7);max-height:88vh;overflow:auto;font-family:Arial,sans-serif';
     el.innerHTML = build();
     document.body.appendChild(el);
+    if(!document.getElementById('dml-style')){
+      var _st = document.createElement('style'); _st.id = 'dml-style';
+      _st.textContent = '.dml-off{display:none !important}';
+      document.head.appendChild(_st);
+    }
+    place();
+    organise();
+    // the organiser's own controls (no data-* keys, so the value handlers below ignore them)
+    el.addEventListener('change', function(ev){
+      var t = ev.target;
+      if(t && t.id === 'dml-cat'){ ui.cat = t.value; uiSave(); var qq = el.querySelector('#dml-q'); if(qq) qq.value = ''; filter(); el.scrollTop = 0; }
+      else if(t && t.id === 'dml-notes'){ ui.notes = t.checked; uiSave(); filter(); }
+    });
+    el.addEventListener('input', function(ev){
+      var t = ev.target;
+      if(t && t.id === 'dml-q'){ filter(); el.scrollTop = 0; return; }
+      setTimeout(marks, 0);   // after the value handler has written it
+    });
+    el.addEventListener('dblclick', function(ev){
+      var lb = ev.target && ev.target.closest && ev.target.closest('.dml-row label');
+      var r = lb && lb.closest('.dml-row');
+      if(r){ ev.preventDefault(); resetOne(r.getAttribute('data-k')); }
+    });
+    // × — a delegated listener, since Reset rebuilds the window's contents
+    el.addEventListener('click', function(ev){ if(ev.target && ev.target.id === 'dml-x'){ ev.stopPropagation(); toggle(); } });
 
     el.addEventListener('input', function(ev){
       var t = ev.target, k = t.getAttribute && t.getAttribute('data-dk');
       if(k){
+        var _old = DML.P[k];
         DML.P[k] = parseFloat(t.value);
         var o = el.querySelector('[data-dv="' + k + '"]');
         if(o) o.textContent = fmt(DML.P[k], t.getAttribute('step'));
+        // CAMERA: a dolly zoom keeps distance × tan(fov/2) — the frame's height at the wheels — fixed.
+        if(DML.P.camDolly && (k === 'camPhoneFov' || k === 'camDeskFov') && _old > 0){
+          var dk = k === 'camPhoneFov' ? 'camPhoneDist' : 'camDeskDist';
+          var nd = DML.P[dk] * Math.tan(_old * Math.PI / 360) / Math.tan(DML.P[k] * Math.PI / 360);
+          DML.P[dk] = Math.max(0.05, Math.min(10, nd));
+          var ds = el.querySelector('[data-dk="' + dk + '"]'), dv = el.querySelector('[data-dv="' + dk + '"]');
+          if(ds) ds.value = DML.P[dk];
+          if(dv) dv.textContent = fmt(DML.P[dk], ds ? ds.getAttribute('step') : 0.01);
+        }
+        if(k.indexOf('cam') === 0 && typeof updateCamRadius === 'function') updateCamRadius();
         reflow(); save();
         return;
       }
@@ -7420,13 +7691,14 @@ SHIRT.setFilter(DML.shirtVisible);
       if(b){ DML.P[b] = ev.target.checked; reflow(); save(); }
     });
 
-    el.querySelector('#dml-reset').onclick = function(){
+    var doReset = function(){
       for(var k in base) if(base.hasOwnProperty(k)) DML.P[k] = Array.isArray(base[k]) ? base[k].slice() : base[k];
       forget();
+      if(typeof updateCamRadius === 'function') updateCamRadius();
       reflow();
-      var keep = el.scrollTop; el.innerHTML = build(); el.scrollTop = keep;
+      var keep = el.scrollTop; el.innerHTML = build(); organise(); el.scrollTop = keep;
     };
-    el.querySelector('#dml-dump').onclick = function(){
+    var doDump = function(){
       var d = diff(), out = [], k;
       for(k in d){
         var a = d[k];
@@ -7439,6 +7711,10 @@ SHIRT.setFilter(DML.shirtVisible);
       // Straight to the clipboard as well, so a paste into the chat needs no selecting.
       try { if(out.length && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(out.join('\n')).catch(function(){}); } catch(e){}
     };
+    el.addEventListener('click', function(ev){
+      var id = ev.target && ev.target.id;
+      if(id === 'dml-reset') doReset(); else if(id === 'dml-dump') doDump();
+    });
 
     ['wheel','pointerdown','pointermove','pointerup','mousedown','touchstart'].forEach(function(t){
       el.addEventListener(t, function(e){ e.stopPropagation(); }, {passive: true});
@@ -7488,7 +7764,11 @@ SHIRT.setFilter(DML.shirtVisible);
     }
   }
 
-  function toggle(){ if(!el) make(); else el.style.display = (el.style.display === 'none') ? '' : 'none'; }
+  function toggle(){
+    if(!el) make(); else el.style.display = (el.style.display === 'none') ? '' : 'none';
+    place();
+    showPill(el.style.display === 'none' && (window.innerWidth < window.innerHeight));   // the way back on a phone
+  }
   window.addEventListener('keydown', function(e){
     if(e.target && /input|textarea|select/i.test(e.target.tagName)) return;
     if(e.key === 'n' || e.key === 'N') toggle();
@@ -9283,7 +9563,7 @@ var HOLO = (function(){
         uShut:{value:0}, uSIn:{value:0}, uSOut:{value:0}, uSDirI:{value:1}, uSDirO:{value:1}, uSlats:{value:13}, uSW:{value:0.38}, uGlint:{value:0.9}, uBuild:{value:1},
         uDist:{value:0}, uDZone:{value:0.34}, uDPx:{value:4}, uDCA:{value:2}, uDSeed:{value:0},
         uVPhoto:{value:0.55}, uVLines:{value:180}, uVScanD:{value:0.42}, uVInk:{value:0.3}, uVCA:{value:1.3}, uVFringe:{value:0.7}, uVJit:{value:1.2}, uVSlip:{value:12},
-        uFlash:{value:0}, uFogColor:{value:new THREE.Color(0xffffff)}, uFogDensity:{value:0}
+        uFlash:{value:0}, uFogColor:{value:new THREE.Color(0xffffff)}, uFogDensity:{value:0}, uFogStart:{value:0}
       }),
       vertexShader: [
         'varying vec2 vUv; varying float vDepth;',
@@ -9295,7 +9575,7 @@ var HOLO = (function(){
         'uniform float uShut, uSIn, uSOut, uSDirI, uSDirO, uSlats, uSW, uGlint, uBuild;',
         'uniform float uDist, uDZone, uDPx, uDCA, uDSeed;',
         'uniform float uVPhoto, uVLines, uVScanD, uVInk, uVCA, uVFringe, uVJit, uVSlip, uFlash;',
-        'uniform vec3 uFogColor; uniform float uFogDensity;',
+        'uniform vec3 uFogColor; uniform float uFogDensity, uFogStart;',
         GLSL_COL,
         'varying vec2 vUv; varying float vDepth;',
         'float h11(float n){ return fract(sin(n*127.1)*43758.5453); }',
@@ -9386,7 +9666,7 @@ var HOLO = (function(){
         '  c4 = clamp(c4, 0.0, 1.0) * uPow;',
         '  if(c4.a < 0.003) discard;',
         // fog by hand, like the shirts: the picture must sit at the panels\' distance
-        '  float fg = 1.0 - exp(-uFogDensity*uFogDensity*vDepth*vDepth);',
+        '  float fgD = max(0.0, vDepth - uFogStart); float fg = 1.0 - exp(-uFogDensity*uFogDensity*fgD*fgD);',
         '  c4.rgb = mix(c4.rgb, uFogColor*c4.a, clamp(fg, 0.0, 1.0));',
         '  gl_FragColor = vec4(c4.rgb, c4.a*(1.0 - uAdd));',
         '}'
@@ -10354,7 +10634,7 @@ var HOLO = (function(){
       iu.uVPhoto.value = P.vPhoto; iu.uVLines.value = IMG.cssH / Math.max(2.6/pr, P.vScanPx); iu.uVScanD.value = P.vScanDepth; iu.uVInk.value = P.vInk;
       iu.uVCA.value = P.vCA; iu.uVFringe.value = P.vFringe; iu.uVJit.value = P.vJit; iu.uVSlip.value = P.vSlip;
       iu.uFlash.value = SH.flash;
-      if(scene.fog){ iu.uFogColor.value.copy(scene.fog.color); iu.uFogDensity.value = scene.fog.density || 0; } else iu.uFogDensity.value = 0;
+      if(scene.fog){ iu.uFogColor.value.copy(scene.fog.color); iu.uFogDensity.value = scene.fog.density || 0; iu.uFogStart.value = (typeof siteFogStart === 'function') ? siteFogStart() : 0; } else iu.uFogDensity.value = 0;
     } else { imgQuad.visible = false; IMG.ok = false; }
 
     // beam uniforms
@@ -11975,7 +12255,13 @@ function storeBootSchedule(){
 //    photo and the card come out exactly the size they always have.
 // Changed from N, the panels are rebuilt in place — once the storefront is at rest (no product view
 // open or closing, no snake running), since an open captures where everything is.
-function rowPanelK(){ return (typeof DML !== 'undefined' && DML.P && DML.P.rowPanelH > 0.2) ? DML.P.rowPanelH : 1; }
+// The PHONE has its own set (a portrait screen, the camera profiles' split): rowPanelHPhone etc.
+function rowVal(k){
+  if(typeof DML === 'undefined' || !DML.P) return undefined;
+  var phone = window.innerWidth < window.innerHeight, pk = k + 'Phone';
+  return (phone && DML.P[pk] !== undefined) ? DML.P[pk] : DML.P[k];
+}
+function rowPanelK(){ var k = rowVal('rowPanelH'); return (k > 0.2) ? k : 1; }
 var _rowK = null;
 // A big ring's place for the current height: its baked y, pushed out by half the extra height. The
 // side is decided once, at its baked place: above the middle, below it, or AT it (a rim through the
@@ -12029,8 +12315,9 @@ function rowPanelRebuild(p, pH){
 function rowPanelsTick(){
   if(typeof DML === 'undefined' || typeof floors === 'undefined' || !floors.length) return;
   if(typeof SHIRT !== 'undefined'){
-    SHIRT.P.gap = DML.P.rowHoloGap;
-    if(SHIRT.P.fit !== DML.P.rowHoloSize){ SHIRT.P.fit = DML.P.rowHoloSize; SHIRT.refit(); }
+    SHIRT.P.gap = rowVal('rowHoloGap');
+    var _fit = rowVal('rowHoloSize');
+    if(SHIRT.P.fit !== _fit){ SHIRT.P.fit = _fit; SHIRT.refit(); }
   }
   var k = rowPanelK();
   if(k === _rowK) return;
@@ -61007,7 +61294,7 @@ function captureStorefrontReflections(){
   finally {for(var i=0;i<hidden.length;i++)hidden[i].visible=true;}
 }
 function init(){
-  scene=new THREE.Scene();scene.background=new THREE.Color(SITE_BG);scene.fog=new THREE.FogExp2(SITE_BG,0.018);
+  scene=new THREE.Scene();scene.background=new THREE.Color(SITE_BG);scene.fog=makeSiteFog(SITE_BG,SITE_FOG_D);   // RELATIVE FOG
   camera=new THREE.PerspectiveCamera(75,window.innerWidth/window.innerHeight,0.1,200);
   camera.userData.lastFaceY=0;
   camera.layers.enable(1);
@@ -100317,6 +100604,7 @@ function animate(){
 
   DML.update();         // the desktop detail split: scrim, background fade, resize reflow
   rowPanelsTick();      // ROW PANELS: the height (rebuilt once at rest), the shirts' distance and size
+  siteFogTick();        // RELATIVE FOG: where the storefront's haze starts, and how thick
   SHIRT.update(time);   // the garment projections: bob, sway, and the panel fade they ride
   holoPoses();          // …then the product's own shirt eased onto its photo (THE SPLIT)
 
