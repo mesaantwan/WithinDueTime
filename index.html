@@ -3177,11 +3177,14 @@ var DML = (function(){
     descLead:     0.35,   // when the description box's stream starts, as a share of the glass setting
     // ── THE CAMERA (2026-10-13): the storefront camera — a portrait screen (phones) and a landscape one ──
     camPhoneFov:  38,     // phone (portrait): vertical field of view, degrees — the zoom (wider = more fits, more perspective)
-    camPhoneDist: 3.06,   // phone: distance, × the automatic one (bigger = further back, more fits on screen)
+    camPhoneDist: 2.41,   // phone: distance, × the automatic one (bigger = further back, more fits on screen)
     camDeskFov:   51.5,  // desktop (landscape): vertical field of view, degrees
     camDeskDist:  1.13,   // desktop: distance, × the automatic one
     camDolly:     false,  // DOLLY ZOOM: changing a field of view moves the camera to keep the wheels the same size
     siteFog:      0.018,  // the storefront's haze (density), measured from where the camera normally stands
+    // ── THE PHONE SWIPE (2026-10-13): a vertical swipe moves the storefront like a web page ──
+    swipeGain:    1,      // 1 = the front of the wheel stays exactly under the finger, whatever the camera (bigger = more travel)
+    swipeGlide:   0.998,  // the flick's glide once the finger lifts, kept per millisecond (0.998 = an iPhone page; lower stops sooner)
     // ── THE ROW PANELS (2026-10-13): the storefront wheels' own panels, not the detail view ──
     rowPanelH:    1.14,   // panel height as a multiple of its width (1 = the original square); the rings move apart with it
     rowHoloGap:   1,   // how far each panel's shirt hologram floats in front of it, world units (was 0.28)
@@ -7406,6 +7409,9 @@ SHIRT.setFilter(DML.shirtVisible);
       row('Desktop: distance (×)', 'camDeskDist', 0.4, 5, 0.01) +
       chk('Dolly zoom (keep the framing)', 'camDolly') +
       row('Fog (haze over the rows)', 'siteFog', 0, 0.06, 0.001) +
+      row('Phone swipe: speed (\u00d7 finger)', 'swipeGain', 0.25, 3, 0.01) +
+      row('Phone swipe: glide after a flick', 'swipeGlide', 0.99, 0.999, 0.0005) +
+      note('A vertical swipe on a phone moves the rows like a web page: at 1 the front of the wheel stays exactly under the finger, whatever the camera\u2019s distance or field of view. The glide is how much of the flick\u2019s speed is kept each millisecond after the finger lifts \u2014 0.998 is an iPhone page, 0.99 stops quickly.') +
       note('The haze is measured from where the camera NORMALLY stands, so pulling the camera back no longer drowns the rows — they keep a little haze from their front to their back. 0 = none; 0.018 is the original.') +
       note('With dolly zoom on, a field-of-view change moves the camera to keep the wheels the same size on screen — the Vertigo effect: only the perspective changes. Off, the two are independent.') +
 
@@ -14342,7 +14348,36 @@ function onMM(e){
   renderer.domElement.parentElement.style.cursor=hoveredPanel?'pointer':'';
 }
 function onMU(e){pUp(e.clientX,e.clientY);}
-var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null, startX:0, startY:0, startTime:0, scrollMomentum:0 }; // locked: null,'scroll','wheel','vwheel'
+var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null, startX:0, startY:0, startTime:0, scrollMomentum:0,
+  wpp:0, hist:[], flingT:0, caught:false }; // locked: null,'scroll','wheel','vwheel'
+// scrollMomentum is the FLING: CSS px per millisecond (finger-down = positive), glided in animate().
+// wpp: camera world units per CSS px, solved once when a swipe locks to 'scroll' (touchScrollWorldPerPx).
+// hist: the finger's {y, t} over its last ~100 ms, for the release rate. caught: this touch landed on
+// a moving page — like a web page, that tap only stops it.
+var pUpNoTap = false;   // true around a pUp that must release everything but never act as a tap
+
+// THE PHONE SWIPE (2026-10-13): camera travel per pixel of finger travel, solved so the FRONT of the
+// nearest wheel stays exactly under the finger. It used to be tan(fov/2)·4.5·0.004 — tied to the field
+// of view and blind to the distance, so every camera profile change re-tuned the swipe. The storefront
+// camera is level and scrolling only moves it in y, so a point at depth D moves Δy·H / (2·D·tan(fov/2))
+// pixels; this inverts that. projectionMatrix[5] = 1/tan(fov/2) whatever the zoom or view offset.
+function touchScrollWorldPerPx(){
+  var fl = null, bd = 1e9;
+  for(var i = 0; i < floors.length; i++){
+    var d = Math.abs(floors[i].group.position.y - camera.position.y);
+    if(d < bd){ bd = d; fl = floors[i]; }
+  }
+  var r = (fl && fl.radius > 0) ? fl.radius * (fl.group.scale.x || 1) : 0;
+  var D = Math.max(1, CAM_ORBIT_RADIUS - r);
+  var H = renderer.domElement.clientHeight || window.innerHeight;
+  var g = (typeof DML !== 'undefined' && DML.P && DML.P.swipeGain > 0) ? DML.P.swipeGain : 1;
+  return 2 * D / (camera.projectionMatrix.elements[5] * H) * g;
+}
+// Touch event time on the performance.now() clock (an old Safari stamps events in epoch ms).
+function touchScrollNow(e){
+  var n = performance.now();
+  return (e && e.timeStamp > 0 && Math.abs(e.timeStamp - n) < 1000) ? e.timeStamp : n;
+}
 function onTS(e){
   e.preventDefault();
   if(treeUI.open) return;   // skill tree: pointer events drive pan/zoom/tap — keep the joystick out
@@ -14450,7 +14485,8 @@ function onTS(e){
     touchScroll.startX=tx; touchScroll.startY=ty;
     touchScroll.startTime=performance.now();
     touchScroll.velY=0; touchScroll.active=true; touchScroll.locked=null;
-    touchScroll.scrollMomentum=0;
+    touchScroll.caught=Math.abs(touchScroll.scrollMomentum)>0.15;   // ~2.5 px a frame: visibly moving
+    touchScroll.scrollMomentum=0; touchScroll.hist.length=0;
     // Tap hover animation
     updateHoverPanel(tx, ty);
     pDown(tx,ty);
@@ -14669,6 +14705,10 @@ function onTM(e){
       } else if(totalDY > totalDX * 0.8){
         // Predominantly vertical swipe — always page scroll
         touchScroll.locked='scroll';
+        // Grab the page where it IS (a camera still easing in would jump), at this camera's scale.
+        targetCameraY=camera.position.y;
+        touchScroll.wpp=touchScrollWorldPerPx();
+        dy=ty-touchScroll.startY;   // the slop since the finger landed: under the finger from pixel one
         HOLO.cancel();   // a vertical swipe that started on the hologram scrolls the page instead
         // Release any wheel/vwheel drag that pDown started
         if(isDragging){
@@ -14687,18 +14727,15 @@ function onTM(e){
     }
 
     if(touchScroll.locked==='scroll'){
-      var dist=4.5; var fovRad=camera.fov*Math.PI/180;
-      var halfH=Math.tan(fovRad/2)*dist;
-      var scrollAmt=dy*halfH*0.004;
-      if(!PANTS.isOpen()) targetCameraY+=scrollAmt;   // a touch scroll does not move the page under the product view
+      // 1:1 under the finger (touchScrollWorldPerPx); animate() puts the camera straight here.
+      if(!PANTS.isOpen()) targetCameraY+=dy*touchScroll.wpp;   // a touch scroll does not move the page under the product view
       var minY=STOREFRONT_MODEL.floorY(TOTAL_FLOORS-1);
       targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
-      // Track velocity for momentum
-      var now=performance.now();
-      var dt=(now-touchScroll.startTime)||1;
-      touchScroll.velY=scrollAmt;
-      touchScroll.scrollMomentum=touchScroll.scrollMomentum*0.7+scrollAmt*0.3;
-      touchScroll.startTime=now;
+      // The finger's recent path, for the release rate. Two samples minimum: a window pruned to one
+      // measures a flick as zero.
+      var now=touchScrollNow(e), h=touchScroll.hist;
+      h.push({y:ty, t:now});
+      while(h.length>2 && now-h[0].t>100) h.shift();
     }
 
     touchScroll.lastX=tx; touchScroll.lastY=ty;
@@ -14818,14 +14855,24 @@ function onTE(e){
     return;
   }
   if(touchScroll.active && touchScroll.locked==='scroll'){
-    // Apply momentum — use smoothed velocity scaled up for continued scrolling
-    touchScroll.scrollMomentum=touchScroll.scrollMomentum*4;
+    // THE FLING: the finger's rate over its last ~100 ms, in CSS px/ms, glided in animate(). A finger
+    // held still before lifting lets go dead. "Still" is measured against the finger's own event
+    // cadence, which drops to the frame rate on a slow phone (touchmove is rAF-aligned).
+    var h=touchScroll.hist, tEnd=touchScrollNow(e), v=0;
+    if(h.length>=2){
+      var hl=h[h.length-1], step=hl.t-h[h.length-2].t;
+      if(tEnd-hl.t < Math.max(70, step*2.5)) v=(hl.y-h[0].y)/Math.max(8, hl.t-h[0].t);
+    }
+    touchScroll.scrollMomentum=Math.max(-8,Math.min(8,v));
+    touchScroll.flingT=performance.now();
+    h.length=0;
   }
   var wasScroll = touchScroll.locked==='scroll';
   touchScroll.active=false; touchScroll.locked=null;
   // Release tap hover — will animate back to 0
   hoveredPanel=null;
-  if(!wasScroll) pUp(e.changedTouches[0].clientX,e.changedTouches[0].clientY);
+  // A tap that caught a moving page only stops it — the release still runs, but never as a tap.
+  if(!wasScroll){ pUpNoTap=touchScroll.caught; pUp(e.changedTouches[0].clientX,e.changedTouches[0].clientY); pUpNoTap=false; }
   else { isDragging=false; selectedFloor=null; renderer.domElement.parentElement.classList.remove('dragging'); }
 }
 
@@ -15316,7 +15363,7 @@ function updateCursor(cx,cy){
 function pUp(cx,cy){
   if(czReady && CZ.isLockingScroll()){ CZ.onPointerUp(); return; }
   if(VIEWER.pUp(cx,cy)) return;
-  if(HOLO.dragging()){ var _holoRel = HOLO.release(); isDragging=false; renderer.domElement.parentElement.classList.remove('dragging'); if(_holoRel === 'tap') PANTS.tapJeans(); return; }   // let go of the hologram: it coasts — a tap opens its product view
+  if(HOLO.dragging()){ var _holoRel = HOLO.release(); isDragging=false; renderer.domElement.parentElement.classList.remove('dragging'); if(_holoRel === 'tap' && !pUpNoTap) PANTS.tapJeans(); return; }   // let go of the hologram: it coasts — a tap opens its product view
   if(PANTS.pUp(cx,cy)) return;   // the jeans' product view: its orbs, fields and tiles
   pressedGlassMesh = null;
   // Release in-game window drag
@@ -15365,7 +15412,7 @@ function pUp(cx,cy){
     return;
   }
   var dist=Math.sqrt(Math.pow(cx-mouseDownX,2)+Math.pow(cy-mouseDownY,2));
-  var wasClick=dist<5&&(performance.now()-mouseDownTime)<300;
+  var wasClick=!pUpNoTap&&dist<5&&(performance.now()-mouseDownTime)<300;
   if(wasClick){
     mouse.x=(cx/renderer.domElement.clientWidth)*2-1;mouse.y=-(cy/renderer.domElement.clientHeight)*2+1;
     raycaster.setFromCamera(mouse,camera);
@@ -100485,19 +100532,29 @@ function animate(){
     floors.forEach(function(f){if(f.hasRings){f.rings.top.forEach(function(r){r.visible=true;});f.rings.bottom.forEach(function(r){r.visible=true;});}});
   }
   
-  // Apply touch scroll momentum with friction
-  if(Math.abs(touchScroll.scrollMomentum) > 0.0001){
-    if(!PANTS.isOpen()) targetCameraY+=touchScroll.scrollMomentum;
-    touchScroll.scrollMomentum*=0.88; // friction
+  // THE FLING (phone swipe): the release rate, keeping swipeGlide of its speed per millisecond and
+  // integrated exactly over the frame's real time — the same distance at 30 fps as at 120.
+  if(touchScroll.scrollMomentum !== 0){
+    var flNow=performance.now(), flDt=Math.min(100, Math.max(0, flNow-touchScroll.flingT));
+    touchScroll.flingT=flNow;
+    var flG=Math.max(0.95, Math.min(0.9999, DML.P.swipeGlide || 0.998)), flK=Math.pow(flG, flDt);
+    var flPx=touchScroll.scrollMomentum*(flK-1)/Math.log(flG);   // ∫ v·g^t dt over the frame
+    touchScroll.scrollMomentum*=flK;
+    if(!PANTS.isOpen()) targetCameraY+=flPx*touchScroll.wpp;
     var minY=STOREFRONT_MODEL.floorY(TOTAL_FLOORS-1);
+    if(targetCameraY<=minY || targetCameraY>=0) touchScroll.scrollMomentum=0;   // ran into an end: stop there
     targetCameraY=Math.max(minY,Math.min(0,targetCameraY));
+    if(Math.abs(touchScroll.scrollMomentum)<0.01) touchScroll.scrollMomentum=0;
   }
 
   // Skip the website's camera-y/tilt/lookAt code while the mini-game owns the camera.
   // Without this gate, the orbit-camera math fights our chase camera and the view
   // snaps back to the website even mid-transition.
   if(!gameMode.entering && !gameMode.active && !gameMode.decelerating) {
-  camera.position.y+=(targetCameraY-camera.position.y)*0.45;
+  // A phone swipe and its fling ARE the motion: following them through the 0.45 ease left the page a
+  // frame or two behind the finger. Desktop scroll and the nav jumps keep the ease.
+  if(touchScroll.locked==='scroll' || touchScroll.scrollMomentum!==0) camera.position.y=targetCameraY;
+  else camera.position.y+=(targetCameraY-camera.position.y)*0.45;
 
   // Nav scroll animation — overrides camera Y with smooth ease-out
   if(navScrollAnim.active){
