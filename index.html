@@ -91941,29 +91941,30 @@ function stepGameSim(dt){
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
-// MOBILE RUNNER — the phone's game (2026-10-15)
+// MOBILE RUNNER — the phone's game (2026-10-15, shapes + coins 10-16)
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // On a phone (GAME_LOW_FX) or any portrait screen, spinning the wheel no longer drops you onto the
-// planet. It drops you into an endless octagonal tube in deep space, running forward at one constant
-// speed, with nothing on screen but a small distance readout:
-//   • thumb left / right ........ slide across the face you are on, 1:1 with the thumb; keep going past
-//                                 its edge and the ship rolls over the corner onto the next wall, which
-//                                 becomes the floor — a long drag runs you right round the tube
+// planet. It drops you into an endless tube in deep space, running forward, with nothing on screen but
+// a small distance readout and a coin count:
+//   • thumb left / right ........ move round the tube — one screen width is the whole 360°, at the same
+//                                 rate everywhere; past a wall's edge the ship rolls onto the next wall,
+//                                 and that wall is the floor
 //   • swipe up .................. jump (the planet game's own hop)
-//   • swipe up, then left/right . while airborne: CLING to the neighbouring wall. Gravity turns to
-//                                 it, the ship flies onto it, and the view rolls until it is the floor.
-//                                 One L-shaped stroke or two separate swipes, either works.
+//   • swipe up, then left/right . while airborne: CLING to the neighbouring wall. Gravity turns to it,
+//                                 the ship flies onto it, and the view rolls until it is the floor
 //   • swipe down ................ in the air: slam down to land (the planet game's own slam)
-// Every one of the eight faces is reachable that way. Obstacles spawn in rows ahead; hit one and the
-// ship crashes for real (its forward speed goes into the obstacle, it tumbles, gravity still holds),
-// then a card offers RESTART or BACK TO STORE.
+// THE TUBE CHANGES SHAPE: it holds one regular polygon for a stretch (anything from a square to a
+// 16-sided tube), then folds into another — see THE COURSE. Obstacles spawn in rows; coins in strings
+// between them. Speed rises the longer you live and the rows get denser. Hit an obstacle and the ship
+// crashes for real (its forward speed goes into the obstacle, it tumbles, gravity still holds), then a
+// card offers RESTART or BACK TO STORE.
 //
 // THE SAME AS THE PLANET GAME, ON PURPOSE: the ship itself (gameMode.ship — same hull, same skin), its
 // whole procedural rig (wing sweep, flap springs, cockpit spin, recoil, underglow, wing thrusters —
 // every one of them fed from the ship's own measured motion, so they answer strafes, hops, clings,
-// landings and the crash with no new animation code), and the movement constants: hover height, jump
-// impulse, jump gravity, slam velocity, the boost acceleration, the km/h scale and the fixed 60 Hz
-// step. Only the WORLD is new.
+// landings, a wall folding under it and the crash with no new animation code), and the movement
+// constants: hover height, jump impulse, jump gravity, slam velocity, the boost acceleration, the km/h
+// scale and the fixed 60 Hz step. Only the WORLD is new.
 //
 // HOW IT SITS IN THE SITE: its own THREE.Scene and camera, drawn by the site's renderer. While it runs,
 // animate() hands it the frame and returns before any storefront work — no shop, no clouds, no cube
@@ -91973,36 +91974,44 @@ function stepGameSim(dt){
 // frost glass (DML.frostMaterial), frosting the runner's own frame.
 //
 // ?runner forces it on any screen; ?runner=play also starts it straight after load; ?runspeed=80 sets
-// the run speed in km/h. RUNNER.P holds every tunable.
+// the starting speed in km/h; ?runsides=5 holds the tube at one shape (testing). RUNNER.P holds every
+// tunable.
 var RUNNER = (function(){
   var Q = location.search;
   var FORCE = /[?&]runner(?:[=&]|$)/.test(Q), AUTOPLAY = /[?&]runner=play(?:&|$)/.test(Q);
-  var N = 8, SECT = Math.PI / 4;
+  var TAU = Math.PI * 2;
   // The planet game's distance scale: GAME_BASE_MAXSPEED (0.007 units a frame at 60 Hz) is what its
   // speed counter calls 15 km/h, so one world unit is (15 / 3.6 / 60) / 0.007 = 9.92 m.
   var M_PER_UNIT = (15 / 3.6 / 60) / GAME_BASE_MAXSPEED;
   var SLAM_V = 0.04;          // triggerSlam's hop slam (s.vertVel = -0.04), toward the floor
   var BG = 0x02040a;
-  var BEST_KEY = 'chrysolin_runner_best';
+  var BEST_KEY = 'chrysolin_runner_best', BANK_KEY = 'chrysolin_runner_coins';
 
   var P = {
-    apothem: 0.36,        // tube: axis → face. Face width = 2·apothem·tan(22.5°) ≈ 0.30 ≈ four ship spans
+    apothem: 0.36,        // tube: axis → every wall, whatever the shape — so the floor is always the same
+                          // distance from the middle and the hop, the camera and the cling feel the same
     speedKmh: 192,        // the run's STARTING speed, on the planet game's km/h scale (3× the first cut's 64)
     speedRampSec: 100,    // …and it grows ×(1 + t/this) the longer you stay alive: double at 100 s…
     speedMaxMul: 2.5,     // …up to this (480 km/h)
-    steerScreen: 0.12,    // fraction of the screen WIDTH a thumb travels per face: ~47 px on a phone, so one
-                          // screen width is the whole way round (0.55 → 0.30 → 0.12, "a lot" more sensitive)
-    steerHz: 7.0,         // the ship's chase of the thumb along the track (exact critically damped step)
-    cornerBand: 0.35,     // share of a face pitch, centred on each corner, over which the ship rolls onto the next wall
+    // THE COURSE: shapes from a square up to 16 sides, held for shapeSec, folding into the next over morphSec.
+    sidesMin: 4, sidesMax: 16, startSides: 8, holdSides: 0,
+    shapeSecMin: 9, shapeSecMax: 18, morphSec: 1.2,
+    morphClearBefore: 0.5, morphClearAfter: 0.7,   // no obstacle rows this many seconds either side of a fold
+    steerTurnScreen: 0.96,  // screen widths of thumb for one whole turn of the tube (= 47 px a face of the octagon)
+    steerHz: 7.0,         // the ship's chase of the thumb round the tube (exact critically damped step)
+    cornerBand: 0.35,     // share of a wall's angle, centred on each corner, over which the ship rolls onto the next wall
     rollHz: 6.0,          // the ship's up following that (and righting onto a new floor after a cling)
     camRollHz: 5.0,       // the camera's roll with your angle round the tube
     camFollowHz: 5.0,     // the camera's chase across the tube's cross-section
+    camPolarMix: 0.5,     // camera roll: 0 = the ship's up (level on every wall, turning only at corners), 1 = the
+                          // ship's angle round the tube (one even turn rate — but on a square that tilts the floor
+                          // 45° on screen at a wall's edge). Half and half: continuous, never more than ~22° off.
     camBack: 0.30, camUp: 0.085, camLook: 0.9,
     camHFov: 50, camVFovMin: 58, camVFovMax: 90,
     camJumpFollow: 0.45,  // share of a hop's height the camera rides up with
     bankK: 16,            // shipVisual roll per unit/frame of sideways speed (lean into the dodge)
-    swipeUp: 0.04,        // vertical swipe: this fraction of the screen HEIGHT within swipeMs (was 0.05)
-    swipeSide: 0.075,     // sideways flick (the cling): this fraction of the screen WIDTH within flickMs (was 0.10)
+    swipeUp: 0.04,        // vertical swipe: this fraction of the screen HEIGHT within swipeMs
+    swipeSide: 0.075,     // sideways flick (the cling): this fraction of the screen WIDTH within flickMs
     swipeMs: 260, flickMs: 170,
     lStrokeMs: 450,       // after a swipe-up, the same stroke's sideways leg clings for this long
     flickStartMs: 220,    // …and a NEW touch that flicks within this long of landing on the glass clings too
@@ -92011,30 +92020,33 @@ var RUNNER = (function(){
     // not how much time you get between decisions: ~1–1.7 s at the start, shrinking to rowGapEndMul of
     // that (0.5–0.8 s) as the run's difficulty ramps up over rampSec.
     rowGapSecMin: 1.0, rowGapSecMax: 1.65, rowGapEndMul: 0.5, firstRowSec: 2.5, firstRow: null,
-    ahead: 30, aheadSec: 4.5,   // rows exist this far ahead: the larger of the two
+    ahead: 30, aheadSec: 4.5,   // rows and coins exist this far ahead: the larger of the two
     rampSec: 120,         // obstacles get more frequent (denser rows, closer together) over this much time alive
+    // COINS: strings in the gaps between rows (and through the folds).
+    coinChance: 0.7, coinSpacingSec: 0.075, coinMax: 10,
+    coinR: 0.016, coinLift: 0.022,   // size; centre height above the ship's ride line
+    coinGrab: 0.034, coinMagnet: 0.10, coinPullHz: 7,
     fog: 0.075,
     crashSec: 1.1,        // the crash plays this long before the card
     hitScale: 0.85        // collision ellipsoid = the hull's measured half-extents × this
   };
   var _rsq = Q.match(/[?&]runspeed=([\d.]+)/); if(_rsq) P.speedKmh = +_rsq[1];
+  var _rsd = Q.match(/[?&]runsides=(\d+)/); if(_rsd) P.holdSides = P.startSides = Math.max(3, Math.min(32, +_rsd[1]));
 
   // Obstacles. Heights against the hop: the ship's centre peaks at hover + v²/2g = 0.021 + 0.133 = 0.154,
   // so a bar (top 0.048) is a hop and anything 0.2+ is not.
   var OB = {
-    bar:    { r: 0.017, y: 0.031 },          // a tube lying across the face: hop it
-    pillar: { r: 0.028, h: 0.20 },           // a tube standing on the face: steer round it
-    half:   { frac: 1.1, h: 0.22, d: 0.06 },  // a wall over a little more than half the face: take the gap
-    gate:   { h: 0.22, d: 0.06 }             // the whole face: only a cling gets past
+    bar:    { r: 0.017, y: 0.031 },          // a tube lying across the wall: hop it
+    pillar: { r: 0.028, h: 0.20 },           // a tube standing on the wall: steer round it
+    half:   { frac: 1.1, h: 0.22, d: 0.06 },  // a wall over a little more than half of it: take the gap
+    gate:   { h: 0.22, d: 0.06 }             // the whole wall: only a cling (or a roll round) gets past
   };
 
-  // ── Geometry. Face k's outward normal d (axis → face) and its tangent t (the ship's right on it).
-  // The ship looks down −Z with up = −d, so t = forward × up: face k+1 is to its right, k−1 its left.
-  function dX(k){ return Math.sin(k * SECT); }  function dY(k){ return -Math.cos(k * SECT); }
-  function tX(k){ return Math.cos(k * SECT); }  function tY(k){ return Math.sin(k * SECT); }
-  function fm(k){ return ((k % N) + N) % N; }
-  function halfW(){ return P.apothem * Math.tan(Math.PI / 8); }
+  // ── Directions. A wall is known by its NORMAL ANGLE φ, measured round the tube from straight down:
+  // d(φ) = (sin φ, −cos φ) points from the axis out through that wall, and t(φ) = (cos φ, sin φ) runs
+  // across it — the ship's right when that wall is its floor (it looks down −Z with up = −d).
   function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+  function wrapPi(a){ return a - TAU * Math.round(a / TAU); }
   function hover(){ return gameMode.surfaceState.hoverHeight; }   // 0.021
   function JI(){ return gameMode.physics.jumpImpulse; }            // 0.0171
   function JG(){ return gameMode.physics.jumpGravity; }            // 0.0011
@@ -92045,16 +92057,140 @@ var RUNNER = (function(){
   function maxAhead(){ return Math.max(P.ahead, baseSpeed() * 60 * P.speedMaxMul * P.aheadSec); }
   // The ship's half-extents (world units), measured off the hull by measureShip().
   var SHIP = { hw: 0.03, hh: 0.012, hl: 0.032, measured: false };
-  // How close to a face's edge the ship may ride: its wing tip then just clears the 135° corner.
   function edgeMargin(){ return SHIP.hw * 0.8; }
+  // SPEED GROWS WITH TIME ALIVE: ×(1 + t/speedRampSec), capped at speedMaxMul.
+  function speedMul(){ return S ? Math.min(P.speedMaxMul, 1 + S.runT / P.speedRampSec) : 1; }
+  // DIFFICULTY (0 → 1 over rampSec alive): denser rows, closer together.
+  function difficulty(){ return S ? Math.min(1, S.runT / P.rampSec) : 0; }
 
   var api = { active: false, P: P };
   var R = { built: false, compiled: false, preStep: 0, preWait: 0, preDone: false,
-            obs: [], pool: {}, geo: {}, mat: {}, acc: 0, flash: 0, shake: 0, lastM: -1,
+            obs: [], kits: {}, acc: 0, flash: 0, shake: 0, lastM: -1, lastC: -1, coinPulse: 0,
             keyL: false, keyR: false, cardShown: false, press: -1 };
   var S = null;
   var _m = new THREE.Matrix4(), _o = new THREE.Vector3(), _f = new THREE.Vector3(), _u = new THREE.Vector3(),
-      _v = new THREE.Vector3(), _q = new THREE.Quaternion(), _p = new THREE.Vector3(), _db = new THREE.Vector2();
+      _v = new THREE.Vector3(), _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _p = new THREE.Vector3(),
+      _db = new THREE.Vector2(), _sc = new THREE.Vector3(1, 1, 1), _zAx = new THREE.Vector3(0, 0, 1), _yAx = new THREE.Vector3(0, 1, 0);
+
+  // ════════════════════════════════════════ THE SHAPES ════════════════════════════════════════
+  // A cross-section is a convex polygon kept as its walls: normal angles phi[] (rising) and plane offsets
+  // h[] (axis → wall). A regular n-gon is n walls all at the apothem.
+  //
+  // THE FOLD between an a-gon and a b-gon is their MINKOWSKI BLEND: walls at the normals of BOTH, each
+  // at offset (1−t)·hA(φ) + t·hB(φ), with h the support function. That has three properties nothing
+  // else does at once: it is EXACTLY the a-gon at t = 0 and the b-gon at t = 1; every shape in between
+  // is still a convex polygon of flat walls (so the ride, the walls-as-planes contact and the cling all
+  // work unchanged mid-fold); and walls only ever grow from or shrink to a line — the old walls fold
+  // away as the new ones open, which is what you see.
+  var REG = {}, MORPH = {};
+  function regShape(n){
+    var s = REG[n];
+    if(s) return s;
+    s = REG[n] = { n: n, phi: new Float64Array(n), h: new Float64Array(n), span: TAU / n, reg: n };
+    for(var j = 0; j < n; j++){ s.phi[j] = j * TAU / n; s.h[j] = P.apothem; }
+    return s;
+  }
+  // Support function of the regular n-gon: its circumradius × cos(angle to the nearest vertex).
+  function supportReg(n, phi){
+    var step = TAU / n, x = phi / step - 0.5, d = (x - Math.round(x)) * step;
+    return P.apothem / Math.cos(Math.PI / n) * Math.cos(d);
+  }
+  function morphInfo(a, b){
+    var key = a + '_' + b, M = MORPH[key];
+    if(M) return M;
+    var all = [], i;
+    for(i = 0; i < a; i++) all.push(i * TAU / a);
+    for(i = 0; i < b; i++) all.push(i * TAU / b);
+    all.sort(function(x, y){ return x - y; });
+    var phi = [];
+    for(i = 0; i < all.length; i++) if(!phi.length || all[i] - phi[phi.length - 1] > 1e-6) phi.push(all[i]);
+    if(phi.length > 1 && TAU - phi[phi.length - 1] + phi[0] < 1e-6) phi.pop();
+    M = MORPH[key] = { n: phi.length, phi: phi, hA: phi.map(function(p){ return supportReg(a, p); }),
+                       hB: phi.map(function(p){ return supportReg(b, p); }), a: a, b: b };
+    return M;
+  }
+  // ── THE COURSE: sections laid down ahead of the run, each HOLDING one shape or FOLDING between two. ──
+  function holdSec(){ return P.shapeSecMin + Math.random() * (P.shapeSecMax - P.shapeSecMin); }
+  function pickSides(not){
+    if(P.holdSides) return P.holdSides;
+    var n;
+    do { n = P.sidesMin + Math.floor(Math.random() * (P.sidesMax - P.sidesMin + 1)); } while(n === not);
+    return n;
+  }
+  function extendCourse(zTo){
+    var c = S.course;
+    while(c[c.length - 1].z1 < zTo){
+      var last = c[c.length - 1], ups = unitsPerSec(), sec;
+      if(last.kind === 'hold' && !P.holdSides) sec = { z0: last.z1, z1: last.z1 + ups * P.morphSec, kind: 'morph', a: last.n, b: pickSides(last.n) };
+      else sec = { z0: last.z1, z1: last.z1 + ups * holdSec(), kind: 'hold', n: last.kind === 'morph' ? last.b : last.n };
+      c.push(sec);
+      buildChunk(sec);
+    }
+    while(c.length > 1 && c[0].z1 < S.z - 8){ disposeChunk(c[0]); c.shift(); }
+  }
+  function sectionAt(z){
+    var c = S.course;
+    for(var i = 0; i < c.length; i++) if(z < c[i].z1) return c[i];
+    return c[c.length - 1];
+  }
+  function foldT(sec, z){ var t = clamp((z - sec.z0) / (sec.z1 - sec.z0), 0, 1); return t * t * (3 - 2 * t); }
+  var _shA = { n: 0, phi: new Float64Array(48), h: new Float64Array(48), span: 0, reg: 0 },
+      _shB = { n: 0, phi: new Float64Array(48), h: new Float64Array(48), span: 0, reg: 0 };
+  function shapeInto(z, out){
+    var sec = sectionAt(z);
+    if(sec.kind === 'hold') return regShape(sec.n);
+    var M = morphInfo(sec.a, sec.b), t = foldT(sec, z);
+    out.n = M.n; out.reg = 0;
+    for(var i = 0; i < M.n; i++){ out.phi[i] = M.phi[i]; out.h[i] = (1 - t) * M.hA[i] + t * M.hB[i]; }
+    out.span = (1 - t) * TAU / sec.a + t * TAU / sec.b;
+    return out;
+  }
+  var _shZ = NaN, _shS = null;
+  function shapeAt(z){ if(z === _shZ && _shS) return _shS; _shZ = z; _shS = shapeInto(z, _shA); return _shS; }
+
+  // The ride: the ship's hover line is every wall pushed in by the hover height. Its point at polar angle
+  // th is where a ray from the axis at th first meets one of those planes.
+  var _ra = { x: 0, y: 0, r: 0, i: 0 }, _rb = { x: 0, y: 0, r: 0, i: 0 }, _rc = { x: 0, y: 0, r: 0, i: 0 };
+  function rideAt(sh, th, out){
+    var lh = hover(), sx = Math.sin(th), cy = Math.cos(th), best = Infinity, bi = 0;
+    for(var i = 0; i < sh.n; i++){
+      var c = sx * Math.sin(sh.phi[i]) + cy * Math.cos(sh.phi[i]);   // cos(th − φi)
+      if(c < 1e-4) continue;
+      var r = (sh.h[i] - lh) / c;
+      if(r < best){ best = r; bi = i; }
+    }
+    out.x = sx * best; out.y = -cy * best; out.r = best; out.i = bi;
+    return out;
+  }
+  // The ship's up along the ride: the chord across ±δ of the ride IS its tangent, and the tangent's angle is
+  // the up's (a wall at φ runs along t(φ)). On a flat wall that is exactly the wall's own up; within δ of a
+  // corner the chord straddles it, so the ship rolls over the corner as over a rounded edge — on any shape,
+  // with δ a fixed share of a wall's angle.
+  function upAt(sh, th){
+    var dl = P.cornerBand * 0.5 * sh.span;
+    rideAt(sh, th - dl, _ra); rideAt(sh, th + dl, _rb);
+    return th + wrapPi(Math.atan2(_rb.y - _ra.y, _rb.x - _ra.x) - th);
+  }
+  // Ray from (px, py) along d(g) to the ride: the point under the ship as gravity sees it. → distance.
+  function footDist(sh, px, py, g){
+    var lh = hover(), gx = Math.sin(g), gy = -Math.cos(g), best = Infinity;
+    for(var i = 0; i < sh.n; i++){
+      var nx = Math.sin(sh.phi[i]), ny = -Math.cos(sh.phi[i]), c = gx * nx + gy * ny;
+      if(c < 1e-4) continue;
+      var t = ((sh.h[i] - lh) - (px * nx + py * ny)) / c;
+      if(t < best) best = t;
+    }
+    return best === Infinity ? 0 : Math.max(0, best);
+  }
+  function polar(x, y, near){ return near + wrapPi(Math.atan2(x, -y) - near); }
+  // Exact critically damped step (one frame; v in units per frame). Closed form, so stiff springs stay
+  // stable — semi-implicit Euler with these rates flips the velocity's sign every frame and buzzes.
+  var _cd = { x: 0, v: 0 };
+  function cd(x, v, tgt, hz){
+    var w = 2 * Math.PI * hz / 60, e = x - tgt, ex = Math.exp(-w), c = v + w * e;
+    _cd.x = tgt + (e + c) * ex; _cd.v = (v - w * c) * ex;
+    return _cd;
+  }
 
   // ════════════════════════════════════════ BUILD ════════════════════════════════════════
   function build(){
@@ -92062,13 +92198,13 @@ var RUNNER = (function(){
     if(!gameMode.group) buildGameMode();
     var sc = R.scene = new THREE.Scene();
     sc.background = new THREE.Color(BG);
-    sc.fog = new THREE.FogExp2(BG, P.fog);   // the ship, trails and sparks fog like the hand-written shaders do
-    R.cam = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.004, 90);
+    sc.fog = new THREE.FogExp2(BG, P.fog);   // the ship, trails, sparks and coins fog like the hand-written shaders do
+    R.cam = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.004, 120);
     // Lights are built once and never toggled: a change in light count relinks every lit program.
     sc.add(new THREE.AmbientLight(0x6b78a8, 0.55));
     R.key = new THREE.DirectionalLight(0xe6ecff, 1.0); sc.add(R.key); sc.add(R.key.target);
     R.glow = new THREE.PointLight(0x10c4b2, 0.7, 1.4, 2.0); sc.add(R.glow);   // the seams' teal on the hull
-    buildTube(); buildStars(); buildObstacleKit(); buildSparks(); buildOverlay(); buildLayer();
+    buildTubeKit(); buildStars(); kit(8); kitPillar(); buildCoins(); buildSparks(); buildOverlay(); buildLayer();
     // Wing thrusters: the planet game's candle trails, our own two states so its pair is never touched.
     R.thr = { L: makeThrusterState(null), R: makeThrusterState(null) };
     // Their spine ages at `fade` a frame, so a trail is (1/fade) frames of travel long. At the planet
@@ -92082,49 +92218,38 @@ var RUNNER = (function(){
     R.built = true;
   }
 
-  // The tube: eight long quads, one shader. Lines are analytic (fwidth), so they hold one pixel-ish
-  // width at every distance and fade out before they alias. The mesh is snapped to whole tiles under
-  // the ship so the rings never swim.
-  function buildTube(){
-    var a = P.apothem, hw = halfW(), z0 = 4, z1 = -(maxAhead() + 8);   // long enough for the top speed's view
-    var pos = [], uu = [], ff = [], idx = [];
-    for(var k = 0; k < N; k++){
-      var cx = dX(k) * a, cy = dY(k) * a, tx = tX(k), ty = tY(k), b = pos.length / 3;
-      var c = [[-hw, z0], [hw, z0], [hw, z1], [-hw, z1]];
-      for(var i = 0; i < 4; i++){ pos.push(cx + tx * c[i][0], cy + ty * c[i][0], c[i][1]); uu.push(c[i][0]); ff.push(k); }
-      idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
-    }
-    var g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-    g.setAttribute('aU', new THREE.Float32BufferAttribute(uu, 1));
-    g.setAttribute('aF', new THREE.Float32BufferAttribute(ff, 1));
-    g.setIndex(idx);
-    var m = new THREE.ShaderMaterial({
+  // ── The tube: one mesh per course section, one shared shader. Lines are analytic (fwidth), so they
+  // hold one pixel-ish width at every distance and fade out before they alias. Each vertex carries where
+  // it is across its wall (aU), that wall's half-width there (aW — it changes through a fold) and the
+  // wall's normal angle (aPhi, for the floor's highlight). Each chunk sits at a whole-unit z, so the rings
+  // land on whole units of the run and never swim.
+  function buildTubeKit(){
+    R.tubeMat = new THREE.ShaderMaterial({
       uniforms: {
-        uHalfW: { value: hw }, uFloor: { value: 0 }, uFogD: { value: P.fog }, uAlpha: { value: 0.6 },
+        uFloor: { value: 0 }, uFlrCos: { value: Math.cos(0.6 * TAU / 8) }, uFogD: { value: P.fog }, uAlpha: { value: 0.6 },
         uSeam: { value: new THREE.Color(0.063, 0.769, 0.698) },   // the site accent, 16,196,178 — the HIGHLIGHT
         uRing: { value: new THREE.Color(0.16, 0.30, 0.78) },      // blue — the non-highlight
         uBase: { value: new THREE.Color(0.010, 0.018, 0.032) },
         uFogCol: { value: new THREE.Color(BG) }
       },
       vertexShader: [
-        'attribute float aU, aF; varying float vU, vF, vZ; varying vec3 vView;',
-        'void main(){ vU = aU; vF = aF; vZ = position.z;',
+        'attribute float aU, aW, aPhi; varying float vU, vW, vPhi, vZ; varying vec3 vView;',
+        'void main(){ vU = aU; vW = aW; vPhi = aPhi; vZ = position.z;',
         '  vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
       ].join('\n'),
       fragmentShader: [
-        'uniform float uHalfW, uFloor, uFogD, uAlpha; uniform vec3 uSeam, uRing, uBase, uFogCol;',
-        'varying float vU, vF, vZ; varying vec3 vView;',
+        'uniform float uFloor, uFlrCos, uFogD, uAlpha; uniform vec3 uSeam, uRing, uBase, uFogCol;',
+        'varying float vU, vW, vPhi, vZ; varying vec3 vView;',
         'float ln(float d, float w){ return exp(-max(d, 0.0) / max(w, 1e-6)); }',
         'void main(){',
         '  float pu = fwidth(vU), pz = fwidth(vZ);',
-        '  float du = uHalfW - abs(vU);',                                  // to the corner seam
+        '  float du = vW - abs(vU);',                                      // to the corner seam
         '  float seam = ln(du, pu * 1.4) + 0.45 * ln(du, pu * 9.0);',
         '  float fz = abs(fract(vZ + 0.5) - 0.5);',                         // to the nearest ring (1 unit apart)
         '  float ring = (ln(fz, pz * 1.2) + 0.25 * ln(fz, pz * 6.0)) * (1.0 - smoothstep(0.08, 0.3, pz));',
-        '  float dl = abs(abs(vU) - uHalfW / 3.0);',                        // two faint lane rules per face
-        '  float lane = ln(dl, pu * 1.1) * 0.2 * (1.0 - smoothstep(0.01, 0.04, pu));',
-        '  float flr = smoothstep(0.70, 1.0, cos(vF * 0.7853982 - uFloor));',  // the face that is the floor
+        '  float dl = abs(abs(vU) - vW / 3.0);',                            // two faint lane rules per wall
+        '  float lane = ln(dl, pu * 1.1) * 0.2 * (1.0 - smoothstep(0.01, 0.04, pu)) * smoothstep(0.02, 0.05, vW);',
+        '  float flr = smoothstep(uFlrCos, 1.0, cos(vPhi - uFloor));',      // the wall that is the floor
         '  vec3 col = uBase + uSeam * seam * (0.55 + 0.9 * flr) + uRing * ring * (0.45 + 0.55 * flr) + uSeam * lane * (0.4 + flr);',
         '  float a = clamp(uAlpha + 0.8 * max(max(seam, ring), lane), 0.0, 1.0);',
         '  float d = length(vView), fog = exp(-uFogD * uFogD * d * d);',
@@ -92133,14 +92258,49 @@ var RUNNER = (function(){
       ].join('\n'),
       transparent: true, depthWrite: false, side: THREE.DoubleSide, extensions: { derivatives: true }
     });
-    R.tube = new THREE.Mesh(g, m);
-    R.tube.frustumCulled = false; R.tube.renderOrder = -1;
-    R.scene.add(R.tube);
-    // An end cap in the fog colour, so the far mouth is the dark it fades into, not a disc of stars.
-    var cap = new THREE.Mesh(new THREE.CircleGeometry(a * 1.2, 8), new THREE.MeshBasicMaterial({ color: BG, fog: false }));
-    cap.position.z = z1 + 0.01; cap.rotation.z = SECT / 2;
-    R.tube.add(cap);
+    // A cap in the fog colour at the far end of what exists, so the mouth is the dark it fades into.
+    R.cap = new THREE.Mesh(new THREE.CircleGeometry(0.75, 40), new THREE.MeshBasicMaterial({ color: BG, fog: false }));
+    R.cap.frustumCulled = false;
+    R.scene.add(R.cap);
   }
+  // Corner of walls i and j (planes n·p = H): the polygon's vertex between them.
+  function corner(pi, Hi, pj, Hj, out, k){
+    var det = Math.sin(pj - pi);
+    out[k] = (Hj * Math.cos(pi) - Hi * Math.cos(pj)) / det;
+    out[k + 1] = (Math.sin(pi) * Hj - Math.sin(pj) * Hi) / det;
+  }
+  function buildChunk(sec){
+    var fold = sec.kind === 'morph', info = fold ? morphInfo(sec.a, sec.b) : regShape(sec.n);
+    var nF = info.n, K = fold ? 18 : 2, zO = Math.floor(sec.z0);
+    var pos = [], aU = [], aW = [], aPh = [], idx = [], V = new Float64Array(nF * 2), H = new Float64Array(nF), k, i;
+    for(k = 0; k < K; k++){
+      var zk = sec.z0 + (sec.z1 - sec.z0) * k / (K - 1), t = fold ? foldT(sec, zk) : 0;
+      for(i = 0; i < nF; i++) H[i] = fold ? (1 - t) * info.hA[i] + t * info.hB[i] : info.h[i];
+      for(i = 0; i < nF; i++){ var j = (i + 1) % nF; corner(info.phi[i], H[i], info.phi[j], H[j], V, i * 2); }
+      for(i = 0; i < nF; i++){
+        var pv = (i - 1 + nF) % nF, ax = V[pv * 2], ay = V[pv * 2 + 1], bx = V[i * 2], by = V[i * 2 + 1];
+        var cx = (ax + bx) * 0.5, cy = (ay + by) * 0.5, tx = Math.cos(info.phi[i]), ty = Math.sin(info.phi[i]);
+        var ua = (ax - cx) * tx + (ay - cy) * ty, ub = (bx - cx) * tx + (by - cy) * ty, w = Math.abs(ub - ua) * 0.5;
+        pos.push(ax, ay, -(zk - zO), bx, by, -(zk - zO));
+        aU.push(ua, ub); aW.push(w, w); aPh.push(info.phi[i], info.phi[i]);
+      }
+    }
+    for(k = 0; k + 1 < K; k++) for(i = 0; i < nF; i++){
+      var v00 = (k * nF + i) * 2, v10 = ((k + 1) * nF + i) * 2;
+      idx.push(v00, v00 + 1, v10 + 1, v00, v10 + 1, v10);
+    }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aU', new THREE.Float32BufferAttribute(aU, 1));
+    g.setAttribute('aW', new THREE.Float32BufferAttribute(aW, 1));
+    g.setAttribute('aPhi', new THREE.Float32BufferAttribute(aPh, 1));
+    g.setIndex(idx);
+    var m = sec.mesh = new THREE.Mesh(g, R.tubeMat);
+    m.frustumCulled = false; m.renderOrder = -1;
+    m.position.z = -(zO - S.zBase);
+    R.scene.add(m);
+  }
+  function disposeChunk(sec){ if(!sec.mesh) return; R.scene.remove(sec.mesh); sec.mesh.geometry.dispose(); sec.mesh = null; }
 
   // Stars on a shell round the camera (re-centred each frame, so the sky is at infinity).
   function buildStars(){
@@ -92165,14 +92325,18 @@ var RUNNER = (function(){
   // plane it is nearest, and the SECOND-nearest plane is its distance to an edge. Boxes and the
   // trapezoids alike, no wireframe geometry.
   //
-  // THE SECTOR RULE: a wall belongs to its face's SECTOR — the wedge from the tube's axis out to that
-  // face's two corners. A box as wide as the face would leave a triangular slot up each corner (the
-  // octagon widens with height) big enough to fly through; one as wide as the octagon would block the
-  // NEIGHBOURING faces too, which is exactly where a cling has to land. The sector is the one shape
-  // that seals its own face and nothing else, so walls narrow toward the axis: hw·(1 − y/a).
-  function sectorHalf(y){ return halfW() * (1 - y / P.apothem); }
+  // THE SECTOR RULE: a wall-obstacle belongs to its wall's SECTOR — the wedge from the tube's axis out to
+  // that wall's two corners. A box as wide as the wall would leave a triangular slot up each corner (the
+  // polygon widens with height) big enough to fly through; one as wide as the polygon would block the
+  // NEIGHBOURING walls too, which is exactly where a cling has to land. The sector is the one shape that
+  // seals its own wall and nothing else, so obstacles narrow toward the axis: hw·(1 − y/a).
+  //
+  // A wall's width depends on the shape (2·a·tan(π/n): 0.72 on a square, 0.14 on a 16-gon), so there is
+  // a kit per side count, made the first time the course needs it. Same shader source, so no new links.
+  function halfWn(n){ return P.apothem * Math.tan(Math.PI / n); }
+  function sectorHalf(y, n){ return halfWn(n) * (1 - y / P.apothem); }
   function prismGeo(poly, d){
-    // poly: [[u, y], …] counter-clockwise in the face's (u, y) plane; extruded over z ∈ [−d/2, d/2]
+    // poly: [[u, y], …] counter-clockwise in the wall's (u, y) plane; extruded over z ∈ [−d/2, d/2]
     var pos = [], nor = [], i, n = poly.length, zf = d / 2, zb = -d / 2;
     function tri(a, b, c, nx, ny, nz){ pos.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]); for(var k = 0; k < 3; k++) nor.push(nx, ny, nz); }
     for(i = 1; i + 1 < n; i++){
@@ -92250,29 +92414,50 @@ var RUNNER = (function(){
       extensions: { derivatives: true }
     });
   }
-  function buildObstacleKit(){
-    var hw = halfW(), a = P.apothem;
-    R.geo.bar = new THREE.CylinderGeometry(OB.bar.r, OB.bar.r, 2 * hw, 20, 1, false); R.geo.bar.rotateZ(Math.PI / 2);   // across the face
-    R.mat.bar = cylMat(new THREE.Vector3(1, 0, 0), OB.bar.r, hw);
-    R.geo.pillar = new THREE.CylinderGeometry(OB.pillar.r, OB.pillar.r, OB.pillar.h, 20, 1, false);
-    R.mat.pillar = cylMat(new THREE.Vector3(0, 1, 0), OB.pillar.r, OB.pillar.h / 2);
-    var gh = OB.gate.h, top = sectorHalf(gh);
-    R.geo.gate = prismGeo([[-hw, 0], [hw, 0], [top, gh], [-top, gh]], OB.gate.d);
-    R.mat.gate = prismMat(R.geo.gate, 1);
-    var hh = OB.half.h, inner = -hw + OB.half.frac * hw, topH = sectorHalf(hh);
-    R.geo.halfL = prismGeo([[-hw, 0], [inner, 0], [inner, hh], [-topH, hh]], OB.half.d);
-    R.geo.halfR = prismGeo([[-inner, 0], [hw, 0], [topH, hh], [-inner, hh]], OB.half.d);
-    R.mat.halfL = prismMat(R.geo.halfL, 0); R.mat.halfR = prismMat(R.geo.halfR, 0);
-    // A few of each up front, so the warm-up compile links every program before the first row.
-    ['bar', 'pillar', 'gate', 'halfL', 'halfR'].forEach(function(t){
-      R.pool[t] = [];
-      for(var i = 0; i < 6; i++){ var m = new THREE.Mesh(R.geo[t], R.mat[t]); m.visible = false; R.scene.add(m); R.pool[t].push(m); }
-    });
+  function kit(n){
+    if(R.kits[n]) return R.kits[n];
+    var hw = halfWn(n), K = R.kits[n] = { geo: {}, mat: {}, pool: {} };
+    K.geo.bar = new THREE.CylinderGeometry(OB.bar.r, OB.bar.r, 2 * hw, 20, 1, false); K.geo.bar.rotateZ(Math.PI / 2);   // across the wall
+    K.mat.bar = cylMat(new THREE.Vector3(1, 0, 0), OB.bar.r, hw);
+    var gh = OB.gate.h, top = sectorHalf(gh, n);
+    K.geo.gate = prismGeo([[-hw, 0], [hw, 0], [top, gh], [-top, gh]], OB.gate.d);
+    K.mat.gate = prismMat(K.geo.gate, 1);
+    var hh = OB.half.h, inner = -hw + OB.half.frac * hw, topH = sectorHalf(hh, n);
+    K.geo.halfL = prismGeo([[-hw, 0], [inner, 0], [inner, hh], [-topH, hh]], OB.half.d);
+    K.geo.halfR = prismGeo([[-inner, 0], [hw, 0], [topH, hh], [-inner, hh]], OB.half.d);
+    K.mat.halfL = prismMat(K.geo.halfL, 0); K.mat.halfR = prismMat(K.geo.halfR, 0);
+    for(var t in K.geo){
+      K.pool[t] = [];
+      if(n === 8) for(var i = 0; i < 6; i++){ var m = new THREE.Mesh(K.geo[t], K.mat[t]); m.visible = false; R.scene.add(m); K.pool[t].push(m); }
+      if(R.fogD) K.mat[t].uniforms.uFogD.value = R.fogD;
+    }
+    return K;
+  }
+  // The pillar does not depend on the wall's width: one for every shape.
+  function kitPillar(){
+    R.pil = { geo: new THREE.CylinderGeometry(OB.pillar.r, OB.pillar.r, OB.pillar.h, 20, 1, false),
+              mat: cylMat(new THREE.Vector3(0, 1, 0), OB.pillar.r, OB.pillar.h / 2), pool: [] };
+    for(var i = 0; i < 6; i++){ var m = new THREE.Mesh(R.pil.geo, R.pil.mat); m.visible = false; R.scene.add(m); R.pil.pool.push(m); }
   }
 
-  // Crash sparks — additive points whose colour fades to black (= out, under additive).
+  // ── COINS: one instanced draw. A gold disc that faces down the tube and spins about the wall's up. ──
+  var COIN_MAX = 96;
+  function buildCoins(){
+    var g = new THREE.CylinderGeometry(P.coinR, P.coinR, P.coinR * 0.28, 24, 1, false);
+    g.rotateX(Math.PI / 2);   // disc face toward the run
+    // Only half metallic on purpose: with no environment to reflect, a full metal reads as dark brass in here.
+    // And held UNDER 1.0 at its brightest — the renderer has no tone mapping, so lit + emissive past 1 is a flat
+    // yellow disc with no spin in it (measured: emissive 0.95 clipped the face solid). ~0.75 at the face, so
+    // the key light's shading across the spin still reads.
+    var m = new THREE.MeshStandardMaterial({ color: 0xe0a838, metalness: 0.4, roughness: 0.32, emissive: 0x7a5208, emissiveIntensity: 0.5 });
+    R.coinMesh = new THREE.InstancedMesh(g, m, COIN_MAX);
+    R.coinMesh.count = 0; R.coinMesh.frustumCulled = false;
+    R.scene.add(R.coinMesh);
+  }
+
+  // Crash sparks — additive points whose colour fades to black (= out, under additive). Coins pop in it too.
   function buildSparks(){
-    var n = 90;
+    var n = 120;
     R.sp = { n: n, pos: new Float32Array(n * 3), col: new Float32Array(n * 3), vel: new Float32Array(n * 3),
              life: new Float32Array(n), max: new Float32Array(n), base: new Float32Array(n * 3), live: 0 };
     var g = new THREE.BufferGeometry();
@@ -92315,20 +92500,27 @@ var RUNNER = (function(){
     }
   }
 
-  // ── The layer: input for the whole screen, plus the readout and the card's type. ──
+  // ── The layer: input for the whole screen, plus the readouts and the card's type. ──
   function el(tag, css, parent, text){ var e = document.createElement(tag); e.style.cssText = css; if(text != null) e.textContent = text; (parent || document.body).appendChild(e); return e; }
   function buildLayer(){
     var L = R.layer = el('div', 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483000;display:none;touch-action:none;' +
       '-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;overflow:hidden;cursor:default;');
     L.id = 'runnerLayer';
     var T = 'position:absolute;pointer-events:none;font-family:Arial,Helvetica,sans-serif;font-weight:700;white-space:nowrap;';
-    // A readout, not a control: tracked caps in the accent, top centre, clear of the notch.
+    // Readouts, not controls: tracked caps, top centre, clear of the notch. Distance in the accent;
+    // coins in their own gold, with a gold dot for the coin, under it.
     R.elDist = el('div', T + 'left:0;right:0;top:calc(14px + env(safe-area-inset-top, 0px));text-align:center;font-size:13px;' +
       'letter-spacing:0.24em;color:rgba(16,196,178,0.95);text-shadow:0 0 10px rgba(16,196,178,0.45);transition:opacity .25s;', L, '0 M');
+    R.elCoins = el('div', T + 'left:0;right:0;top:calc(34px + env(safe-area-inset-top, 0px));text-align:center;font-size:12px;' +
+      'letter-spacing:0.2em;color:rgba(255,205,90,0.95);text-shadow:0 0 10px rgba(255,190,60,0.45);transition:opacity .25s;', L);
+    R.elCoinDot = el('span', 'display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:1px;' +
+      'background:radial-gradient(circle at 35% 35%,#fff3c4,#ffc94a 55%,#b07a12);box-shadow:0 0 8px rgba(255,190,60,0.6);', R.elCoins);
+    R.elCoinN = el('span', 'display:inline-block;', R.elCoins, '0');
     R.elCard = el('div', T + 'left:0;right:0;text-align:center;opacity:0;', L);
     R.elK = el('div', 'font-size:11px;letter-spacing:0.34em;color:rgba(150,170,205,0.85);', R.elCard, 'DISTANCE');
     R.elV = el('div', 'font-size:44px;letter-spacing:0.06em;color:#f2f5fa;margin-top:8px;text-shadow:0 0 18px rgba(16,196,178,0.35);', R.elCard, '0 M');
     R.elBest = el('div', 'font-size:12px;letter-spacing:0.28em;color:rgba(16,196,178,0.95);margin-top:10px;', R.elCard, '');
+    R.elCardCoins = el('div', 'font-size:12px;letter-spacing:0.28em;color:rgba(255,205,90,0.95);margin-top:8px;', R.elCard, '');
     R.elBtn = [
       el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L, 'RESTART'),
       el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L, 'BACK TO STORE')
@@ -92366,53 +92558,39 @@ var RUNNER = (function(){
   }
 
   // ════════════════════════════════════════ THE RUN ════════════════════════════════════════
-  // THE TRACK IS ONE COORDINATE. On the ground the ship's place across the tube is `s`: distance along
-  // the hover line, measured all the way round, never wrapped — face k's centre is at s = k·F, its
-  // corners at k·F ± F/2. The thumb moves a target `sTgt` along that same line at one fixed rate, and
-  // NOTHING about it changes at an edge, a jump or a landing: crossing onto a wall is just s passing a
-  // corner. (The first cut kept a per-face coordinate and handed the target across at each edge, clamped
-  // it in the air, and rolled the camera in 45° steps — which is what read as the steering resetting
-  // every time you changed plane.)
-  function pitch(){ return 2 * (P.apothem - hover()) * Math.tan(Math.PI / 8); }   // F: one face of hover line
-  var _sp = { x: 0, y: 0, k: 0 };
-  function sPoint(s){
-    var F = pitch(), k = Math.round(s / F), u = s - k * F, lim = P.apothem - hover();
-    _sp.x = dX(k) * lim + tX(k) * u; _sp.y = dY(k) * lim + tY(k) * u; _sp.k = k; _sp.u = u;
-    return _sp;
-  }
-  // The ship's up along the track: the face's own up across its middle, rolling over each corner through
-  // a band either side of it (smoothstep, so the roll has no kink) — the corner driven as a rounded edge.
-  function upAtS(s){
-    var c = s / pitch(), n = Math.floor(c), m = c - n, b = P.cornerBand * 0.5;
-    var t = clamp((m - (0.5 - b)) / (2 * b), 0, 1);
-    return SECT * (n + t * t * (3 - 2 * t));
-  }
-  // Exact critically damped step (one frame; v in units per frame). Closed form, so stiff springs stay
-  // stable — semi-implicit Euler with these rates flips the velocity's sign every frame and buzzes.
-  var _cd = { x: 0, v: 0 };
-  function cd(x, v, tgt, hz){
-    var w = 2 * Math.PI * hz / 60, e = x - tgt, ex = Math.exp(-w), c = v + w * e;
-    _cd.x = tgt + (e + c) * ex; _cd.v = (v - w * c) * ex;
-    return _cd;
-  }
-  // SPEED GROWS WITH TIME ALIVE: ×(1 + t/speedRampSec), capped at speedMaxMul.
-  function speedMul(){ return S ? Math.min(P.speedMaxMul, 1 + S.runT / P.speedRampSec) : 1; }
-  // DIFFICULTY (0 → 1 over rampSec alive): denser rows, closer together.
-  function difficulty(){ return S ? Math.min(1, S.runT / P.rampSec) : 0; }
-
+  // THE TRACK IS ONE ANGLE. On the ground the ship's place round the tube is `th`, its polar angle about
+  // the axis, never wrapped; the thumb moves a target `thTgt` at one fixed rate (a whole turn per
+  // steerTurnScreen of screen width) and nothing about it changes at a corner, a jump, a landing or a
+  // fold — the shape decides only WHERE on the ride that angle is. An angle, not distance along the
+  // walls, because the walls themselves change: a square's perimeter is not a 16-gon's, but a turn is
+  // a turn. (The first cut kept a per-face coordinate and handed the target across at each edge; the
+  // second, distance along an octagon — which would have no meaning once the octagon is a pentagon.)
+  //
+  // In the air the ship is a point in the cross-section under gravity toward `g` (a wall's normal angle),
+  // against every wall of the shape at its own z as a plane; `th` there is the angle of the point under
+  // it, so the camera and the thumb carry straight through.
   function resetRun(){
     var lim = P.apothem - hover();
+    if(S && S.course) S.course.forEach(disposeChunk);
     S = { x: 0, y: -lim, vx: 0, vy: 0, z: 0, zBase: 0, v: 0, runT: 0,
-          s: 0, sv: 0, sTgt: 0,
-          face: 0, grounded: true, airF: 0, jumpBuf: -1e9,
+          th: 0, thV: 0, thTgt: 0, g: 0,
+          grounded: true, airF: 0, jumpBuf: -1e9,
           up: 0, upV: 0, cam: 0, camV: 0, cx: 0, cy: -lim, cvx: 0, cvy: 0,
-          dead: false, deadF: 0, av: new THREE.Vector3(), nextRow: (P.firstRow != null ? P.firstRow : P.firstRowSec * baseSpeed() * 60), best: loadBest() };
+          dead: false, deadF: 0, rest: false, av: new THREE.Vector3(),
+          nextRow: (P.firstRow != null ? P.firstRow : P.firstRowSec * baseSpeed() * 60), best: loadBest(),
+          coins: [], coinN: 0, course: null };
+    _shZ = NaN; _shS = null;
+    S.course = [{ z0: -20, z1: baseSpeed() * 60 * holdSec(), kind: 'hold', n: P.startSides }];
+    buildChunk(S.course[0]);
+    extendCourse(maxAhead() + 20);
     for(var i = 0; i < R.obs.length; i++) freeObs(R.obs[i]);
     R.obs.length = 0;
     for(var j = 0; j < R.sp.n; j++) R.sp.life[j] = 0;
+    R.coinMesh.count = 0;
     clearTrail(R.thr.L); clearTrail(R.thr.R);
-    R.cardShown = false; R.press = -1; R.lastM = -1;
-    R.elCard.style.opacity = 0; R.elBtn[0].style.opacity = 0; R.elBtn[1].style.opacity = 0; R.elDist.style.opacity = 1;
+    R.cardShown = false; R.press = -1; R.lastM = -1; R.lastC = -1; R.coinPulse = 0;
+    R.elCard.style.opacity = 0; R.elBtn[0].style.opacity = 0; R.elBtn[1].style.opacity = 0;
+    R.elDist.style.opacity = 1; R.elCoins.style.opacity = 1;
     resetRig();
     var s = gameMode.surfaceState;
     s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.speed = 0; s.isDrifting = false; s.driftBoost = false;
@@ -92430,17 +92608,19 @@ var RUNNER = (function(){
     if(gameMode.shipVisual){ gameMode.shipVisual.rotation.set(0, 0, 0); gameMode.shipVisual.position.set(0, 0, 0); }
   }
   function clearTrail(DT){ if(!DT) return; DT.points.length = 0; DT.lastPos = null; DT._prevMount = null; DT.boosting = false; DT.intensity = 0; if(DT.geo) DT.geo.setDrawRange(0, 0); }
-  function loadBest(){ try { return +(localStorage.getItem(BEST_KEY) || 0) || 0; } catch(e){ return 0; } }
-  function saveBest(m){ try { localStorage.setItem(BEST_KEY, String(m)); } catch(e){} }
+  function loadNum(k){ try { return +(localStorage.getItem(k) || 0) || 0; } catch(e){ return 0; } }
+  function saveNum(k, v){ try { localStorage.setItem(k, String(v)); } catch(e){} }
+  function loadBest(){ return loadNum(BEST_KEY); }
 
   // ── Moves. Same numbers as the planet game: jumpImpulse up the floor normal, jumpGravity toward it,
   // the slam's 0.04. The CLING is the one new move, and it is built from the same parts — a jump's
   // impulse, aimed at the neighbouring wall, with gravity handed over to that wall.
   function wantJump(){ if(S.dead) return; if(S.grounded) jump(); else S.jumpBuf = performance.now(); }
   function jump(){
-    var k = S.face;
+    // Gravity stays with the up the ship had when it left — a wall's own, or between two near a corner.
+    var g = S.g = S.up;
     S.grounded = false; S.airF = 0; S.jumpBuf = -1e9; S.clung = false;
-    S.vx -= dX(k) * JI(); S.vy -= dY(k) * JI();
+    S.vx -= Math.sin(g) * JI(); S.vy += Math.cos(g) * JI();
   }
   // ONE cling per jump. A single L-stroke's sideways leg is usually longer than the flick threshold,
   // and reading it again after the first cling turned one stroke into two wall changes (measured: a
@@ -92449,99 +92629,101 @@ var RUNNER = (function(){
   function cling(dir){
     if(S.dead || S.grounded || S.airF < 2 || S.clung) return;
     S.clung = true; G.muteT = performance.now() + 250;
-    var nk = (S.face += dir), hw = halfW(), mg = edgeMargin();
-    var vn = S.vx * dX(nk) + S.vy * dY(nk);
-    if(vn < 0){ S.vx -= dX(nk) * vn; S.vy -= dY(nk) * vn; }   // stop flying away from the new wall…
-    S.vx += dX(nk) * JI(); S.vy += dY(nk) * JI();             // …and leap at it
-    // The target moves to where you are across the new wall — the one place it must: left on the old
+    // The neighbouring wall: of this shape's walls, the one nearest a wall's angle on from gravity's.
+    var sh = shapeAt(S.z), want = S.g + dir * sh.span, best = 1e9, ng = want;
+    for(var i = 0; i < sh.n; i++){ var d = Math.abs(wrapPi(sh.phi[i] - want)); if(d < best){ best = d; ng = want + wrapPi(sh.phi[i] - want); } }
+    S.g = ng;
+    var gx = Math.sin(ng), gy = -Math.cos(ng), vn = S.vx * gx + S.vy * gy;
+    if(vn < 0){ S.vx -= gx * vn; S.vy -= gy * vn; }   // stop flying away from the new wall…
+    S.vx += gx * JI(); S.vy += gy * JI();             // …and leap at it
+    // The target moves to where you will meet the new wall — the one place it must: left on the old
     // floor, it would pull the ship straight back over the corner it just left.
-    S.sTgt = nk * pitch() + clamp(S.x * tX(nk) + S.y * tY(nk), -(hw - mg), hw - mg);
+    // …but kept out of its corner band: on a big wall (a square's is 0.72 wide) you meet the new wall low,
+    // right by the old floor, and riding there the ship would sit half-rolled between the two — the wall
+    // never quite became the floor. Clear of the band, it does.
+    var fd = footDist(sh, S.x, S.y, ng), keep = sh.span * (0.5 - P.cornerBand * 0.5 * 1.15);
+    S.thTgt = ng + clamp(wrapPi(polar(S.x + gx * fd, S.y + gy * fd, S.th) - ng), -keep, keep);
   }
   function slam(){
     if(S.dead || S.grounded) return;
-    var k = S.face, vn = S.vx * dX(k) + S.vy * dY(k);
-    if(vn < SLAM_V){ S.vx += dX(k) * (SLAM_V - vn); S.vy += dY(k) * (SLAM_V - vn); }
+    var gx = Math.sin(S.g), gy = -Math.cos(S.g), vn = S.vx * gx + S.vy * gy;
+    if(vn < SLAM_V){ S.vx += gx * (SLAM_V - vn); S.vy += gy * (SLAM_V - vn); }
   }
   function land(){
-    var k = S.face, F = pitch(), vn = S.vx * dX(k) + S.vy * dY(k);
-    S.vx -= dX(k) * vn; S.vy -= dY(k) * vn;                   // flat onto the face, as the planet game lands
     S.grounded = true;
-    // Back onto the track: where along it, and how fast. sTgt is untouched — the thumb never let go of it.
-    S.s = k * F + clamp(S.x * tX(k) + S.y * tY(k), -F / 2, F / 2);
-    S.sv = S.vx * tX(k) + S.vy * tY(k);
+    // Back onto the track: where round it, and how fast. thTgt is untouched — the thumb never let go of it.
+    S.th = polar(S.x, S.y, S.th);
+    S.thV = (S.x * S.vy - S.y * S.vx) / Math.max(1e-6, S.x * S.x + S.y * S.y);
     if(performance.now() - S.jumpBuf < P.jumpBufferMs) jump();
   }
 
   // ── One fixed 60 Hz step ──
   function step(){
-    var a = P.apothem, h = hover(), lim = a - h, hw = halfW(), mg = edgeMargin(), F = pitch();
+    var lh = hover();
     // Forward: spool up — at the planet game's boost acceleration, or faster where that would take
     // more than a second to reach the run speed (it is +60 km/h a second) — then ride the run speed,
     // which itself keeps rising the longer you live.
     var vt = runSpeed();
     if(!S.dead){ S.v = Math.min(vt, S.v + Math.max(GAME_BASE_MAXSPEED * (60 / 15) / 60, vt / 60)); S.runT += 1 / 60; }
-    else S.v *= S.grounded ? 0.90 : 0.985;
+    else S.v *= S.rest ? 0.90 : 0.985;
     var x0 = S.x, y0 = S.y, z0 = S.z;
     S.z += S.v;
-    if(!S.dead && (R.keyL || R.keyR)) S.sTgt += ((R.keyR ? 1 : 0) - (R.keyL ? 1 : 0)) * F / 10;
+    extendCourse(S.z + maxAhead() + 20);
+    var sh = shapeAt(S.z);
+    if(!S.dead && (R.keyL || R.keyR)) S.thTgt += ((R.keyR ? 1 : 0) - (R.keyL ? 1 : 0)) * TAU / 60;
     if(S.grounded && !S.dead){
-      // ON THE TRACK. One spring along the whole 360°; the face is wherever s is.
-      var r = cd(S.s, S.sv, S.sTgt, P.steerHz);
-      S.s = r.x; S.sv = r.v;
-      var p = sPoint(S.s);
-      S.face = p.k; S.x = p.x; S.y = p.y; S.vx = tX(p.k) * S.sv; S.vy = tY(p.k) * S.sv;
+      // ON THE TRACK. One spring round the whole 360°; the wall is wherever th is, on whatever shape.
+      var r = cd(S.th, S.thV, S.thTgt, P.steerHz);
+      S.th = r.x; S.thV = r.v;
+      rideAt(sh, S.th, _ra);
+      S.x = _ra.x; S.y = _ra.y; S.vx = S.x - x0; S.vy = S.y - y0;   // the motion is what the ride did — fold included
+      S.g = upAt(sh, S.th);
     } else {
-      var k = S.face, kx = dX(k), ky = dY(k), tx = tX(k), ty = tY(k);
+      var gx = Math.sin(S.g), gy = -Math.cos(S.g), tx = Math.cos(S.g), ty = Math.sin(S.g);
       if(!S.dead){
-        // In the air the thumb's target is still the target: the ship slides toward where it lies
-        // across this floor (as far as the floor goes). It is not clamped or moved — land, and the
-        // track picks it up exactly where it was.
+        // In the air the thumb's target is still the target: the ship slides across under gravity toward
+        // where it lies (no further than about a wall's angle away). Land, and the track takes it up.
+        rideAt(sh, S.th + clamp(S.thTgt - S.th, -0.6 * sh.span, 0.6 * sh.span), _rb);
         var u = S.x * tx + S.y * ty, uv = S.vx * tx + S.vy * ty;
-        var ra = cd(u, uv, clamp(S.sTgt - k * F, -(hw - mg), hw - mg), P.steerHz);
+        var ra = cd(u, uv, _rb.x * tx + _rb.y * ty, P.steerHz);
         S.vx += tx * (ra.x - u - uv); S.vy += ty * (ra.x - u - uv);   // lateral move this frame = the spring's
+        S.airF++;
       }
-      if(!S.grounded){ S.vx += kx * JG(); S.vy += ky * JG(); S.airF++; }
+      S.vx += gx * JG(); S.vy += gy * JG();
       S.x += S.vx; S.y += S.vy;
-      if(S.grounded){
-        // A wreck on the floor: slides to rest on its face; the corners are walls to it.
-        var u2 = S.x * tx + S.y * ty, vl = S.vx * tx + S.vy * ty, uc = clamp(u2, -(hw - mg), hw - mg);
-        if(uc !== u2 && vl * (u2 - uc) > 0) vl = 0;
-        vl *= 0.9;
-        S.x = kx * lim + tx * uc; S.y = ky * lim + ty * uc; S.vx = tx * vl; S.vy = ty * vl;
-      } else {
-        // In the air every face is a wall: the tube is convex, so inside all eight IS the whole test.
-        // The floor's plane is a landing; the rest are slid along.
-        for(var j = 0; j < N; j++){
-          var jx = dX(j), jy = dY(j), dj = S.x * jx + S.y * jy;
-          if(dj <= lim) continue;
-          S.x -= jx * (dj - lim); S.y -= jy * (dj - lim);
-          var vn = S.vx * jx + S.vy * jy;
-          if(fm(j) === fm(k)){
-            if(!S.dead) land();
-            else if(vn > 0){
-              S.vx -= jx * vn * 1.35; S.vy -= jy * vn * 1.35;   // a wreck bounces (restitution 0.35)…
-              S.v *= 0.8; S.av.multiplyScalar(0.7);
-              if(vn < 0.004){ var vn2 = S.vx * jx + S.vy * jy; S.vx -= jx * vn2; S.vy -= jy * vn2; S.grounded = true; }   // …until it lies there
-            }
-          } else if(vn > 0){ S.vx -= jx * vn; S.vy -= jy * vn; }
-          if(S.grounded) break;
-        }
+      // Every wall is a plane: the tube is convex, so inside all of them IS the whole test. A wall that
+      // faces gravity (within ~half a wall's angle) is a landing; the rest are slid along. A wreck
+      // bounces on the floor (restitution 0.35) and comes to rest.
+      S.rest = false;
+      var landed = false, tol = 0.6 * sh.span;
+      for(var i = 0; i < sh.n; i++){
+        var nx = Math.sin(sh.phi[i]), ny = -Math.cos(sh.phi[i]), dj = S.x * nx + S.y * ny - (sh.h[i] - lh);
+        if(dj <= 0) continue;
+        S.x -= nx * dj; S.y -= ny * dj;
+        var vn = S.vx * nx + S.vy * ny, floor = Math.abs(wrapPi(sh.phi[i] - S.g)) < tol;
+        if(floor && !S.dead) landed = true;
+        else if(floor){
+          if(vn > 0){ S.vx -= nx * vn * (vn < 0.004 ? 1 : 1.35); S.vy -= ny * vn * (vn < 0.004 ? 1 : 1.35); S.av.multiplyScalar(0.7); }
+          S.vx *= 0.9; S.vy *= 0.9; S.rest = true;
+        } else if(vn > 0){ S.vx -= nx * vn; S.vy -= ny * vn; }
       }
+      // The point under the ship is what the camera and the thumb read while it is up.
+      var fd = footDist(sh, S.x, S.y, S.g);
+      S.th = polar(S.x + gx * fd, S.y + gy * fd, S.th);
+      if(landed) land();
     }
-    // The ship's up: on the track it follows the rounded-corner up for where it is; in the air (and as a
-    // wreck) the up of the face gravity holds it to.
-    var ru = cd(S.up, S.upV, (S.grounded && !S.dead) ? upAtS(S.s) : S.face * SECT, P.rollHz);
+    // The ship's up: on the track the rounded up for where it is; in the air (and as a wreck) gravity's.
+    var ru = cd(S.up, S.upV, (S.grounded && !S.dead) ? S.g : S.g, P.rollHz);
     S.up = ru.x; S.upV = ru.v;
-    // The camera rolls with the ship's ANGLE ROUND THE TUBE — the polar angle of the point under it on
-    // its floor — so the whole 360° turns under you at one even rate as you steer, instead of stepping
-    // a face at a time. Measured at the foot, not the ship, so a hop straight up does not roll the view.
-    var kf = S.face, uf = S.x * tX(kf) + S.y * tY(kf);
-    var rc = cd(S.cam, S.camV, kf * SECT + Math.atan(uf / lim), P.camRollHz);
+    // The camera rolls with the ship's ANGLE ROUND THE TUBE, so the whole 360° turns under you at one
+    // even rate as you steer, on any shape.
+    var rc = cd(S.cam, S.camV, S.up + (S.th - S.up) * P.camPolarMix, P.camRollHz);
     S.cam = rc.x; S.camV = rc.v;
     poseShip();
     rig();
     if(!S.dead){ var o = sweptHit(x0, y0, z0); if(o) crash(o); }
     else S.deadF++;
+    stepCoins();
     placeCam(false);
     stepSparks();
     rows();
@@ -92568,7 +92750,7 @@ var RUNNER = (function(){
       // A wreck: no steering, no righting — it tumbles on the spin the impact gave it.
       var al = S.av.length();
       if(al > 1e-6){ _q.setFromAxisAngle(_v.copy(S.av).divideScalar(al), al); sh.quaternion.premultiply(_q); }
-      S.av.multiplyScalar(S.grounded ? 0.86 : 0.985);
+      S.av.multiplyScalar(S.rest ? 0.86 : 0.985);
       if(sv){ sv.rotation.x *= 0.9; sv.rotation.z *= 0.9; }
       _f.set(0, 0, -1).applyQuaternion(sh.quaternion);
     }
@@ -92590,9 +92772,8 @@ var RUNNER = (function(){
     // The wicks are a fixed LENGTH behind the ship, not a fixed number of frames: a spine point lives
     // 1/fade frames, so fade = speed / length. (At a frame count, tripling the speed tripled the trail and
     // ran it back under the lens.) And a step at speed is ~0.09 units, so each step lays samples along the
-    // whole stretch it covered, or the cone is a few straight segments.
-    // Past ~390 km/h one step is longer than the whole wick: points then live one frame (fade 1) and the
-    // samples cover only the last TRAIL_LEN of the step.
+    // whole stretch it covered, or the cone is a few straight segments. Past ~390 km/h one step is longer
+    // than the whole wick: points then live one frame and the samples cover only the last TRAIL_LEN.
     var fade = clamp(Math.max(S.v, 0) / TRAIL_LEN, 0.17, 1.0);
     ['L', 'R'].forEach(function(side){
       var DT = R.thr[side];
@@ -92616,13 +92797,13 @@ var RUNNER = (function(){
                          // right to the edge of the screen; 0.12 ends the whole wick well inside it.
 
   // ── The camera: chases the point under the ship on the floor (plus a share of a hop's height),
-  // rolls onto the floor's up, and sits a fixed distance behind. ──
+  // rolls with the ship's angle round the tube, and sits a fixed distance behind. ──
   function placeCam(snap){
-    var k = S.face, lim = P.apothem - hover();
-    var u = S.x * tX(k) + S.y * tY(k), dn = S.x * dX(k) + S.y * dY(k);
-    var alt = S.dead ? 0 : Math.max(0, lim - dn) * P.camJumpFollow;
-    var txp = dX(k) * (lim - alt) + tX(k) * u, typ = dY(k) * (lim - alt) + tY(k) * u;
-    if(snap){ S.cx = txp; S.cy = typ; S.cvx = S.cvy = 0; S.cam = S.up; S.camV = 0; }
+    var sh = shapeAt(S.z), gx = Math.sin(S.g), gy = -Math.cos(S.g);
+    var fd = (S.grounded && !S.dead) ? 0 : footDist(sh, S.x, S.y, S.g);
+    var keep = S.dead ? 0 : fd * (1 - P.camJumpFollow);            // ride up with a share of the hop
+    var txp = S.x + gx * keep, typ = S.y + gy * keep;
+    if(snap){ S.cx = txp; S.cy = typ; S.cvx = S.cvy = 0; S.cam = S.th; S.camV = 0; }
     else {
       var c = cd(S.cx, S.cvx, txp, P.camFollowHz); S.cx = c.x; S.cvx = c.v;
       c = cd(S.cy, S.cvy, typ, P.camFollowHz); S.cy = c.x; S.cvy = c.v;
@@ -92640,39 +92821,55 @@ var RUNNER = (function(){
   function rows(){
     var ahead = Math.max(P.ahead, unitsPerSec() * P.aheadSec);
     while(S.nextRow < S.z + ahead){
-      spawnRow(S.nextRow);
+      var ups = unitsPerSec(), z = S.nextRow, sec = sectionAt(z), skipTo = null;
+      // No rows on a fold, nor just either side of one: the walls are moving.
+      var c = S.course;
+      for(var k = 0; k < c.length; k++){
+        if(c[k].kind !== 'morph') continue;
+        var a0 = c[k].z0 - ups * P.morphClearBefore, a1 = c[k].z1 + ups * P.morphClearAfter;
+        if(z > a0 && z < a1){ skipTo = a1; break; }
+      }
       // The gap in seconds shrinks with the run's difficulty; in units it is that × the current speed.
       var gs = (P.rowGapSecMin + Math.random() * (P.rowGapSecMax - P.rowGapSecMin)) * (1 + (P.rowGapEndMul - 1) * difficulty());
-      S.nextRow += unitsPerSec() * gs;
+      var next = (skipTo != null ? skipTo : z) + ups * gs;
+      if(skipTo == null && sec.kind === 'hold') spawnRow(z, sec.n);
+      // Coins in the gap this leaves — through a fold too: the walls move, a coin string just rides them.
+      if(Math.random() < P.coinChance) spawnCoins(z + (next - z) * 0.3, z + (next - z) * 0.75);
+      S.nextRow = next;
     }
     for(var i = R.obs.length - 1; i >= 0; i--) if(R.obs[i].z < S.z - 1.5){ freeObs(R.obs[i]); R.obs.splice(i, 1); }
   }
-  function spawnRow(z){
-    var d = difficulty(), me = fm(S.face), pick = [], j;
-    for(j = 0; j < N; j++){
-      var p = 0.20 + 0.32 * d, near = Math.min(Math.abs(j - me), N - Math.abs(j - me));
-      if(near === 0) p *= 1.9; else if(near === 1) p *= 1.3;   // the run is on your face: so are the obstacles
-      pick.push(Math.random() < p ? wpick({ bar: 3, pillar: 3, half: 2.2, gate: 0.5 + 1.6 * d }) : null);
+  function spawnRow(z, n){
+    var d = difficulty(), span = TAU / n, me = ((Math.round(S.th / span) % n) + n) % n, pick = [], j;
+    for(j = 0; j < n; j++){
+      var p = 0.20 + 0.32 * d, near = Math.min(Math.abs(j - me), n - Math.abs(j - me));
+      if(near === 0) p *= 1.9; else if(near === 1) p *= 1.3;   // the run is on your wall: so are the obstacles
+      pick.push(Math.random() < p ? wpick({ bar: 3, pillar: 3, half: n > 13 ? 1.2 : 2.2, gate: 0.5 + 1.6 * d }) : null);
     }
-    // FAIRNESS: a gate is only beaten by a cling, so every gated face keeps one EMPTY neighbour to cling to.
-    for(j = 0; j < N; j++){
+    // FAIRNESS: a gate is only beaten by a cling or a roll round, so every gated wall keeps one EMPTY
+    // neighbour to get to.
+    for(j = 0; j < n; j++){
       if(pick[j] !== 'gate') continue;
-      var L = fm(j - 1), Rr = fm(j + 1);
+      var L = (j - 1 + n) % n, Rr = (j + 1) % n;
       if(pick[L] !== null && pick[Rr] !== null) pick[Math.random() < 0.5 ? L : Rr] = null;
     }
-    for(j = 0; j < N; j++) if(pick[j]) addObs(pick[j], j, z);
+    for(j = 0; j < n; j++) if(pick[j]) addObs(pick[j], j, z, n);
   }
-  function takeMesh(t){ var m = R.pool[t].pop(); if(!m){ m = new THREE.Mesh(R.geo[t], R.mat[t]); R.scene.add(m); } m.visible = true; return m; }
-  function freeObs(o){ o.mesh.visible = false; R.pool[o.mt].push(o.mesh); }
-  function addObs(type, j, z){
-    var hw = halfW(), o = { type: type, face: j, z: z, sector: false };
+  function takeMesh(o){
+    var pool = o.type === 'pillar' ? R.pil.pool : kit(o.n).pool[o.mt], m = pool.pop();
+    if(!m){ m = o.type === 'pillar' ? new THREE.Mesh(R.pil.geo, R.pil.mat) : new THREE.Mesh(kit(o.n).geo[o.mt], kit(o.n).mat[o.mt]); R.scene.add(m); }
+    m.visible = true; return m;
+  }
+  function freeObs(o){ o.mesh.visible = false; (o.type === 'pillar' ? R.pil.pool : R.kits[o.n].pool[o.mt]).push(o.mesh); }
+  function addObs(type, j, z, n){
+    var hw = halfWn(n), phi = j * TAU / n, o = { type: type, face: j, n: n, phi: phi, z: z, sector: false };
     var uc = 0, yc = 0;
     if(type === 'bar'){
       o.mt = 'bar'; yc = OB.bar.y;
       var rb = OB.bar.r * P.hitScale;
       o.u0 = -hw; o.u1 = hw; o.y0 = yc - rb; o.y1 = yc + rb; o.dz = rb; o.sector = true;
     } else if(type === 'pillar'){
-      o.mt = 'pillar'; var rp = OB.pillar.r, span = hw - rp - edgeMargin() * 0.5;
+      o.mt = 'pillar'; var rp = OB.pillar.r, span = Math.max(0, hw - rp - edgeMargin() * 0.5);
       uc = (Math.random() * 2 - 1) * span; yc = OB.pillar.h / 2;
       o.u0 = uc - rp * P.hitScale; o.u1 = uc + rp * P.hitScale; o.y0 = 0; o.y1 = OB.pillar.h; o.dz = rp * P.hitScale;
     } else if(type === 'half'){
@@ -92682,14 +92879,14 @@ var RUNNER = (function(){
     } else {
       o.mt = 'gate'; o.u0 = -hw; o.u1 = hw; o.y0 = 0; o.y1 = OB.gate.h; o.dz = OB.gate.d / 2; o.sector = true;
     }
-    var m = o.mesh = takeMesh(o.mt), a = P.apothem;
-    // Mesh frame: local X = the face's tangent, Y = up off the face, Z = along the tube.
-    m.position.set(dX(j) * a + tX(j) * uc - dX(j) * yc, dY(j) * a + tY(j) * uc - dY(j) * yc, -(z - S.zBase));
-    m.rotation.set(0, 0, j * SECT);
+    var m = o.mesh = takeMesh(o), a = P.apothem, dx = Math.sin(phi), dy = -Math.cos(phi), tx = Math.cos(phi), ty = Math.sin(phi);
+    // Mesh frame: local X = the wall's tangent, Y = up off the wall, Z = along the tube.
+    m.position.set(dx * a + tx * uc - dx * yc, dy * a + ty * uc - dy * yc, -(z - S.zBase));
+    m.rotation.set(0, 0, phi);
     R.obs.push(o);
   }
   // Ship (an ellipsoid of its measured half-extents) against each obstacle's shape in that obstacle's
-  // face frame. Scaling space by the ellipsoid's axes makes it a unit sphere and leaves an axis-aligned
+  // wall frame. Scaling space by the ellipsoid's axes makes it a unit sphere and leaves an axis-aligned
   // box axis-aligned, so clamp-and-measure is exact for the boxes. Sector walls clamp their width at
   // the height being tested.
   function hitTest(px, py, pz){
@@ -92697,13 +92894,14 @@ var RUNNER = (function(){
     for(var i = 0; i < R.obs.length; i++){
       var o = R.obs[i], dz = pz - o.z;
       if(dz > 0.3 || dz < -0.3) continue;
-      var j = o.face, u = px * tX(j) + py * tY(j), y = a - (px * dX(j) + py * dY(j));
-      var aligned = Math.abs(S.up - j * SECT - Math.round((S.up - j * SECT) / (2 * Math.PI)) * 2 * Math.PI) < SECT * 0.5;
+      var dx = Math.sin(o.phi), dy = -Math.cos(o.phi), tx = Math.cos(o.phi), ty = Math.sin(o.phi);
+      var u = px * tx + py * ty, y = a - (px * dx + py * dy);
+      var aligned = Math.abs(wrapPi(S.up - o.phi)) < Math.PI / o.n;
       var ru = (aligned ? SHIP.hw : (SHIP.hw + SHIP.hh) * 0.5) * P.hitScale;
       var ry = (aligned ? SHIP.hh : (SHIP.hw + SHIP.hh) * 0.5) * P.hitScale;
       var rz = SHIP.hl * P.hitScale;
       var cy = clamp(y, o.y0, o.y1), u0 = o.u0, u1 = o.u1;
-      if(o.sector){ var sh = sectorHalf(cy); u0 = Math.max(u0, -sh); u1 = Math.min(u1, sh); }
+      if(o.sector){ var shh = sectorHalf(cy, o.n); u0 = Math.max(u0, -shh); u1 = Math.min(u1, shh); }
       var cu = clamp(u, u0, u1), cz = clamp(dz, -o.dz, o.dz);
       var qu = (u - cu) / ru, qy = (y - cy) / ry, qz = (dz - cz) / rz;
       if(qu * qu + qy * qy + qz * qz < 1) return o;
@@ -92724,18 +92922,86 @@ var RUNNER = (function(){
     return null;
   }
 
+  // ── COINS. A string is laid round the ride: a LINE down one wall, a SPIRAL round the tube, or a WEAVE
+  // either side of a line. Each coin sits coinLift above the ride, on whatever the shape is at its own z
+  // (so a string laid through a fold follows the walls as they move). Inside coinMagnet it is pulled to
+  // the ship on a critically damped spring; inside coinGrab it is collected — a gold pop, the count, and
+  // a kick to the cockpit diamond's spin (the hull's own reaction to an event, as a shot kicks it). ──
+  var _shC = { n: 0, phi: new Float64Array(48), h: new Float64Array(48), span: 0, reg: 0 };
+  function spawnCoins(zA, zB, onLine){
+    var ups = unitsPerSec(), gap = P.coinSpacingSec * ups, count = Math.min(P.coinMax, Math.floor((zB - zA) / gap));
+    if(count < 3) return;
+    var sh0 = shapeInto(zA, _shC), span = sh0.span, kind = Math.random();
+    var th0 = S.th + (Math.random() * 2 - 1) * span * 1.2;
+    if(sh0.reg) th0 = Math.round(th0 / span) * span;   // a held shape: start on a wall's middle
+    if(onLine){ th0 = S.th; kind = 0; }                // (test surface: a straight line on the ship's own path)
+    var turn = (Math.random() < 0.5 ? -1 : 1) * span * 0.22;
+    for(var i = 0; i < count; i++){
+      if(S.coins.length >= COIN_MAX) return;
+      var z = zA + i * gap, th = th0;
+      if(kind < 0.4){} else if(kind < 0.75) th = th0 + turn * i; else th = th0 + Math.sin(i * 0.9) * span * 0.35;
+      // (the ride point is copied out before upAt runs — it re-uses the same scratch for its chord)
+      var sh = shapeInto(z, _shC), ra = rideAt(sh, th, _rc), rx = ra.x, ry = ra.y, up = upAt(sh, th);
+      S.coins.push({ z: z, x: rx - Math.sin(up) * P.coinLift, y: ry + Math.cos(up) * P.coinLift, up: up,
+                     spin: Math.random() * TAU, pulled: false, rx: 0, ry: 0, rz: 0, vx: 0, vy: 0, vz: 0 });
+    }
+  }
+  function stepCoins(){
+    var list = S.coins, sx = S.x, sy = S.y, sz = S.z;
+    for(var i = list.length - 1; i >= 0; i--){
+      var c = list[i];
+      c.spin += 0.09;
+      if(c.z < sz - 1.0){ list.splice(i, 1); continue; }
+      if(S.dead) continue;
+      if(!c.pulled){
+        // Measured at the CLOSEST point of this step, not its end: at the top speed a step is 0.22 units
+        // and a coin a little off the line would fall between two samples, never in reach of either.
+        var dx = c.x - sx, dy = c.y - sy, dzA = c.z - sz, dzB = dzA + S.v;
+        var dzc = (dzA <= 0 && dzB >= 0) ? 0 : (Math.abs(dzA) < Math.abs(dzB) ? dzA : dzB);
+        var d2 = dx * dx + dy * dy + dzc * dzc, dz = dzA;
+        if(d2 < P.coinMagnet * P.coinMagnet){ c.pulled = true; c.rx = dx; c.ry = dy; c.rz = dz; }
+      }
+      if(c.pulled){
+        // Pulled in the ship's frame, so the coin keeps up with it and closes the gap on the spring.
+        var r = cd(c.rx, c.vx, 0, P.coinPullHz); c.rx = r.x; c.vx = r.v;
+        r = cd(c.ry, c.vy, 0, P.coinPullHz); c.ry = r.x; c.vy = r.v;
+        r = cd(c.rz, c.vz, 0, P.coinPullHz); c.rz = r.x; c.vz = r.v;
+        c.x = sx + c.rx; c.y = sy + c.ry; c.z = sz + c.rz;
+        if(c.rx * c.rx + c.ry * c.ry + c.rz * c.rz < P.coinGrab * P.coinGrab){ collect(c); list.splice(i, 1); }
+      }
+    }
+  }
+  function collect(c){
+    S.coinN++; R.coinPulse = 1;
+    _p.set(c.x, c.y, -(c.z - S.zBase));
+    burst(_p, 10, true);
+    if(typeof ckptSpinKick === 'function') ckptSpinKick(0.6);
+  }
+  function drawCoins(){
+    var list = S.coins, n = Math.min(list.length, COIN_MAX), m = R.coinMesh;
+    for(var i = 0; i < n; i++){
+      var c = list[i];
+      _q.setFromAxisAngle(_zAx, c.up); _q2.setFromAxisAngle(_yAx, c.spin); _q.multiply(_q2);
+      _p.set(c.x, c.y, -(c.z - S.zBase));
+      _m.compose(_p, _q, _sc);
+      m.setMatrixAt(i, _m);
+    }
+    m.count = n;
+    if(n) m.instanceMatrix.needsUpdate = true;
+  }
+
   // ── The crash: real momentum, not an animation. The forward speed goes into the obstacle (a little
   // comes back), the hit throws the nose up and the ship off the floor, and it tumbles on that spin
   // until gravity and the floor have taken it all. The rig reacts to the deceleration on its own. ──
   function crash(o){
-    var k = S.face, v0 = S.v;
+    var v0 = S.v, g = S.g = S.up;
     S.dead = true; S.deadF = 0; S.grounded = false;
     S.v = -0.22 * v0;
     // …capped at a jump's impulse: at run speed the raw share threw the wreck across the tube.
     var pop = Math.min(v0 * 0.35, JI());
-    S.vx += -dX(k) * pop; S.vy += -dY(k) * pop;
-    var side = (S.x * tX(o.face) + S.y * tY(o.face)) - (o.u0 + o.u1) * 0.5;
-    S.av.set(tX(k), tY(k), 0).multiplyScalar(0.20);                    // nose up, about the ship's right
+    S.vx -= Math.sin(g) * pop; S.vy += Math.cos(g) * pop;
+    var side = (S.x * Math.cos(o.phi) + S.y * Math.sin(o.phi)) - (o.u0 + o.u1) * 0.5;
+    S.av.set(Math.cos(g), Math.sin(g), 0).multiplyScalar(0.20);         // nose up, about the ship's right
     S.av.z += (side >= 0 ? -1 : 1) * 0.10;                             // and a roll away from the side it struck
     var sh = gameMode.ship;
     _p.copy(sh.position).addScaledVector(gameMode.surfaceState.forward, SHIP.hl);
@@ -92744,25 +93010,27 @@ var RUNNER = (function(){
     // The distance is what was RUN: taken at impact, before the bounce carries the wreck back.
     var m = S.crashM = Math.floor(S.z * M_PER_UNIT);
     S.newBest = m > S.best;
-    if(S.newBest){ S.best = m; saveBest(m); }
+    if(S.newBest){ S.best = m; saveNum(BEST_KEY, m); }
+    S.bank = loadNum(BANK_KEY) + S.coinN; saveNum(BANK_KEY, S.bank);
   }
-  function burst(p, n){
-    var sp = R.sp, k = S.face;
+  var GOLD = new THREE.Color(1.0, 0.78, 0.32);
+  function burst(p, n, gold){
+    var sp = R.sp, gx = Math.sin(S.g), gy = -Math.cos(S.g);
     for(var i = 0, made = 0; i < sp.n && made < n; i++){
       if(sp.life[i] > 0) continue;
-      var th = Math.random() * Math.PI * 2, ph = Math.acos(Math.random() * 2 - 1), s = 0.006 + Math.random() * 0.022;
+      var th = Math.random() * Math.PI * 2, ph = Math.acos(Math.random() * 2 - 1), s = (gold ? 0.003 : 0.006) + Math.random() * (gold ? 0.008 : 0.022);
       sp.pos[i * 3] = p.x; sp.pos[i * 3 + 1] = p.y; sp.pos[i * 3 + 2] = p.z;
-      sp.vel[i * 3] = Math.sin(ph) * Math.cos(th) * s - dX(k) * 0.008;
-      sp.vel[i * 3 + 1] = Math.sin(ph) * Math.sin(th) * s - dY(k) * 0.008;
-      sp.vel[i * 3 + 2] = Math.cos(ph) * s * 0.6 + S.v * 0.5;
-      sp.max[i] = sp.life[i] = 30 + Math.random() * 30;
-      var hot = Math.random() < 0.35;
-      sp.base[i * 3] = hot ? 1.0 : HAZ_EDGE.r; sp.base[i * 3 + 1] = hot ? 0.92 : HAZ_EDGE.g; sp.base[i * 3 + 2] = hot ? 0.85 : HAZ_EDGE.b;
+      sp.vel[i * 3] = Math.sin(ph) * Math.cos(th) * s - gx * 0.008;
+      sp.vel[i * 3 + 1] = Math.sin(ph) * Math.sin(th) * s - gy * 0.008;
+      sp.vel[i * 3 + 2] = Math.cos(ph) * s * 0.6 + (gold ? -S.v * 0.9 : S.v * 0.5);
+      sp.max[i] = sp.life[i] = gold ? 14 + Math.random() * 10 : 30 + Math.random() * 30;
+      var hot = Math.random() < 0.35, base = gold ? GOLD : HAZ_EDGE;
+      sp.base[i * 3] = hot ? 1.0 : base.r; sp.base[i * 3 + 1] = hot ? 0.92 : base.g; sp.base[i * 3 + 2] = hot ? 0.85 : base.b;
       made++;
     }
   }
   function stepSparks(){
-    var sp = R.sp, k = S.face, any = false, gx = dX(k) * JG() * 0.6, gy = dY(k) * JG() * 0.6;
+    var sp = R.sp, any = false, gx = Math.sin(S.g) * JG() * 0.6, gy = -Math.cos(S.g) * JG() * 0.6;
     for(var i = 0; i < sp.n; i++){
       if(sp.life[i] <= 0){ sp.col[i * 3] = sp.col[i * 3 + 1] = sp.col[i * 3 + 2] = 0; continue; }
       any = true; sp.life[i]--;
@@ -92785,6 +93053,7 @@ var RUNNER = (function(){
     gameMode.ship.position.z += D;
     if(gameMode.flapMotion && gameMode.flapMotion.prevPos) gameMode.flapMotion.prevPos.z += D;
     for(i = 0; i < R.obs.length; i++) R.obs[i].mesh.position.z += D;
+    for(i = 0; i < S.course.length; i++) if(S.course[i].mesh) S.course[i].mesh.position.z += D;
     ['L', 'R'].forEach(function(s){ var DT = R.thr[s]; for(var q = 0; q < DT.points.length; q++) DT.points[q].p.z += D; if(DT.lastPos) DT.lastPos.z += D; if(DT._prevMount) DT._prevMount.z += D; });
     for(i = 0; i < R.sp.n; i++) R.sp.pos[i * 3 + 2] += D;
     R.cam.position.z += D;
@@ -92797,6 +93066,7 @@ var RUNNER = (function(){
     var n = 0;
     while(R.acc >= GAME_FIXED_DT && n < 5){ step(); R.acc -= GAME_FIXED_DT; n++; }
     R.flash = Math.max(0, R.flash - dt / GAME_FLASH_SEC);
+    R.coinPulse = Math.max(0, R.coinPulse - dt * 5);
     render();
     dom();
   }
@@ -92805,21 +93075,25 @@ var RUNNER = (function(){
     var t = (S.deadF / 60 - P.crashSec) / 0.3;
     t = clamp(t, 0, 1); return t * t * (3 - 2 * t);
   }
+  function setFog(fogD){
+    if(fogD === R.fogD) return;
+    R.fogD = fogD; R.scene.fog.density = fogD; R.tubeMat.uniforms.uFogD.value = fogD; R.pil.mat.uniforms.uFogD.value = fogD;
+    for(var n in R.kits) for(var mk in R.kits[n].mat) R.kits[n].mat[mk].uniforms.uFogD.value = fogD;
+  }
   function render(){
     var W = window.innerWidth, H = window.innerHeight, asp = W / Math.max(1, H);
     var vf = 2 * Math.atan(Math.tan(P.camHFov * Math.PI / 360) / asp) * 180 / Math.PI;
     vf = clamp(vf, P.camVFovMin, P.camVFovMax);
     if(R.cam.aspect !== asp || R.cam.fov !== vf){ R.cam.aspect = asp; R.cam.fov = vf; R.cam.updateProjectionMatrix(); }
     R.stars.position.copy(R.cam.position);
-    R.tube.position.z = -(Math.floor(S.z) - S.zBase);
-    R.tube.material.uniforms.uFloor.value = S.up;
+    var shp = shapeAt(S.z);
+    R.tubeMat.uniforms.uFloor.value = S.up;
+    R.tubeMat.uniforms.uFlrCos.value = Math.cos(0.6 * shp.span);
+    R.cap.position.set(0, 0, -(S.z + maxAhead() + 10 - S.zBase));
     // The fog thins as the run speeds up, so what you can see ahead stays the same TIME away (the view
     // distance is ∝ 1/density). Every hand-written material and the scene's own fog share the one value.
-    var fogD = P.fog / speedMul();
-    if(fogD !== R.fogD){
-      R.fogD = fogD; R.scene.fog.density = fogD; R.tube.material.uniforms.uFogD.value = fogD;
-      for(var mk in R.mat) if(R.mat[mk].uniforms && R.mat[mk].uniforms.uFogD) R.mat[mk].uniforms.uFogD.value = fogD;
-    }
+    setFog(P.fog / speedMul());
+    drawCoins();
     // Key light from over the camera's shoulder; the teal glow rides just above the ship.
     var sh = gameMode.ship;
     R.key.position.copy(R.cam.position).addScaledVector(R.cam.up, 0.6).add(_v.set(0, 0, 0.4));
@@ -92852,7 +93126,7 @@ var RUNNER = (function(){
   }
   // Card layout, in CSS px — chrome is sized from the frame, never from world units.
   function layout(W, H){
-    var bw = Math.round(Math.min(W * 0.66, 300)), bh = 56, gap = 14, y0 = Math.round(H * 0.56);
+    var bw = Math.round(Math.min(W * 0.66, 300)), bh = 56, gap = 14, y0 = Math.round(H * 0.58);
     R.btns[0].r = { x: Math.round((W - bw) / 2), y: y0, w: bw, h: bh };
     R.btns[1].r = { x: Math.round((W - bw) / 2), y: y0 + bh + gap, w: bw, h: bh };
   }
@@ -92881,18 +93155,22 @@ var RUNNER = (function(){
   function dom(){
     var m = Math.floor(S.z * M_PER_UNIT);
     if(m !== R.lastM && !S.dead){ R.lastM = m; R.elDist.textContent = m.toLocaleString('en-US') + ' M'; }
+    if(S.coinN !== R.lastC){ R.lastC = S.coinN; R.elCoinN.textContent = S.coinN.toLocaleString('en-US'); }
+    R.elCoins.style.transform = R.coinPulse > 0 ? 'scale(' + (1 + 0.28 * R.coinPulse).toFixed(3) + ')' : '';
     var card = cardAmt();
     if(S.dead && !R.cardShown && card > 0){
       R.cardShown = true;
-      R.elDist.style.opacity = 0;
+      R.elDist.style.opacity = 0; R.elCoins.style.opacity = 0;
       R.elV.textContent = S.crashM.toLocaleString('en-US') + ' M';
       R.elBest.textContent = S.newBest ? 'NEW BEST' : ('BEST ' + S.best.toLocaleString('en-US') + ' M');
+      R.elCardCoins.textContent = S.coinN.toLocaleString('en-US') + (S.coinN === 1 ? ' COIN' : ' COINS') +
+        '  ·  ' + (S.bank || 0).toLocaleString('en-US') + ' TOTAL';
     }
     if(R.cardShown){
       var W = window.innerWidth, H = window.innerHeight;
       layout(W, H);
       R.elCard.style.opacity = card;
-      R.elCard.style.top = Math.round(H * 0.30) + 'px';
+      R.elCard.style.top = Math.round(H * 0.28) + 'px';
       for(var i = 0; i < 2; i++){
         var r = R.btns[i].r, e = R.elBtn[i];
         e.style.left = r.x + 'px'; e.style.top = r.y + 'px'; e.style.width = r.w + 'px'; e.style.height = r.h + 'px';
@@ -92910,10 +93188,10 @@ var RUNNER = (function(){
   function gMove(x, y){
     if(!G.on) return;
     var dx = x - G.lx; G.lx = x; G.ly = y;
-    var hw = halfW(), W = window.innerWidth, H = window.innerHeight, t0 = performance.now();
-    // One rate everywhere on the track: a face's pitch per steerScreen of screen width, edge or no edge.
-    if(!S.dead && !(t0 < G.muteT)) S.sTgt += dx / (W * P.steerScreen) * pitch();
-    var t = performance.now(), hs = G.hist;
+    var W = window.innerWidth, H = window.innerHeight, t = performance.now();
+    // One rate everywhere: a whole turn of the tube per steerTurnScreen of screen width, on any shape.
+    if(!S.dead && !(t < G.muteT)) S.thTgt += dx / (W * P.steerTurnScreen) * TAU;
+    var hs = G.hist;
     hs.push({ x: x, y: y, t: t });
     while(hs.length > 1 && t - hs[0].t > P.swipeMs) hs.shift();
     var o = hs[0], sx = x - o.x, sy = y - o.y;
@@ -92921,7 +93199,7 @@ var RUNNER = (function(){
     if(sy > P.swipeUp * H && sy > 1.2 * Math.abs(sx)){ slam(); G.hist = [{ x: x, y: y, t: t }]; return; }
     // The flick is read over its own, shorter window: a quick sideways snap, not a steer. And it is only
     // a CLING when it is a swipe — the second leg of the stroke that just jumped (up, then left), or a
-    // fresh touch that opens with it. A thumb already down and steering is steering: at ~47 px a face a
+    // fresh touch that opens with it. A thumb already down and steering is steering: at ~47 px a wall a
     // quick dodge in the air is easily flick-fast, and read as a cling it threw the ship onto a wall.
     for(var i = 0; i < hs.length && t - hs[i].t > P.flickMs; i++){}
     var of = hs[Math.min(i, hs.length - 1)], fx = x - of.x, fy = y - of.y;
@@ -92979,16 +93257,19 @@ var RUNNER = (function(){
 
   // ════════════════════════════════════ IN AND OUT ════════════════════════════════════
   // Link every program the tube draws — with the ship IN its scene, under its lights — so the first
-  // frame after the whiteout draws instead of compiling. The spin pays for it.
+  // frame after the whiteout draws instead of compiling. The spin pays for it. (A tube chunk, a coin and
+  // the n = 8 obstacle kit are standing by then; every later kit and chunk reuses those programs.)
   function compile(){
     if(R.compiled) return;
     var g = gameMode.group, par = g.parent, vis = g.visible;
     R.scene.add(g); g.visible = true;
+    var tmp = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), R.tubeMat); R.scene.add(tmp);
+    R.coinMesh.count = 1;
     try {
       renderer.compile(R.scene, R.cam);
       renderer.compile(R.fxScene, R.ortho); renderer.compile(R.blitScene, R.ortho); renderer.compile(R.ui, R.uiCam);
       R.compiled = true;
-    } finally { if(par) par.add(g); g.visible = vis; }
+    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); tmp.geometry.dispose(); R.coinMesh.count = 0; }
   }
   // Called from gamePreloadStep while the wheel spins — the same cadence as the planet preload.
   function preloadStep(){
@@ -93030,8 +93311,8 @@ var RUNNER = (function(){
     R.layer.style.display = 'block';
     R.acc = 0; R.flash = 1;   // in out of the same white the spin ended in
     api.active = true;
-    console.log('[RUNNER] start — tube a=' + P.apothem + ', ' + P.speedKmh + ' km/h, ship half-extents ' +
-      SHIP.hw.toFixed(4) + ' × ' + SHIP.hh.toFixed(4) + ' × ' + SHIP.hl.toFixed(4));
+    console.log('[RUNNER] start — a=' + P.apothem + ', ' + P.speedKmh + ' km/h, sides ' + P.sidesMin + '–' + P.sidesMax +
+      ', ship half-extents ' + SHIP.hw.toFixed(4) + ' × ' + SHIP.hh.toFixed(4) + ' × ' + SHIP.hl.toFixed(4));
   }
   function restart(){ resetRun(); R.flash = 0.7; }
   function exit(){
@@ -93040,6 +93321,8 @@ var RUNNER = (function(){
     R.layer.style.display = 'none';
     for(var i = 0; i < R.obs.length; i++) freeObs(R.obs[i]);
     R.obs.length = 0;
+    if(S && S.course){ S.course.forEach(disposeChunk); S.course = [S.course[0]]; }
+    R.coinMesh.count = 0;
     clearTrail(R.thr.L); clearTrail(R.thr.R);
     scene.add(gameMode.group); gameMode.group.visible = false;
     gameMode.ship.scale.setScalar(R.shipScale0 || GAME_BASE_SHIP_SCALE);
@@ -93058,8 +93341,10 @@ var RUNNER = (function(){
   api.start = start; api.exit = exit; api.restart = restart; api.frame = frame; api.preloadStep = preloadStep;
   // test surface
   api._S = function(){ return S; }; api._R = R; api.SHIP = SHIP;
-  api._in = { jump: wantJump, cling: cling, slam: slam, steerTo: function(s){ S.sTgt = s; }, pitch: pitch,
-              obs: function(type, face, dz){ addObs(type, face, S.z + dz); } };
+  api._in = { jump: wantJump, cling: cling, slam: slam, steerTo: function(th){ S.thTgt = th; },
+              shapeAt: function(z){ var s = shapeInto(z == null ? S.z : z, _shB); return { n: s.n, span: s.span, reg: s.reg, phi: Array.prototype.slice.call(s.phi, 0, s.n), h: Array.prototype.slice.call(s.h, 0, s.n) }; },
+              obs: function(type, face, dz){ var sec = sectionAt(S.z + dz); addObs(type, face, S.z + dz, sec.kind === 'hold' ? sec.n : 8); },
+              coins: function(dz0, dz1, onLine){ spawnCoins(S.z + dz0, S.z + dz1, onLine); } };
   return api;
 })();
 
