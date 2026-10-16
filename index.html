@@ -91960,10 +91960,24 @@ function stepGameSim(dt){
 // 16-sided tube), then folds into another — see THE COURSE. Now and then it opens out instead onto a
 // FLAT: one wide platform in open space, gravity straight down, nothing past its edges but a fall; it
 // narrows into the next tube's mouth at its far end. Tube walls sometimes have GAPS cut in them — jump
-// them, or fall out of the tube. Obstacles spawn in rows; coins in strings between them. Speed rises the
+// them, or fall out of the tube. Every few seconds the course runs a PATTERN — a set piece you learn
+// (bulkheads with a few openings, an iris closing onto one point, a tightrope over a pit, a fork with dead
+// ends, a corkscrew, a slalom, hurdles, turning blades: see THE PATTERNS); between them, random rows of
+// obstacles fill in, and coins come in strings. Speed rises the
 // longer you live and the rows get denser. Hit an obstacle and the ship crashes for real (its forward
 // speed goes into the obstacle, it tumbles, gravity still holds); fall and it is lost to space. Then a
-// card offers RESTART or BACK TO STORE.
+// card offers RESTART, the SHOP, or BACK TO STORE.
+//
+// COINS ARE WORTH MORE THE FURTHER OUT THEY ARE: gold ×1 at the start, then emerald, sapphire, amethyst,
+// diamond and prism coins (TIERS), each its own colour. THE SHOP sells THE SLINGSHOT, five strengths, for
+// coins. With one, a run no longer spools up from a standstill: the ship starts on the tube's axis inside
+// three energy rings. Drag down to pull it back (the rings stretch apart), sideways to aim round the tube,
+// and let go — while you hold, a marker runs up and down a meter, and letting go with it in the green is a
+// full shot (power = how far you pulled × that). The shot is physics, not a canned flight: the stored
+// energy is the launch speed, air drag bleeds it, lift holds the ship on the axis while it is fast, and as
+// it slows it sinks onto the wall it was aimed at — still fast, then ground drag eases it to the run. Nothing
+// is put in its way while it flies, a clear stretch follows the landing, and the rows after it are spaced
+// for the speed it is doing. Each slingshot glows the colour of the coin tier its full shot reaches.
 //
 // THE SAME AS THE PLANET GAME, ON PURPOSE: the ship itself (gameMode.ship — same hull, same skin), its
 // whole procedural rig (wing sweep, flap springs, cockpit spin, recoil, underglow, wing thrusters —
@@ -91991,7 +92005,7 @@ var RUNNER = (function(){
   var M_PER_UNIT = (15 / 3.6 / 60) / GAME_BASE_MAXSPEED;
   var SLAM_V = 0.04;          // triggerSlam's hop slam (s.vertVel = -0.04), toward the floor
   var BG = 0x02040a;
-  var BEST_KEY = 'chrysolin_runner_best', BANK_KEY = 'chrysolin_runner_coins';
+  var BEST_KEY = 'chrysolin_runner_best', BANK_KEY = 'chrysolin_runner_coins', SLING_KEY = 'chrysolin_runner_sling';
 
   var P = {
     apothem: 0.36,        // tube: axis → every wall, whatever the shape — so the floor is always the same
@@ -92006,6 +92020,9 @@ var RUNNER = (function(){
     // FLATS: after a held tube, this often the course opens onto a flat platform instead of folding.
     flatChance: 0.3, flatSecMin: 7, flatSecMax: 12, flatWidth: 2.6, flatTaperSec: 1.6,
     flatClearIn: 0.8, flatClearOut: 0.6,          // no rows this long after the tube opens / before the taper
+    // PATTERNS: a set piece every patGapSec (after the first at firstPatSec), on a held tube with room for it.
+    firstPatSec: 6, patGapSecMin: 5, patGapSecMax: 9, onlyPat: '',
+    fodder: true,         // the random rows between patterns (off: patterns only — testing)
     // GAPS in tube walls: a row may cut one in a wall instead of standing something on it.
     holeSecMin: 0.14, holeSecMax: 0.26, holeHalfChance: 0.35, holeMax: 16,
     // THE TUBE CAMERA (zoomed out): on the axis, this far behind the ship, at this field of view.
@@ -92044,11 +92061,33 @@ var RUNNER = (function(){
     coinGrab: 0.034, coinMagnet: 0.10, coinPullHz: 7,
     fog: 0.075,
     crashSec: 1.1,        // the crash plays this long before the card
-    hitScale: 0.85        // collision ellipsoid = the hull's measured half-extents × this
+    hitScale: 0.85,       // collision ellipsoid = the hull's measured half-extents × this
+    // MOMENTUM: speed over the run speed is drag's to take — quickly in the air, slowly on the ground — so a
+    // slingshot's landing carries on fast for a few seconds and eases down to the run.
+    dragAir: 0.85, dragGround: 0.45,   // per second, of the excess over the run speed
+    stallMul: 2.4,        // a slingshot's flight: lift holds the ship on the axis while it is faster than this ×
+                          // the run speed, and fails (it sinks) as the speed falls toward the run's
+    landClearSec: 2.4,    // after a slingshot landing, nothing in the way for this long (at the landing speed)
+    // THE SLINGSHOT, five strengths. slingReach = metres flown by a full pull let go in the green — what the
+    // shop says; the launch speed is SOLVED for it. Each lands just past a coin tier (see TIERS).
+    slingReach: [1200, 2900, 5600, 9300, 14000],
+    slingPrice: [100, 400, 1200, 3000, 7500],
+    slingPull: 0.22,      // world units the ship comes back at a full pull
+    slingPullScreen: 0.30,  // share of the screen height dragged down for a full pull
+    slingMeterSec: 1.1,   // the meter's marker: bottom → top in this long, and back down as long again
+    slingZone: [0.26, 0.23, 0.20, 0.18, 0.16],   // the green zone's share of the meter, per strength
+    slingMiss: 0.5,       // power kept when let go outside the green, plus up to slingNear more the closer it was
+    slingNear: 0.3,
+    slingRingR: 0.072, slingGap: 0.034,          // ring radius (the hull spans ~0.06) and the rings' rest spacing
+    slingK: 900, slingKA: 3000, slingZeta: 0.22, // the ring chain: spring rates (s⁻², per unit ring mass), damping
+    slingFov: 16          // degrees the lens opens at full flight speed
   };
   var _rsq = Q.match(/[?&]runspeed=([\d.]+)/); if(_rsq) P.speedKmh = +_rsq[1];
   var _rsd = Q.match(/[?&]runsides=(\d+)/); if(_rsd) P.holdSides = P.startSides = Math.max(3, Math.min(32, +_rsd[1]));
   var _rfl = /[?&]runflat(?:[=&]|$)/.test(Q);   // testing: a flat straight after the first tube
+  var _rpt = Q.match(/[?&]runpattern=(\w+)/); if(_rpt) P.onlyPat = _rpt[1];   // testing: only this pattern, early and often
+  if(P.onlyPat){ P.firstPatSec = 3; P.patGapSecMin = P.patGapSecMax = 2.5; }
+  var _rsl = (function(){ var q = Q.match(/[?&]runsling=(\d)/); return q ? Math.min(5, +q[1]) : null; })();   // testing: own this slingshot
 
   // Obstacles. Heights against the hop: the ship's centre peaks at hover + v²/2g = 0.021 + 0.133 = 0.154,
   // so a bar (top 0.048) is a hop and anything 0.2+ is not.
@@ -92075,17 +92114,39 @@ var RUNNER = (function(){
   // The ship's half-extents (world units), measured off the hull by measureShip().
   var SHIP = { hw: 0.03, hh: 0.012, hl: 0.032, measured: false };
   function edgeMargin(){ return SHIP.hw * 0.8; }
-  // SPEED GROWS WITH TIME ALIVE: ×(1 + t/speedRampSec), capped at speedMaxMul.
-  function speedMul(){ return S ? Math.min(P.speedMaxMul, 1 + S.runT / P.speedRampSec) : 1; }
-  // DIFFICULTY (0 → 1 over rampSec alive): denser rows, closer together.
-  function difficulty(){ return S ? Math.min(1, S.runT / P.rampSec) : 0; }
+  // SPEED GROWS WITH THE RUN: ×(1 + t/speedRampSec), capped at speedMaxMul — t being the run's PROGRESS clock,
+  // S.progT: time alive, except that ground covered faster than the run speed counts as the time the run
+  // would have taken to cover it. So a slingshot lands you as fast as a run that got that far on foot.
+  // (S.runT stays plain time alive — the turning blades keep real time.)
+  function speedMul(){ return S ? Math.min(P.speedMaxMul, 1 + S.progT / P.speedRampSec) : 1; }
+  // DIFFICULTY (0 → 1 over rampSec of that clock): denser rows, closer together.
+  function difficulty(){ return S ? Math.min(1, S.progT / P.rampSec) : 0; }
+  // Rows and coins are spaced in TIME at the speed the ship is actually doing — after a slingshot that is
+  // more than the run speed for a while, so they come further apart until drag has taken it back.
+  function rowUps(){ return Math.max(unitsPerSec(), S.v * 60); }
+  // COIN TIERS: a coin is worth more the further out it is, and wears that tier's colour. col/em are the
+  // coin's metal and glow (tier 0 is the shipped gold exactly; every metal peaks at gold's 0.88 — with no tone
+  // mapping a 1.0 channel clips the lit face flat); rgb is its colour bright — type on the dark, the rings —
+  // and ui its colour on the frost.
+  var TIERS = [
+    { m: 0,     mul: 1,  name: 'GOLD',     col: 0xe0a838, em: 0x7a5208, rgb: '255,205,90',  ui: '#c98d12' },
+    { m: 1000,  mul: 2,  name: 'EMERALD',  col: 0x34d873, em: 0x0c6a2a, rgb: '80,232,140',  ui: '#169a4b' },
+    { m: 2500,  mul: 3,  name: 'SAPPHIRE', col: 0x4579e0, em: 0x123d9a, rgb: '110,160,255', ui: '#2f63d8' },
+    { m: 5000,  mul: 5,  name: 'AMETHYST', col: 0x9a5fe0, em: 0x4e1696, rgb: '190,135,255', ui: '#8442e0' },
+    { m: 8500,  mul: 8,  name: 'DIAMOND',  col: 0xc4d6e6, em: 0x4c6680, rgb: '225,242,255', ui: '#6f9fcc' },
+    { m: 13000, mul: 12, name: 'PRISM',    col: 0xe0e0e0, em: 0x808080, rgb: '255,255,255', ui: '#c8408f', prism: true }
+  ];
+  function tierAt(z){ var m = z * M_PER_UNIT, k = 0; while(k + 1 < TIERS.length && m >= TIERS[k + 1].m) k++; return k; }
 
   var api = { active: false, P: P };
   var R = { built: false, compiled: false, preStep: 0, preWait: 0, preDone: false,
-            obs: [], kits: {}, fk: {}, holes: [], acc: 0, flash: 0, shake: 0, lastM: -1, lastC: -1, coinPulse: 0,
+            obs: [], kits: {}, fk: {}, holes: [], walls: [], wallPool: [], pits: [], acc: 0, flash: 0, shake: 0, lastM: -1, lastC: -1, coinPulse: 0,
             // The camera mode survives a restart: zoom 0 = the chase camera, 1 = THE TUBE CAMERA.
             zoom: 0, zoomV: 0, zoomTgt: 0, roll: 0, pinch: null,
-            keyL: false, keyR: false, cardShown: false, press: -1 };
+            keyL: false, keyR: false, cardShown: false, press: -1,
+            // THE SHOP and THE SLINGSHOT's chrome; the coin tier on the readout.
+            shop: null, shopAmt: 0, aimAmt: 0, plates: [], sling: [], rowShake: {}, lastTier: -1, tierToast: 0,
+            fovKick: 0, keyPull: false, slingUsed: false };
   var S = null;
   var _m = new THREE.Matrix4(), _o = new THREE.Vector3(), _f = new THREE.Vector3(), _u = new THREE.Vector3(),
       _v = new THREE.Vector3(), _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _p = new THREE.Vector3(),
@@ -92140,7 +92201,8 @@ var RUNNER = (function(){
     var c = S.course;
     while(c[c.length - 1].z1 < zTo){
       var last = c[c.length - 1], ups = unitsPerSec(), sec;
-      var flat = last.kind === 'hold' && !P.holdSides && (_rfl ? !S.flatDone : Math.random() < P.flatChance);
+      // (never under a slingshot shot in the air: it has to come down on a tube's wall)
+      var flat = last.kind === 'hold' && !P.holdSides && !(S.sl && S.sl.phase === 'fly') && (_rfl ? !S.flatDone : Math.random() < P.flatChance);
       if(flat) S.flatDone = true;
       if(flat){
         // A FLAT: the tube just ends and the platform carries on from its floor, flatWidth wide, then
@@ -92239,7 +92301,9 @@ var RUNNER = (function(){
     sc.add(new THREE.AmbientLight(0x6b78a8, 0.55));
     R.key = new THREE.DirectionalLight(0xe6ecff, 1.0); sc.add(R.key); sc.add(R.key.target);
     R.glow = new THREE.PointLight(0x10c4b2, 0.7, 1.4, 2.0); sc.add(R.glow);   // the seams' teal on the hull
-    buildTubeKit(); buildStars(); kit(8); kitPillar(); buildCoins(); buildSparks(); buildOverlay(); buildLayer();
+    buildTubeKit(); buildStars(); kit(8); kitPillar(); buildCoins(); buildSling();
+    BULK_GEO = new THREE.CircleGeometry(0.56, 48);   // one bulkhead standing by, so the warm-up links its program
+    var w0 = { mesh: new THREE.Mesh(BULK_GEO, bulkMat()) }; w0.mesh.visible = false; w0.mesh.frustumCulled = false; w0.mesh.renderOrder = 1; sc.add(w0.mesh); R.wallPool.push(w0); buildSparks(); buildOverlay(); buildLayer();
     // Wing thrusters: the planet game's candle trails, our own two states so its pair is never touched.
     R.thr = { L: makeThrusterState(null), R: makeThrusterState(null) };
     // Their spine ages at `fade` a frame, so a trail is (1/fade) frames of travel long. At the planet
@@ -92259,8 +92323,9 @@ var RUNNER = (function(){
   // wall's normal angle (aPhi, for the floor's highlight). Each chunk sits at a whole-unit z, so the rings
   // land on whole units of the run and never swim.
   function buildTubeKit(){
-    var HA = [], HB = [];
+    var HA = [], HB = [], SA = [], SB = [];
     for(var i = 0; i < P.holeMax; i++){ HA.push(new THREE.Vector4()); HB.push(new THREE.Vector2()); }
+    for(i = 0; i < 6; i++){ SA.push(new THREE.Vector4()); SB.push(new THREE.Vector4()); }
     R.tubeMat = new THREE.ShaderMaterial({
       uniforms: {
         uFloor: { value: 0 }, uFlrCos: { value: Math.cos(0.6 * TAU / 8) }, uFogD: { value: P.fog }, uAlpha: { value: 0.6 },
@@ -92270,20 +92335,39 @@ var RUNNER = (function(){
         uFogCol: { value: new THREE.Color(BG) },
         // GAPS: up to holeMax on screen — (wall φ, world z from, world z to) and (from, to) across the wall
         // as fractions of its half-width. World z, not each chunk's own, so one shared material serves all.
-        uHA: { value: HA }, uHB: { value: HB }, uHN: { value: 0 }, uHole: { value: HAZ_EDGE }
+        uHA: { value: HA }, uHB: { value: HB }, uHN: { value: 0 }, uHole: { value: HAZ_EDGE },
+        // A PIT field (see THE PATTERNS): over world z uPit.x → uPit.y every wall is open space except the
+        // safe strips — (z from, z to, angle at start, drift per unit) + (wobble amp, wobble freq, half-width
+        // at start, at end), all in world z and polar angle round the axis.
+        uPit: { value: new THREE.Vector4() }, uSA: { value: SA }, uSB: { value: SB }, uSN: { value: 0 }
       },
       vertexShader: [
-        'attribute float aU, aW, aPhi, aN; varying float vU, vW, vPhi, vN, vZ, vWZ; varying vec3 vView;',
-        'void main(){ vU = aU; vW = aW; vPhi = aPhi; vN = aN; vZ = position.z; vWZ = (modelMatrix * vec4(position, 1.0)).z;',
+        'attribute float aU, aW, aPhi, aN; varying float vU, vW, vPhi, vN, vZ, vWZ; varying vec2 vXY; varying vec3 vView;',
+        'void main(){ vU = aU; vW = aW; vPhi = aPhi; vN = aN; vZ = position.z; vWZ = (modelMatrix * vec4(position, 1.0)).z; vXY = position.xy;',
         '  vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
       ].join('\n'),
       fragmentShader: [
-        'uniform float uFloor, uFlrCos, uFogD, uAlpha, uHN; uniform vec3 uSeam, uRing, uBase, uFogCol, uHole;',
+        'uniform float uFloor, uFlrCos, uFogD, uAlpha, uHN, uSN; uniform vec3 uSeam, uRing, uBase, uFogCol, uHole;',
         'uniform vec4 uHA[' + P.holeMax + ']; uniform vec2 uHB[' + P.holeMax + '];',
-        'varying float vU, vW, vPhi, vN, vZ, vWZ; varying vec3 vView;',
+        'uniform vec4 uPit; uniform vec4 uSA[6]; uniform vec4 uSB[6];',
+        'varying float vU, vW, vPhi, vN, vZ, vWZ; varying vec2 vXY; varying vec3 vView;',
         'float ln(float d, float w){ return exp(-max(d, 0.0) / max(w, 1e-6)); }',
         'void main(){',
-        '  float pu = fwidth(vU), pz = fwidth(vZ);',
+        '  float pu = fwidth(vU), pz = fwidth(vZ), prim = 1e3;',
+        '  if(uPit.z > 0.5 && vWZ <= uPit.x && vWZ >= uPit.y){',
+        '    float al = atan(vXY.x, -vXY.y), rr = length(vXY), inS = -1e3;',
+        '    for(int i = 0; i < 6; i++){',
+        '      if(float(i) >= uSN) break;',
+        '      vec4 A = uSA[i], B = uSB[i];',
+        '      if(vWZ > A.x || vWZ < A.y) continue;',
+        '      float s = A.x - vWZ, th = A.z + A.w * s + B.x * sin(B.y * s);',
+        '      float hw = B.z + (B.w - B.z) * clamp(s / max(A.x - A.y, 1e-4), 0.0, 1.0);',
+        '      float d = al - th; d -= 6.2831853 * floor(d / 6.2831853 + 0.5);',
+        '      inS = max(inS, (hw - abs(d)) * rr);',
+        '    }',
+        '    if(inS < 0.0) discard;',
+        '    prim = inS;',                                                    // the safe path's edges glow
+        '  }',
         // A gap: nothing there at all (space shows through) — and a hazard rim round it, so it reads.
         '  float rim = 1e3;',
         '  for(int i = 0; i < ' + P.holeMax + '; i++){',
@@ -92303,6 +92387,7 @@ var RUNNER = (function(){
         '  float lf = (vU / max(vW, 1e-5) * 0.5 + 0.5) * vN, dl = abs(fract(lf + 0.5) - 0.5) * 2.0 * vW / max(vN, 1.0);',
         '  float lane = ln(dl, pu * 1.1) * 0.2 * (1.0 - smoothstep(0.01, 0.04, pu)) * smoothstep(0.02, 0.05, vW) * step(0.5, du / max(pu, 1e-6));',
         '  float flr = smoothstep(uFlrCos, 1.0, cos(vPhi - uFloor));',      // the wall that is the floor
+        '  rim = min(rim, prim);',
         '  float hr = ln(rim, pu * 1.6 + pz * 0.6) + 0.4 * ln(rim, pu * 8.0 + pz * 3.0);',
         '  vec3 col = uBase + uSeam * seam * (0.55 + 0.9 * flr) + uRing * ring * (0.45 + 0.55 * flr) + uSeam * lane * (0.4 + flr) + uHole * hr * 1.2;',
         '  float a = clamp(uAlpha + 0.8 * max(max(max(seam, ring), lane), hr), 0.0, 1.0);',
@@ -92537,7 +92622,7 @@ var RUNNER = (function(){
   }
 
   // ── COINS: one instanced draw. A gold disc that faces down the tube and spins about the wall's up. ──
-  var COIN_MAX = 96;
+  var COIN_MAX = 160;   // patterns lay long strings (a tightrope alone is ~40)
   function buildCoins(){
     var g = new THREE.CylinderGeometry(P.coinR, P.coinR, P.coinR * 0.28, 24, 1, false);
     g.rotateX(Math.PI / 2);   // disc face toward the run
@@ -92545,7 +92630,25 @@ var RUNNER = (function(){
     // And held UNDER 1.0 at its brightest — the renderer has no tone mapping, so lit + emissive past 1 is a flat
     // yellow disc with no spin in it (measured: emissive 0.95 clipped the face solid). ~0.75 at the face, so
     // the key light's shading across the spin still reads.
-    var m = new THREE.MeshStandardMaterial({ color: 0xe0a838, metalness: 0.4, roughness: 0.32, emissive: 0x7a5208, emissiveIntensity: 0.5 });
+    // Colour and glow come per coin from its TIER (TIERS col/em; tier 0 is this gold exactly): an instance
+    // attribute carries the tier and a phase for the prism's colours, so every tier is one draw, one program.
+    var m = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.4, roughness: 0.32, emissive: 0xffffff, emissiveIntensity: 0.5 });
+    R.coinTier = new THREE.InstancedBufferAttribute(new Float32Array(COIN_MAX * 2), 2);
+    g.setAttribute('aCoin', R.coinTier);
+    var TC = [], TE = [], NT = TIERS.length;
+    R.tierCol = [];
+    for(var k = 0; k < NT; k++){ TC.push(new THREE.Color(TIERS[k].col)); TE.push(new THREE.Color(TIERS[k].em)); R.tierCol.push(new THREE.Color(TIERS[k].col)); }
+    R.coinU = { uTierCol: { value: TC }, uTierEm: { value: TE }, uCoinT: { value: 0 } };
+    m.onBeforeCompile = function(sh){
+      sh.uniforms.uTierCol = R.coinU.uTierCol; sh.uniforms.uTierEm = R.coinU.uTierEm; sh.uniforms.uCoinT = R.coinU.uCoinT;
+      sh.vertexShader = 'attribute vec2 aCoin; uniform vec3 uTierCol[' + NT + ']; uniform vec3 uTierEm[' + NT + ']; uniform float uCoinT; varying vec3 vTCol, vTEm;\n' +
+        'vec3 coinHue(float h){ return clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0); }\n' +
+        sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n  int ti = int(aCoin.x + 0.5); vTCol = uTierCol[ti]; vTEm = uTierEm[ti];\n' +
+          '  if(ti == ' + (NT - 1) + '){ vec3 hc = coinHue(aCoin.y + uCoinT); vTCol = mix(vec3(0.88), hc * 0.88, 0.6); vTEm = hc * 0.5; }');
+      sh.fragmentShader = 'varying vec3 vTCol, vTEm;\n' + sh.fragmentShader
+        .replace('#include <color_fragment>', '#include <color_fragment>\n  diffuseColor.rgb *= vTCol;')
+        .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n  totalEmissiveRadiance *= vTEm;');
+    };
     R.coinMesh = new THREE.InstancedMesh(g, m, COIN_MAX);
     R.coinMesh.count = 0; R.coinMesh.frustumCulled = false;
     R.scene.add(R.coinMesh);
@@ -92582,17 +92685,19 @@ var RUNNER = (function(){
     R.blitMat = new THREE.ShaderMaterial({ uniforms: bu, vertexShader: vs, depthTest: false, depthWrite: false,
       fragmentShader: head + 'uniform sampler2D tScene;\nvoid main(){ vec3 c = texture2D(tScene, vUv).rgb * (1.0 - dark()); gl_FragColor = vec4(mix(c, vec3(1.0), uFlash), 1.0); }' });
     R.blitScene = quad(R.blitMat);
-    // The card's two buttons: the shared frost (THE material for UI glass on this site), in CSS-px space.
+    // THE FROST PLATES — the crash card's buttons, the shop's rows, the slingshot's meter and SHOP pill: the
+    // shared frost (THE material for UI glass on this site), in CSS-px space. One pool; each frame the open
+    // screens lay out the ones they show (see layout).
     R.ui = new THREE.Scene();
     R.uiCam = new THREE.OrthographicCamera(0, 1, 0, -1, -10, 10);
     R.btns = [];
-    for(var i = 0; i < 2; i++){
+    for(var i = 0; i < 9; i++){
       var mat = DML.frostMaterial();
       mat.depthTest = false;
       var mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
       mesh.frustumCulled = false; mesh.renderOrder = 4;
       R.ui.add(mesh);
-      R.btns.push({ mesh: mesh, r: { x: 0, y: 0, w: 1, h: 1 }, act: i === 0 ? 'restart' : 'store', press: 0 });
+      R.btns.push({ mesh: mesh, press: 0 });
     }
   }
 
@@ -92617,10 +92722,10 @@ var RUNNER = (function(){
     R.elV = el('div', 'font-size:44px;letter-spacing:0.06em;color:#f2f5fa;margin-top:8px;text-shadow:0 0 18px rgba(16,196,178,0.35);', R.elCard, '0 M');
     R.elBest = el('div', 'font-size:12px;letter-spacing:0.28em;color:rgba(16,196,178,0.95);margin-top:10px;', R.elCard, '');
     R.elCardCoins = el('div', 'font-size:12px;letter-spacing:0.28em;color:rgba(255,205,90,0.95);margin-top:8px;', R.elCard, '');
-    R.elBtn = [
-      el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L, 'RESTART'),
-      el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L, 'BACK TO STORE')
-    ];
+    // One label per frost plate (see layout): a button's word, or a shop row's whole content.
+    R.elBtn = [];
+    for(var bi = 0; bi < 9; bi++) R.elBtn.push(el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L));
+    buildSlingLayer(T);
     L.addEventListener('touchstart', tStart, { passive: false });
     L.addEventListener('touchmove', tMove, { passive: false });
     L.addEventListener('touchend', tEnd, { passive: false });
@@ -92669,7 +92774,7 @@ var RUNNER = (function(){
   function resetRun(){
     var lim = P.apothem - hover();
     if(S && S.course) S.course.forEach(disposeChunk);
-    S = { x: 0, y: -lim, vx: 0, vy: 0, z: 0, zBase: 0, v: 0, runT: 0,
+    S = { x: 0, y: -lim, vx: 0, vy: 0, z: 0, zBase: 0, v: 0, runT: 0, progT: 0, sl: null,
           th: 0, thV: 0, thTgt: 0, g: 0,
           mode: 'tube', fx: 0, fxV: 0, fxTgt: 0, fell: false, flatDone: false,
           tcY: 0, tcYV: 0, tcB: P.tubeCamBack, tcBV: 0, tcL: 0, tcLV: 0,
@@ -92677,19 +92782,20 @@ var RUNNER = (function(){
           up: 0, upV: 0, cam: 0, camV: 0, cx: 0, cy: -lim, cvx: 0, cvy: 0,
           dead: false, deadF: 0, rest: false, av: new THREE.Vector3(),
           nextRow: (P.firstRow != null ? P.firstRow : P.firstRowSec * baseSpeed() * 60), best: loadBest(),
-          coins: [], coinN: 0, course: null };
+          coins: [], coinN: 0, course: null, nextPat: P.firstPatSec * baseSpeed() * 60, lastPat: null, patLog: [] };
     _shZ = NaN; _shS = null;
     S.course = [{ z0: -20, z1: baseSpeed() * 60 * holdSec(), kind: 'hold', n: P.startSides }];
     buildChunk(S.course[0]);
     extendCourse(maxAhead() + 20);
     for(var i = 0; i < R.obs.length; i++) freeObs(R.obs[i]);
-    R.obs.length = 0; R.holes.length = 0;
+    R.obs.length = 0; R.holes.length = 0; R.pits.length = 0; freeWalls(true);
     for(var j = 0; j < R.sp.n; j++) R.sp.life[j] = 0;
     R.coinMesh.count = 0;
     clearTrail(R.thr.L); clearTrail(R.thr.R);
-    R.cardShown = false; R.press = -1; R.lastM = -1; R.lastC = -1; R.coinPulse = 0;
-    R.elCard.style.opacity = 0; R.elBtn[0].style.opacity = 0; R.elBtn[1].style.opacity = 0;
+    R.cardShown = false; R.press = -1; R.lastM = -1; R.lastC = -1; R.coinPulse = 0; R.lastTier = -1; R.tierToast = 0; R.shop = null;
+    R.elCard.style.opacity = 0; for(var b = 0; b < R.elBtn.length; b++){ R.elBtn[b].style.opacity = 0; R.elBtn[b]._on = false; }
     R.elDist.style.opacity = 1; R.elCoins.style.opacity = 1;
+    slingReset();   // owning a slingshot: the run starts in it, on the axis (see THE SLINGSHOT)
     resetRig();
     var s = gameMode.surfaceState;
     s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.speed = 0; s.isDrifting = false; s.driftBoost = false;
@@ -92753,6 +92859,7 @@ var RUNNER = (function(){
     // Back onto the track: where round it, and how fast. thTgt is untouched — the thumb never let go of it.
     S.th = polar(S.x, S.y, S.th);
     S.thV = (S.x * S.vy - S.y * S.vx) / Math.max(1e-6, S.x * S.x + S.y * S.y);
+    if(S.sl && S.sl.phase === 'fly') slingLanded();
     if(performance.now() - S.jumpBuf < P.jumpBufferMs) jump();
   }
 
@@ -92762,11 +92869,18 @@ var RUNNER = (function(){
   // run's state across — position, speed, gravity and where the thumb is pointing — so nothing jumps.
   function step(){
     var lh = hover();
+    if(S.sl && S.sl.phase === 'aim'){ aimStep(); return; }   // sitting in the slingshot: nothing moves on yet
     // Forward: spool up — at the planet game's boost acceleration, or faster where that would take
     // more than a second to reach the run speed (it is +60 km/h a second) — then ride the run speed,
-    // which itself keeps rising the longer you live.
+    // which itself keeps rising the longer you live. Anything OVER the run speed (a slingshot's) is
+    // drag's: the excess decays, quickly in the air and slowly on the ground.
     var vt = runSpeed();
-    if(!S.dead){ S.v = Math.min(vt, S.v + Math.max(GAME_BASE_MAXSPEED * (60 / 15) / 60, vt / 60)); S.runT += 1 / 60; }
+    if(!S.dead){
+      if(S.v > vt) S.v = vt + (S.v - vt) * Math.exp(-(S.grounded ? P.dragGround : P.dragAir) / 60);
+      else S.v = Math.min(vt, S.v + Math.max(GAME_BASE_MAXSPEED * (60 / 15) / 60, vt / 60));
+      S.runT += 1 / 60;
+      S.progT += Math.max(1, S.v / vt) / 60;   // the progress clock (see speedMul)
+    }
     else S.v *= S.fell ? 0.99 : (S.rest ? 0.90 : 0.985);
     var x0 = S.x, y0 = S.y, z0 = S.z;
     S.z += S.v;
@@ -92792,6 +92906,7 @@ var RUNNER = (function(){
     stepCoins();
     placeCam(false);
     stepSparks();
+    if(S.sl) slingTick();
     rows();
     rebase();
   }
@@ -92846,7 +92961,8 @@ var RUNNER = (function(){
       S.vx += tx * (ra.x - u - uv); S.vy += ty * (ra.x - u - uv);   // lateral move this frame = the spring's
       S.airF++;
     }
-    S.vx += gx * JG(); S.vy += gy * JG();
+    var gj = JG() * (1 - lift());   // gravity, less a slingshot flight's lift (see THE SLINGSHOT)
+    S.vx += gx * gj; S.vy += gy * gj;
     S.x += S.vx; S.y += S.vy;
     // Every wall is a plane: the tube is convex, so inside all of them IS the whole test. A wall that
     // faces gravity (within ~half a wall's angle) is a landing; the rest are slid along. A wreck bounces on
@@ -92874,6 +92990,7 @@ var RUNNER = (function(){
   }
   // Is the ship (at x, y, z) over a gap in wall i of shape sh? Only held shapes have gaps.
   function overHole(sh, i, x, y, z){
+    if(R.pits.length && pitAt(Math.atan2(x, -y), z)) return true;   // a pattern's pit: open space but the strips
     if(!sh.reg || !R.holes.length) return false;
     var p = sh.phi[i];
     return holeAt(p, (x * Math.cos(p) + y * Math.sin(p)) / halfWn(sh.reg), z);
@@ -93008,7 +93125,7 @@ var RUNNER = (function(){
     var lim = P.apothem - hover(), z = -(S.z - S.zBase), flat = S.mode === 'flat';
     var gx = Math.sin(S.g), gy = -Math.cos(S.g), fd = 0;
     if(!(S.grounded && !S.dead) && !S.fell) fd = flat ? Math.max(0, S.y + lim) : footDist(shapeAt(S.z), S.x, S.y, S.g);
-    var keep = S.dead ? 0 : fd * (1 - P.camJumpFollow);            // ride up with a share of the hop
+    var keep = S.dead ? 0 : fd * (1 - (S.sl && S.sl.phase !== 'run' ? 1 : P.camJumpFollow));   // ride up with a share of the hop (all of a slingshot's flight)
     var txp = S.x + gx * keep, typ = S.y + gy * keep;
     if(snap){ S.cx = txp; S.cy = typ; S.cvx = S.cvy = 0; S.cam = S.th; S.camV = 0; }
     else if(!S.fell){                                               // a fall: let the ship go, the camera stays
@@ -93026,7 +93143,8 @@ var RUNNER = (function(){
     var e = R.zoom * R.zoom * (3 - 2 * R.zoom), sk = R.shake * 0.006 * (1 - e);
     var ang = S.cam + wrapPi(R.roll - S.cam) * e, cux = -Math.sin(S.cam), cuy = Math.cos(S.cam);
     // chase pose
-    var px = S.cx + cux * P.camUp, py = S.cy + cuy * P.camUp, pz = z + P.camBack;
+    // (pulling the slingshot back brings the ship a quarter of the way toward the lens)
+    var px = S.cx + cux * P.camUp, py = S.cy + cuy * P.camUp, pz = z + P.camBack - (S.sl && S.sl.phase === 'aim' ? S.sl.pull * P.slingPull * 0.25 : 0);
     var lx = S.cx + cux * 0.02, ly = S.cy + cuy * 0.02, lz = z - P.camLook;
     if(S.fell){ lx += (S.x - lx) * 0.5; ly += (S.y - ly) * 0.5; lz = z; }   // and watch it go
     // tube pose
@@ -93035,6 +93153,667 @@ var RUNNER = (function(){
     R.cam.position.set(px + (qx - px) * e + (Math.random() - 0.5) * sk, py + (qy - py) * e + (Math.random() - 0.5) * sk, pz + (qz - pz) * e);
     R.cam.lookAt(lx + (mx - lx) * e, ly + (my - ly) * e, lz + (mz - lz) * e);
     R.shake *= 0.9;
+  }
+  // ════════════════════════════════════════ THE SLINGSHOT ════════════════════════════════════════
+  // Bought in THE SHOP (five strengths; the strongest owned is the one you get). A run with one starts on the
+  // tube's axis inside its three rings: the front ring is anchored, the back one is held round the ship's tail,
+  // and the middle one rides between on springs — so pulling back stretches them apart, and letting go frees
+  // the chain to snap forward through its rest and ring out on its own damping.
+  //
+  // THE SHOT. Power = how far it was pulled × the meter (1 in the green; outside it slingMiss, plus up to
+  // slingNear by how close). The springs' energy is the launch speed — spent in a fraction of a frame, so the
+  // ship simply leaves at it — and from there it is the run's own physics: air drag takes the speed above the
+  // run speed, lift (in this flight only) holds the ship on the axis in proportion to that excess, and as the
+  // speed falls toward the stall it sinks, under the ordinary jump gravity, onto the wall it was aimed at.
+  // Where it lands is never placed; it is where the physics puts it. The launch speed of each strength is
+  // SOLVED (flightSim, bisection) so a perfect full pull lands slingReach metres out, and the reach shown
+  // while aiming is the same sim on the live power.
+  //
+  // While it flies: no rows, no coins, no flats (the course stays tube — it has to land on a wall), no steer
+  // and no cling (the aim was the steer); a slam still drives it down early. On landing: a clear stretch, then
+  // rows spaced for the speed it is actually doing (rowUps), which ground drag eases back to the run's. The
+  // progress clock has counted the ground covered (see speedMul), so out there it is as fast and as dense as
+  // for a run that got there on foot.
+  var ROMAN = ['I', 'II', 'III', 'IV', 'V'];
+  function slingOwned(){ return _rsl != null ? _rsl : clamp(loadNum(SLING_KEY) | 0, 0, P.slingReach.length); }
+  function slingTier(lvl){ return TIERS[Math.min(lvl, TIERS.length - 1)]; }   // a slingshot wears the tier it reaches
+  function mulAt(t){ return Math.min(P.speedMaxMul, 1 + t / P.speedRampSec); }
+  function liftAt(v, vt){ return clamp((v / vt - 1) / (P.stallMul - 1), 0, 1); }
+  function lift(){ return (S.sl && S.sl.phase === 'fly' && !S.dead) ? liftAt(S.v, runSpeed()) : 0; }
+  // The flight exactly as step() + stepTube() integrate it, in one dimension — the speed along the tube and the
+  // drop from the axis to the ride — from progress-clock t0. → metres flown, seconds, the landing speed.
+  function flightSim(v0, t0){
+    var z = 0, v = v0, r = 0, vr = 0, t = t0 || 0, lim = P.apothem - hover(), n = 0;
+    while(n++ < 2400){
+      var vt = baseSpeed() * mulAt(t);
+      if(v > vt) v = vt + (v - vt) * Math.exp(-P.dragAir / 60);
+      t += Math.max(1, v / vt) / 60;
+      z += v;
+      vr += JG() * (1 - liftAt(v, baseSpeed() * mulAt(t)));
+      r += vr;
+      if(r >= lim) break;
+    }
+    return { m: z * M_PER_UNIT, sec: n / 60, v: v, t: t };
+  }
+  // The launch speed (units a frame) whose perfect shot from the start lands slingReach out. The flight is
+  // monotonic in it, so bisection; cached against everything that changes the answer.
+  var _v0c = {};
+  function slingV0(lvl){
+    var want = P.slingReach[lvl - 1], key = [lvl, want, P.dragAir, P.stallMul, P.speedKmh, P.speedRampSec, P.speedMaxMul].join(':');
+    if(_v0c[key]) return _v0c[key];
+    var lo = baseSpeed(), hi = baseSpeed() * 3000;
+    for(var i = 0; i < 50; i++){ var mid = 0.5 * (lo + hi); if(flightSim(mid, 0).m < want) lo = mid; else hi = mid; }
+    return (_v0c[key] = 0.5 * (lo + hi));
+  }
+  function slingPower(L){
+    var a = L.zone - L.zoneW / 2, b = L.zone + L.zoneW / 2, p = L.mkPos, inG = p >= a && p <= b;
+    var off = inG ? 0 : Math.min(Math.abs(p - a), Math.abs(p - b));
+    var tf = inG ? 1 : P.slingMiss + P.slingNear * Math.max(0, 1 - off / 0.35);
+    return { pow: L.pull * tf, inG: inG, tf: tf };
+  }
+  function launchV(L, pow){ var vt = runSpeed(); return vt + (L.v0 - vt) * pow; }
+
+  function buildSling(){
+    // Each ring: a flat quad across the tube with the ring drawn analytically on it — a hot core one pixel-ish
+    // wide at any distance, a glow with energy running round it, a soft halo — additive, in the tier colour.
+    var geo = new THREE.PlaneGeometry(0.36, 0.36);
+    R.sling = [];
+    for(var i = 0; i < 3; i++){
+      var mat = new THREE.ShaderMaterial({
+        uniforms: { uCol: { value: new THREE.Color('rgb(' + TIERS[1].rgb + ')') }, uR: { value: P.slingRingR }, uE: { value: 0 }, uT: { value: 0 },
+                    uPh: { value: i * 2.1 }, uPrism: { value: 0 }, uFogD: { value: P.fog } },
+        vertexShader: 'varying vec2 vP; varying vec3 vView; void main(){ vP = position.xy; vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
+        fragmentShader: [
+          'uniform vec3 uCol; uniform float uR, uE, uT, uPh, uPrism, uFogD;',
+          'varying vec2 vP; varying vec3 vView;',
+          'vec3 hue(float h){ return clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0); }',
+          'void main(){',
+          '  float r = length(vP), d = abs(r - uR), w = fwidth(r) + 1e-5, a = atan(vP.y, vP.x);',
+          '  float core = exp(-d / (w * 1.3 + uR * 0.01));',
+          '  float flow = 0.55 + 0.45 * sin(a * 5.0 - uT * (5.0 + 14.0 * uE) + uPh);',      // energy running round it
+          '  float glow = exp(-d / (uR * (0.07 + 0.06 * uE))) * flow;',
+          '  float halo = exp(-d / (uR * 0.32));',
+          '  vec3 c = mix(uCol, hue(a / 6.2831853 + uT * 0.2 + uPh * 0.1), uPrism);',
+          '  float I = core * (0.75 + 0.45 * uE) + glow * (0.35 + 0.75 * uE) + halo * (0.12 + 0.22 * uE);',
+          '  vec3 col = c * I + vec3(core * 0.3 * min(uE, 1.0));',                         // white-hot under tension
+          '  float fog = exp(-uFogD * uFogD * dot(vView, vView)), nf = smoothstep(0.1, 0.3, -vView.z);',   // and out of the way right at the lens
+          '  gl_FragColor = vec4(col * fog * nf, 1.0);',
+          '}'
+        ].join('\n'),
+        transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, extensions: { derivatives: true }
+      });
+      var m = new THREE.Mesh(geo, mat);
+      m.frustumCulled = false; m.renderOrder = 5; m.visible = false;
+      R.scene.add(m);
+      R.sling.push({ mesh: m, z: 0, v: 0 });
+    }
+  }
+  // A run that owns one starts here: on the axis, weightless, rows held off until the shot is down.
+  function slingReset(){
+    var lvl = slingOwned(), i;
+    S.sl = null;
+    for(i = 0; i < 3; i++) R.sling[i].mesh.visible = false;
+    if(!lvl) return;
+    var L = S.sl = { phase: 'aim', lvl: lvl, zA: 0, pull: 0, pullV: 0, pullTgt: 0, pull0: 0, aim: 0, aimV: 0, aimTgt: 0,
+                     hold: false, gy: 0, mk: 0, mkPos: 0, zone: 0.65, zoneW: P.slingZone[lvl - 1], v0: slingV0(lvl),
+                     power: 0, result: '', resT: 0, reachM: 0 };
+    S.x = 0; S.y = 0; S.vx = S.vy = 0; S.grounded = false; S.airF = 0; S.clung = true;
+    S.g = S.up = S.th = S.thTgt = 0;
+    S.nextRow = S.nextPat = Infinity;
+    var T = slingTier(lvl);
+    for(i = 0; i < 3; i++){
+      var q = R.sling[i], u = q.mesh.material.uniforms;
+      q.z = L.zA + P.slingGap * (1 - i); q.v = 0; q.mesh.visible = true;
+      u.uCol.value.setStyle('rgb(' + T.rgb + ')'); u.uPrism.value = T.prism ? 1 : 0;
+    }
+  }
+  function aimStep(){
+    var L = S.sl;
+    // A pinch (or anything else) that took the finger away ends the pull without a shot.
+    if(L.hold && !G.on && !mouseDown && !R.keyPull){ L.hold = false; L.pullTgt = 0; }
+    // The meter runs while the pull is held: the marker bottom → top → bottom, at one speed.
+    if(L.hold){ L.mk += 1 / (60 * P.slingMeterSec); var mm = L.mk % 2; L.mkPos = mm < 1 ? mm : 2 - mm; }
+    if(R.keyPull) L.pullTgt = Math.min(1, L.pullTgt + 1 / (0.8 * 60));
+    if(R.keyL || R.keyR) L.aimTgt += ((R.keyR ? 1 : 0) - (R.keyL ? 1 : 0)) * TAU / 90;
+    // The pull and the aim follow the finger on springs: the ship has weight, nothing jumps.
+    var r = cd(L.pull, L.pullV, L.pullTgt, 6); L.pull = clamp(r.x, 0, 1); L.pullV = r.v;
+    r = cd(L.aim, L.aimV, L.aimTgt, P.steerHz); L.aim = r.x; L.aimV = r.v;
+    S.z = L.zA - L.pull * P.slingPull; S.v = 0;
+    // The aimed wall is "down": gravity's, the ship's up and the camera's roll all turn to it.
+    S.g = S.th = S.thTgt = L.aim;
+    var ru = cd(S.up, S.upV, S.g, P.rollHz); S.up = ru.x; S.upV = ru.v;
+    var rc = cd(S.cam, S.camV, S.up, P.camRollHz); S.cam = rc.x; S.camV = rc.v;
+    if(!R.pinch){ var rz = cd(R.zoom, R.zoomV, R.zoomTgt, P.zoomHz); R.zoom = clamp(rz.x, 0, 1); R.zoomV = rz.v; }
+    poseShip(); rig(); slingTick(); placeCam(false); stepSparks();
+    if(L.hold) L.reachM = flightSim(launchV(L, slingPower(L).pow), S.progT).m;
+  }
+  function slingGrab(x, y){
+    var L = S.sl;
+    if(!L || L.phase !== 'aim') return;
+    L.hold = true; L.gy = y; L.pull0 = L.pullTgt;
+    // A fresh go at the meter: the marker from the bottom, the green somewhere in its upper part.
+    L.mk = 0; L.mkPos = 0;
+    L.zone = 0.42 + L.zoneW / 2 + Math.random() * (0.5 - L.zoneW);
+  }
+  function slingDrag(x, y, dx){
+    var L = S.sl, W = window.innerWidth, H = window.innerHeight;
+    if(!L.hold) return;
+    L.pullTgt = clamp(L.pull0 + (y - L.gy) / (P.slingPullScreen * H), 0, 1);
+    L.aimTgt += dx / (W * P.steerTurnScreen) * TAU;   // the steer's own rate: about a screen width for a whole turn
+  }
+  function slingLetGo(){
+    var L = S.sl;
+    if(!L || L.phase !== 'aim' || !L.hold) return;
+    L.hold = false;
+    if(Math.max(L.pullTgt, L.pull) < 0.08){ L.pullTgt = 0; return; }   // barely pulled: it settles back, no shot
+    launch();
+  }
+  function launch(){
+    var L = S.sl, sp = slingPower(L);
+    L.power = sp.pow; L.result = sp.inG ? 'PERFECT' : (sp.tf > 0.65 ? 'CLOSE' : 'MISSED'); L.resT = 1.6;
+    L.phase = 'fly'; R.slingUsed = true;
+    S.v = launchV(L, sp.pow);
+    // Away on the aim: gravity toward the aimed wall (lift holds it off for now), the thumb's target on it,
+    // the cling spent and the steer muted until it is down.
+    S.grounded = false; S.airF = 2; S.clung = true; S.jumpBuf = -1e9;
+    S.g = S.th = S.thTgt = L.aim; S.thV = 0;
+    G.muteT = Infinity;
+    // The course ahead is laid again, with no flats in it.
+    var c = S.course;
+    while(c.length > 1) disposeChunk(c.pop());
+    extendCourse(S.z + maxAhead() + 20);
+    R.shake = Math.max(R.shake, 0.3 + 0.5 * sp.pow);
+  }
+  function slingLanded(){
+    var L = S.sl, ups = rowUps();
+    L.phase = 'run'; G.muteT = 0; S.clung = false;
+    S.nextRow = S.z + ups * P.landClearSec;
+    S.nextPat = S.nextRow + ups * 2.5;
+    R.shake = Math.max(R.shake, 0.5);
+    _p.copy(gameMode.ship.position); burst(_p, 26, false, R.tierCol[Math.min(L.lvl, TIERS.length - 1)]);
+  }
+  // THE RING CHAIN: anchor ─kA─ front ─k─ middle ─k─ back, rest spacing slingGap, unit masses, four substeps a
+  // frame. Held, the back ring rides the ship's tail; let go, it is free.
+  function slingTick(){
+    var L = S.sl, Q3 = R.sling, i;
+    if(L.resT > 0) L.resT -= 1 / 60;
+    if(!Q3[0].mesh.visible) return;
+    if(L.phase !== 'aim' && S.z - L.zA > 30){ for(i = 0; i < 3; i++) Q3[i].mesh.visible = false; return; }
+    var held = L.phase === 'aim', s0 = P.slingGap, k = P.slingK, kA = P.slingKA, h = 1 / 240;
+    var c = 2 * P.slingZeta * Math.sqrt(2 * k), zh0 = Q3[2].z, zh1 = S.z - s0;
+    for(var it = 1; it <= 4; it++){
+      var z0 = Q3[0].z, z1 = Q3[1].z, z2 = Q3[2].z, T01 = k * ((z0 - z1) - s0), T12 = k * ((z1 - z2) - s0);
+      Q3[0].v += (-kA * (z0 - (L.zA + s0)) - T01 - c * Q3[0].v) * h;
+      Q3[1].v += (T01 - T12 - c * Q3[1].v) * h;
+      if(held) Q3[2].v = (zh0 + (zh1 - zh0) * it / 4 - z2) / h;
+      else Q3[2].v += (T12 - c * Q3[2].v) * h;
+      for(i = 0; i < 3; i++) Q3[i].z += Q3[i].v * h;
+    }
+    // Each ring's energy: how far its spring is from rest, and how fast it is moving — it glows with it.
+    for(i = 0; i < 3; i++){
+      var gap = i < 2 ? Q3[i].z - Q3[i + 1].z : Q3[1].z - Q3[2].z;
+      Q3[i].mesh.material.uniforms.uE.value = clamp(Math.abs(gap - s0) / 0.09 + Math.abs(Q3[i].v) * 0.25, 0, 1.4);
+    }
+  }
+
+  // ── THE SHOP ──
+  function openShop(){
+    if(S.sl && S.sl.hold){ S.sl.hold = false; S.sl.pullTgt = 0; }
+    R.shop = { from: S.dead ? 'card' : 'aim' }; R.press = -1;
+  }
+  function buy(k){
+    var own = slingOwned(), bank = loadNum(BANK_KEY), price = P.slingPrice[k - 1];
+    if(k <= own) return;
+    if(k > own + 1 || bank < price){ R.rowShake['buy' + k] = 1; return; }   // not yet: the row shakes its head
+    bank -= price; saveNum(BANK_KEY, bank); saveNum(SLING_KEY, k);
+    if(S.dead){
+      S.bank = bank;
+      R.elCardCoins.textContent = S.coinN.toLocaleString('en-US') + (S.coinN === 1 ? ' COIN' : ' COINS') + '  ·  ' + bank.toLocaleString('en-US') + ' TOTAL';
+    } else if(S.sl && S.sl.phase === 'aim') slingReset();   // bought from the start of a run: in the new one now
+    R.coinPulse = 1;
+  }
+
+  // ── The DOM over it all: the words on the plates, the shop's header, the meter's insides, the readouts. ──
+  function hexCss(c){ return '#' + ('000000' + c.toString(16)).slice(-6); }
+  function dotBg(k){
+    if(TIERS[k].prism) return 'conic-gradient(#ff6b8a,#ffc46b,#5fe08f,#5fb8ff,#b07cff,#ff6b8a)';
+    if(k === 0) return 'radial-gradient(circle at 35% 35%,#fff3c4,#ffc94a 55%,#b07a12)';
+    var c = TIERS[k].rgb.split(',').map(Number), lt = c.map(function(v){ return Math.round(v + (255 - v) * 0.7); }), dk = c.map(function(v){ return Math.round(v * 0.45); });
+    return 'radial-gradient(circle at 35% 35%,rgb(' + lt + '),rgb(' + c + ') 55%,rgb(' + dk + '))';
+  }
+  function coinDot(k, px){
+    return '<span style="display:inline-block;width:' + px + 'px;height:' + px + 'px;border-radius:50%;margin-right:7px;vertical-align:0;background:' +
+      dotBg(k) + ';box-shadow:0 0 6px rgba(' + TIERS[k].rgb + ',0.55);"></span>';
+  }
+  function ringIcon(k){
+    var T = slingTier(k), h = '';
+    for(var i = 0; i < 3; i++){
+      var c = T.prism ? ['#ff5f86', '#36c773', '#4f86ff'][i] : T.ui;
+      h += '<span style="position:absolute;left:' + (16 + i * 9) + 'px;top:50%;width:11px;height:30px;margin-top:-17px;border-radius:50%;' +
+           'border:2px solid ' + c + ';box-shadow:0 0 6px ' + c + ',inset 0 0 3px ' + c + ';"></span>';
+    }
+    return h;
+  }
+  function plateHTML(a, own, bank){
+    if(a === 'restart') return 'RESTART';
+    if(a === 'shop') return 'SHOP';
+    if(a === 'store') return 'BACK TO STORE';
+    if(a === 'shopback') return 'BACK';
+    var k = +a.slice(3), price = P.slingPrice[k - 1], T = slingTier(k), state, sc;
+    if(k === own){ state = 'EQUIPPED'; sc = 'rgb(6,116,106)'; }
+    else if(k < own){ state = 'OWNED'; sc = 'rgba(27,32,41,0.5)'; }
+    else { state = coinDot(0, 9) + price.toLocaleString('en-US'); sc = (k === own + 1 && bank >= price) ? '#1b2029' : 'rgba(27,32,41,0.45)'; }
+    return ringIcon(k) +
+      '<div style="position:absolute;left:62px;top:14px;font-size:14px;letter-spacing:0.22em;color:#1b2029;">SLINGSHOT ' + ROMAN[k - 1] + '</div>' +
+      '<div style="position:absolute;left:62px;top:36px;font-size:10px;letter-spacing:0.16em;color:rgba(27,32,41,0.62);">' +
+        P.slingReach[k - 1].toLocaleString('en-US') + ' M  ·  <span style="color:' + T.ui + ';">' + T.name + '</span> ×' + T.mul + '</div>' +
+      '<div style="position:absolute;right:18px;top:0;bottom:0;display:flex;align-items:center;font-size:13px;letter-spacing:0.14em;color:' + sc + ';">' + state + '</div>';
+  }
+  function buildSlingLayer(T){
+    var L = R.layer;
+    // The meter's insides (its glass is a plate): the pull's fill, the green zone, the running marker.
+    R.elMeter = el('div', T + 'overflow:hidden;opacity:0;', L);
+    R.elFill = el('div', 'position:absolute;left:0;right:0;bottom:0;height:0;', R.elMeter);
+    R.elZone = el('div', 'position:absolute;left:5px;right:5px;border-radius:5px;background:rgba(52,216,115,0.62);' +
+      'box-shadow:0 0 12px rgba(52,216,115,0.7),inset 0 0 0 1px rgba(10,80,40,0.55);', R.elMeter);
+    R.elMark = el('div', 'position:absolute;left:2px;right:2px;height:4px;margin-bottom:-2px;border-radius:2px;background:#fff;' +
+      'box-shadow:0 0 0 1px rgba(27,32,41,0.75),0 0 10px rgba(255,255,255,0.9);', R.elMeter);
+    R.elReach = el('div', T + 'text-align:right;opacity:0;font-size:10px;letter-spacing:0.26em;color:rgba(150,170,205,0.9);', L);
+    R.elReachK = el('div', '', R.elReach, 'UP TO');
+    R.elReachV = el('div', 'font-size:20px;letter-spacing:0.05em;color:#f2f5fa;margin-top:5px;text-shadow:0 0 14px rgba(16,196,178,0.35);', R.elReach, '');
+    // Over the SHOP pill: the slingshot's name, and (until the first shot) how to fire it.
+    R.elHint = el('div', T + 'left:0;right:0;text-align:center;opacity:0;font-size:10px;letter-spacing:0.26em;color:rgba(150,170,205,0.9);', L);
+    R.elHintName = el('div', 'font-size:13px;letter-spacing:0.3em;margin-bottom:9px;', R.elHint, '');
+    R.elHintHow = el('div', '', R.elHint, 'DRAG DOWN TO PULL  ·  SIDEWAYS TO AIM');
+    R.elResult = el('div', T + 'left:0;right:0;text-align:center;opacity:0;font-size:24px;letter-spacing:0.32em;', L);
+    // The tier the coins have just turned, under the coin count.
+    R.elTier = el('div', T + 'left:0;right:0;top:calc(56px + env(safe-area-inset-top, 0px));text-align:center;opacity:0;font-size:10px;letter-spacing:0.3em;', L);
+    // The shop's header: what it sells, the bank, and the reason to go far.
+    R.elShop = el('div', T + 'left:0;right:0;text-align:center;opacity:0;', L);
+    el('div', 'font-size:11px;letter-spacing:0.34em;color:rgba(150,170,205,0.85);', R.elShop, 'SLINGSHOTS');
+    R.elShopBank = el('div', 'font-size:22px;letter-spacing:0.06em;color:rgba(255,205,90,0.95);margin-top:9px;text-shadow:0 0 12px rgba(255,190,60,0.35);', R.elShop, '');
+    el('div', 'font-size:10px;letter-spacing:0.22em;color:rgba(150,170,205,0.75);margin-top:9px;', R.elShop, 'THE FURTHER OUT, THE MORE A COIN IS WORTH');
+  }
+  function slingDom(W, H, card){
+    var Lp = R.plates || [], sl = S.sl, shop = R.shopAmt, own = slingOwned(), bank = loadNum(BANK_KEY), i, p;
+    R.elCard.style.opacity = R.cardShown ? card * (1 - shop) : 0;
+    if(R.cardShown) R.elCard.style.top = Math.round(H * 0.2) + 'px';
+    else { var ho = (1 - shop).toFixed(3); R.elDist.style.opacity = ho; R.elCoins.style.opacity = ho; }
+    // a label on every plate that is a button
+    var meter = null, pill = null, first = null;
+    for(i = 0; i < R.elBtn.length; i++){
+      var e = R.elBtn[i]; p = Lp[i];
+      if(p && p.meter) meter = p;
+      if(p && p.act === 'shop' && sl && !S.dead) pill = p;
+      if(p && p.act === 'buy1') first = p;
+      if(!p || !p.act){ if(e._on){ e._on = false; e.style.opacity = 0; } continue; }
+      e._on = true;
+      var r = p.r, bk = p.act.indexOf('buy') === 0 ? +p.act.slice(3) : 0;
+      var key = p.act + ':' + own + ':' + (bk && bank >= P.slingPrice[bk - 1] ? 1 : 0);
+      if(e._key !== key){ e._key = key; e.innerHTML = plateHTML(p.act, own, bank); e.style.lineHeight = bk ? 'normal' : r.h + 'px'; }
+      var sh = R.rowShake[p.act] || 0;
+      e.style.left = Math.round(r.x + Math.sin(sh * 26) * 7 * sh) + 'px'; e.style.top = r.y + 'px';
+      e.style.width = r.w + 'px'; e.style.height = r.h + 'px';
+      e.style.opacity = (p.amt * (p.dim || 1)).toFixed(3);
+    }
+    // the shop's header
+    R.elShop.style.opacity = shop.toFixed(3);
+    if(shop > 0.001){
+      R.elShop.style.top = Math.round((first ? first.r.y : H * 0.21) - 96) + 'px';
+      var bt = coinDot(0, 12) + bank.toLocaleString('en-US');
+      if(R.elShopBank._v !== bt){ R.elShopBank._v = bt; R.elShopBank.innerHTML = bt; }
+    }
+    // the meter: fill = the pull, the green zone, the marker; beside it, how far this shot goes
+    if(meter && sl){
+      var mr = meter.r, ins = 5, T = slingTier(sl.lvl), ms = R.elMeter.style, iw = mr.w - 2 * ins;
+      ms.left = (mr.x + ins) + 'px'; ms.top = (mr.y + ins) + 'px'; ms.width = iw + 'px'; ms.height = (mr.h - 2 * ins) + 'px';
+      ms.borderRadius = (iw / 2) + 'px'; ms.opacity = meter.amt.toFixed(3);
+      if(R.elFill._lvl !== sl.lvl){ R.elFill._lvl = sl.lvl; R.elFill.style.background = 'linear-gradient(to top,rgba(' + T.rgb + ',0.85),rgba(' + T.rgb + ',0.2))'; }
+      R.elFill.style.height = (sl.pull * 100).toFixed(2) + '%';
+      R.elZone.style.bottom = ((sl.zone - sl.zoneW / 2) * 100).toFixed(2) + '%'; R.elZone.style.height = (sl.zoneW * 100).toFixed(2) + '%';
+      R.elZone.style.opacity = sl.hold ? 1 : 0.3;
+      R.elMark.style.bottom = (sl.mkPos * 100).toFixed(2) + '%'; R.elMark.style.opacity = sl.hold ? 1 : 0;
+      var live = sl.hold || sl.pull > 0.05, rs = R.elReach.style;
+      rs.opacity = meter.amt.toFixed(3); rs.right = (W - mr.x + 14) + 'px'; rs.top = Math.round(mr.y + mr.h / 2 - 22) + 'px';
+      var rk = live ? 'REACH' : 'UP TO', rv = Math.round(live ? sl.reachM : P.slingReach[sl.lvl - 1]).toLocaleString('en-US') + ' M';
+      if(R.elReachK.textContent !== rk) R.elReachK.textContent = rk;
+      if(R.elReachV.textContent !== rv) R.elReachV.textContent = rv;
+    } else { R.elMeter.style.opacity = 0; R.elReach.style.opacity = 0; }
+    if(pill && sl){
+      var T2 = slingTier(sl.lvl), nm = 'SLINGSHOT ' + ROMAN[sl.lvl - 1];
+      R.elHint.style.opacity = pill.amt.toFixed(3); R.elHint.style.top = (pill.r.y - (R.slingUsed ? 34 : 58)) + 'px';
+      if(R.elHintName.textContent !== nm){ R.elHintName.textContent = nm; R.elHintName.style.color = 'rgba(' + T2.rgb + ',0.95)'; R.elHintName.style.textShadow = '0 0 12px rgba(' + T2.rgb + ',0.5)'; }
+      R.elHintHow.style.display = R.slingUsed ? 'none' : '';
+    } else R.elHint.style.opacity = 0;
+    // how the shot went
+    var ro = sl && sl.resT > 0 ? clamp(sl.resT / 0.6, 0, 1) : 0;
+    R.elResult.style.opacity = ro.toFixed(3);
+    if(ro > 0){
+      if(R.elResult._v !== sl.result){
+        R.elResult._v = sl.result; R.elResult.textContent = sl.result;
+        var rc = sl.result === 'PERFECT' ? '80,232,140' : (sl.result === 'CLOSE' ? '242,245,250' : '150,170,205');
+        R.elResult.style.color = 'rgba(' + rc + ',0.95)'; R.elResult.style.textShadow = '0 0 16px rgba(' + rc + ',0.5)';
+      }
+      R.elResult.style.top = Math.round(H * 0.3) + 'px';
+      R.elResult.style.transform = 'scale(' + (1 + 0.3 * Math.max(0, sl.resT - 1.3)).toFixed(3) + ')';
+    }
+    // THE COIN TIER on the readout: the count and its dot wear the colour of where you are, and turning a
+    // new tier says so for a moment.
+    var tk = tierAt(Math.max(0, S.z)), TT = TIERS[tk];
+    if(tk !== R.lastTier){
+      if(R.lastTier >= 0 && tk > R.lastTier && !S.dead){ R.elTier.textContent = TT.name + ' COINS  ×' + TT.mul; R.tierToast = 2.6; }
+      R.lastTier = tk;
+      R.elCoinDot.style.background = dotBg(tk);
+      R.elCoins.style.color = R.elTier.style.color = 'rgba(' + TT.rgb + ',0.95)';
+      R.elCoins.style.textShadow = R.elTier.style.textShadow = '0 0 10px rgba(' + TT.rgb + ',0.45)';
+    }
+    if(TT.prism){ var hc = 'hsl(' + Math.round(performance.now() * 0.08 % 360) + ',90%,76%)'; R.elCoins.style.color = R.elTier.style.color = hc; }
+    R.elTier.style.opacity = (R.cardShown ? 0 : clamp(R.tierToast / 0.6, 0, 1) * (1 - shop)).toFixed(3);
+  }
+
+  // ════════════════════════════════════════ THE PATTERNS ════════════════════════════════════════
+  // The random rows are fodder; the meat is SET PIECES — a few seconds of the course built to one idea you
+  // learn and get better at. Each pattern is a spawn(z, n, d) that lays its pieces from z on a held n-gon at
+  // difficulty d and returns where it ends; the scheduler (rows) keeps the fodder out of its way. Three new
+  // building blocks make them possible, besides the ordinary obstacles:
+  //   • BULKHEADS — a wall across the whole tube, solid except where it is cut: round OPENINGS (which can
+  //     move and shrink — the iris), or solid only in turning BLADES.
+  //   • PITS — a stretch where every wall is open space except SAFE STRIPS (which can narrow, wind round the
+  //     tube, and end).
+  //   • coin strings laid along exactly the line the pattern wants you on (or tempts you onto).
+  // To add a pattern: write spawn(), give it a weight and the shapes it works on, add it to PATTERNS.
+
+  // ── Bulkheads: one shared disc (covering every shape's corners), a material each — the cut is uniforms,
+  // so an opening can slide and close or a blade turn without touching geometry. The shader clips the disc
+  // to the tube's own polygon first. Mode 0: solid except OPENINGS (≤ 6 circles); mode 1: solid only in the
+  // BLADES (≤ 4 sectors). Edges glow from the same distance field the cut uses. Faces are a dark glass you
+  // can just see the next one through. ──
+  var BULK_GEO = null;
+  function bulkMat(){
+    var H = [], B = [];
+    for(var i = 0; i < 6; i++) H.push(new THREE.Vector4());
+    for(i = 0; i < 4; i++) B.push(new THREE.Vector4());
+    return new THREE.ShaderMaterial({
+      uniforms: { uN: { value: 8 }, uA: { value: P.apothem }, uMode: { value: 0 }, uHole: { value: H }, uBlade: { value: B },
+                  uEdge: { value: HAZ_EDGE }, uCore: { value: HAZ_CORE }, uFogCol: { value: new THREE.Color(BG) }, uFogD: { value: P.fog } },
+      vertexShader: 'varying vec2 vXY; varying vec3 vView; void main(){ vXY = position.xy; vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
+      fragmentShader: [
+        'uniform float uN, uA, uMode, uFogD; uniform vec3 uEdge, uCore, uFogCol; uniform vec4 uHole[6]; uniform vec4 uBlade[4];',
+        'varying vec2 vXY; varying vec3 vView;',
+        'void main(){',
+        '  vec2 p = vXY; float r = length(p), al = atan(p.x, -p.y);',
+        '  float st = 6.2831853 / uN, dA = al - st * floor(al / st + 0.5);',
+        '  float de = uA - r * cos(dA);',                                   // inside the tube's polygon
+        '  if(de < 0.0) discard;',
+        '  if(uMode < 0.5){',
+        '    for(int i = 0; i < 6; i++){ if(uHole[i].w < 0.5) continue; float d = length(p - uHole[i].xy) - uHole[i].z; if(d < 0.0) discard; de = min(de, d); }',
+        '  } else {',
+        '    float ib = -1.0;',
+        '    for(int i = 0; i < 4; i++){ if(uBlade[i].z < 0.5) continue; float d = al - uBlade[i].x; d -= 6.2831853 * floor(d / 6.2831853 + 0.5); ib = max(ib, (uBlade[i].y - abs(d)) * max(r, 0.03)); }',
+        '    if(ib < 0.0) discard;',
+        '    de = min(de, ib);',
+        '  }',
+        '  float w = length(fwidth(p)) + 1e-5;',
+        '  float edge = exp(-de / (w * 1.4)) + 0.4 * exp(-de / (w * 8.0));',
+        '  float hs = abs(fract((p.x + p.y) * 22.0) - 0.5);',
+        '  float hatch = smoothstep(0.36, 0.47, hs) * (1.0 - smoothstep(0.004, 0.012, w));',
+        '  vec3 col = uCore + uEdge * (edge + hatch * 0.2 + 0.05);',
+        '  float a = clamp(0.74 + edge, 0.0, 1.0);',
+        '  float dd = length(vView), fog = exp(-uFogD * uFogD * dd * dd);',
+        '  gl_FragColor = vec4(mix(uFogCol, col, fog), mix(1.0, a, fog));',
+        '}'
+      ].join('\n'),
+      transparent: true, depthWrite: false, side: THREE.DoubleSide, extensions: { derivatives: true }
+    });
+  }
+  // A bulkhead at z on the n-gon. opts: { holes: [{th, r}] } (fixed openings on the ride at angle th), or
+  // { iris: {th, rMin, open, close} } (one opening: the whole tube far off, closing onto th — see wallCut),
+  // or { blades: {k, half, omega, b0} } (k blades, half-width `half` rad, turning omega rad/s).
+  function addWall(z, n, opts){
+    if(!BULK_GEO) BULK_GEO = new THREE.CircleGeometry(0.56, 48);
+    var w = R.wallPool.pop();
+    if(!w){ w = { mesh: new THREE.Mesh(BULK_GEO, bulkMat()) }; w.mesh.frustumCulled = false; w.mesh.renderOrder = 1; R.scene.add(w.mesh); }
+    w.z = z; w.n = n; w.holes = null; w.iris = null; w.blades = null;
+    if(opts.holes) w.holes = opts.holes.map(function(h){ var p = rideAt(regShape(n), h.th, _rc); return { x: p.x, y: p.y, r: h.r }; });
+    if(opts.iris){ w.iris = opts.iris; var q = rideAt(regShape(n), opts.iris.th, _rc); w.iris.x = q.x; w.iris.y = q.y; }
+    if(opts.blades) w.blades = opts.blades;
+    var u = w.mesh.material.uniforms;
+    u.uN.value = n; u.uMode.value = w.blades ? 1 : 0; u.uFogD.value = R.fogD || P.fog;
+    w.mesh.visible = true;
+    w.mesh.position.set(0, 0, -(z - S.zBase));
+    R.walls.push(w);
+    return w;
+  }
+  // A wall's cut right now. The iris is a pure function of how far off the ship is: the whole tube (a circle
+  // round the axis bigger than any corner) at `open` units away, closed onto the ride at th by `close`
+  // units — smoothstep between — so what you see is exactly what you will meet.
+  var _cut = [{ x: 0, y: 0, r: 0 }];
+  function wallCut(w){
+    if(w.holes) return w.holes;
+    var I = w.iris, dz = w.z - S.z, e = clamp((I.open - dz) / (I.open - I.close), 0, 1);
+    e = e * e * (3 - 2 * e);
+    _cut[0].x = I.x * e; _cut[0].y = I.y * e; _cut[0].r = 0.62 + (I.rMin - 0.62) * e;
+    return _cut;
+  }
+  function bladeAng(w, i){ var B = w.blades; return B.b0 + i * TAU / B.k + B.omega * S.runT; }
+  function feedWalls(){
+    for(var i = 0; i < R.walls.length; i++){
+      var w = R.walls[i], u = w.mesh.material.uniforms, j;
+      u.uFogD.value = R.fogD || P.fog;
+      if(w.blades){
+        for(j = 0; j < 4; j++) u.uBlade.value[j].set(j < w.blades.k ? bladeAng(w, j) : 0, w.blades.half, j < w.blades.k ? 1 : 0, 0);
+      } else {
+        var c = wallCut(w);
+        for(j = 0; j < 6; j++){ if(j < c.length) u.uHole.value[j].set(c[j].x, c[j].y, c[j].r, 1); else u.uHole.value[j].w = 0; }
+      }
+    }
+  }
+  // Does the ship (at px, py, pz) strike a bulkhead? Through an opening only if the whole hull clears its rim.
+  function wallHit(px, py, pz){
+    var rs = SHIP.hw * P.hitScale, slab = 0.025 + SHIP.hl * P.hitScale;
+    for(var i = 0; i < R.walls.length; i++){
+      var w = R.walls[i];
+      if(Math.abs(pz - w.z) > slab) continue;
+      if(w.blades){
+        var ang = Math.atan2(px, -py), rr = Math.max(0.05, Math.hypot(px, py));
+        for(var b = 0; b < w.blades.k; b++) if(Math.abs(wrapPi(ang - bladeAng(w, b))) < w.blades.half + rs / rr) return { phi: ang, u0: 0, u1: 0 };
+        continue;
+      }
+      var c = wallCut(w), clear = false;
+      for(var j = 0; j < c.length; j++) if(Math.hypot(px - c[j].x, py - c[j].y) <= c[j].r - rs){ clear = true; break; }
+      if(!clear) return { phi: Math.atan2(px, -py), u0: 0, u1: 0 };
+    }
+    return null;
+  }
+  function freeWalls(all){
+    for(var i = R.walls.length - 1; i >= 0; i--){
+      var w = R.walls[i];
+      if(all || w.z < S.z - 1.5){ w.mesh.visible = false; R.wallPool.push(w); R.walls.splice(i, 1); }
+    }
+  }
+
+  // ── Pits: is polar angle th at z over open space? Inside a pit stretch, only the safe strips hold you. ──
+  function stripAt(s, z){ var u = z - s.zA; return s.th0 + s.drift * u + s.amp * Math.sin(s.freq * u); }
+  function pitAt(th, z){
+    for(var i = 0; i < R.pits.length; i++){
+      var p = R.pits[i];
+      if(z < p.z0 || z > p.z1) continue;
+      for(var k = 0; k < p.strips.length; k++){
+        var s = p.strips[k];
+        if(z < s.zA || z > s.zB) continue;
+        var w = s.w0 + (s.w1 - s.w0) * clamp((z - s.zA) / (s.zB - s.zA), 0, 1);
+        if(Math.abs(wrapPi(th - stripAt(s, z))) <= w) return false;
+      }
+      return true;
+    }
+    return false;
+  }
+  // The pit stretch nearest ahead goes to the tube shader (patterns never overlap in view).
+  function feedPits(){
+    var u = R.tubeMat.uniforms, best = null;
+    for(var i = 0; i < R.pits.length; i++){ var p = R.pits[i]; if(p.z1 > S.z - 3 && (!best || p.z0 < best.z0)) best = p; }
+    if(!best){ u.uPit.value.z = 0; u.uSN.value = 0; return; }
+    u.uPit.value.set(-(best.z0 - S.zBase), -(best.z1 - S.zBase), 1, 0);
+    var n = Math.min(6, best.strips.length);
+    for(var k = 0; k < n; k++){
+      var s = best.strips[k];
+      u.uSA.value[k].set(-(s.zA - S.zBase), -(s.zB - S.zBase), s.th0, s.drift);
+      u.uSB.value[k].set(s.amp, s.freq, s.w0, s.w1);
+    }
+    u.uSN.value = n;
+  }
+
+  // ── A coin on the ride at angle th, at z, `lift` above it (default: hover height). ──
+  function placeCoin(th, z, lift){
+    if(S.coins.length >= COIN_MAX) return;
+    var sh = shapeInto(z, _shC), ra = rideAt(sh, th, _rc), rx = ra.x, ry = ra.y, up = upAt(sh, th), L = lift == null ? P.coinLift : lift;
+    S.coins.push({ z: z, x: rx - Math.sin(up) * L, y: ry + Math.cos(up) * L, up: up,
+                   spin: Math.random() * TAU, pulled: false, rx: 0, ry: 0, rz: 0, vx: 0, vy: 0, vz: 0 });
+  }
+  function coinLine(thOf, zA, zB, ups, lift){
+    var gap = P.coinSpacingSec * ups;
+    for(var z = zA; z <= zB; z += gap) placeCoin(thOf(z), z, lift);
+  }
+  // Random angles round the tube, at least `sep` apart.
+  function spreadAngles(k, sep, near, within){
+    var out = [], tries = 0;
+    while(out.length < k && tries++ < 200){
+      var a = near + (Math.random() * 2 - 1) * within, ok = true;
+      for(var i = 0; i < out.length; i++) if(Math.abs(wrapPi(a - out[i])) < sep) ok = false;
+      if(ok) out.push(a);
+    }
+    return out;
+  }
+  function wallIdx(th, n){ var span = TAU / n; return ((Math.round(th / span) % n) + n) % n; }
+
+  // Each pattern: w = how often it comes up, min/max sides it works on, sec(d) = how long it runs.
+  var PATTERNS = {
+    // THE BULKHEADS — giant walls, each with three openings you fit through; one of them is threaded with
+    // coins. Then another, with its openings somewhere else.
+    bulkheads: { w: 3, min: 4, max: 16, sec: function(d){ return 0.6 + (3 + (d > 0.6 ? 1 : 0)) * (0.85 - 0.2 * d) + 0.3; },
+      spawn: function(z, n, d, ups){
+        var cnt = 3 + (d > 0.6 ? 1 : 0), gap = ups * (0.85 - 0.2 * d), r = 0.08 + 0.03 * (1 - d), zz = z + ups * 0.6, near = S.th;
+        for(var k = 0; k < cnt; k++){
+          var ths = spreadAngles(3, 0.9, near, Math.PI);
+          addWall(zz, n, { holes: ths.map(function(t){ return { th: t, r: r }; }) });
+          var lucky = ths[Math.floor(Math.random() * ths.length)];
+          coinLine(function(){ return lucky; }, zz - ups * 0.3, zz + ups * 0.12, ups);
+          near = ths[0];
+          zz += gap;
+        }
+        return zz - gap + ups * 0.3;
+      } },
+    // THE IRIS — one wall whose opening starts as the whole tube and closes down onto a single point on the
+    // wall as you come at it. Watch where it is closing to, and be there. Two in a row when it gets hard.
+    iris: { w: 2.5, min: 4, max: 16, sec: function(d){ return 3.6 + (d > 0.5 ? 1.2 : 0); },
+      spawn: function(z, n, d, ups){
+        var span = TAU / n, cnt = d > 0.5 ? 2 : 1, zz = z + ups * 3.2, th = S.th;
+        for(var k = 0; k < cnt; k++){
+          th = th + (Math.random() < 0.5 ? -1 : 1) * span * (1.2 + Math.random() * 1.6);
+          addWall(zz, n, { iris: { th: th, rMin: 0.075 + 0.03 * (1 - d), open: ups * 2.8, close: ups * 0.35 } });
+          var tt = th;
+          coinLine(function(){ return tt; }, zz - ups * 0.45, zz + ups * 0.15, ups);
+          zz += ups * 1.2;
+        }
+        return zz - ups * 1.2 + ups * 0.4;
+      } },
+    // THE TIGHTROPE — the tube falls away: every wall is a pit but one path, which narrows from a wall and a
+    // half wide to barely the ship, and winds round the tube as it goes. Coins down its middle.
+    tightrope: { w: 2.5, min: 4, max: 16, sec: function(d){ return 0.3 + 3.0 + 1.5 * d + 0.4; },
+      spawn: function(z, n, d, ups){
+        var span = TAU / n, L = ups * (3.0 + 1.5 * d), z0 = z + ups * 0.3, z1 = z0 + L;
+        var th0 = Math.round((S.th + (Math.random() * 2 - 1) * span) / span) * span;
+        var s = { zA: z0 - 0.01, zB: z1 + 0.01, th0: th0, drift: (Math.random() < 0.5 ? -1 : 1) * span * (0.5 + Math.random()) / L,
+                  amp: span * 0.2 * Math.random(), freq: TAU / (L * (0.5 + 0.5 * Math.random())),
+                  w0: Math.max(0.3, span * 0.75), w1: 0.10 + 0.07 * (1 - d) };
+        R.pits.push({ z0: z0, z1: z1, strips: [s] });
+        coinLine(function(zc){ return stripAt(s, zc); }, z0 + ups * 0.15, z1 - ups * 0.1, ups * 1.3);
+        return z1 + ups * 0.4;
+      } },
+    // THE FORK — three paths over a pit; all but one run out. One carries coins — sometimes the safe one,
+    // sometimes bait. You can see the ends coming, and jump across to another path if you are quick.
+    fork: { w: 2, min: 5, max: 16, sec: function(d){ return 0.3 + 3.4 + 0.4; },
+      spawn: function(z, n, d, ups){
+        // Paths at least ~35° apart (whole walls), so there is always pit between them to choose across —
+        // on a 16-gon, neighbouring walls' paths would touch.
+        var span = TAU / n, L = ups * 3.4, z0 = z + ups * 0.3, z1 = z0 + L, base = Math.round(S.th / span) * span;
+        var sep = span * Math.max(1, Math.ceil(0.62 / span)), ang = [base - sep, base, base + sep], safe = Math.floor(Math.random() * 3), strips = [];
+        var coined = Math.random() < 0.5 ? safe : (safe + 1 + Math.floor(Math.random() * 2)) % 3, hw = 0.16 + 0.06 * (1 - d);
+        for(var k = 0; k < 3; k++){
+          var zB = k === safe ? z1 + 0.01 : z0 + L * (0.35 + 0.45 * Math.random());
+          strips.push({ zA: z0 - 0.01, zB: zB, th0: ang[k], drift: 0, amp: 0, freq: 0, w0: hw, w1: hw });
+        }
+        R.pits.push({ z0: z0, z1: z1, strips: strips });
+        var cs = strips[coined];
+        coinLine(function(){ return cs.th0; }, z0 + ups * 0.15, Math.min(cs.zB, z1) - ups * 0.12, ups);
+        return z1 + ups * 0.4;
+      } },
+    // THE CORKSCREW — rows of gates with one wall open, and the open wall steps one round the tube each
+    // row: you roll round with it. Coins in the openings.
+    corkscrew: { w: 2, min: 5, max: 10, sec: function(d){ return 0.4 + (6 + Math.round(3 * d)) * (0.55 - 0.12 * d) + 0.3; },
+      spawn: function(z, n, d, ups){
+        var rowsN = 6 + Math.round(3 * d), gap = ups * (0.55 - 0.12 * d), dir = Math.random() < 0.5 ? -1 : 1, j0 = wallIdx(S.th, n), zz = z + ups * 0.4;
+        for(var k = 0; k < rowsN; k++){
+          var open = ((j0 + dir * k) % n + n) % n;
+          for(var j = 0; j < n; j++) if(j !== open) addObs('gate', j, zz, n);
+          var th = Math.round(S.th / (TAU / n)) * (TAU / n) + dir * k * (TAU / n);
+          placeCoin(th, zz - gap * 0.3); placeCoin(th, zz);
+          zz += gap;
+        }
+        return zz - gap + ups * 0.3;
+      } },
+    // THE SLALOM — half-walls down every wall, left, right, left: each covers a little past the middle, so
+    // there is no straight line through — you weave. Tighter and longer when it gets hard. (Pillars at
+    // ±half a wall were tried first: they left the middle clear, and riding straight down it beat them.)
+    slalom: { w: 1.5, min: 4, max: 10, sec: function(d){ return 0.4 + (6 + Math.round(3 * d)) * (0.42 - 0.08 * d) + 0.3; },
+      spawn: function(z, n, d, ups){
+        var cnt = 6 + Math.round(3 * d), gap = ups * (0.42 - 0.08 * d), zz = z + ups * 0.4, left = Math.random() < 0.5;
+        for(var k = 0; k < cnt; k++){
+          for(var j = 0; j < n; j++) addObs('half', j, zz, n, { left: left });
+          left = !left; zz += gap;
+        }
+        return zz - gap + ups * 0.3;
+      } },
+    // THE HURDLES — a bar across every wall, in a steady beat: hop, hop, hop. Coins arc over each bar along
+    // the line of the hop itself.
+    hurdles: { w: 1.5, min: 4, max: 10, sec: function(d){ return 0.5 + 5 * (0.8 - 0.15 * d) + 0.3; },
+      spawn: function(z, n, d, ups){
+        var gap = ups * (0.8 - 0.15 * d), zz = z + ups * 0.5, th = Math.round(S.th / (TAU / n)) * (TAU / n);
+        for(var k = 0; k < 5; k++){
+          for(var j = 0; j < n; j++) addObs('bar', j, zz, n);
+          for(var c = -2; c <= 2; c++){ var f = c / 2.5; placeCoin(th, zz + c * ups * 0.1, P.coinLift + 0.11 * (1 - f * f)); }
+          zz += gap;
+        }
+        return zz - gap + ups * 0.3;
+      } },
+    // THE BLADES — walls made of turning blades: be where they are not when you reach each one.
+    blades: { w: 1.5, min: 4, max: 16, sec: function(d){ return 0.8 + 3 * 0.9 + 0.3; },
+      spawn: function(z, n, d, ups){
+        var zz = z + ups * 0.8, dir = Math.random() < 0.5 ? -1 : 1;
+        for(var k = 0; k < 3; k++){
+          var kb = 2 + (d > 0.5 && Math.random() < 0.5 ? 1 : 0);
+          addWall(zz, n, { blades: { k: kb, half: Math.PI / kb * (0.42 + 0.12 * d), omega: dir * (0.8 + 0.9 * d), b0: Math.random() * TAU } });
+          dir = -dir; zz += ups * 0.9;
+        }
+        return zz - ups * 0.9 + ups * 0.3;
+      } }
+  };
+  // A pillar at an exact place across wall j (the fodder's are random).
+  function addPillar(j, z, n, uc){
+    var hw = halfWn(n), rp = OB.pillar.r, phi = j * TAU / n, o = { type: 'pillar', face: j, n: n, phi: phi, z: z, sector: false, mt: 'pillar', kr: R.pil };
+    uc = clamp(uc, -(hw - rp), hw - rp);
+    o.u0 = uc - rp * P.hitScale; o.u1 = uc + rp * P.hitScale; o.y0 = 0; o.y1 = OB.pillar.h; o.dz = rp * P.hitScale;
+    var m = o.mesh = takeMesh(o), a = P.apothem, yc = OB.pillar.h / 2;
+    m.position.set(Math.sin(phi) * a + Math.cos(phi) * uc - Math.sin(phi) * yc, -Math.cos(phi) * a + Math.sin(phi) * uc + Math.cos(phi) * yc, -(z - S.zBase));
+    m.rotation.set(0, 0, phi);
+    R.obs.push(o);
+  }
+  // Which pattern next: weighted, never the same twice running, and only ones that work on this shape.
+  function pickPattern(n){
+    if(P.onlyPat && PATTERNS[P.onlyPat]) return P.onlyPat;
+    var w = {}, any = false;
+    for(var k in PATTERNS){ var p = PATTERNS[k]; if(n >= p.min && n <= p.max && k !== S.lastPat){ w[k] = p.w; any = true; } }
+    return any ? wpick(w) : null;
   }
   // ── Obstacles ──
   function wpick(w){ var t = 0, k; for(k in w) t += w[k]; var r = Math.random() * t; for(k in w){ r -= w[k]; if(r <= 0) return k; } return k; }
@@ -93058,14 +93837,26 @@ var RUNNER = (function(){
     return null;
   }
   function rows(){
-    var ahead = Math.max(P.ahead, unitsPerSec() * P.aheadSec);
+    var ahead = Math.max(P.ahead, rowUps() * P.aheadSec);
     while(S.nextRow < S.z + ahead){
-      var ups = unitsPerSec(), z = S.nextRow, sec = sectionAt(z), skipTo = clearZone(z, ups);
+      var ups = rowUps(), z = S.nextRow, sec = sectionAt(z), skipTo = clearZone(z, ups);
       // The gap in seconds shrinks with the run's difficulty; in units it is that × the current speed.
       var gs = (P.rowGapSecMin + Math.random() * (P.rowGapSecMax - P.rowGapSecMin)) * (1 + (P.rowGapEndMul - 1) * difficulty());
       var next = (skipTo != null ? skipTo : z) + ups * gs;
+      // A PATTERN when one is due — on a held tube with room for all of it before the tube changes.
+      if(skipTo == null && sec.kind === 'hold' && z >= S.nextPat){
+        var pk = pickPattern(sec.n), PT = pk && PATTERNS[pk], dd = difficulty();
+        if(PT && z + PT.sec(dd) * ups < sec.z1 - ups * P.morphClearBefore){
+          var zEnd = PT.spawn(z, sec.n, dd, ups);
+          S.lastPat = pk; S.patLog.push(pk);
+          S.nextRow = zEnd + ups * gs * 0.5;
+          S.nextPat = zEnd + ups * (P.patGapSecMin + Math.random() * (P.patGapSecMax - P.patGapSecMin));
+          continue;
+        }
+      }
       if(skipTo == null){
-        if(sec.kind === 'hold') spawnRow(z, sec.n);
+        if(!P.fodder){}
+        else if(sec.kind === 'hold') spawnRow(z, sec.n);
         else if(sec.kind === 'flat') spawnFlatRow(z, sec);
       }
       // Coins in the gap this leaves — through a fold too: the walls move, a coin string just rides them.
@@ -93074,6 +93865,8 @@ var RUNNER = (function(){
     }
     for(var i = R.obs.length - 1; i >= 0; i--) if(R.obs[i].z < S.z - 1.5){ freeObs(R.obs[i]); R.obs.splice(i, 1); }
     for(i = R.holes.length - 1; i >= 0; i--) if(R.holes[i].z1 < S.z - 3) R.holes.splice(i, 1);
+    for(i = R.pits.length - 1; i >= 0; i--) if(R.pits[i].z1 < S.z - 3) R.pits.splice(i, 1);
+    freeWalls(false);
   }
   function spawnRow(z, n){
     var d = difficulty(), span = TAU / n, me = ((Math.round(S.th / span) % n) + n) % n, pick = [], j;
@@ -93156,7 +93949,7 @@ var RUNNER = (function(){
     var K = kit(n); K.kr = K.kr || {};
     return K.kr[mt] || (K.kr[mt] = { geo: K.geo[mt], mat: K.mat[mt], pool: K.pool[mt] });
   }
-  function addObs(type, j, z, n){
+  function addObs(type, j, z, n, opt){
     var hw = halfWn(n), phi = j * TAU / n, o = { type: type, face: j, n: n, phi: phi, z: z, sector: false };
     var uc = 0, yc = 0;
     if(type === 'bar'){
@@ -93168,7 +93961,7 @@ var RUNNER = (function(){
       uc = (Math.random() * 2 - 1) * span; yc = OB.pillar.h / 2;
       o.u0 = uc - rp * P.hitScale; o.u1 = uc + rp * P.hitScale; o.y0 = 0; o.y1 = OB.pillar.h; o.dz = rp * P.hitScale;
     } else if(type === 'half'){
-      var left = Math.random() < 0.5, inner = -hw + OB.half.frac * hw;
+      var left = (opt && opt.left != null) ? opt.left : Math.random() < 0.5, inner = -hw + OB.half.frac * hw;
       o.mt = left ? 'halfL' : 'halfR';
       o.u0 = left ? -hw : -inner; o.u1 = left ? inner : hw; o.y0 = 0; o.y1 = OB.half.h; o.dz = OB.half.d / 2; o.sector = true;
     } else {
@@ -93212,7 +94005,7 @@ var RUNNER = (function(){
     var x1 = S.x, y1 = S.y, z1 = S.z, n = Math.max(1, Math.ceil((z1 - z0) / 0.02));
     for(var i = 1; i <= n; i++){
       var f = i / n, px = x0 + (x1 - x0) * f, py = y0 + (y1 - y0) * f, pz = z0 + (z1 - z0) * f;
-      var o = hitTest(px, py, pz);
+      var o = hitTest(px, py, pz) || (R.walls.length ? wallHit(px, py, pz) : null);
       if(o){ S.x = px; S.y = py; S.z = pz; return o; }
     }
     return null;
@@ -93225,7 +94018,7 @@ var RUNNER = (function(){
   // a kick to the cockpit diamond's spin (the hull's own reaction to an event, as a shot kicks it). ──
   var _shC = { n: 0, phi: new Float64Array(48), h: new Float64Array(48), span: 0, reg: 0 };
   function spawnCoins(zA, zB, onLine){
-    var ups = unitsPerSec(), gap = P.coinSpacingSec * ups, count = Math.min(P.coinMax, Math.floor((zB - zA) / gap));
+    var ups = rowUps(), gap = P.coinSpacingSec * ups, count = Math.min(P.coinMax, Math.floor((zB - zA) / gap));
     if(count < 3) return;
     var sh0 = shapeInto(zA, _shC), span = sh0.span, kind = Math.random();
     var th0 = S.th + (Math.random() * 2 - 1) * span * 1.2;
@@ -93278,9 +94071,10 @@ var RUNNER = (function(){
     }
   }
   function collect(c){
-    S.coinN++; R.coinPulse = 1;
+    var tk = c.tier != null ? c.tier : tierAt(c.z);
+    S.coinN += TIERS[tk].mul; R.coinPulse = 1;   // the run's coins are counted in WORTH (what is banked)
     _p.set(c.x, c.y, -(c.z - S.zBase));
-    burst(_p, 10, true);
+    burst(_p, 10, true, R.tierCol[tk]);
     if(typeof ckptSpinKick === 'function') ckptSpinKick(0.6);
   }
   function drawCoins(){
@@ -93291,15 +94085,18 @@ var RUNNER = (function(){
       _p.set(c.x, c.y, -(c.z - S.zBase));
       _m.compose(_p, _q, _sc);
       m.setMatrixAt(i, _m);
+      if(c.tier == null){ c.tier = tierAt(c.z); c.ph = Math.random(); }   // its tier: where it was laid
+      R.coinTier.setXY(i, c.tier, c.ph);
     }
     m.count = n;
-    if(n) m.instanceMatrix.needsUpdate = true;
+    if(n){ m.instanceMatrix.needsUpdate = true; R.coinTier.needsUpdate = true; }
   }
 
   // ── The crash: real momentum, not an animation. The forward speed goes into the obstacle (a little
   // comes back), the hit throws the nose up and the ship off the floor, and it tumbles on that spin
   // until gravity and the floor have taken it all. The rig reacts to the deceleration on its own. ──
   function crash(o){
+    S.hitBy = { type: o.type || 'bulkhead', face: o.face, n: o.n, z: o.z, at: S.z, th: S.th };   // (what ended it — readable from the test surface)
     var v0 = S.v, g = S.g = S.up;
     S.dead = true; S.deadF = 0; S.grounded = false;
     S.v = -0.22 * v0;
@@ -93316,7 +94113,7 @@ var RUNNER = (function(){
     finishRun();
   }
   var GOLD = new THREE.Color(1.0, 0.78, 0.32);
-  function burst(p, n, gold){
+  function burst(p, n, gold, tint){
     var sp = R.sp, gx = Math.sin(S.g), gy = -Math.cos(S.g);
     for(var i = 0, made = 0; i < sp.n && made < n; i++){
       if(sp.life[i] > 0) continue;
@@ -93326,7 +94123,7 @@ var RUNNER = (function(){
       sp.vel[i * 3 + 1] = Math.sin(ph) * Math.sin(th) * s - gy * 0.008;
       sp.vel[i * 3 + 2] = Math.cos(ph) * s * 0.6 + (gold ? -S.v * 0.9 : S.v * 0.5);
       sp.max[i] = sp.life[i] = gold ? 14 + Math.random() * 10 : 30 + Math.random() * 30;
-      var hot = Math.random() < 0.35, base = gold ? GOLD : HAZ_EDGE;
+      var hot = Math.random() < 0.35, base = tint || (gold ? GOLD : HAZ_EDGE);
       sp.base[i * 3] = hot ? 1.0 : base.r; sp.base[i * 3 + 1] = hot ? 0.92 : base.g; sp.base[i * 3 + 2] = hot ? 0.85 : base.b;
       made++;
     }
@@ -93355,6 +94152,7 @@ var RUNNER = (function(){
     gameMode.ship.position.z += D;
     if(gameMode.flapMotion && gameMode.flapMotion.prevPos) gameMode.flapMotion.prevPos.z += D;
     for(i = 0; i < R.obs.length; i++) R.obs[i].mesh.position.z += D;
+    for(i = 0; i < R.walls.length; i++) R.walls[i].mesh.position.z += D;
     for(i = 0; i < S.course.length; i++) if(S.course[i].mesh) S.course[i].mesh.position.z += D;
     ['L', 'R'].forEach(function(s){ var DT = R.thr[s]; for(var q = 0; q < DT.points.length; q++) DT.points[q].p.z += D; if(DT.lastPos) DT.lastPos.z += D; if(DT._prevMount) DT._prevMount.z += D; });
     for(i = 0; i < R.sp.n; i++) R.sp.pos[i * 3 + 2] += D;
@@ -93369,6 +94167,14 @@ var RUNNER = (function(){
     while(R.acc >= GAME_FIXED_DT && n < 5){ step(); R.acc -= GAME_FIXED_DT; n++; }
     R.flash = Math.max(0, R.flash - dt / GAME_FLASH_SEC);
     R.coinPulse = Math.max(0, R.coinPulse - dt * 5);
+    var ez = Math.min(1, dt * 9);
+    R.shopAmt += ((R.shop ? 1 : 0) - R.shopAmt) * ez; if(!R.shop && R.shopAmt < 0.003) R.shopAmt = 0;
+    R.aimAmt += ((S.sl && S.sl.phase === 'aim' ? 1 : 0) - R.aimAmt) * ez; if(R.aimAmt < 0.003) R.aimAmt = 0;
+    // The lens opens with a slingshot's flight speed (and draws in a touch under the pull's tension).
+    var fk = !S.sl ? 0 : S.sl.phase === 'fly' ? P.slingFov * clamp((S.v / runSpeed() - 1) / 6, 0, 1) : (S.sl.phase === 'aim' ? -3 * S.sl.pull : 0);
+    R.fovKick += (fk - R.fovKick) * Math.min(1, dt * 5);
+    R.tierToast = Math.max(0, R.tierToast - dt);
+    for(var rk in R.rowShake) R.rowShake[rk] = Math.max(0, R.rowShake[rk] - dt * 2.2);
     render();
     dom();
   }
@@ -93400,26 +94206,33 @@ var RUNNER = (function(){
     // The lens: the chase camera's, widening into the tube camera's as the pinch takes it there.
     var e = R.zoom * R.zoom * (3 - 2 * R.zoom), hf = P.camHFov + (P.tubeCamHFov - P.camHFov) * e;
     var vf = 2 * Math.atan(Math.tan(hf * Math.PI / 360) / asp) * 180 / Math.PI;
-    vf = clamp(vf, P.camVFovMin, P.camVFovMax + (P.tubeCamVFovMax - P.camVFovMax) * e);
+    vf = clamp(vf, P.camVFovMin, P.camVFovMax + (P.tubeCamVFovMax - P.camVFovMax) * e) + R.fovKick;
     if(R.cam.aspect !== asp || R.cam.fov !== vf){ R.cam.aspect = asp; R.cam.fov = vf; R.cam.updateProjectionMatrix(); }
     R.stars.position.copy(R.cam.position);
     R.tubeMat.uniforms.uFloor.value = S.up;
     R.tubeMat.uniforms.uFlrCos.value = Math.cos(0.6 * (S.mode === 'flat' ? TAU / 8 : shapeAt(S.z).span));
-    feedHoles();
+    feedHoles(); feedPits(); feedWalls();
     R.cap.position.set(0, 0, -(S.z + maxAhead() + 10 - S.zBase));
     // The fog thins as the run speeds up, so what you can see ahead stays the same TIME away (the view
     // distance is ∝ 1/density). Every hand-written material and the scene's own fog share the one value.
-    setFog(P.fog / speedMul());
+    // (and with a slingshot's speed while it lasts — capped, the tube is only built so far ahead)
+    setFog(P.fog / Math.max(speedMul(), Math.min(S.v / baseSpeed(), P.speedMaxMul * 1.6)));
     drawCoins();
+    R.coinU.uCoinT.value = performance.now() * 0.00025;
+    if(R.sling[0].mesh.visible) for(var si = 0; si < 3; si++){
+      var sg = R.sling[si], su = sg.mesh.material.uniforms;
+      sg.mesh.position.set(0, 0, -(sg.z - S.zBase)); su.uT.value = performance.now() * 0.001; su.uFogD.value = R.fogD;
+    }
     // Key light from over the camera's shoulder; the teal glow rides just above the ship.
     var sh = gameMode.ship;
     R.key.position.copy(R.cam.position).addScaledVector(R.cam.up, 0.6).add(_v.set(0, 0, 0.4));
     R.key.target.position.copy(sh.position);
     R.glow.position.copy(sh.position).addScaledVector(R.cam.up, 0.12);
-    var card = cardAmt(), vig = 0.55, dim = card * 0.45;
+    var card = cardAmt(), vig = 0.55, dim = card * 0.45 * (1 - R.shopAmt) + R.shopAmt * 0.62;
     var prevAC = renderer.autoClear, prevRT = renderer.getRenderTarget();
     renderer.autoClear = true;
-    if(card > 0.001){
+    layout(W, H);
+    if(R.plates.length){
       renderer.getDrawingBufferSize(_db);
       if(!R.rt) R.rt = new THREE.WebGLRenderTarget(_db.x, _db.y, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat });
       else if(R.rt.width !== _db.x || R.rt.height !== _db.y) R.rt.setSize(_db.x, _db.y);
@@ -93429,7 +94242,7 @@ var RUNNER = (function(){
       bu.tScene.value = R.rt.texture; bu.uFlash.value = R.flash; bu.uVig.value = vig; bu.uDim.value = dim; bu.uRes.value.set(W, H);
       renderer.render(R.blitScene, R.ortho);
       renderer.autoClear = false;
-      frostButtons(card, W, H);
+      frostButtons(W, H);
       renderer.render(R.ui, R.uiCam);
     } else {
       renderer.setRenderTarget(null);
@@ -93441,36 +94254,55 @@ var RUNNER = (function(){
     }
     renderer.autoClear = prevAC; renderer.setRenderTarget(prevRT);
   }
-  // Card layout, in CSS px — chrome is sized from the frame, never from world units.
+  // The chrome that is up, in CSS px — chrome is sized from the frame, never from world units. Every plate:
+  // its rect, its action (none: a readout's glass), its own fade, and a corner radius (default: a capsule).
+  // The crash card's three buttons; the shop's five rows and BACK; the slingshot's meter and SHOP pill.
   function layout(W, H){
-    var bw = Math.round(Math.min(W * 0.66, 300)), bh = 56, gap = 14, y0 = Math.round(H * 0.58);
-    R.btns[0].r = { x: Math.round((W - bw) / 2), y: y0, w: bw, h: bh };
-    R.btns[1].r = { x: Math.round((W - bw) / 2), y: y0 + bh + gap, w: bw, h: bh };
+    var L = [], card = cardAmt() * (1 - R.shopAmt), shop = R.shopAmt, aim = R.aimAmt * (1 - R.shopAmt), k;
+    if(card > 0.001){
+      var bw = Math.round(Math.min(W * 0.66, 300)), bh = 56, gap = 14, y0 = Math.round(H * 0.55);
+      ['restart', 'shop', 'store'].forEach(function(a, j){ L.push({ r: { x: Math.round((W - bw) / 2), y: y0 + j * (bh + gap), w: bw, h: bh }, act: a, amt: card }); });
+    }
+    if(shop > 0.001){
+      var own = slingOwned(), rw = Math.round(Math.min(W - 32, 380)), rh = 62, rg = 10, ry = Math.round(Math.max(110, H * 0.21));
+      for(k = 1; k <= P.slingReach.length; k++)
+        L.push({ r: { x: Math.round((W - rw) / 2), y: ry + (k - 1) * (rh + rg), w: rw, h: rh }, act: 'buy' + k, amt: shop, rad: 18, dim: k > own + 1 ? 0.55 : 1 });
+      var bw2 = Math.round(Math.min(W * 0.5, 220));
+      L.push({ r: { x: Math.round((W - bw2) / 2), y: ry + P.slingReach.length * (rh + rg) + 16, w: bw2, h: 52 }, act: 'shopback', amt: shop });
+    }
+    if(aim > 0.001){
+      var mh = Math.round(Math.min(H * 0.34, 290)), mw = 44;
+      L.push({ r: { x: W - mw - 16, y: Math.round(H * 0.47 - mh / 2), w: mw, h: mh }, act: null, amt: aim, meter: true });
+      L.push({ r: { x: Math.round((W - 128) / 2), y: H - 84, w: 128, h: 46 }, act: 'shop', amt: aim });
+    }
+    R.plates = L;
   }
-  function frostButtons(card, W, H){
-    layout(W, H);
-    var DP = DML.P, pr = renderer.getPixelRatio();
+  function frostButtons(W, H){
+    var DP = DML.P, pr = renderer.getPixelRatio(), L = R.plates;
     R.uiCam.left = 0; R.uiCam.right = W; R.uiCam.top = 0; R.uiCam.bottom = -H; R.uiCam.updateProjectionMatrix();
     for(var i = 0; i < R.btns.length; i++){
-      var b = R.btns[i], r = b.r, u = b.mesh.material.uniforms;
+      var b = R.btns[i], p = L[i];
+      b.mesh.visible = !!p;
+      if(!p) continue;
+      var r = p.r, u = b.mesh.material.uniforms;
       b.press += ((R.press === i ? 1 : 0) - b.press) * 0.35;
-      var s = 1 - 0.04 * b.press;
+      var s = 1 - 0.04 * b.press, rad = p.rad != null ? p.rad : Math.min(r.w, r.h) * 0.5;
       b.mesh.scale.set(r.w * s, r.h * s, 1);
       b.mesh.position.set(r.x + r.w / 2, -(r.y + r.h / 2), 0);
       // Same feed as DML.feedFrost, in px: 1 unit = 1 CSS px here, so the px params ARE the units.
       u.tBg.value = R.rt.texture;
       u.res.value.set(W * pr, H * pr);
       u.hsize.value.set(r.w * s * 0.5, r.h * s * 0.5);
-      u.rad.value = r.h * s * 0.5;
+      u.rad.value = rad * s;
       u.aa.value = Math.max(1e-3, DP.plateEdgePx); u.bevelW.value = Math.max(1e-3, DP.plateBevelPx);
       u.blurPx.value = DP.plateBlur; u.frost.value = DP.plateFrost; u.bevel.value = DP.plateBevel;
       u.dim.value = DP.plateDim + 0.12 * b.press;
       u.tint.value.setRGB(DP.plateTint[0], DP.plateTint[1], DP.plateTint[2]);
-      u.opacity.value = DP.plateOpacity * card;
+      u.opacity.value = DP.plateOpacity * p.amt * (p.dim || 1);
     }
   }
   function dom(){
-    var m = Math.floor(S.z * M_PER_UNIT);
+    var m = Math.max(0, Math.floor(S.z * M_PER_UNIT));   // (a slingshot's pull takes the ship a little behind 0)
     if(m !== R.lastM && !S.dead){ R.lastM = m; R.elDist.textContent = m.toLocaleString('en-US') + ' M'; }
     if(S.coinN !== R.lastC){ R.lastC = S.coinN; R.elCoinN.textContent = S.coinN.toLocaleString('en-US'); }
     R.elCoins.style.transform = R.coinPulse > 0 ? 'scale(' + (1 + 0.28 * R.coinPulse).toFixed(3) + ')' : '';
@@ -93483,17 +94315,7 @@ var RUNNER = (function(){
       R.elCardCoins.textContent = S.coinN.toLocaleString('en-US') + (S.coinN === 1 ? ' COIN' : ' COINS') +
         '  ·  ' + (S.bank || 0).toLocaleString('en-US') + ' TOTAL';
     }
-    if(R.cardShown){
-      var W = window.innerWidth, H = window.innerHeight;
-      layout(W, H);
-      R.elCard.style.opacity = card;
-      R.elCard.style.top = Math.round(H * 0.28) + 'px';
-      for(var i = 0; i < 2; i++){
-        var r = R.btns[i].r, e = R.elBtn[i];
-        e.style.left = r.x + 'px'; e.style.top = r.y + 'px'; e.style.width = r.w + 'px'; e.style.height = r.h + 'px';
-        e.style.lineHeight = r.h + 'px'; e.style.opacity = card;
-      }
-    }
+    slingDom(window.innerWidth, window.innerHeight, card);   // the plates' words, the shop, the meter, the tier
   }
 
   // ════════════════════════════════════════ INPUT ════════════════════════════════════════
@@ -93505,6 +94327,7 @@ var RUNNER = (function(){
   function gMove(x, y){
     if(!G.on) return;
     var dx = x - G.lx; G.lx = x; G.ly = y;
+    if(S.sl && S.sl.phase === 'aim'){ slingDrag(x, y, dx); return; }   // in the slingshot the stroke is the pull and the aim
     var W = window.innerWidth, H = window.innerHeight, t = performance.now();
     // One rate everywhere: a whole turn of the tube per steerTurnScreen of screen width, on any shape.
     if(!S.dead && !(t < G.muteT)) steerBy(dx);
@@ -93527,16 +94350,30 @@ var RUNNER = (function(){
   }
   function gEnd(){ G.on = false; }
   function btnAt(x, y){
-    if(cardAmt() < 0.6) return -1;
-    for(var i = 0; i < R.btns.length; i++){ var r = R.btns[i].r; if(x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i; }
+    var L = R.plates || [];
+    for(var i = 0; i < L.length; i++){ var p = L[i], r = p.r; if(p.act && p.amt > 0.6 && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i; }
     return -1;
   }
-  function press(x, y){ if(S.dead){ R.press = btnAt(x, y); return; } gStart(x, y); }
-  function release(x, y){
-    if(S.dead){ var b = btnAt(x, y), p = R.press; R.press = -1; if(b >= 0 && b === p) act(R.btns[b].act); return; }
-    gEnd();
+  // A press on a plate is a button (it acts on release, if still on it). Anywhere else, while running, it is
+  // the thumb — and sitting in the slingshot, the pull.
+  function press(x, y){
+    var b = (S.dead || R.shop || (S.sl && S.sl.phase === 'aim')) ? btnAt(x, y) : -1;
+    if(b >= 0 || S.dead || R.shop){ R.press = b; return; }
+    gStart(x, y);
+    if(S.sl && S.sl.phase === 'aim') slingGrab(x, y);
   }
-  function act(a){ if(a === 'restart') restart(); else exit(); }
+  function release(x, y){
+    if(R.press >= 0 || S.dead || R.shop){ var b = btnAt(x, y), p = R.press; R.press = -1; if(b >= 0 && b === p) act(R.plates[b].act); return; }
+    gEnd();
+    if(S.sl && S.sl.phase === 'aim') slingLetGo();
+  }
+  function act(a){
+    if(a === 'restart') restart();
+    else if(a === 'store') exit();
+    else if(a === 'shop') openShop();
+    else if(a === 'shopback') R.shop = null;
+    else if(a && a.indexOf('buy') === 0) buy(+a.slice(3));
+  }
   // TWO FINGERS = THE CAMERA. A pinch in pulls out to the tube camera and a spread brings it back, 1:1
   // with the gap between the fingers (halving it is all the way); let go and it settles on whichever is
   // nearer. Turning the two fingers turns the tube camera's view with them. A second finger ends the
@@ -93591,12 +94428,17 @@ var RUNNER = (function(){
   function kDown(e){
     if(!api.active) return;
     var k = (e.key || '').toLowerCase();
+    // In the slingshot: hold Space / ↑ / ↓ to pull back (it draws itself), ←/→ aim, let go to fire.
+    if(S.sl && S.sl.phase === 'aim' && !R.shop && (k === ' ' || k === 'arrowup' || k === 'arrowdown' || k === 'w' || k === 's')){
+      if(!e.repeat && !R.keyPull){ R.keyPull = true; slingGrab(-1, -1); }
+      e.preventDefault(); e.stopImmediatePropagation(); return;
+    }
     if(k === 'arrowleft' || k === 'a'){ R.keyL = true; if(!e.repeat) cling(-1); }
     else if(k === 'arrowright' || k === 'd'){ R.keyR = true; if(!e.repeat) cling(1); }
     else if(k === 'arrowup' || k === 'w' || k === ' '){ if(!e.repeat) wantJump(); }
     else if(k === 'arrowdown' || k === 's'){ if(!e.repeat) slam(); }
     else if((k === 'enter' || k === 'r') && S.dead && cardAmt() > 0.6) restart();
-    else if(k === 'escape') exit();
+    else if(k === 'escape'){ if(R.shop) R.shop = null; else exit(); }
     else if(k === 'z'){ if(!e.repeat) R.zoomTgt = R.zoomTgt > 0.5 ? 0 : 1; }      // Z: the tube camera
     else if(k === 'q' || k === 'e'){ R.roll += (k === 'e' ? 1 : -1) * 0.12; }     // Q/E: turn it
     else return;
@@ -93605,6 +94447,10 @@ var RUNNER = (function(){
   function kUp(e){
     if(!api.active) return;
     var k = (e.key || '').toLowerCase();
+    if(R.keyPull && (k === ' ' || k === 'arrowup' || k === 'arrowdown' || k === 'w' || k === 's')){
+      R.keyPull = false; if(S.sl && S.sl.phase === 'aim') slingLetGo();
+      e.preventDefault(); e.stopImmediatePropagation(); return;
+    }
     if(k === 'arrowleft' || k === 'a') R.keyL = false;
     else if(k === 'arrowright' || k === 'd') R.keyR = false;
     else return;
@@ -93621,11 +94467,12 @@ var RUNNER = (function(){
     R.scene.add(g); g.visible = true;
     var tmp = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), R.tubeMat); R.scene.add(tmp);
     R.coinMesh.count = 1;
+    R.sling.forEach(function(q){ q.mesh.visible = true; });
     try {
       renderer.compile(R.scene, R.cam);
       renderer.compile(R.fxScene, R.ortho); renderer.compile(R.blitScene, R.ortho); renderer.compile(R.ui, R.uiCam);
       R.compiled = true;
-    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); tmp.geometry.dispose(); R.coinMesh.count = 0; }
+    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); tmp.geometry.dispose(); R.coinMesh.count = 0; R.sling.forEach(function(q){ q.mesh.visible = false; }); }
   }
   // Called from gamePreloadStep while the wheel spins — the same cadence as the planet preload.
   function preloadStep(){
@@ -93676,9 +94523,10 @@ var RUNNER = (function(){
     api.active = false;
     R.layer.style.display = 'none';
     for(var i = 0; i < R.obs.length; i++) freeObs(R.obs[i]);
-    R.obs.length = 0; R.holes.length = 0; R.pinch = null;
+    R.obs.length = 0; R.holes.length = 0; R.pits.length = 0; freeWalls(true); R.pinch = null;
     if(S && S.course){ S.course.forEach(disposeChunk); S.course = [S.course[0]]; }
     R.coinMesh.count = 0;
+    R.sling.forEach(function(q){ q.mesh.visible = false; }); R.shop = null; R.shopAmt = 0; R.aimAmt = 0; R.keyPull = false;
     clearTrail(R.thr.L); clearTrail(R.thr.R);
     scene.add(gameMode.group); gameMode.group.visible = false;
     gameMode.ship.scale.setScalar(R.shipScale0 || GAME_BASE_SHIP_SCALE);
@@ -93702,7 +94550,12 @@ var RUNNER = (function(){
               obs: function(type, face, dz){ var sec = sectionAt(S.z + dz); addObs(type, face, S.z + dz, sec.kind === 'hold' ? sec.n : 8); },
               coins: function(dz0, dz1, onLine){ spawnCoins(S.z + dz0, S.z + dz1, onLine); },
               hole: function(face, dz){ var sec = sectionAt(S.z + dz); addHole(face, S.z + dz, sec.kind === 'hold' ? sec.n : 8); return R.holes[R.holes.length - 1]; },
-              zoom: function(v){ R.zoomTgt = v; }, section: function(z){ var c = sectionAt(z == null ? S.z : z); return c.kind + (c.n || c.nNext || '') ; } };
+              zoom: function(v){ R.zoomTgt = v; },
+              pattern: function(name, dz){ var sec = sectionAt(S.z + dz); return PATTERNS[name].spawn(S.z + dz, sec.kind === 'hold' ? sec.n : 8, difficulty(), unitsPerSec()); },
+              patterns: function(){ return Object.keys(PATTERNS); }, gapAt: function(th, z){ return pitAt(th, z); }, section: function(z){ var c = sectionAt(z == null ? S.z : z); return c.kind + (c.n || c.nNext || '') ; } };
+  api._sling = { sim: flightSim, v0: slingV0, tiers: TIERS, tierAt: tierAt, owned: slingOwned, power: function(){ return slingPower(S.sl); },
+                 grab: function(){ slingGrab(-1, -1); }, letGo: slingLetGo, set: function(o){ for(var k in o) S.sl[k] = o[k]; },
+                 shop: openShop, buy: buy, act: act, plates: function(){ return R.plates.map(function(p){ return { act: p.act, r: p.r, amt: +p.amt.toFixed(3) }; }); } };
   return api;
 })();
 
