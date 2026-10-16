@@ -957,6 +957,9 @@ function assetPrefetchWorld(){
   // after the declaration executes. With PUBLIC_GAME on, the game IS enterable, so the head
   // start is worth having again and this runs.
   if(PUBLIC_BUILD && !PUBLIC_GAME) return;
+  // MOBILE RUNNER: a phone's spin leads to the tube, never the planet — warming the planet's bytes
+  // there is bandwidth spent on nothing.
+  if(typeof RUNNER !== 'undefined' && RUNNER.device()) return;
   if(_assetWorldPrefetched || ASSET_NO_PREFETCH) return;
   _assetWorldPrefetched = true;
   if(!assetPrefetchAllowed()) return;
@@ -3098,9 +3101,18 @@ var DML = (function(){
     mBodyK:      1.0,    //   the title is set small for a wide screen and needs the most help
     mPriceK:     1.0,
     mWheelGap:   0.034,  // description bottom → the top of the wheel, × H
-    mWheelW:     0.69,   // wheel diameter, × W (its depth is wheelDepth, as on desktop)
+    mWheelW:     0.69,   // wheel diameter, × W (its depth is mWheelDepth, below)
     mWheelTilt:  0,      // degrees about the screen's horizontal, on top of the desktop's
                          // orientation — the wheel is seen from above down here, not from below
+    // THE PHONE WHEEL (2026-10-15). It used to stand at the desktop's wheelDepth, 5.8 units from
+    // the lens, while the row it comes from is ~40 away on the phone camera: the snake spent most of
+    // its trip far off, then rushed at the lens. Size is solved from the frame, so depth alone never
+    // changed its look — and for the same reason pushing it back could not flatten it either.
+    mWheelDepth: 18,     // world units in front of the camera — only how far the snake travels; never
+                         //   past 60% of the way to the row's front (mobWheelD), whatever the camera does
+    mWheelFov:   14,     // THE WHEEL'S LENS, degrees (vertical): drawn as if through this field of view
+                         //   from as far back as keeps it the same size — a dolly zoom on the wheel alone.
+                         //   Lower = flatter. The camera's own field of view (38 on phones) or more = off.
     mScrollEnd:  0.04,   // scrolled to the bottom, the wheel's lowest point sits this far up, × H
     mScrollEase: 0.25,   // per-frame ease of the stack toward a wheel/trackpad scroll
     mFriction:   0.93,   // a fling's per-frame decay once the finger lifts
@@ -3169,6 +3181,10 @@ var DML = (function(){
                             //   inherits the body's momentum and spins down from it
     snakeEndClose:  0.20,   // the same for landing back on the row
     snakeSizeAt:    0.50,   // where along the trip the panels change size: 0 at the row, 1 at the wheel
+    // …and a phone's (THE STACK) own trip (2026-10-15): quicker, and straight off the row
+    mSnakeOpen:     0.95,   // seconds, row -> wheel
+    mSnakeClose:    0.85,   // seconds, wheel -> row
+    mSnakeLead:     12,     // degrees the head may run on round the row before it peels off
 
     // ── opening a product: it flies in, splits open, the glass bubbles up behind it (2026-10-08) ──
     openFly:      0.65,   // seconds — the product's flight from the row to where it stands
@@ -3284,7 +3300,9 @@ var DML = (function(){
     // The page's two corner buttons are this view's orbs (THE CORNER ORBS, outside DML): the same
     // glass, icon set, size-track pad and frost seat. Sized on SCREEN so they match the orbs here.
     cornerSize:   0.1225, // orb diameter x screen height: the action column's orb, measured (98.5 of 804 px).
-                          // P.mOrb x the width wins where it is smaller, the phone stack's own rule
+                          // cornerSizeW x the width wins where it is smaller (phones)
+    cornerSizeW:  0.15,   // orb diameter x screen WIDTH, where that is the smaller (phones): 2026-10-15 a
+                          // little bigger than the product view's mOrb (0.125) it used to share
     cornerMargin: 0.16,   // screen edge -> the seat's frost, x the orb diameter
     // THE CORNER FLOAT (2026-10-14): how the two buttons give as the page scrolls — see cornerFloatTick
     cornerFloat:    0.10, // how far a scroll's start or stop carries them (0 = fixed to the screen)
@@ -3781,7 +3799,10 @@ var DML = (function(){
   function starTarget(floorData){
     if(!live || !floorData) return null;
     var k = camK();
-    if(mob.on) return {x: 0, y: mob.wheelYc, z: frustum().camZ - P.wheelDepth, k: k};   // the stack's hub
+    if(mob.on){   // the stack's hub, at the stack's own depth — scaled with it, so it looks the size it did at wheelDepth
+      var md = mobWheelD(floorData);
+      return {x: 0, y: mob.wheelYc, z: frustum().camZ - md, k: k * md / Math.max(0.001, P.wheelDepth)};
+    }
     var f = frustum(), s = spans(), d = P.wheelDepth;
     // y as well as x/z: the star becomes the wheel's hub, so it has to take the SAME vertical
     // nudge placeWheel applies or wheelY pulls the wheel off the diamond it is supposed to sit on.
@@ -4193,10 +4214,13 @@ var DML = (function(){
   var _mwV = new THREE.Vector3();
   function mobWheelNdc(q, k, R, hz, yc, d, fy, tH){
     var top = -1e9, bot = 1e9, topD = d, botD = d;
+    // the outline as THE LENS draws it: squashed along the line of sight by s (camera at height fy)
+    var ls = lensS(), uy = yc - fy, uz = -d, ul = Math.sqrt(uy * uy + uz * uz) || 1; uy /= ul; uz /= ul;
     for(var i = 0; i < 24; i++){
       var a = i / 24 * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
       for(var e = -1; e <= 1; e += 2){
         _mwV.set(R * ca, R * sa, e * hz).multiplyScalar(k).applyQuaternion(q);
+        if(ls < 1){ var qd = (_mwV.y * uy + _mwV.z * uz) * (ls - 1); _mwV.y += qd * uy; _mwV.z += qd * uz; }
         var dz = Math.max(0.05, d - _mwV.z);
         var ny = (yc + _mwV.y - fy) / (dz * tH);
         if(ny > top){ top = ny; topD = dz; }
@@ -4205,8 +4229,14 @@ var DML = (function(){
     }
     return {top: top, bot: bot, topD: topD, botD: botD};
   }
+  // The stack's wheel depth: mWheelDepth, but never more than 60% of the way to the row's front,
+  // or a closer phone camera would stand the wheel behind the row its panels come from.
+  function mobWheelD(floorData){
+    var rr = (floorData && floorData.radius) || 0;
+    return Math.max(1.5, Math.min(P.mWheelDepth > 0 ? P.mWheelDepth : P.wheelDepth, 0.6 * (frustum().camZ - rr)));
+  }
   function mobPlaceWheel(vg, floorData){
-    var f = frustum(), d = P.wheelDepth, fy = floorData.group.position.y;
+    var f = frustum(), d = mobWheelD(floorData), fy = floorData.group.position.y;
     var tH = Math.tan((typeof CAM_FOV === 'number' ? CAM_FOV : 75) * Math.PI / 360);
     var R = Math.max(0.001, floorData.vRadius || 1);
     var k = f.halfW(d) * P.mWheelW / R;
@@ -4234,6 +4264,106 @@ var DML = (function(){
     if(!mobBusy() || !(mob.max > 0))
       mob.max = Math.max(0, mob.s + ((-1 + 2 * P.mScrollEnd) - e1.bot) * e1.botD / Math.max(0.05, e1.topD));
     return true;
+  }
+
+  // ── THE WHEEL'S LENS (2026-10-15) ──
+  // A phone's wheel looked as if shot on a very wide lens: the near shirts loomed, the far ones
+  // shrank. Moving it back and scaling it up to keep its size changes nothing (similar triangles —
+  // it is sized from the frame); what flattens it is a narrower lens from further back, a dolly
+  // zoom. One camera serves the whole page, so the wheel gets the zoom on its own: every object of
+  // it is DRAWN squashed by s along the line of sight through the wheel's centre. A camera M = 1/s
+  // times further back, zoomed in M times, sees exactly that (offset q from the centre lands at
+  // depth d − s·q either way). Only the drawing changes — matrixWorld is swapped in onBeforeRender
+  // and restored in onAfterRender — so the snake's circle model, measureLand and every placement
+  // read the true wheel. Taps go through lensPick (the inverse squash on the ray). The snake's
+  // travelling copies take the lens by how close they are to the wheel: none on the row, all of it
+  // on the wheel ring, where they hand over to the real panels without a pop.
+  var lens = {on: false, s: 1, c: new THREE.Vector3(), u: new THREE.Vector3(), r: 1};
+  var _lm = new THREE.Matrix4(), _lp = new THREE.Vector3(), _lo = new THREE.Vector3(), _ld = new THREE.Vector3();
+  function lensS(){   // the squash for mWheelFov against the camera's own field of view (1 = off)
+    if(!live || !mob.on) return 1;
+    var fov = typeof CAM_FOV === 'number' ? CAM_FOV : 75, lf = Math.max(1, Math.min(fov, P.mWheelFov || fov));
+    return Math.min(1, Math.tan(lf * Math.PI / 360) / Math.tan(fov * Math.PI / 360));
+  }
+  // S(x) = x + (s − 1)((x − c)·u)u, as a matrix
+  function lensMat(s, m){
+    var u = lens.u, k = s - 1, t = -k * u.dot(lens.c);
+    return m.set(1 + k * u.x * u.x, k * u.x * u.y, k * u.x * u.z, t * u.x,
+                 k * u.y * u.x, 1 + k * u.y * u.y, k * u.y * u.z, t * u.y,
+                 k * u.z * u.x, k * u.z * u.y, 1 + k * u.z * u.z, t * u.z,
+                 0, 0, 0, 1);
+  }
+  // where an object is, for its share of the lens: a panel's FACE (its frame origin is the ring's
+  // centre, not the panel), from floorR..vertR as it morphs; a shirt or an outline reads its panel's
+  function lensRef(o, out){
+    var r = o.__lensRoot || o, u = r.userData, fR = r.__lensFR !== undefined ? r.__lensFR : u.baseRadius,
+        vR = r.__lensVR !== undefined ? r.__lensVR : u.vRadius, zc = 0;
+    if(fR !== undefined && vR !== undefined) zc = fR + (vR - fR) * (u.morphT || 0);
+    return out.set(0, 0, zc).applyMatrix4(r.matrixWorld);
+  }
+  function lensW(dist){ return 1 - smooth01((dist - 1.1 * lens.r) / (1.2 * lens.r)); }
+  function smooth01(x){ x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); }
+  function lensBefore(){
+    if(!lens.on) return;
+    var w = lensW(lensRef(this, _lp).distanceTo(lens.c));
+    if(w <= 0) return;
+    if(!this.__lensSave) this.__lensSave = new THREE.Matrix4();
+    this.__lensSave.copy(this.matrixWorld);
+    this.matrixWorld.premultiply(lensMat(1 - (1 - lens.s) * w, _lm));
+    this.__lensOn = true;
+  }
+  function lensAfter(){ if(this.__lensOn){ this.matrixWorld.copy(this.__lensSave); this.__lensOn = false; } }
+  // Own properties, never userData: a panel is cloned into the snake's copies, and userData clones.
+  var _obr = THREE.Object3D.prototype.onBeforeRender, _oar = THREE.Object3D.prototype.onAfterRender;
+  function lensHook(o, root){
+    if(!o) return;
+    o.__lensRoot = root || null;
+    if(o.__lensHooked) return;
+    o.__lensHooked = true;
+    var b0 = o.onBeforeRender, a0 = o.onAfterRender;
+    if(b0 === _obr && a0 === _oar){ o.onBeforeRender = lensBefore; o.onAfterRender = lensAfter; return; }
+    o.onBeforeRender = function(r, sc, c, g, m, gr){ b0.call(this, r, sc, c, g, m, gr); lensBefore.call(this); };
+    o.onAfterRender = function(r, sc, c, g, m, gr){ lensAfter.call(this); a0.call(this, r, sc, c, g, m, gr); };
+  }
+  function lensTree(o, root){ if(o) o.traverse(function(n){ lensHook(n, n === root ? null : root); }); }
+  // Every frame, after the wheel is placed: the centre and the line of sight, and the hooks on
+  // whatever is wheel this frame (cheap: a flag check once an object has them).
+  function lensTick(){
+    var s = lensS();
+    var busy = typeof dm !== 'undefined' && (dm.active || dm.closing || dm.animating ||
+               (typeof SNAKE !== 'undefined' && SNAKE.runs && SNAKE.runs.length > 0));
+    lens.on = busy && s < 0.999;
+    if(!lens.on) return;
+    lens.s = s;
+    var fd = dm.floor, vg = dm.vWheel && dm.vWheel.parent ? dm.vWheel : null;
+    // the wheel; before it is built, the place it is planned at; after it has gone, where it was
+    if(vg){ lens.c.copy(vg.position); lens.r = Math.max(0.05, ((fd && fd.vRadius) || 1) * vg.scale.x); }
+    else if(dm.active && dm._vwConfig){ lens.c.copy(dm._vwConfig.pos); lens.r = Math.max(0.05, ((fd && fd.vRadius) || 1) * dm._vwConfig.scale.x); }
+    lens.u.subVectors(lens.c, camera.position).normalize();
+    if(fd && fd.panels) for(var i = 0; i < fd.panels.length; i++){
+      var p = fd.panels[i]; if(!p || !p.mesh) continue;
+      lensTree(p.mesh, p.mesh); lensHook(p.edges, p.mesh);
+    }
+    if(vg) vg.traverse(function(n){ if(!n.__lensHooked) lensHook(n, null); });
+    if(typeof SNAKE !== 'undefined' && SNAKE.runs) for(var r = 0; r < SNAKE.runs.length; r++){
+      var bs = SNAKE.runs[r].beads || [];
+      for(var j = 0; j < bs.length; j++){
+        var b = bs[j]; if(!b.mesh) continue;
+        b.mesh.__lensFR = b.fR; b.mesh.__lensVR = b.vR;
+        lensTree(b.mesh, b.mesh); lensHook(b.edge, b.mesh);
+      }
+    }
+  }
+  // A tap on the wheel: the drawn wheel is S·wheel, so test the true one with S⁻¹·ray (exact —
+  // S is affine). Wheel taps only happen with the wheel settled, where every part of it has w = 1.
+  function lensPick(rc, objs, rec){
+    if(!lens.on || lens.s >= 0.999) return rc.intersectObjects(objs, rec);
+    var o = rc.ray.origin, d = rc.ray.direction;
+    _lo.copy(o); _ld.copy(d);
+    lensMat(1 / lens.s, _lm); o.applyMatrix4(_lm); d.transformDirection(_lm);
+    var h = rc.intersectObjects(objs, rec);
+    o.copy(_lo); d.copy(_ld);
+    return h;
   }
 
   // ── scrolling the stack ──
@@ -5645,6 +5775,7 @@ var DML = (function(){
     // …and the wheel hangs off the description box, which hangs off the card, so it is placed
     // every frame after both — a scroll, the card settling, the text arriving all carry it.
     if(open && mob.on && dm.vWheel && !dm.closing) placeWheel(dm.vWheel, dm.floor);
+    lensTick();   // the wheel's own lens (THE STACK) — centre, line of sight, hooks
 
     // Resizing mid-view would otherwise leave both halves solved for the old frustum. The wheel
     // and the scrim can be re-placed outright; the product is left alone while displayAnim owns
@@ -6514,6 +6645,7 @@ var DML = (function(){
           mobile:mobile, stackWanted:stackWanted, mobileLive:mobileLive, mobScrollWheel:mobScrollWheel,
           mobDragStart:mobDragStart, mobDragMove:mobDragMove, mobDragEnd:mobDragEnd, mobDragCancel:mobDragCancel,
           get _mob(){ return mob; },
+          lensPick:lensPick, get _lens(){ return lens; }, mobWheelD:mobWheelD,
           get side(){ return side; },
           // read-only peeks for the harnesses — never written through
           get _sz(){ return sz; }, get _ac(){ return ac; }, get _uni(){ return uni; }, get _desc(){ return desc; }, get _prodPanel(){ return prodPanel; },
@@ -7303,7 +7435,11 @@ SHIRT.setFilter(DML.shirtVisible);
       row('Description → wheel (× H)', 'mWheelGap', -0.1, 0.2, 0.001) +
       row('Wheel width (× W)', 'mWheelW', 0.4, 1.6, 0.01) +
       row('Wheel tip (degrees)', 'mWheelTilt', -90, 90, 1) +
-      note('The wheel keeps the desktop’s tilt, yaw, roll, spin and depth (WHEEL HALF below). Down here the camera looks DOWN into it instead of slightly up, so this tips it about the screen’s horizontal, on top of all that, until it reads as the same reel.') +
+      note('The wheel keeps the desktop’s tilt, yaw, roll and spin (WHEEL HALF below). Down here the camera looks DOWN into it instead of slightly up, so this tips it about the screen’s horizontal, on top of all that, until it reads as the same reel.') +
+      row('Wheel lens (field of view°)', 'mWheelFov', 4, 75, 0.5) +
+      note('The wheel is drawn as if through this lens, from as far back as it takes to stay the same size — a dolly zoom on the wheel alone. Lower = flatter (the near shirts stop looming); the camera’s own field of view or more = off. Taps follow what you see.') +
+      row('Wheel depth (world units)', 'mWheelDepth', 3, 30, 0.1) +
+      note('How far in front of the camera the wheel stands. It is sized from the screen, so this does not change how it looks — only how far the other panels travel to reach it (THE SNAKE). Never further than 60% of the way to the row.') +
       row('Scroll end margin (× H)', 'mScrollEnd', 0, 0.3, 0.005) +
       row('Wheel-scroll speed', 'mWheelK', 0.2, 3, 0.05) +
       row('Wheel-scroll ease', 'mScrollEase', 0.05, 1, 0.01) +
@@ -7358,6 +7494,10 @@ SHIRT.setFilter(DML.shirtVisible);
       note('The panels you did not click ride ONE path, like segments of one body: round the row, out through a turn, along a straight, through a turn into the wheel, and round the wheel until the head is one slot short of its own tail again. Closing runs the same body back. Off = the old trip, the whole row sliding over as one bundle. Takes effect on the next open or close.') +
       row('Open (s)', 'snakeOpenDur', 0.3, 4, 0.05) +
       row('Close (s)', 'snakeCloseDur', 0.3, 4, 0.05) +
+      row('Phone: open (s)', 'mSnakeOpen', 0.3, 4, 0.05) +
+      row('Phone: close (s)', 'mSnakeClose', 0.3, 4, 0.05) +
+      row('Phone: lead round the row (deg)', 'mSnakeLead', 0, 180, 1) +
+      note('A phone’s trip (THE STACK) uses these three instead of the times above and the lead below: quicker, and straight off the row.') +
       row('Spacing on the straight (× panel)', 'snakeStrip', 0.9, 3, 0.01) +
       note('How far apart the panels ride while the body is straight, in panel widths: 1 is edge to edge, a film strip. They spread back out to the row’s and the wheel’s own spacing as they reach each.') +
       row('Turn out of the row', 'snakeTurnRow', 0.5, 8, 0.1) +
@@ -7448,6 +7588,8 @@ SHIRT.setFilter(DML.shirtVisible);
       hd('THE CORNER ORBS (menu + bag)') +
       note('The two buttons in the page\u2019s top corners are this view\u2019s orbs in the same frost seat. Their size is a share of the SCREEN, so they match the orbs beside the card; frost, bevel and pad follow the plate and size-track settings above.') +
       row('Orb size (\u00d7 screen height)', 'cornerSize', 0.05, 0.2, 0.0025) +
+      row('Phones: orb size (\u00d7 screen width)', 'cornerSizeW', 0.08, 0.25, 0.0025) +
+      note('Whichever of the two is smaller wins, so this is the size on a phone (the width is the short side). The bag panel\u2019s own \u2212, + and checkout stay the product view\u2019s size.') +
       row('Gap from the screen edge (\u00d7 orb)', 'cornerMargin', 0, 0.6, 0.01) +
       row('Float: give when a scroll starts / stops (0 = fixed)', 'cornerFloat', 0, 0.5, 0.01) +
       row('Float: spring back (Hz, higher = tighter)', 'cornerFloatHz', 0.5, 5, 0.05) +
@@ -9034,18 +9176,19 @@ var STOREFRONT_MODEL = (function(){
 //   CONSTRUCT the boot, ONCE per page load. The brief (10-15): the wireframe ONLY while the pants are
 //             loading in — so rev 3's occasional SHUTTER into a light-teal virtual version is gone —
 //             and the load itself is the hologram being BUILT, a virtual world loading in:
-//             1. WIRE   flares, cones, beams; then the two tips trace a WIREFRAME in from both ends,
-//                       edge by edge like a network spreading (each vertex has its own moment, so the
-//                       front is ragged, never a ruler), its vertices lit as nodes. The mesh is a clean
+//             1. WIRE   flares, cones, beams; then a WIREFRAME comes down from the waist to the hems
+//                       (P.sweepTime), edge by edge (each vertex has its own moment, so the front is
+//                       gently ragged, never a ruler) — thin black lines and vertex dots, drawn, not
+//                       lit (rev 2 the same day: "glow less, smaller and black"). The mesh is a clean
 //                       low-poly retopology of the jeans (jeans-lowpoly.js — the scan's own mesh is
 //                       triangle soup), baked from the GLB at build time so it is here before the
-//                       3.5 MB model is. Still downloading, or its shaders still linking? The wire
-//                       holds, a scan sweeping it and light running along it: the wireframe IS the
-//                       loading state, however long that takes.
-//             2. PANELS polygons light up one at a time, top to bottom, at a pace that scales — a
-//                       few, then faster and faster, the order jittered, a few running ahead. Each
-//                       blinks, pops into place, flashes, and its TEXTURE STREAMS IN: a coarse mosaic
-//                       of the jeans' own colour sharpening to the full texture in a fraction of a
+//                       3.5 MB model is. Still downloading, or its shaders still linking? The finished
+//                       wire holds, a scan sweeping it: the wireframe IS the loading state, however
+//                       long that takes.
+//             2. PANELS a little behind the wire (P.panelLag) and at exactly its pace, polygons
+//                       light top to bottom — each once its own edges are drawn. Each pops into place
+//                       (a few blink first), flashes, and its TEXTURE STREAMS IN: a coarse mosaic of
+//                       the jeans' own colour sharpening to the full texture in a fraction of a
 //                       second. The texture is the REAL model's (an albedo pass of it from the same
 //                       camera, read at each pixel), lit by the same rig with flat normals: the
 //                       low-poly IS the jeans, faceted.
@@ -9060,9 +9203,9 @@ var STOREFRONT_MODEL = (function(){
 //      THAT TIP, ending on the waistband rim from above and the hems from below.
 //   2. SURFACE RAYS — land only on points the emitter can actually SEE (a per-emitter depth map in
 //      azimuth/spread bins). Drawn BEHIND the picture, so what shows is beam in the air.
-//   3. FRONT RAYS — while the projector constructs, a fan from each tip follows the wire being
-//      drawn, then the polygons being lit (the top tip paints the top, the bottom one the legs).
-//      The beams run brighter for the whole construction.
+//   3. FRONT RAYS — while the projector constructs, a fan from the top tip follows the wire coming
+//      down and one from the bottom tip the panels lighting behind it (then the glitch). The beams
+//      run brighter for the whole construction.
 //
 // SWAPPING IN THE REAL MODEL: HOLO.loadModel('product-images/jeans.glb') or ?holomodel=… — the
 // file keeps its OWN materials and textures in the photograph (same light rig, same environment),
@@ -9102,7 +9245,7 @@ var HOLO = (function(){
     spin: 0.36,            // turntable, rad/s
     bob: 0.008,            // float, as a share of the span
     // ── power ──
-    bootTime: 1.6,         // seconds from dark until the wireframe is fully drawn (then the polygons light)
+    bootTime: 1.6,         // seconds from dark to full power (flares, cones, beams); the wire starts coming down at 35%
     offTime: 0.6,
     reTime: 0.15,          // after the first boot: seconds to fade back in when the bay returns
     // THE PRODUCT VIEW (PANTS): where the jeans go when you open them — on screen, not in the world
@@ -9142,24 +9285,23 @@ var HOLO = (function(){
     distZone: 0.34,        // share of the object's height, from the top
     distPx: 6,             // ripple amplitude, CSS px
     distCA: 2.2,           // channel split at full strength, CSS px
-    // ── CONSTRUCT: the boot — wire, polygons lit with the texture, a glitch into the real model ──
-    wireJitter: 0.22,      // the wire's front is ragged: each vertex's moment strays this far (share of the draw)
-    scanTime: 1.5,         // seconds per scan sweep while the wire waits for the model
-    fillTime: 2.3,         // seconds for every polygon to light, top to bottom
-    fillAccel: 2.2,        // the pace scales: share lit by t = (t / fillTime)^this — 1 steady, higher = a slow start, ever faster
-    fillJitter: 0.1,       // how far (share of the height) a polygon's turn strays from its row
-    fillLead: 0.05,        // share of polygons that light early, ahead of the front
-    flash: 1.2,            // a polygon's flash as it lights (light, before the tone map)
-    flashTime: 0.09,       // ... gone this long after its blinks, s (the denim is dark: a lingering flash reads as white panels)
-    pop: 0.3,              // a lighting polygon grows into place from this much smaller
-    texIn: 0.16,           // seconds for a lit polygon's texture to stream in (mosaic → sharp)
-    texBlock: 14,          // ... its first mosaic blocks, CSS px
-    wireA: 0.9,            // the wire
+    // ── CONSTRUCT: the boot — the wire coming down, the panels following it, a glitch into the real model ──
+    sweepTime: 1.6,        // seconds for the wire to come down from the waist to the hems — the panels keep the same pace
+    panelLag: 0.22,        // seconds the panels run behind the wire (the wire is always just ahead of them)
+    wireJitter: 0.12,      // the wire's front is ragged: each vertex's moment strays this far (share of the sweep)
+    scanTime: 1.5,         // seconds per scan sweep while the finished wire waits for the model
+    fillJitter: 0.04,      // a panel lights up to this much later (share of the sweep) — never ahead of its wire
+    flash: 1.0,            // a polygon's flash as it lights (light, before the tone map)
+    flashTime: 0.06,       // ... gone this long after its blink, s (the denim is dark: a lingering flash reads as white panels)
+    pop: 0.25,             // a lighting polygon grows into place from this much smaller
+    texIn: 0.12,           // seconds for a lit polygon's texture to stream in (mosaic → sharp)
+    texBlock: 12,          // ... its first mosaic blocks, CSS px
+    wireA: 0.85,           // the wire (P.wireCol: black — no glow)
     wireBack: 0.25,        // ... on the far side, seen through the unlit near side
-    wireTex: 0.12,         // ... left on a lit polygon
-    wirePx: 0.95,          // ... line width, CSS px
-    wireFill: 0.05,        // the unlit polygons' faint glass
-    nodes: 1.0,            // the vertices as points of light
+    wireTex: 0.15,         // ... left on a lit polygon
+    wirePx: 0.6,           // ... line width, CSS px
+    wireFill: 0,           // the unlit polygons' faint glass (in the wire's colour)
+    nodes: 0.6,            // the vertices as dots
     glitchLag: 0.35,       // seconds the glitch front trails the polygons (it never passes one still lighting)
     glitchBand: 0.1,       // the glitch band's half-height, share of the model's height
     glitchAmt: 1.0,
@@ -9194,7 +9336,8 @@ var HOLO = (function(){
     thread: '#d39a46',     // gold stitching
     ink:  '#067468',       // the UI constitution's two-stop teal: colAccD for ink ...
     acc:  '#10c4b2',       // ... colAcc for strokes ...
-    glow: '#c6fff4'        // ... and near-white aqua for the hottest light
+    glow: '#c6fff4',       // ... and near-white aqua for the hottest light
+    wireCol: '#000000'     // the construction's wire (on a page gone dark it turns to `glow`)
   };
   var DEFAULTS = JSON.parse(JSON.stringify(P));
   try { var saved = JSON.parse(localStorage.getItem(KEY) || 'null'); if(saved) for(var sk in saved) if(sk in P && typeof saved[sk] === typeof DEFAULTS[sk]) P[sk] = saved[sk]; } catch(e){}
@@ -9220,13 +9363,14 @@ var HOLO = (function(){
   var scaleS = 0, scaleFit = 0, haveFit = false, spanNow = 0, failNote = '', cmK = 1, modelKind = 'none';
   var tipRings = null;
   var _v = new THREE.Vector3(), _u = new THREE.Vector3(), _w = new THREE.Vector3(), _a = new THREE.Vector3();
-  var col = { ink: new THREE.Color(), acc: new THREE.Color(), glow: new THREE.Color() };
+  var col = { ink: new THREE.Color(), acc: new THREE.Color(), glow: new THREE.Color(), wire: new THREE.Color() };
   // linear twins of the cloth colours, for the PBR photograph (hex values are sRGB)
   var lin = { indigo: new THREE.Color(), fadeCol: new THREE.Color(), weft: new THREE.Color(), thread: new THREE.Color() };
   var _colKey = '';
+  function colKey(){ return P.ink + P.acc + P.glow + P.wireCol + P.indigo + P.fadeCol + P.weft + P.thread; }
   function readCols(){
-    _colKey = P.ink + P.acc + P.glow + P.indigo + P.fadeCol + P.weft + P.thread;
-    col.ink.set(P.ink); col.acc.set(P.acc); col.glow.set(P.glow);
+    _colKey = colKey();
+    col.ink.set(P.ink); col.acc.set(P.acc); col.glow.set(P.glow); col.wire.set(P.wireCol);
     for(var k in lin) lin[k].set(P[k]).convertSRGBToLinear();
   }
   readCols();
@@ -9925,9 +10069,12 @@ var HOLO = (function(){
   //            that shrink to one pixel over uTexIn s, under a teal cast that clears as it sharpens.
   //   lpWireB  the wire of the far side (back faces), dim, seen through the unlit near side
   //   lpWireF  the near wire: bright on unlit facets, a trace on lit ones
-  // Every vertex carries its face's schedule (aFace: when it lights as a share of P.fillTime, a seed,
-  // how many blinks, its height), its face's centre (aCen) and its own moment in the wire's trace
-  // (aWT), so the whole construction runs off three uniforms: uWire (0..1), uFill (s), and time.
+  // Every vertex carries its face's schedule (aFace: when it lights as a share of P.sweepTime on the
+  // panels' clock, a seed, blinks, its height), its face's centre (aCen) and its own moment in the
+  // wire's trace (aWT), so the whole construction runs off three uniforms: uWire (0..1), uFill (s), time.
+  //   The wire is DRAWN, not lit (2026-10-15 rev 2, the brief: "glow less, smaller and black"): thin,
+  // hard lines in P.wireCol, vertex dots, touched with teal only where an edge is growing, scanned, or
+  // its panel has just lit.
   var LPU = { uFill:{value:-1}, uFillT:{value:2.3}, uFlash:{value:1.5}, uFlashT:{value:0.2}, uPop:{value:0.3},
               uTexIn:{value:0.2}, uTexBlk:{value:14}, tAlb:{value:null}, uAlbPx:{value:new THREE.Vector2(1, 1)}, uAlbOn:{value:0},
               uFlashC:{value:new THREE.Color(1, 1, 1)}, uTint:{value:new THREE.Color(0.5, 0.9, 0.85)}, uAlbAvg:{value:new THREE.Color(0.012, 0.02, 0.05)} };
@@ -9940,12 +10087,12 @@ var HOLO = (function(){
         sh.vertexShader.replace('#include <begin_vertex>', [
           '#include <begin_vertex>',
           'vTau = uFill - aFace.x*uFillT; vBlink = aFace.z;',
-          'transformed = aCen + (transformed - aCen)*(1.0 - uPop*exp(-max(vTau, 0.0)/0.07));'   // grows into place from its centre
+          'transformed = aCen + (transformed - aCen)*(1.0 - uPop*exp(-max(vTau, 0.0)/0.05));'   // grows into place from its centre
         ].join('\n'));
       sh.fragmentShader = 'uniform sampler2D tAlb; uniform vec2 uAlbPx; uniform float uFlash, uFlashT, uAlbOn, uTexIn, uTexBlk; uniform vec3 uFlashC, uTint, uAlbAvg;\nvarying float vTau, vBlink;\n' +
         sh.fragmentShader
-          // unlit: not there. Lighting: none, one or two 35 ms blinks first.
-          .replace('void main() {', 'void main() {\n  if(vTau < 0.0) discard;\n  if(vTau < 0.035*(vBlink*2.0 + 1.0) && mod(floor(vTau/0.035), 2.0) > 0.5) discard;')
+          // unlit: not there. Lighting: straight on, or one 30 ms blink first.
+          .replace('void main() {', 'void main() {\n  if(vTau < 0.0) discard;\n  if(vTau < 0.03*(vBlink*2.0 + 1.0) && mod(floor(vTau/0.03), 2.0) > 0.5) discard;')
           .replace('#include <map_fragment>', [
             '#include <map_fragment>',
             // the real model's albedo under this pixel, through a mosaic that sharpens as it streams in
@@ -9971,7 +10118,7 @@ var HOLO = (function(){
             '#include <emissivemap_fragment>',
             // the flash: full through the blinks, then GONE uFlashT later — an exponential tail of a light
             // ~25x the dark denim's stays visible for a third of a second, and the panels read white
-            'float lpB = 0.035*(vBlink*2.0 + 1.0), lpF = 1.0 - smoothstep(0.0, uFlashT, vTau - lpB);',
+            'float lpB = 0.03*(vBlink*2.0 + 1.0), lpF = 1.0 - smoothstep(0.0, uFlashT, vTau - lpB);',
             'totalEmissiveRadiance += uFlashC*uFlash*lpF*lpF;'
           ].join('\n'));
     };
@@ -9979,7 +10126,8 @@ var HOLO = (function(){
     function wireMat(face){
       return premul(new THREE.ShaderMaterial({
         uniforms: colUniforms({ uFill: LPU.uFill, uFillT: LPU.uFillT, uWire:{value:0}, uScan:{value:-1}, uWait:{value:0}, uT:{value:0},
-          uA:{value:0.9}, uTex:{value:0.12}, uPx:{value:1.2}, uGlass:{value:0.07}, uNodes:{value:1}, uFace:{value:face}, uPow:{value:1}, uLoY:{value:0}, uSizeY:{value:1} }),
+          uA:{value:0.9}, uTex:{value:0.12}, uPx:{value:1.2}, uGlass:{value:0.07}, uNodes:{value:1}, uFace:{value:face}, uPow:{value:1}, uLoY:{value:0}, uSizeY:{value:1},
+          uWireC:{value:new THREE.Color(0, 0, 0)} }),
         vertexShader: [
           'attribute vec3 aBary; attribute vec4 aFace; attribute float aWT;',
           'uniform float uFill, uFillT, uLoY, uSizeY;',
@@ -9992,34 +10140,36 @@ var HOLO = (function(){
         ].join('\n'),
         fragmentShader: [
           'uniform float uWire, uScan, uWait, uT, uA, uTex, uPx, uGlass, uNodes, uFace, uPow;',
+          'uniform vec3 uWireC;',
           GLSL_COL,
           'varying vec3 vBary, vVN, vVP; varying float vY, vTau, vWT;',
           'void main(){',
-          // TRACED IN: a point is drawn once the trace reaches its moment. Each vertex has its own (both
-          // tips first, the middle last, ragged), interpolated along the edges — so every edge grows
-          // from its earlier end toward its later one, and the growing ends are hot.
+          // TRACED IN, from the waist down: a point is drawn once the trace reaches its moment. Each
+          // vertex has its own (top first, hems last, a little ragged), interpolated along the edges —
+          // so every edge grows from its higher end toward its lower one.
           '  float dW = vWT - uWire;',
           '  if(dW > 0.0) discard;',
-          '  float hot = (1.0 - smoothstep(0.0, 0.06, -dW))*(1.0 - step(1.0, uWire));',
-          // the lines: each barycentric over its screen rate is the distance to that edge in pixels
+          '  float tip = (1.0 - smoothstep(0.0, 0.035, -dW))*(1.0 - step(1.0, uWire));',   // the growing ends
+          // the lines: each barycentric over its screen rate is the distance to that edge in pixels.
+          // Thin, hard, no halo: a drawn line, not a light.
           '  vec3 dpx = vBary/max(fwidth(vBary), vec3(1e-6));',
           '  float d = min(dpx.x, min(dpx.y, dpx.z));',
           '  float med = max(min(dpx.x, dpx.y), min(max(dpx.x, dpx.y), dpx.z));',   // the 2nd nearest edge: near only at a vertex
           '  float line = 1.0 - smoothstep(uPx*0.5, uPx*0.5 + 1.0, d);',
-          '  float halo = (1.0 - smoothstep(0.0, uPx*2.0 + 3.0, d))*0.18;',
-          '  float node = (1.0 - smoothstep(uPx*1.1, uPx*1.1 + 1.2, med))*uNodes;',
-          // lit facets keep a trace of their edges; one lighting now flashes them
-          '  float lit = step(0.0, vTau), fl = lit*(1.0 - smoothstep(0.0, 0.14, vTau));',
+          '  float node = (1.0 - smoothstep(uPx*1.4, uPx*1.4 + 1.0, med))*uNodes;',
+          // lit facets keep a trace of their edges; one lighting now marks them for a moment
+          '  float lit = step(0.0, vTau), fl = lit*(1.0 - smoothstep(0.0, 0.1, vTau));',
           '  float k = mix(1.0, uTex, lit*(1.0 - fl));',
-          // waiting for the real model: a scan sweeps the wire and light runs along it, tips to middle
+          // waiting for the real model: a scan sweeps the wire and a pulse runs down it
           '  float sc = uScan >= 0.0 ? exp(-pow((vY - uScan)/0.035, 2.0)) : 0.0;',
           '  float run = uWait*pow(0.5 + 0.5*sin((vWT*4.0 - uT*1.1)*6.2831853), 8.0)*(1.0 - lit);',
           '  float fr = pow(1.0 - abs(dot(normalize(vVN), normalize(-vVP))), 2.0);',
           '  float glass = uGlass*(0.35 + fr)*(1.0 - lit);',
-          '  float w = line + halo + node*0.9;',
-          '  float a = clamp(w*uA*k + (hot + sc*0.8 + fl*0.9 + run*0.6)*w + glass, 0.0, 1.0)*uFace*uPow;',
+          '  float w = max(line, node);',
+          '  float hl = clamp(tip + sc*0.8 + run + fl*0.6, 0.0, 1.0);',   // where the wire is touched with teal
+          '  float a = clamp(w*(uA*k + hl*0.35) + glass, 0.0, 1.0)*uFace*uPow;',
           '  if(a < 0.002) discard;',
-          '  gl_FragColor = vec4(ramp(0.42 + 0.3*line + 0.45*clamp(hot + fl + sc + run + node*0.6, 0.0, 1.0))*a, a);',
+          '  gl_FragColor = vec4(mix(uWireC, uAcc, hl*0.8)*a, a);',
           '}'
         ].join('\n'),
         side: face > 0.99 ? THREE.FrontSide : THREE.BackSide, toneMapped: false, extensions: { derivatives: true },
@@ -10064,66 +10214,66 @@ var HOLO = (function(){
     g.computeBoundingSphere();
     return g;
   }
-  // WHEN EACH FACE LIGHTS (aFace.x, a share of P.fillTime): top to bottom, at a pace that scales.
-  // Faces are ranked by height — jittered by P.fillJitter, and P.fillLead of them run ahead of the
-  // front — the gaps between turns are random (exponential: little bursts and pauses, never a metronome),
-  // and the share lit by time t is (t / T)^fillAccel: one, then another, then faster and faster.
-  // THE WIRE'S MOMENTS (aWT): 0 at both ends, 1 in the middle, strayed by P.wireJitter — a smooth field
-  // round the legs plus a little per vertex, so the front is a ragged wave rather than salt.
-  // THE FRONTS, tabulated over the fill (u = t / fillTime): FH where faces are lighting now (the front
-  // rays aim there), LA the top edge of the highest face still unlit (the glitch never comes below it).
-  function schedKey(){ return P.fillJitter + '|' + P.fillLead + '|' + P.fillAccel + '|' + P.wireJitter; }
+  // THE WIRE'S MOMENTS (aWT, a share of P.sweepTime): 0 at the waist, 1 at the hems, strayed by
+  // P.wireJitter — a smooth field round the legs plus a little per vertex, so the front coming down is
+  // a gently ragged wave, not a ruler.
+  // WHEN EACH FACE LIGHTS (aFace.x, the same units on the panels' own clock): the moment its LAST edge
+  // is drawn, plus up to P.fillJitter. So the panels come down at exactly the wire's pace and — their
+  // clock starting P.panelLag after the wire's — always that far behind it, never ahead of their wire.
+  // THE FRONTS, tabulated over u = 0 .. U.X (the last face's moment): FH where faces are lighting (the
+  // front rays aim there), LA the top edge of the highest face still unlit (the glitch never comes below it).
+  function schedKey(){ return P.fillJitter + '|' + P.wireJitter; }
   var NT = 129;
   function schedule(g){
-    var U = g.userData, h = U.h, nf = h.length, rank = new Float32Array(nf), ord = [], s = 31, f, n, j;
+    var U = g.userData, h = U.h, nf = h.length, s = 31, f, n, j;
     function r(){ s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; }
-    for(f = 0; f < nf; f++){ rank[f] = (1 - h[f]) + (r() - 0.5) * 2 * P.fillJitter; if(r() < P.fillLead) rank[f] -= 0.08 + r() * 0.4; ord.push(f); }
-    ord.sort(function(a, b){ return rank[a] - rank[b]; });
-    var gap = new Float32Array(nf), tot = 0;
-    for(f = 0; f < nf; f++){ gap[f] = -Math.log(1 - r() * 0.999); tot += gap[f]; }
-    var fac = g.attributes.aFace.array, acc = 0, inv = 1 / Math.max(0.2, P.fillAccel), wn = new Float32Array(nf), hn = new Float32Array(nf), tn = new Float32Array(nf);
-    for(n = 0; n < nf; n++){
-      acc += gap[n];
-      var fi = ord[n], when = Math.pow(acc / tot, inv), sd = r(), blinks = sd < 0.6 ? 0 : sd < 0.9 ? 1 : 2;
-      wn[n] = when; hn[n] = h[fi]; tn[n] = U.ht[fi];
-      for(var k = 0; k < 3; k++){ var o = (fi*3 + k)*4; fac[o] = when; fac[o+1] = sd; fac[o+2] = blinks; fac[o+3] = h[fi]; }
-    }
-    g.attributes.aFace.needsUpdate = true;
     var vh = U.vh, vaz = U.vaz, J = sat(P.wireJitter), wt = new Float32Array(vh.length), awt = g.attributes.aWT.array, vid = U.vid;
     for(f = 0; f < vh.length; f++){
       var fld = 0.5 + 0.5*Math.sin(vaz[f]*3.0 + vh[f]*9.0 + 1.3)*Math.sin(vaz[f]*2.0 - vh[f]*6.0 + 0.4);
-      wt[f] = sat(Math.min(vh[f], 1 - vh[f])*2*(1 - J) + J*(0.65*fld + 0.35*r()));
+      wt[f] = sat((1 - vh[f])*(1 - J) + J*(0.65*fld + 0.35*r()));
     }
     for(f = 0; f < vid.length; f++) awt[f] = wt[vid[f]];
     g.attributes.aWT.needsUpdate = true;
-    var LA = new Float32Array(NT), FH = new Float32Array(NT), suf = new Float32Array(nf + 1), p = 0;
-    suf[nf] = -0.05; for(n = nf - 1; n >= 0; n--) suf[n] = Math.max(suf[n+1], tn[n]);
+    var fac = g.attributes.aFace.array, x = new Float32Array(nf), ord = [];
+    for(f = 0; f < nf; f++){
+      x[f] = Math.max(wt[vid[f*3]], wt[vid[f*3+1]], wt[vid[f*3+2]]) + Math.max(0, P.fillJitter) * r();
+      var sd = r(), blinks = sd < 0.75 ? 0 : 1;
+      for(var k = 0; k < 3; k++){ var o = (f*3 + k)*4; fac[o] = x[f]; fac[o+1] = sd; fac[o+2] = blinks; fac[o+3] = h[f]; }
+      ord.push(f);
+    }
+    g.attributes.aFace.needsUpdate = true;
+    ord.sort(function(a, b){ return x[a] - x[b]; });
+    var X = Math.max(1e-3, x[ord[nf - 1]]), LA = new Float32Array(NT), FH = new Float32Array(NT), suf = new Float32Array(nf + 1), p = 0;
+    suf[nf] = -0.05; for(n = nf - 1; n >= 0; n--) suf[n] = Math.max(suf[n+1], U.ht[ord[n]]);
     for(j = 0; j < NT; j++){
-      var u = j / (NT - 1);
-      while(p < nf && wn[p] <= u) p++;
+      var u = j / (NT - 1) * X;
+      while(p < nf && x[ord[p]] <= u) p++;
       LA[j] = suf[p];
-      var a0 = Math.max(0, p - 8), a1 = Math.min(nf, p + 8), sm = 0; for(n = a0; n < a1; n++) sm += hn[n];
+      var a0 = Math.max(0, p - 8), a1 = Math.min(nf, p + 8), sm = 0; for(n = a0; n < a1; n++) sm += h[ord[n]];
       FH[j] = a1 > a0 ? sm / (a1 - a0) : 0;
     }
     var LS = smoothTab(LA, 3); for(j = 0; j < NT; j++) LS[j] = Math.max(LS[j], LA[j]);   // smoothed, never below the raw guarantee
-    U.LA = LS; U.FH = smoothTab(FH, 4);
+    U.LA = LS; U.FH = smoothTab(FH, 4); U.X = X;
     U.key = schedKey();
   }
   function smoothTab(A, w){ var B = new Float32Array(A.length); for(var j = 0; j < A.length; j++){ var s = 0, c = 0; for(var q = -w; q <= w; q++){ var i = Math.max(0, Math.min(A.length - 1, j + q)); s += A[i]; c++; } B[j] = s / c; } return B; }
   function tab(A, u){ u = sat(u) * (A.length - 1); var i = Math.min(A.length - 2, Math.floor(u)), f = u - i; return A[i] + (A[i+1] - A[i]) * f; }
-  // where the polygons are lighting (model height 0..1) at fill time t — the front rays aim there
-  function fillFront(t){ var U = lpFill && lpFill.geometry.userData; return U && U.FH ? tab(U.FH, t / Math.max(0.05, P.fillTime)) : 1 - sat(t / Math.max(0.05, P.fillTime)); }
+  function sweep(){ return Math.max(0.2, P.sweepTime); }
+  // where the panels are lighting (model height 0..1) at panel time t — the bottom tip's rays aim there; −1 = all lit
+  function fillFront(t){ var U = lpFill && lpFill.geometry.userData; if(!U || !U.FH) return -1; var u = t / sweep(); return u > U.X ? -1 : tab(U.FH, u / U.X); }
+  // the wire's own front (model height) at trace progress w (0..1) — the top tip's rays aim there
+  function wireFront(w){ var J = sat(P.wireJitter); return sat(1 - (w - J*0.5) / Math.max(0.05, 1 - J)); }
   // THE GLITCH FRONT (model height): the band sits on top of it, so it is where every polygon above has
   // been lit for P.glitchLag — the top edge of the highest polygon that was still unlit P.glitchLag ago.
-  // It starts at the waist (the band above the picture), and once the last polygon is lit it runs off
-  // the hems. 9 = not yet.
+  // It starts at the waist (the band above the picture), comes down at the panels' pace and, once the
+  // last polygon is lit, runs off the hems. 9 = not yet.
   function glitchFront(t){
     var U = lpFill && lpFill.geometry.userData;
     if(!U || !U.LA || t < 0) return 9;
-    var T0 = Math.max(0.05, P.fillTime), tg = t - P.glitchLag;
-    if(tg <= 0) return U.LA[0];
-    if(tg <= T0) return tab(U.LA, tg / T0);
-    return U.LA[U.LA.length - 1] - (tg - T0) * 1.4;
+    var u = (t - P.glitchLag) / sweep();
+    if(u <= 0) return U.LA[0];
+    if(u <= U.X) return tab(U.LA, u / U.X);
+    return U.LA[U.LA.length - 1] - (u - U.X) * sweep() * 1.4;
   }
   // the fill is over when the band (up to 2.6 band above the front, with its ragged columns) has left the hems
   function conDone(t){ return t >= 0 && glitchFront(t) + 2.6 * Math.max(0.01, P.glitchBand) < -0.03; }
@@ -11051,9 +11201,10 @@ function jeansLowPoly(pos, idx, opt){
 
   // frontW[k]: how strongly emitter k's front rays should show (0 = rest)
   var frontW = [0, 0];
-  function updateRays(dt, rayP, buildP){
+  // drawnFrom: the model is drawn from this height up (0 = all of it; the wire comes down from the waist)
+  function updateRays(dt, rayP, drawnFrom){
     var n = P.rays*2, A = rayM.geometry.attributes.iA.array, B = rayM.geometry.attributes.iB.array, Kk = rayM.geometry.attributes.iK.array;
-    var half = buildP*0.5 + 0.02, w = 0.035;
+    var w = 0.035;
     for(var i=0;i<n;i++){
       var k = i < P.rays ? 0 : 1, e = E[k], vis = VIS.vis[k], t = R.tgt[i], kind = R.kind[i];
       var wantNew = false;
@@ -11069,13 +11220,13 @@ function jeansLowPoly(pos, idx, opt){
       } else {
         // surface rays only ever land on what is both SEEN from this tip and already DRAWN
         R.life[i] -= dt;
-        if(t < 0 || !vis[t] || Math.min(sY[t], 1 - sY[t]) > half || R.life[i] <= 0){
+        if(t < 0 || !vis[t] || sY[t] < drawnFrom || R.life[i] <= 0){
           R.al[i] -= dt * 2.5;
           if(R.al[i] <= 0){ R.al[i] = 0; wantNew = true; }
         } else R.al[i] = Math.min(1, R.al[i] + dt*1.6);
         if(wantNew){
           t = -1;
-          for(var tries=0; tries<12; tries++){ var c2 = Math.floor(rnd()*S); if(vis[c2] && Math.min(sY[c2], 1 - sY[c2]) <= half){ t = c2; break; } }
+          for(var tries=0; tries<12; tries++){ var c2 = Math.floor(rnd()*S); if(vis[c2] && sY[c2] >= drawnFrom){ t = c2; break; } }
           R.tgt[i] = t; R.life[i] = P.rayLife * (0.5 + rnd());
         }
       }
@@ -11306,13 +11457,15 @@ function jeansLowPoly(pos, idx, opt){
   }
 
   // ══ the event clock ════════════════════════════════════════════════════════════════════════
-  // THE CONSTRUCTION (once per page load, see the header). CN.w: the wire's trace, 0..1, drawn on the
-  // power-up. CN.wait: seconds the whole wire has held for the real model (a download, a shader link).
-  // CN.t: seconds into the PANELS (−1 = not yet); the glitch front follows them on the same clock and
-  // the construction is over once it has left the hems. Scrolled away before then, it starts over
-  // next time. The product view opened in the middle of it runs the clock 3× (it is what you asked
-  // for). DI: the top distortion, only on the finished object.
-  var CN = { w: 0, wait: 0, t: -1, energy: 0 };
+  // THE CONSTRUCTION (once per page load, see the header). CN.ww: seconds since the wire started down
+  // (−1 = not yet; it starts once the beams are up, power 35%), CN.w its trace 0..1 (ww / sweepTime).
+  // CN.t: seconds into the PANELS (−1 = not yet) — they start P.panelLag after the wire if the model is
+  // ready by then, else the finished wire holds (CN.wait: seconds; a scan sweeps it) and they start the
+  // moment it is, coming down at the same pace from the top. The glitch front follows them on that
+  // clock and the construction is over once it has left the hems. Scrolled away before then, it starts
+  // over next time. The product view opened in the middle of it runs the clocks 3× (it is what you
+  // asked for). DI: the top distortion, only on the finished object.
+  var CN = { ww: -1, w: 0, wait: 0, t: -1, energy: 0 };
   var DI = { t: -1, dur: 1.7, next: 0, seed: 0, env: 0 };
   function schedDist(){ DI.next = P.distEvery * (0.5 + ernd()); }
   schedDist();
@@ -11321,22 +11474,26 @@ function jeansLowPoly(pos, idx, opt){
   // The construction plays ONCE per page. After that the bay is simply there: scrolled off and back,
   // it fades in on P.reTime as the real object. (Until 2026-10-06 every return replayed the boot.)
   var booted = false;
-  function resetConstruct(){ CN.w = 0; CN.wait = 0; CN.t = -1; }
+  function resetConstruct(){ CN.ww = -1; CN.w = 0; CN.wait = 0; CN.t = -1; }
   // the panels may start: the real model is in, its low-poly is cut, and every program is linked
   function fillReady(){ return built && lpReady && warmed; }
   // play it again (the panel's button, HOLO.construct()): from dark, exactly as on a page load
   function construct(){ if(!built && !lpReady) return; booted = false; resetConstruct(); power = 0; DI.t = -1; DI.env = 0; }
-  function events(dt, wireP){
+  function events(dt){
     if(evFrozen) return;
     if(power < 1e-3){ if(!booted) resetConstruct(); DI.t = -1; DI.env = 0; return; }
     if(!booted){
       // a model the low-poly could not be cut from: no construction, the photograph as it comes
       if(built && !lpReady && lpFail){ booted = true; schedDist(); return; }
-      CN.w = wireP;
+      var k = VIEW.on ? 3 : 1;
+      if(CN.ww < 0){ if(lpReady && power >= 0.35) CN.ww = 0; }
+      else CN.ww += dt * k;
+      CN.w = CN.ww < 0 ? 0 : sat(CN.ww / sweep());
       if(CN.t < 0){
-        if(wireP >= 0.999){ if(fillReady()) CN.t = 0; else CN.wait += dt; }
+        if(CN.ww >= P.panelLag && fillReady()) CN.t = 0;
+        else if(CN.w >= 0.999) CN.wait += dt;
       } else {
-        CN.t += dt * (VIEW.on ? 3 : 1);
+        CN.t += dt * k;
         if(conDone(CN.t)){ booted = true; schedDist(); }
       }
     } else if(power >= 1 && !VIEW.on && VIEW.k <= 0 && DI.t < 0){
@@ -11351,7 +11508,7 @@ function jeansLowPoly(pos, idx, opt){
       if(u >= 1 || !booted){ DI.t = -1; DI.env = 0; }
     } else DI.env = 0;
   }
-  // the scan that sweeps the waiting wire, top to bottom (model height 0..1), or −1
+  // the scan that sweeps the finished wire while it waits, top to bottom (model height 0..1), or −1
   function scanY(){ return (!booted && CN.t < 0 && CN.w >= 0.999) ? 1 - ((CN.wait / Math.max(0.2, P.scanTime)) % 1) : -1; }
 
   var lastErr = 0, msAvg = 0, _frame = 0;
@@ -11366,7 +11523,7 @@ function jeansLowPoly(pos, idx, opt){
     // the baked low-poly is enough to begin: until the model is in, its wire is the loading state
     if(!built && !lpReady){ root.visible = false; return; }
     dt = Math.max(0, Math.min(0.1, dt || 0));
-    if(P.ink + P.acc + P.glow + P.indigo + P.fadeCol + P.weft + P.thread !== _colKey) readCols();
+    if(colKey() !== _colKey) readCols();
     if(lpFill && lpFill.geometry.userData.key !== schedKey()) schedule(lpFill.geometry);   // tuned in the panel
     if(!tips()){ root.visible = false; power = 0; return; }
     spanNow = ER[0].distanceTo(ER[1]);              // the bay at rest — see tips()
@@ -11439,10 +11596,9 @@ function jeansLowPoly(pos, idx, opt){
       sWN[i*3] = nx*cs + nz*sn; sWN[i*3+1] = ny; sWN[i*3+2] = -nx*sn + nz*cs;
     }
 
-    // boot: flares → cones → rays → the wire traced in from both tips → the panels → the glitch
-    var flareP = sat(power/0.22), coneP = sat((power-0.12)/0.35), rayP = sat((power-0.22)/0.35), wireP = sat((power-0.30)/0.70);
-    wireP = wireP*wireP*(3 - 2*wireP);
-    events(dt, wireP);
+    // boot: flares → cones → beams; the wire comes down from the waist, the panels follow it, the glitch them
+    var flareP = sat(power/0.22), coneP = sat((power-0.12)/0.35), rayP = sat((power-0.22)/0.35);
+    events(dt);
     var con = !booted && lpReady;   // the construction is what is on screen
     if(!con && (rtC || rtA)) freeConstruct();
     var gF = con ? glitchFront(CN.t) : -9;
@@ -11452,16 +11608,18 @@ function jeansLowPoly(pos, idx, opt){
     _frame++;
     if(!LOW || !(_frame & 1)) analyse(0);
     if(!LOW || (_frame & 1)) analyse(1);
-    // front rays: the wire's tracing ends, then the waiting scan, then the panels lighting (the top tip
-    // paints the top, the bottom one the legs), then the glitch front running off the hems
-    var sy = scanY();
-    if(con && CN.t < 0 && CN.w < 0.999){ scanBuckets(0, 1 - CN.w*0.5); scanBuckets(1, CN.w*0.5); frontW[0] = frontW[1] = 1; }
-    else if(con && (CN.t >= 0 || sy >= 0)){
-      var fh = sat(CN.t < 0 ? sy : CN.t <= P.fillTime ? fillFront(CN.t) : gF + P.glitchBand);
-      scanBuckets(0, fh); scanBuckets(1, fh); frontW[0] = sat((fh - 0.35)*3); frontW[1] = sat((0.65 - fh)*3);
+    // front rays: the top tip follows the wire coming down, the bottom tip the panels lighting behind it;
+    // while the finished wire waits both ride the scan; after the last panel, the glitch leaving the hems
+    var sy = scanY(), wf = con && CN.ww >= 0 && CN.w < 0.999 ? wireFront(CN.w) : -1, pf = con && CN.t >= 0 ? fillFront(CN.t) : -1;
+    var gb = con && CN.t >= 0 && pf < 0 ? sat(gF + P.glitchBand) : -1;
+    if(wf >= 0 || pf >= 0 || sy >= 0 || gb >= 0){
+      scanBuckets(0, wf >= 0 ? wf : sy >= 0 ? sy : pf >= 0 ? pf : gb);
+      scanBuckets(1, pf >= 0 ? pf : sy >= 0 ? sy : wf >= 0 ? wf : gb);
+      frontW[0] = frontW[1] = 1;
     }
     else { scanBuckets(0, -1); scanBuckets(1, -1); frontW[0] = frontW[1] = 0; }
-    updateRays(dt, rayP * vOff, con && CN.t < 0 ? CN.w : 1);
+    // the surface rays land only on what the wire has drawn
+    updateRays(dt, rayP * vOff, !con ? 0 : CN.ww < 0 ? 1.01 : CN.w < 0.999 ? wireFront(CN.w) : 0);
     var nearT0 = updateCone(0), nearT1 = updateCone(1);
 
     for(var f=0; f<2; f++){
@@ -11541,7 +11699,7 @@ function jeansLowPoly(pos, idx, opt){
   var _lc = new THREE.Color();
   function conUniforms(albOn){
     var pr = renderer.getPixelRatio();
-    LPU.uFill.value = CN.t; LPU.uFillT.value = Math.max(0.05, P.fillTime);
+    LPU.uFill.value = CN.t; LPU.uFillT.value = sweep();
     LPU.uFlash.value = P.flash; LPU.uFlashT.value = Math.max(0.01, P.flashTime); LPU.uPop.value = P.pop;
     LPU.uTexIn.value = Math.max(0, P.texIn); LPU.uTexBlk.value = Math.max(1, P.texBlock * pr);
     LPU.tAlb.value = albOn && rtA ? rtA.texture : null; LPU.uAlbOn.value = albOn && rtA ? 1 : 0; LPU.uAlbPx.value.set(1 / rtW, 1 / rtH);
@@ -11550,11 +11708,12 @@ function jeansLowPoly(pos, idx, opt){
     LPU.uAlbAvg.value.copy(lin.indigo);
     lpFillMat.envMapIntensity = P.envI;
     var sy = scanY(), wait = sy >= 0 ? smooth(CN.wait / 0.6) : 0;
+    _lc.copy(col.wire).lerp(col.glow, pageDark());   // black ink by day; a page gone dark would swallow it
     [lpWireMatF, lpWireMatB].forEach(function(m, i){
       var u = m.uniforms;
       u.uWire.value = CN.w; u.uScan.value = sy; u.uWait.value = wait; u.uT.value = T;
-      u.uA.value = P.wireA; u.uTex.value = P.wireTex; u.uPx.value = Math.max(0.5, P.wirePx * pr); u.uGlass.value = P.wireFill; u.uNodes.value = P.nodes;
-      u.uFace.value = i ? P.wireBack : 1; u.uPow.value = 1; u.uLoY.value = lo.y; u.uSizeY.value = size.y;
+      u.uA.value = P.wireA; u.uTex.value = P.wireTex; u.uPx.value = Math.max(0.3, P.wirePx * pr); u.uGlass.value = P.wireFill; u.uNodes.value = P.nodes;
+      u.uFace.value = i ? P.wireBack : 1; u.uPow.value = 1; u.uLoY.value = lo.y; u.uSizeY.value = size.y; u.uWireC.value.copy(_lc);
     });
   }
 
@@ -11643,10 +11802,10 @@ function jeansLowPoly(pos, idx, opt){
                ['stitch','Gold stitching',0,1,0.01],['seamCm','Stitch band width (cm)',0.1,1.5,0.01],['dashP','Stitch length (cm)',0.2,3,0.05]]],
     ['Distortion (top)', [['distEvery','Every (s, 0 = never)',0,30,0.5],['distDur','Duration (s)',0.3,5,0.05],['distAmt','Strength',0,3,0.01],['distZone','Zone (share from top)',0.05,1,0.01],
                ['distPx','Ripple (px)',0,20,0.1],['distCA','Channel split (px)',0,10,0.1]]],
-    ['Construct (the load-in)', [['bootTime','Power-up + wire trace (s)',0.3,5,0.05],['wireJitter','Wire front: ragged',0,0.6,0.01],['scanTime','Waiting scan (s per sweep)',0.3,5,0.05],
-               ['fillTime','Panels: all lit by (s)',0.3,8,0.05],['fillAccel','Panels: pace scaling',0.3,5,0.05],['fillJitter','Panels: order jitter',0,0.4,0.005],['fillLead','Panels: early ones',0,0.4,0.005],
-               ['flash','Panel flash',0,6,0.05],['flashTime','Flash decay (s)',0.02,1,0.01],['pop','Pop-in',0,0.9,0.01],['texIn','Texture streams in (s)',0,0.8,0.01],['texBlock','Texture: first blocks (px)',1,40,1],
-               ['wireA','Wire',0,1.5,0.01],['wireBack','Far-side wire',0,1,0.01],['wireTex','Wire left on lit panels',0,1,0.01],['wirePx','Wire width (px)',0.4,4,0.05],['wireFill','Unlit panels: glass',0,0.5,0.005],['nodes','Vertex lights',0,2,0.01],
+    ['Construct (the load-in)', [['bootTime','Power-up (s)',0.3,5,0.05],['sweepTime','Wire + panels: waist to hems (s)',0.3,6,0.05],['panelLag','Panels behind the wire (s)',0,1.5,0.01],
+               ['wireJitter','Wire front: ragged',0,0.6,0.01],['scanTime','Waiting scan (s per sweep)',0.3,5,0.05],['fillJitter','Panels: order jitter',0,0.4,0.005],
+               ['flash','Panel flash',0,6,0.05],['flashTime','Flash gone after (s)',0.02,1,0.01],['pop','Pop-in',0,0.9,0.01],['texIn','Texture streams in (s)',0,0.8,0.01],['texBlock','Texture: first blocks (px)',1,40,1],
+               ['wireA','Wire',0,1.5,0.01],['wireBack','Far-side wire',0,1,0.01],['wireTex','Wire left on lit panels',0,1,0.01],['wirePx','Wire width (px)',0.2,4,0.05],['wireFill','Unlit panels: glass',0,0.5,0.005],['nodes','Vertex dots',0,2,0.01],
                ['glitchLag','Glitch: trails the panels by (s)',0,2,0.01],['glitchBand','Glitch: band height',0.01,0.4,0.005],['glitchAmt','Glitch: strength',0,2,0.01],['glitchMosaic','Glitch: first blocks (px)',1,48,1]]],
     ['Rays', [['rays','Rays per emitter',0,160,1],['scanShare','Share on the moving front',0,1,0.01],['rayA','Brightness',0,1.5,0.01],['rayW0','Width at tip',0.001,0.05,0.001],
               ['rayW1','Width at target',0.001,0.08,0.001],['pulse','Pulse rate',0,5,0.05],['rayLife','Dwell (s)',0.1,6,0.05],['facing','Grazing limit',-1,1,0.01]]],
@@ -11671,7 +11830,7 @@ function jeansLowPoly(pos, idx, opt){
     el('button', 'Reset', row).onclick = function(){ for(var k in DEFAULTS) P[k] = DEFAULTS[k]; try { localStorage.removeItem(KEY); } catch(e){} readCols(); buildRays(); buildPanel(); };
     el('button', 'Copy JSON', row).onclick = function(){ var s = JSON.stringify(P, null, 1); try { navigator.clipboard.writeText(s); status.textContent = 'copied'; } catch(e){} console.log(s); };
     var cf = el('fieldset', '', panel); el('legend', 'Colour', cf);
-    [['indigo','Denim (deep)'],['fadeCol','Denim (worn)'],['weft','Reverse face'],['thread','Stitching'],['ink','Hologram ink'],['acc','Hologram teal'],['glow','Hot light']].forEach(function(c){
+    [['indigo','Denim (deep)'],['fadeCol','Denim (worn)'],['weft','Reverse face'],['thread','Stitching'],['ink','Hologram ink'],['acc','Hologram teal'],['glow','Hot light'],['wireCol','Construction wire']].forEach(function(c){
       var lb = el('label', c[1], cf), inp = el('input', '', lb); inp.type = 'color'; inp.value = P[c[0]];
       inp.oninput = function(){ P[c[0]] = inp.value; readCols(); };
     });
@@ -11718,10 +11877,12 @@ function jeansLowPoly(pos, idx, opt){
     centreY: function(){ return haveFit ? Cs.y : null; },   // the jeans' fitted centre, world y (the menu's PANTS)
     photo: function(){ return rt1; },
     // look-dev handle (no behaviour): the offscreen scene, its rig, the cloth, the construction. To
-    // judge one moment of the load-in: HOLO.construct(); freeze(true) once it is up, then set CN.w
-    // (wire 0..1), CN.wait, CN.t (panel seconds) by hand — or at(t), which does the wire + panels.
+    // judge one moment of the load-in: at(t) pins the panels at t s with the wire where it would be
+    // (P.panelLag ahead); at(-1, w) pins the wire alone at w (0..1); CN.wait drives the waiting scan.
+    // freeze(false) lets go.
     _dev: function(){ return { CN: CN, DI: DI, freeze: function(f){ evFrozen = !!f; },
-      at: function(t){ evFrozen = true; booted = false; power = 1; CN.w = 1; CN.wait = 0; CN.t = t; },
+      at: function(t, w){ evFrozen = true; booted = false; power = 1; CN.t = t; CN.wait = 0;
+        CN.ww = typeof w === 'number' ? w * sweep() : Math.max(0, t + P.panelLag); CN.w = sat(CN.ww / sweep()); },
       glitchFront: function(){ return glitchFront(CN.t); }, lp: function(){ return lpFill && lpFill.geometry; },
       rtScene: rtScene, denimMat: denimMat, DU: DU, keyL: keyL, rimL: rimL, fillL: fillL, tipL: tipL, env: envRT, rtC: rtC, rtA: rtA, rt1: rt1 }; },
     // turntable angle (radians). Pass a number to set it, e.g. HOLO.angle(0) faces the front.
@@ -12866,7 +13027,15 @@ var PANTS = (function(){
         if(img){   // the pocket, cropped portrait round the mark: the pocket's shape, not just the art
           x.save(); rr(x, tc.x + 1, tc.y + 1, ts2 - 2, th2 - 2, 1.8 * u); x.clip();
           var iwd = img.width || 1, iht = img.height || 1, cu = 0.505, cvv = 0.63, hs = 0.37, hv = Math.min(0.5, hs * P.pocketAspect);
-          x.drawImage(img, (cu - hs) * iwd, Math.max(0, cvv - hv) * iht, 2 * hs * iwd, 2 * hv * iht, tc.x, tc.y, ts2, th2);
+          // the crop (image fractions) cut to the image itself, the tile's rect cut with it so the picture lands
+          // where it would have: the crop runs ~11% past the texture's bottom, and WebKit (every iPhone browser)
+          // draws NOTHING when an ImageBitmap's source rect leaves the bitmap — the GLB's own pocket art is an
+          // ImageBitmap there (r128 GLTFLoader) — where Chrome clips quietly. Same picture on both now.
+          var pu0 = cu - hs, pv0 = Math.max(0, cvv - hv), puw = 2 * hs, pvh = 2 * hv;
+          var pa0 = Math.max(0, pu0), pa1 = Math.min(1, pu0 + puw), pb0 = Math.max(0, pv0), pb1 = Math.min(1, pv0 + pvh);
+          if(pa1 > pa0 && pb1 > pb0)
+            x.drawImage(img, pa0 * iwd, pb0 * iht, (pa1 - pa0) * iwd, (pb1 - pb0) * iht,
+                        tc.x + (pa0 - pu0) / puw * ts2, tc.y + (pb0 - pv0) / pvh * th2, (pa1 - pa0) / puw * ts2, (pb1 - pb0) / pvh * th2);
           x.restore();
         } else if(d.soon){
           x.save(); x.setLineDash([0.9 * u, 0.9 * u]); rr(x, tc.x + 1.2 * u, tc.y + 1.2 * u, ts2 - 2.4 * u, th2 - 2.4 * u, 1.4 * u);
@@ -15197,7 +15366,7 @@ function onScroll(){
 // ══════════════════════════════════════════════
 // Right-click is the DRIFT input while driving (see rmbDriftSet) — don't let it also fall through to
 // the gallery/ball pick. It never mattered before because nobody right-clicked mid-game; now it's held.
-function onMD(e){if(e.button === 2 && gameMode.active && !gameMode.fps.active){e.preventDefault();return;}e.preventDefault();pDown(e.clientX,e.clientY);}
+function onMD(e){if(RUNNER.active)return;if(e.button === 2 && gameMode.active && !gameMode.fps.active){e.preventDefault();return;}e.preventDefault();pDown(e.clientX,e.clientY);}
 function updateHoverPanel(cx, cy){
   if(!pdv.active && !pdv.entering){
     var hx=(cx/renderer.domElement.clientWidth)*2-1;
@@ -15230,7 +15399,7 @@ function onMM(e){
   else hoveredPanel=null;
   renderer.domElement.parentElement.style.cursor=hoveredPanel?'pointer':'';
 }
-function onMU(e){pUp(e.clientX,e.clientY);}
+function onMU(e){if(RUNNER.active)return;pUp(e.clientX,e.clientY);}
 var touchScroll = { active:false, lastY:0, lastX:0, velY:0, locked:null, startX:0, startY:0, startTime:0, scrollMomentum:0,
   wpp:0, hist:[], flingT:0, caught:false }; // locked: null,'scroll','wheel','vwheel'
 // scrollMomentum is the FLING: CSS px per millisecond (finger-down = positive), glided in animate().
@@ -15263,6 +15432,7 @@ function touchScrollNow(e){
 }
 function onTS(e){
   e.preventDefault();
+  if(RUNNER.active) return;   // MOBILE RUNNER: a finger that was spinning the wheel when the tube took over
   if(treeUI.open) return;   // skill tree: pointer events drive pan/zoom/tap — keep the joystick out
   // THE VIEWER (phone): owns every finger while the full-screen image is up, and a two-finger
   // spread on the product photo opens it.
@@ -15377,6 +15547,7 @@ function onTS(e){
 }
 function onTM(e){
   e.preventDefault();
+  if(RUNNER.active) return;   // MOBILE RUNNER: still arrives here, but must not drag the store under the tube
   if(treeUI.open) return;   // skill tree owns touch while open
   if(VIEWER.touchMove(e)) return;
   if(PANTS.touchMove(e)) return;
@@ -15626,6 +15797,7 @@ function onTM(e){
   }
 }
 function onTE(e){
+  if(RUNNER.active) return;   // MOBILE RUNNER: …nor land as a tap on a product when it lifts
   if(treeUI.open) return;   // skill tree owns touch while open
   if(VIEWER.touchEnd(e)) return;
   if(PANTS.touchEnd(e)) return;
@@ -15930,7 +16102,7 @@ function pDown(cx,cy){
   }
   
   if(dm.active&&dm.vWheel&&!SNAKE.holdsReel(dm.floor)){   // not while the snake is still landing panels on it
-    var vi=raycaster.intersectObjects(dm.vWheel.children,true);
+    var vi=DML.lensPick(raycaster,dm.vWheel.children,true);   // through the wheel's lens (THE STACK)
     if(vi.length>0){isDragging=true;selectedFloor=null;dm.draggingVW=true;previousMouseY=cy;previousMouseX=cx;previousTime=performance.now();renderer.domElement.parentElement.classList.add('dragging');return;}
   }
   // If nav menu is hit, don't start floor drag
@@ -16547,7 +16719,7 @@ function pUp(cx,cy){
     
     // ── Check vertical wheel clicks first via direct raycast against wheel children ──
     if(dm.active && dm.vWheel && !dm.animating && !dm.closing && !switchAnim.active && !SNAKE.holdsReel(dm.floor)) {
-      var vwHits = raycaster.intersectObjects(dm.vWheel.children, true);
+      var vwHits = DML.lensPick(raycaster, dm.vWheel.children, true);   // through the wheel's lens (THE STACK)
       for(var vi=0; vi<vwHits.length; vi++){
         var hitObj = vwHits[vi].object;
         // Walk up to find the mesh with vwIdx
@@ -16669,6 +16841,13 @@ var SNAKE = (function(){
   // (+2 samples: the interval straddling the band's last sample is a lerp, not the ring)
   function clearAngle(run, rg){ return (0.55 * run.arcW * rg.k + (BAND + 2) * H) / rg.R; }
   function P(k, d){ var v = (typeof DML !== 'undefined' && DML.P) ? DML.P[k] : undefined; return (typeof v === 'number' || typeof v === 'boolean') ? v : d; }
+  // A phone (THE STACK) has its own trip — the wheel is under the description there, not beside
+  // the card — so its own times and lead (2026-10-15).
+  function stack(){ return typeof DML !== 'undefined' && !!DML.mobile && DML.mobile(); }
+  function tripDur(open){
+    return Math.max(0.2, stack() ? P(open ? 'mSnakeOpen' : 'mSnakeClose', open ? 0.95 : 0.85)
+                                 : P(open ? 'snakeOpenDur' : 'snakeCloseDur', open ? 1.5 : 1.3));
+  }
 
   // ── RINGS ────────────────────────────────────────────────────────────────────────────────
   // A ring is the circle the panels' FACE CENTRES sit on: centre C, in-plane axes E1/E2, axis A
@@ -17025,7 +17204,7 @@ var SNAKE = (function(){
   // reelAt(run, a) puts the trip's wheel end at angle a (and refills _rR)
   function plan(run, rF, reelAt){
     camSetup();
-    var best = null, bestC = 1e9, leadN = 9, leadMax = Math.max(0, P('snakeLead', 80)) * D2R;
+    var best = null, bestC = 1e9, leadN = 9, leadMax = Math.max(0, stack() ? P('mSnakeLead', 12) : P('snakeLead', 80)) * D2R;
     var lam0 = clearAngle(run, rF);
     for(var sgi = 0; sgi < 2; sgi++){
       run.sg = sgi ? -1 : 1; setOrder(run);
@@ -17138,7 +17317,7 @@ var SNAKE = (function(){
       var b = run.beads[i];
       faceOf(b.mesh, b.fR, b.dF).sub(faceAtU(run.UA - b.k, _v));
     }
-    run.dur = Math.max(0.2, P('snakeOpenDur', 1.5));
+    run.dur = tripDur(true);
     // The wheel idles one way only. Arrive moving that way and it inherits the momentum; the other
     // way it would have to stop and reverse, so ease to a stop instead.
     run.endSlope = (-run.sg === wheelIdleSign()) ? Math.max(0, Math.min(2.5, P('snakeEndOpen', 0.3))) : 0;
@@ -17177,7 +17356,7 @@ var SNAKE = (function(){
       drop(run);
       run.mode = 'close'; run.done = false;
       run.p0 = run.p; run.p1 = 0; run.t = 0;
-      run.dur = Math.max(0.2, P('snakeCloseDur', 1.3) * Math.max(0.35, run.p));
+      run.dur = Math.max(0.2, tripDur(false) * Math.max(0.35, run.p));
     } else {
       if(!P('snakeOn', true) || typeof dm === 'undefined' || !dm.vWheel) return null;
       run = make(fd, sel); if(!run) return null;
@@ -17188,7 +17367,7 @@ var SNAKE = (function(){
       // the wheel's spin is fixed now, so the search is over how far the tail unwinds round it
       plan(run, _rF, function(r, a){ r.lamR = clearAngle(r, r.frozen) + a; copyRing(r.frozen, _rR); });
       run.p0 = 1; run.p1 = 0; run.p = 1; run.t = 0;
-      run.dur = Math.max(0.2, P('snakeCloseDur', 1.3));
+      run.dur = tripDur(false);
       runs.push(run);
     }
     adopt(run, temps);
@@ -20962,8 +21141,15 @@ function cornerFloatTick(){
   var M = Math.max(0, P.cornerFloatMax || 0), r = Math.hypot(F.x, F.y), c = (M > 0 && r > 1e-6) ? M * Math.tanh(r / M) / r : 0;
   F.ox = F.x * c; F.oy = F.y * c;
 }
-// The orb's diameter, world units at cornerDist().
+// The orb's diameter, world units at cornerDist(). On a phone the width rules, at its own share
+// (cornerSizeW) — no longer the product view's mOrb, so the corners can be bigger than the card's orbs.
 function cornerOrbD(){
+  var P = DML.P, kw = P.cornerSizeW > 0 ? P.cornerSizeW : P.mOrb;
+  return Math.min(P.cornerSize * window.innerHeight, kw * window.innerWidth) * cornerWpp();
+}
+// …the product view's own orb size, as the corners were before: the cart panel's −, + and checkout
+// keep it, so a bigger bag button does not crowd the panel's rows.
+function cornerBaseD(){
   var P = DML.P;
   return Math.min(P.cornerSize * window.innerHeight, P.mOrb * window.innerWidth) * cornerWpp();
 }
@@ -22952,7 +23138,7 @@ var cart = {
   panelAnimProg: 0,
   panelAnimating: false,
   panelTargetState: false,
-  dragOffsetX: 0.3,
+  dragOffsetX: 0,     // from the panel's home in the top-right corner (cartPanelHome)
   dragOffsetY: 0
 };
 
@@ -23348,10 +23534,11 @@ function updateCartPanelFall(dt) {
   var dist = cornerDist();
   var halfH = Math.tan(fovRad/2) * dist;
   var dragY = cart.dragOffsetY || 0;
-  // panelY (world Y at rest) = dragY * halfH * 2
+  // panelY (world Y at rest) = home.y + dragY * halfH * 2   (cartPanelHome)
   // panel bottom = panelY - y_offset - CART_RH/2; want = -halfH + 0.30
-  // → y_offset = halfH*(2*dragY + 1) - 0.30 - CART_RH/2
-  var groundDist = halfH * (2 * dragY + 1) - 0.30 - CART_RH * 0.5;
+  // → y_offset = home.y + halfH*(2*dragY + 1) - 0.30 - CART_RH/2
+  var homeY = cartPanelHome(halfH * camera.aspect, halfH).y;
+  var groundDist = homeY + halfH * (2 * dragY + 1) - 0.30 - CART_RH * 0.5;
   if(groundDist < 0) groundDist = 0;
   if(cartPanelFall.y_offset >= groundDist) {
     cartPanelFall.y_offset = groundDist;
@@ -23434,7 +23621,7 @@ function breakCartPanel(impactForce){
     cartPanelFall.vel_y = 0;
     cartPanelFall.hasHit = false;
     cartPanelFall.openTime = 0;
-    cart.dragOffsetX = 0.3;
+    cart.dragOffsetX = 0;   // home: the top-right corner
     cart.dragOffsetY = 0;
     if(cart.panelGroup){ scene.remove(cart.panelGroup); cart.panelGroup = null; }
     for(var ri = 0; ri < cartOverlays.length; ri++) scene.remove(cartOverlays[ri].group);
@@ -24459,7 +24646,24 @@ var cartMorphT = 0, cartTargetT = 0;
 // read one set of numbers.
 var CART_TAB_RISE = 0.40, CART_TAB_H = 0.50, CART_TAB_INSET = 0.26, CART_TITLE_H = 0.15;
 // The panel's orbs: the corner orb's size where it fits, never more than this share of the panel.
-function cartPanelOrbD(){ return Math.min(cornerOrbD(), 0.24 * CART_RW); }
+function cartPanelOrbD(){ return Math.min(cornerBaseD(), 0.24 * CART_RW); }
+// THE CART'S HOME (2026-10-15): the panel opens in the top-right corner, by its button — on a phone
+// hanging under it, right edge flush with the seat's; on a wide screen beside it, tab level with the
+// seat's top — not out in the middle of the screen. A drag moves it from here (dragOffsetX/Y are offsets from home, fractions of the
+// screen) and every close sends the next open home. World units on the corner plane, from its centre.
+function cartPanelHome(halfW, halfH){
+  var d = cornerOrbD(), g = DML.P.cornerMargin * d, R = cornerSeatR(d);
+  // A wide screen (the camera profiles' own split): BESIDE the button, to its left, the tab's top level
+  // with the seat's — under a desktop-sized button the panel would hang lower than it ever opened before.
+  if(camera.aspect >= 1) return { x: halfW - g - 2 * R - g - CART_RW * 0.5, y: halfH - g - CART_TAB_RISE - CART_RH * 0.5, g: g };
+  // A phone: UNDER it, flush with the seat's right edge.
+  // The title tab rises out of the top edge at the LEFT; where it would run into the button seat
+  // (a big desktop button, a small phone) the panel drops by the tab, so the tab sits under the seat.
+  // Eased over one corner gap rather than switched, so a count that widens the tab cannot jump it.
+  var tabR = halfW - g - CART_RW + CART_TAB_INSET + (cart.tabW || 1.19), seatL = halfW - g - 2 * R;
+  var drop = CART_TAB_RISE * Math.max(0, Math.min(1, (tabR + 2 * g - seatL) / g));
+  return { x: halfW - g - CART_RW * 0.5, y: halfH - cornerInset(d) - R - g - drop - CART_RH * 0.5, g: g };
+}
 // The closed seat's half-size — what the bouncing balls collide with when the panel is shut.
 function cartSeatHalf(){ return cornerSeatR(cornerOrbD()); }
 
@@ -24688,9 +24892,10 @@ function positionCartIcon() {
   var iconX=halfW-ins, iconY=halfH-ins;
   // The panel: where the drag left it, sunk by the heavy-cart fall, kept on screen — solved at its
   // full size, because it never travels: the liquid forms it in place.
-  var panelX=(cart.dragOffsetX||0)*halfW*2, panelY=(cart.dragOffsetY||0)*halfH*2;
+  var home=cartPanelHome(halfW, halfH);
+  var panelX=home.x+(cart.dragOffsetX||0)*halfW*2, panelY=home.y+(cart.dragOffsetY||0)*halfH*2;
   if(cartPanelFall && cartPanelFall.y_offset > 0) panelY -= cartPanelFall.y_offset;
-  var pw=CART_RW*0.5, ph=CART_RH*0.5, margin=0.15;
+  var pw=CART_RW*0.5, ph=CART_RH*0.5, margin=Math.min(0.15, home.g);   // the buttons' own gap from the edge
   if(panelX+pw>halfW-margin) panelX=halfW-margin-pw;
   if(panelX-pw<-halfW+margin) panelX=-halfW+margin+pw;
   if(panelY+ph+CART_TAB_RISE>halfH-margin) panelY=halfH-margin-ph-CART_TAB_RISE;
@@ -24749,7 +24954,7 @@ function positionCartIcon() {
       cartOverlays=[];
       if(cart.iconOverlay)cart.iconOverlay.visible=true;
       if(cart.countMesh)cart.countMesh.visible=true;
-      cart.dragOffsetX=0.3; cart.dragOffsetY=0;   // the next open starts top-right again
+      cart.dragOffsetX=0; cart.dragOffsetY=0;   // the next open starts at home, top-right, again
       updateCartIcon();
     }
   }
@@ -33996,6 +34201,9 @@ var GAME_PRELOAD_RPM = 3;
 var PRELOAD_GAP = 10;          // frames between steps
 var gamePreload = { step: 0, wait: 0, done: false, t0: 0, log: [] };
 function gamePreloadStep(){
+  // MOBILE RUNNER: where the tube is what the spin leads to, the spin preloads the tube (ship, scene,
+  // shader links) and never starts the 5MB planet.
+  if(typeof RUNNER !== 'undefined' && RUNNER.wanted()){ RUNNER.preloadStep(); return; }
   if(gamePreload.done) return;
   if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
   if(typeof editor !== 'undefined' && editor.active) return;
@@ -34042,6 +34250,10 @@ function enterGameMode() {
   // only the commit at the end of it.
   if(PUBLIC_BUILD && !PUBLIC_GAME) return;
   if(gameMode.active || gameMode.entering || gameMode.decelerating) return;
+  // MOBILE RUNNER: a phone, or any portrait screen, gets the tube instead of the planet. This is the
+  // same funnel, so the crystal chain's top contact, the gallery double-tap and every dev route land
+  // there too — and nothing below (the lava module, the planet, the portal) is ever built on a phone.
+  if(typeof RUNNER !== 'undefined' && RUNNER.wanted()){ RUNNER.start(); return; }
   ensureLavaModule();
   if(PORTAL_TEST_MODE){ enterPortalTestMode(); return; }   // TEMP: jump straight into the flat portal sandbox
   if(!gameMode.group) buildGameMode();
@@ -91728,6 +91940,1129 @@ function stepGameSim(dt){
   updateBoostFuel(dt);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// MOBILE RUNNER — the phone's game (2026-10-15)
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// On a phone (GAME_LOW_FX) or any portrait screen, spinning the wheel no longer drops you onto the
+// planet. It drops you into an endless octagonal tube in deep space, running forward at one constant
+// speed, with nothing on screen but a small distance readout:
+//   • thumb left / right ........ slide across the face you are on, 1:1 with the thumb; keep going past
+//                                 its edge and the ship rolls over the corner onto the next wall, which
+//                                 becomes the floor — a long drag runs you right round the tube
+//   • swipe up .................. jump (the planet game's own hop)
+//   • swipe up, then left/right . while airborne: CLING to the neighbouring wall. Gravity turns to
+//                                 it, the ship flies onto it, and the view rolls until it is the floor.
+//                                 One L-shaped stroke or two separate swipes, either works.
+//   • swipe down ................ in the air: slam down to land (the planet game's own slam)
+// Every one of the eight faces is reachable that way. Obstacles spawn in rows ahead; hit one and the
+// ship crashes for real (its forward speed goes into the obstacle, it tumbles, gravity still holds),
+// then a card offers RESTART or BACK TO STORE.
+//
+// THE SAME AS THE PLANET GAME, ON PURPOSE: the ship itself (gameMode.ship — same hull, same skin), its
+// whole procedural rig (wing sweep, flap springs, cockpit spin, recoil, underglow, wing thrusters —
+// every one of them fed from the ship's own measured motion, so they answer strafes, hops, clings,
+// landings and the crash with no new animation code), and the movement constants: hover height, jump
+// impulse, jump gravity, slam velocity, the boost acceleration, the km/h scale and the fixed 60 Hz
+// step. Only the WORLD is new.
+//
+// HOW IT SITS IN THE SITE: its own THREE.Scene and camera, drawn by the site's renderer. While it runs,
+// animate() hands it the frame and returns before any storefront work — no shop, no clouds, no cube
+// map, no HUD — so the phone spends its whole budget on the tube. The ship group is borrowed from the
+// site scene on start and handed back on exit. Input arrives on the runner's own full-screen layer, so
+// no site handler ever sees a runner touch. The two buttons on the crash card are cut from the shared
+// frost glass (DML.frostMaterial), frosting the runner's own frame.
+//
+// ?runner forces it on any screen; ?runner=play also starts it straight after load; ?runspeed=80 sets
+// the run speed in km/h. RUNNER.P holds every tunable.
+var RUNNER = (function(){
+  var Q = location.search;
+  var FORCE = /[?&]runner(?:[=&]|$)/.test(Q), AUTOPLAY = /[?&]runner=play(?:&|$)/.test(Q);
+  var N = 8, SECT = Math.PI / 4;
+  // The planet game's distance scale: GAME_BASE_MAXSPEED (0.007 units a frame at 60 Hz) is what its
+  // speed counter calls 15 km/h, so one world unit is (15 / 3.6 / 60) / 0.007 = 9.92 m.
+  var M_PER_UNIT = (15 / 3.6 / 60) / GAME_BASE_MAXSPEED;
+  var SLAM_V = 0.04;          // triggerSlam's hop slam (s.vertVel = -0.04), toward the floor
+  var BG = 0x02040a;
+  var BEST_KEY = 'chrysolin_runner_best';
+
+  var P = {
+    apothem: 0.36,        // tube: axis → face. Face width = 2·apothem·tan(22.5°) ≈ 0.30 ≈ four ship spans
+    speedKmh: 192,        // the run's STARTING speed, on the planet game's km/h scale (3× the first cut's 64)
+    speedRampSec: 100,    // …and it grows ×(1 + t/this) the longer you stay alive: double at 100 s…
+    speedMaxMul: 2.5,     // …up to this (480 km/h)
+    steerScreen: 0.12,    // fraction of the screen WIDTH a thumb travels per face: ~47 px on a phone, so one
+                          // screen width is the whole way round (0.55 → 0.30 → 0.12, "a lot" more sensitive)
+    steerHz: 7.0,         // the ship's chase of the thumb along the track (exact critically damped step)
+    cornerBand: 0.35,     // share of a face pitch, centred on each corner, over which the ship rolls onto the next wall
+    rollHz: 6.0,          // the ship's up following that (and righting onto a new floor after a cling)
+    camRollHz: 5.0,       // the camera's roll with your angle round the tube
+    camFollowHz: 5.0,     // the camera's chase across the tube's cross-section
+    camBack: 0.30, camUp: 0.085, camLook: 0.9,
+    camHFov: 50, camVFovMin: 58, camVFovMax: 90,
+    camJumpFollow: 0.45,  // share of a hop's height the camera rides up with
+    bankK: 16,            // shipVisual roll per unit/frame of sideways speed (lean into the dodge)
+    swipeUp: 0.04,        // vertical swipe: this fraction of the screen HEIGHT within swipeMs (was 0.05)
+    swipeSide: 0.075,     // sideways flick (the cling): this fraction of the screen WIDTH within flickMs (was 0.10)
+    swipeMs: 260, flickMs: 170,
+    lStrokeMs: 450,       // after a swipe-up, the same stroke's sideways leg clings for this long
+    flickStartMs: 220,    // …and a NEW touch that flicks within this long of landing on the glass clings too
+    jumpBufferMs: 140,    // a swipe-up just before touchdown still jumps on landing
+    // Rows are spaced in TIME, not distance, so the run speed changes how fast the world goes by and
+    // not how much time you get between decisions: ~1–1.7 s at the start, shrinking to rowGapEndMul of
+    // that (0.5–0.8 s) as the run's difficulty ramps up over rampSec.
+    rowGapSecMin: 1.0, rowGapSecMax: 1.65, rowGapEndMul: 0.5, firstRowSec: 2.5, firstRow: null,
+    ahead: 30, aheadSec: 4.5,   // rows exist this far ahead: the larger of the two
+    rampSec: 120,         // obstacles get more frequent (denser rows, closer together) over this much time alive
+    fog: 0.075,
+    crashSec: 1.1,        // the crash plays this long before the card
+    hitScale: 0.85        // collision ellipsoid = the hull's measured half-extents × this
+  };
+  var _rsq = Q.match(/[?&]runspeed=([\d.]+)/); if(_rsq) P.speedKmh = +_rsq[1];
+
+  // Obstacles. Heights against the hop: the ship's centre peaks at hover + v²/2g = 0.021 + 0.133 = 0.154,
+  // so a bar (top 0.048) is a hop and anything 0.2+ is not.
+  var OB = {
+    bar:    { r: 0.017, y: 0.031 },          // a tube lying across the face: hop it
+    pillar: { r: 0.028, h: 0.20 },           // a tube standing on the face: steer round it
+    half:   { frac: 1.1, h: 0.22, d: 0.06 },  // a wall over a little more than half the face: take the gap
+    gate:   { h: 0.22, d: 0.06 }             // the whole face: only a cling gets past
+  };
+
+  // ── Geometry. Face k's outward normal d (axis → face) and its tangent t (the ship's right on it).
+  // The ship looks down −Z with up = −d, so t = forward × up: face k+1 is to its right, k−1 its left.
+  function dX(k){ return Math.sin(k * SECT); }  function dY(k){ return -Math.cos(k * SECT); }
+  function tX(k){ return Math.cos(k * SECT); }  function tY(k){ return Math.sin(k * SECT); }
+  function fm(k){ return ((k % N) + N) % N; }
+  function halfW(){ return P.apothem * Math.tan(Math.PI / 8); }
+  function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+  function hover(){ return gameMode.surfaceState.hoverHeight; }   // 0.021
+  function JI(){ return gameMode.physics.jumpImpulse; }            // 0.0171
+  function JG(){ return gameMode.physics.jumpGravity; }            // 0.0011
+  function baseSpeed(){ return P.speedKmh / 15 * GAME_BASE_MAXSPEED; }
+  function runSpeed(){ return baseSpeed() * speedMul(); }
+  function unitsPerSec(){ return runSpeed() * 60; }
+  // How far the run can see: rows, the tube and the fog all reach aheadSec of travel at the top speed.
+  function maxAhead(){ return Math.max(P.ahead, baseSpeed() * 60 * P.speedMaxMul * P.aheadSec); }
+  // The ship's half-extents (world units), measured off the hull by measureShip().
+  var SHIP = { hw: 0.03, hh: 0.012, hl: 0.032, measured: false };
+  // How close to a face's edge the ship may ride: its wing tip then just clears the 135° corner.
+  function edgeMargin(){ return SHIP.hw * 0.8; }
+
+  var api = { active: false, P: P };
+  var R = { built: false, compiled: false, preStep: 0, preWait: 0, preDone: false,
+            obs: [], pool: {}, geo: {}, mat: {}, acc: 0, flash: 0, shake: 0, lastM: -1,
+            keyL: false, keyR: false, cardShown: false, press: -1 };
+  var S = null;
+  var _m = new THREE.Matrix4(), _o = new THREE.Vector3(), _f = new THREE.Vector3(), _u = new THREE.Vector3(),
+      _v = new THREE.Vector3(), _q = new THREE.Quaternion(), _p = new THREE.Vector3(), _db = new THREE.Vector2();
+
+  // ════════════════════════════════════════ BUILD ════════════════════════════════════════
+  function build(){
+    if(R.built) return;
+    if(!gameMode.group) buildGameMode();
+    var sc = R.scene = new THREE.Scene();
+    sc.background = new THREE.Color(BG);
+    sc.fog = new THREE.FogExp2(BG, P.fog);   // the ship, trails and sparks fog like the hand-written shaders do
+    R.cam = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.004, 90);
+    // Lights are built once and never toggled: a change in light count relinks every lit program.
+    sc.add(new THREE.AmbientLight(0x6b78a8, 0.55));
+    R.key = new THREE.DirectionalLight(0xe6ecff, 1.0); sc.add(R.key); sc.add(R.key.target);
+    R.glow = new THREE.PointLight(0x10c4b2, 0.7, 1.4, 2.0); sc.add(R.glow);   // the seams' teal on the hull
+    buildTube(); buildStars(); buildObstacleKit(); buildSparks(); buildOverlay(); buildLayer();
+    // Wing thrusters: the planet game's candle trails, our own two states so its pair is never touched.
+    R.thr = { L: makeThrusterState(null), R: makeThrusterState(null) };
+    // Their spine ages at `fade` a frame, so a trail is (1/fade) frames of travel long. At the planet
+    // game's 0.075 and this run speed that ran back under the lens and filled the bottom of the frame —
+    // rig() sets fade from the speed every step for a fixed TRAIL_LEN instead. Sampling each step's whole
+    // stretch needs more spine points than the planet game's 24 (sized here, before the mesh is built).
+    R.thr.L.fade = R.thr.R.fade = 0.17;
+    R.thr.L.maxPoints = R.thr.R.maxPoints = 40;
+    ensureBoostTrailMesh(R.thr.L); ensureBoostTrailMesh(R.thr.R);   // tube-only: just the mesh, added to `scene`…
+    sc.add(R.thr.L.mesh); sc.add(R.thr.R.mesh);                       // …so move it into the tube's
+    R.built = true;
+  }
+
+  // The tube: eight long quads, one shader. Lines are analytic (fwidth), so they hold one pixel-ish
+  // width at every distance and fade out before they alias. The mesh is snapped to whole tiles under
+  // the ship so the rings never swim.
+  function buildTube(){
+    var a = P.apothem, hw = halfW(), z0 = 4, z1 = -(maxAhead() + 8);   // long enough for the top speed's view
+    var pos = [], uu = [], ff = [], idx = [];
+    for(var k = 0; k < N; k++){
+      var cx = dX(k) * a, cy = dY(k) * a, tx = tX(k), ty = tY(k), b = pos.length / 3;
+      var c = [[-hw, z0], [hw, z0], [hw, z1], [-hw, z1]];
+      for(var i = 0; i < 4; i++){ pos.push(cx + tx * c[i][0], cy + ty * c[i][0], c[i][1]); uu.push(c[i][0]); ff.push(k); }
+      idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
+    }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aU', new THREE.Float32BufferAttribute(uu, 1));
+    g.setAttribute('aF', new THREE.Float32BufferAttribute(ff, 1));
+    g.setIndex(idx);
+    var m = new THREE.ShaderMaterial({
+      uniforms: {
+        uHalfW: { value: hw }, uFloor: { value: 0 }, uFogD: { value: P.fog }, uAlpha: { value: 0.6 },
+        uSeam: { value: new THREE.Color(0.063, 0.769, 0.698) },   // the site accent, 16,196,178 — the HIGHLIGHT
+        uRing: { value: new THREE.Color(0.16, 0.30, 0.78) },      // blue — the non-highlight
+        uBase: { value: new THREE.Color(0.010, 0.018, 0.032) },
+        uFogCol: { value: new THREE.Color(BG) }
+      },
+      vertexShader: [
+        'attribute float aU, aF; varying float vU, vF, vZ; varying vec3 vView;',
+        'void main(){ vU = aU; vF = aF; vZ = position.z;',
+        '  vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
+      ].join('\n'),
+      fragmentShader: [
+        'uniform float uHalfW, uFloor, uFogD, uAlpha; uniform vec3 uSeam, uRing, uBase, uFogCol;',
+        'varying float vU, vF, vZ; varying vec3 vView;',
+        'float ln(float d, float w){ return exp(-max(d, 0.0) / max(w, 1e-6)); }',
+        'void main(){',
+        '  float pu = fwidth(vU), pz = fwidth(vZ);',
+        '  float du = uHalfW - abs(vU);',                                  // to the corner seam
+        '  float seam = ln(du, pu * 1.4) + 0.45 * ln(du, pu * 9.0);',
+        '  float fz = abs(fract(vZ + 0.5) - 0.5);',                         // to the nearest ring (1 unit apart)
+        '  float ring = (ln(fz, pz * 1.2) + 0.25 * ln(fz, pz * 6.0)) * (1.0 - smoothstep(0.08, 0.3, pz));',
+        '  float dl = abs(abs(vU) - uHalfW / 3.0);',                        // two faint lane rules per face
+        '  float lane = ln(dl, pu * 1.1) * 0.2 * (1.0 - smoothstep(0.01, 0.04, pu));',
+        '  float flr = smoothstep(0.70, 1.0, cos(vF * 0.7853982 - uFloor));',  // the face that is the floor
+        '  vec3 col = uBase + uSeam * seam * (0.55 + 0.9 * flr) + uRing * ring * (0.45 + 0.55 * flr) + uSeam * lane * (0.4 + flr);',
+        '  float a = clamp(uAlpha + 0.8 * max(max(seam, ring), lane), 0.0, 1.0);',
+        '  float d = length(vView), fog = exp(-uFogD * uFogD * d * d);',
+        '  gl_FragColor = vec4(mix(uFogCol, col, fog), mix(1.0, a, fog));',
+        '}'
+      ].join('\n'),
+      transparent: true, depthWrite: false, side: THREE.DoubleSide, extensions: { derivatives: true }
+    });
+    R.tube = new THREE.Mesh(g, m);
+    R.tube.frustumCulled = false; R.tube.renderOrder = -1;
+    R.scene.add(R.tube);
+    // An end cap in the fog colour, so the far mouth is the dark it fades into, not a disc of stars.
+    var cap = new THREE.Mesh(new THREE.CircleGeometry(a * 1.2, 8), new THREE.MeshBasicMaterial({ color: BG, fog: false }));
+    cap.position.z = z1 + 0.01; cap.rotation.z = SECT / 2;
+    R.tube.add(cap);
+  }
+
+  // Stars on a shell round the camera (re-centred each frame, so the sky is at infinity).
+  function buildStars(){
+    var n = 900, pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+    for(var i = 0; i < n; i++){
+      var x = Math.random() * 2 - 1, y = Math.random() * 2 - 1, z = Math.random() * 2 - 1, l = Math.sqrt(x * x + y * y + z * z) || 1;
+      var r = 36 + Math.random() * 18;
+      pos[i * 3] = x / l * r; pos[i * 3 + 1] = y / l * r; pos[i * 3 + 2] = z / l * r;
+      var b = 0.30 + Math.pow(Math.random(), 3) * 0.7, w = Math.random();
+      col[i * 3] = b * (0.80 + 0.20 * w); col[i * 3 + 1] = b * (0.86 + 0.14 * w); col[i * 3 + 2] = b;
+    }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    R.stars = new THREE.Points(g, new THREE.PointsMaterial({ size: 1.7, sizeAttenuation: false, vertexColors: true,
+      fog: false, transparent: true, depthWrite: false }));
+    R.stars.frustumCulled = false; R.stars.renderOrder = -2;
+    R.scene.add(R.stars);
+  }
+
+  // ── Obstacle kit. Prisms are drawn by one shader that finds its own edges: the fragment is ON the
+  // plane it is nearest, and the SECOND-nearest plane is its distance to an edge. Boxes and the
+  // trapezoids alike, no wireframe geometry.
+  //
+  // THE SECTOR RULE: a wall belongs to its face's SECTOR — the wedge from the tube's axis out to that
+  // face's two corners. A box as wide as the face would leave a triangular slot up each corner (the
+  // octagon widens with height) big enough to fly through; one as wide as the octagon would block the
+  // NEIGHBOURING faces too, which is exactly where a cling has to land. The sector is the one shape
+  // that seals its own face and nothing else, so walls narrow toward the axis: hw·(1 − y/a).
+  function sectorHalf(y){ return halfW() * (1 - y / P.apothem); }
+  function prismGeo(poly, d){
+    // poly: [[u, y], …] counter-clockwise in the face's (u, y) plane; extruded over z ∈ [−d/2, d/2]
+    var pos = [], nor = [], i, n = poly.length, zf = d / 2, zb = -d / 2;
+    function tri(a, b, c, nx, ny, nz){ pos.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]); for(var k = 0; k < 3; k++) nor.push(nx, ny, nz); }
+    for(i = 1; i + 1 < n; i++){
+      tri([poly[0][0], poly[0][1], zf], [poly[i][0], poly[i][1], zf], [poly[i + 1][0], poly[i + 1][1], zf], 0, 0, 1);
+      tri([poly[0][0], poly[0][1], zb], [poly[i + 1][0], poly[i + 1][1], zb], [poly[i][0], poly[i][1], zb], 0, 0, -1);
+    }
+    var planes = [];
+    for(i = 0; i < n; i++){
+      var p0 = poly[i], p1 = poly[(i + 1) % n], ex = p1[0] - p0[0], ey = p1[1] - p0[1], el = Math.sqrt(ex * ex + ey * ey);
+      var nx = ey / el, ny = -ex / el;                       // outward for a CCW polygon
+      tri([p0[0], p0[1], zb], [p1[0], p1[1], zb], [p1[0], p1[1], zf], nx, ny, 0);
+      tri([p0[0], p0[1], zb], [p1[0], p1[1], zf], [p0[0], p0[1], zf], nx, ny, 0);
+      planes.push([nx, ny, 0, nx * p0[0] + ny * p0[1]]);
+    }
+    planes.push([0, 0, 1, zf], [0, 0, -1, -zb]);
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+    g.userData.planes = planes;
+    return g;
+  }
+  var HAZ_EDGE = new THREE.Color(1.0, 0.33, 0.40), HAZ_CORE = new THREE.Color(0.035, 0.026, 0.045);
+  var OB_VERT = [
+    'varying vec3 vP, vNl, vN, vView;',
+    'void main(){ vP = position; vNl = normal; vN = normalMatrix * normal;',
+    '  vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
+  ].join('\n');
+  var OB_FOG = '  float dd = length(vView), fog = exp(-uFogD * uFogD * dd * dd); gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);';
+  function prismMat(g, hatch){
+    var pl = g.userData.planes, NN = [], DD = [];
+    for(var i = 0; i < 6; i++){ var q = pl[Math.min(i, pl.length - 1)]; NN.push(new THREE.Vector3(q[0], q[1], q[2])); DD.push(q[3]); }
+    return new THREE.ShaderMaterial({
+      uniforms: { uN: { value: NN }, uD: { value: DD }, uEdge: { value: HAZ_EDGE }, uCore: { value: HAZ_CORE },
+                  uFogCol: { value: new THREE.Color(BG) }, uFogD: { value: P.fog }, uHatch: { value: hatch || 0 } },
+      vertexShader: OB_VERT,
+      fragmentShader: [
+        'uniform vec3 uN[6]; uniform float uD[6]; uniform vec3 uEdge, uCore, uFogCol; uniform float uFogD, uHatch;',
+        'varying vec3 vP, vNl, vN, vView;',
+        'void main(){',
+        '  float m1 = 1e9, m2 = 1e9;',
+        '  for(int i = 0; i < 6; i++){ float e = uD[i] - dot(uN[i], vP); if(e < m1){ m2 = m1; m1 = e; } else if(e < m2){ m2 = e; } }',
+        '  float w = length(fwidth(vP)) + 1e-6;',
+        '  float edge = exp(-max(m2, 0.0) / (w * 1.4)) + 0.35 * exp(-max(m2, 0.0) / (w * 8.0));',
+        '  float rim = pow(1.0 - abs(dot(normalize(vN), normalize(-vView))), 3.0);',
+        '  float hs = abs(fract((vP.x + vP.y) * 24.0) - 0.5);',          // a gate's face is hatched: a wall, not a hole
+        '  float hatch = uHatch * smoothstep(0.36, 0.47, hs) * (1.0 - smoothstep(0.004, 0.012, w));',
+        '  vec3 col = uCore + uEdge * (edge + rim * 0.25 + hatch * 0.22);',
+        OB_FOG,
+        '}'
+      ].join('\n'),
+      extensions: { derivatives: true }
+    });
+  }
+  function cylMat(axis, r, halfH){
+    return new THREE.ShaderMaterial({
+      uniforms: { uAxis: { value: axis }, uR: { value: r }, uHalfH: { value: halfH }, uEdge: { value: HAZ_EDGE }, uCore: { value: HAZ_CORE },
+                  uFogCol: { value: new THREE.Color(BG) }, uFogD: { value: P.fog } },
+      vertexShader: OB_VERT,
+      fragmentShader: [
+        'uniform vec3 uAxis, uEdge, uCore, uFogCol; uniform float uR, uHalfH, uFogD;',
+        'varying vec3 vP, vNl, vN, vView;',
+        'void main(){',
+        '  float along = dot(vP, uAxis), rad = length(vP - uAxis * along);',
+        '  float capness = abs(dot(normalize(vNl), uAxis));',
+        '  float d = capness > 0.5 ? (uR - rad) : (uHalfH - abs(along));',   // to the cap rim, from either side of it
+        '  float w = length(fwidth(vP)) + 1e-6;',
+        '  float edge = exp(-max(d, 0.0) / (w * 1.4)) + 0.35 * exp(-max(d, 0.0) / (w * 8.0));',
+        '  float bd = abs(fract(along / 0.045) - 0.5) * 0.045;',             // bands round the tube
+        '  float band = exp(-bd / (w * 1.3)) * 0.35 * (1.0 - capness) * (1.0 - smoothstep(0.003, 0.01, w));',
+        '  float rim = pow(1.0 - abs(dot(normalize(vN), normalize(-vView))), 2.0);',
+        '  vec3 col = uCore + uEdge * (edge + band + rim * 0.55);',
+        OB_FOG,
+        '}'
+      ].join('\n'),
+      extensions: { derivatives: true }
+    });
+  }
+  function buildObstacleKit(){
+    var hw = halfW(), a = P.apothem;
+    R.geo.bar = new THREE.CylinderGeometry(OB.bar.r, OB.bar.r, 2 * hw, 20, 1, false); R.geo.bar.rotateZ(Math.PI / 2);   // across the face
+    R.mat.bar = cylMat(new THREE.Vector3(1, 0, 0), OB.bar.r, hw);
+    R.geo.pillar = new THREE.CylinderGeometry(OB.pillar.r, OB.pillar.r, OB.pillar.h, 20, 1, false);
+    R.mat.pillar = cylMat(new THREE.Vector3(0, 1, 0), OB.pillar.r, OB.pillar.h / 2);
+    var gh = OB.gate.h, top = sectorHalf(gh);
+    R.geo.gate = prismGeo([[-hw, 0], [hw, 0], [top, gh], [-top, gh]], OB.gate.d);
+    R.mat.gate = prismMat(R.geo.gate, 1);
+    var hh = OB.half.h, inner = -hw + OB.half.frac * hw, topH = sectorHalf(hh);
+    R.geo.halfL = prismGeo([[-hw, 0], [inner, 0], [inner, hh], [-topH, hh]], OB.half.d);
+    R.geo.halfR = prismGeo([[-inner, 0], [hw, 0], [topH, hh], [-inner, hh]], OB.half.d);
+    R.mat.halfL = prismMat(R.geo.halfL, 0); R.mat.halfR = prismMat(R.geo.halfR, 0);
+    // A few of each up front, so the warm-up compile links every program before the first row.
+    ['bar', 'pillar', 'gate', 'halfL', 'halfR'].forEach(function(t){
+      R.pool[t] = [];
+      for(var i = 0; i < 6; i++){ var m = new THREE.Mesh(R.geo[t], R.mat[t]); m.visible = false; R.scene.add(m); R.pool[t].push(m); }
+    });
+  }
+
+  // Crash sparks — additive points whose colour fades to black (= out, under additive).
+  function buildSparks(){
+    var n = 90;
+    R.sp = { n: n, pos: new Float32Array(n * 3), col: new Float32Array(n * 3), vel: new Float32Array(n * 3),
+             life: new Float32Array(n), max: new Float32Array(n), base: new Float32Array(n * 3), live: 0 };
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(R.sp.pos, 3));
+    g.setAttribute('color', new THREE.BufferAttribute(R.sp.col, 3));
+    R.sp.geo = g;
+    R.sp.pts = new THREE.Points(g, new THREE.PointsMaterial({ size: 0.006, sizeAttenuation: true, vertexColors: true, map: getCombatGlowTex(),
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false }));
+    R.sp.pts.frustumCulled = false; R.sp.pts.renderOrder = 6;
+    R.scene.add(R.sp.pts);
+  }
+
+  // Screen passes: the in-play overlay (vignette + flash, blended over the frame) and, for the crash
+  // card, a copy of the frame out of a render target — the frost has to have something to frost.
+  function buildOverlay(){
+    R.ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    var head = 'uniform float uFlash, uVig, uDim; uniform vec2 uRes; varying vec2 vUv;\n' +
+               'float dark(){ vec2 q = (vUv - 0.5) * vec2(uRes.x / uRes.y, 1.0); return clamp(smoothstep(0.42, 1.05, length(q) * 1.25) * uVig + uDim, 0.0, 1.0); }\n';
+    var vs = 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
+    function quad(m){ var q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), m); q.frustumCulled = false; var s = new THREE.Scene(); s.add(q); return s; }
+    var u = function(){ return { uFlash: { value: 0 }, uVig: { value: 0.55 }, uDim: { value: 0 }, uRes: { value: new THREE.Vector2(1, 1) } }; };
+    R.fxMat = new THREE.ShaderMaterial({ uniforms: u(), vertexShader: vs, depthTest: false, depthWrite: false, transparent: true,
+      fragmentShader: head + 'void main(){ float a = uFlash + (1.0 - uFlash) * dark(); gl_FragColor = vec4(vec3(uFlash / max(a, 1e-4)), a); }' });
+    R.fxScene = quad(R.fxMat);
+    var bu = u(); bu.tScene = { value: null };
+    R.blitMat = new THREE.ShaderMaterial({ uniforms: bu, vertexShader: vs, depthTest: false, depthWrite: false,
+      fragmentShader: head + 'uniform sampler2D tScene;\nvoid main(){ vec3 c = texture2D(tScene, vUv).rgb * (1.0 - dark()); gl_FragColor = vec4(mix(c, vec3(1.0), uFlash), 1.0); }' });
+    R.blitScene = quad(R.blitMat);
+    // The card's two buttons: the shared frost (THE material for UI glass on this site), in CSS-px space.
+    R.ui = new THREE.Scene();
+    R.uiCam = new THREE.OrthographicCamera(0, 1, 0, -1, -10, 10);
+    R.btns = [];
+    for(var i = 0; i < 2; i++){
+      var mat = DML.frostMaterial();
+      mat.depthTest = false;
+      var mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+      mesh.frustumCulled = false; mesh.renderOrder = 4;
+      R.ui.add(mesh);
+      R.btns.push({ mesh: mesh, r: { x: 0, y: 0, w: 1, h: 1 }, act: i === 0 ? 'restart' : 'store', press: 0 });
+    }
+  }
+
+  // ── The layer: input for the whole screen, plus the readout and the card's type. ──
+  function el(tag, css, parent, text){ var e = document.createElement(tag); e.style.cssText = css; if(text != null) e.textContent = text; (parent || document.body).appendChild(e); return e; }
+  function buildLayer(){
+    var L = R.layer = el('div', 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483000;display:none;touch-action:none;' +
+      '-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;overflow:hidden;cursor:default;');
+    L.id = 'runnerLayer';
+    var T = 'position:absolute;pointer-events:none;font-family:Arial,Helvetica,sans-serif;font-weight:700;white-space:nowrap;';
+    // A readout, not a control: tracked caps in the accent, top centre, clear of the notch.
+    R.elDist = el('div', T + 'left:0;right:0;top:calc(14px + env(safe-area-inset-top, 0px));text-align:center;font-size:13px;' +
+      'letter-spacing:0.24em;color:rgba(16,196,178,0.95);text-shadow:0 0 10px rgba(16,196,178,0.45);transition:opacity .25s;', L, '0 M');
+    R.elCard = el('div', T + 'left:0;right:0;text-align:center;opacity:0;', L);
+    R.elK = el('div', 'font-size:11px;letter-spacing:0.34em;color:rgba(150,170,205,0.85);', R.elCard, 'DISTANCE');
+    R.elV = el('div', 'font-size:44px;letter-spacing:0.06em;color:#f2f5fa;margin-top:8px;text-shadow:0 0 18px rgba(16,196,178,0.35);', R.elCard, '0 M');
+    R.elBest = el('div', 'font-size:12px;letter-spacing:0.28em;color:rgba(16,196,178,0.95);margin-top:10px;', R.elCard, '');
+    R.elBtn = [
+      el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L, 'RESTART'),
+      el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L, 'BACK TO STORE')
+    ];
+    L.addEventListener('touchstart', tStart, { passive: false });
+    L.addEventListener('touchmove', tMove, { passive: false });
+    L.addEventListener('touchend', tEnd, { passive: false });
+    L.addEventListener('touchcancel', tEnd, { passive: false });
+    L.addEventListener('mousedown', mDown);
+    L.addEventListener('mousemove', mMove);
+    L.addEventListener('mouseup', mUp);
+    L.addEventListener('mouseleave', mUp);
+    L.addEventListener('wheel', function(e){ e.preventDefault(); e.stopPropagation(); }, { passive: false });
+    L.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+    window.addEventListener('keydown', kDown, true);
+    window.addEventListener('keyup', kUp, true);
+  }
+
+  // Measure the hull (its drawn meshes only — not sprites or rigs) in ship-local space.
+  function measureShip(){
+    var sh = gameMode.ship, hull = gameMode.hullObjects;
+    if(SHIP.measured || !sh || !hull || !hull.length) return;
+    sh.updateMatrixWorld(true);
+    var inv = new THREE.Matrix4().copy(sh.matrixWorld).invert(), box = new THREE.Box3(), tmp = new THREE.Box3(), m = new THREE.Matrix4();
+    for(var i = 0; i < hull.length; i++){
+      var o = hull[i]; if(!o.geometry) continue;
+      if(!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+      m.multiplyMatrices(inv, o.matrixWorld);
+      tmp.copy(o.geometry.boundingBox).applyMatrix4(m); box.union(tmp);
+    }
+    if(box.isEmpty()) return;
+    var sc = GAME_BASE_SHIP_SCALE;
+    SHIP.hw = (box.max.x - box.min.x) * 0.5 * sc; SHIP.hh = (box.max.y - box.min.y) * 0.5 * sc; SHIP.hl = (box.max.z - box.min.z) * 0.5 * sc;
+    SHIP.measured = true;
+  }
+
+  // ════════════════════════════════════════ THE RUN ════════════════════════════════════════
+  // THE TRACK IS ONE COORDINATE. On the ground the ship's place across the tube is `s`: distance along
+  // the hover line, measured all the way round, never wrapped — face k's centre is at s = k·F, its
+  // corners at k·F ± F/2. The thumb moves a target `sTgt` along that same line at one fixed rate, and
+  // NOTHING about it changes at an edge, a jump or a landing: crossing onto a wall is just s passing a
+  // corner. (The first cut kept a per-face coordinate and handed the target across at each edge, clamped
+  // it in the air, and rolled the camera in 45° steps — which is what read as the steering resetting
+  // every time you changed plane.)
+  function pitch(){ return 2 * (P.apothem - hover()) * Math.tan(Math.PI / 8); }   // F: one face of hover line
+  var _sp = { x: 0, y: 0, k: 0 };
+  function sPoint(s){
+    var F = pitch(), k = Math.round(s / F), u = s - k * F, lim = P.apothem - hover();
+    _sp.x = dX(k) * lim + tX(k) * u; _sp.y = dY(k) * lim + tY(k) * u; _sp.k = k; _sp.u = u;
+    return _sp;
+  }
+  // The ship's up along the track: the face's own up across its middle, rolling over each corner through
+  // a band either side of it (smoothstep, so the roll has no kink) — the corner driven as a rounded edge.
+  function upAtS(s){
+    var c = s / pitch(), n = Math.floor(c), m = c - n, b = P.cornerBand * 0.5;
+    var t = clamp((m - (0.5 - b)) / (2 * b), 0, 1);
+    return SECT * (n + t * t * (3 - 2 * t));
+  }
+  // Exact critically damped step (one frame; v in units per frame). Closed form, so stiff springs stay
+  // stable — semi-implicit Euler with these rates flips the velocity's sign every frame and buzzes.
+  var _cd = { x: 0, v: 0 };
+  function cd(x, v, tgt, hz){
+    var w = 2 * Math.PI * hz / 60, e = x - tgt, ex = Math.exp(-w), c = v + w * e;
+    _cd.x = tgt + (e + c) * ex; _cd.v = (v - w * c) * ex;
+    return _cd;
+  }
+  // SPEED GROWS WITH TIME ALIVE: ×(1 + t/speedRampSec), capped at speedMaxMul.
+  function speedMul(){ return S ? Math.min(P.speedMaxMul, 1 + S.runT / P.speedRampSec) : 1; }
+  // DIFFICULTY (0 → 1 over rampSec alive): denser rows, closer together.
+  function difficulty(){ return S ? Math.min(1, S.runT / P.rampSec) : 0; }
+
+  function resetRun(){
+    var lim = P.apothem - hover();
+    S = { x: 0, y: -lim, vx: 0, vy: 0, z: 0, zBase: 0, v: 0, runT: 0,
+          s: 0, sv: 0, sTgt: 0,
+          face: 0, grounded: true, airF: 0, jumpBuf: -1e9,
+          up: 0, upV: 0, cam: 0, camV: 0, cx: 0, cy: -lim, cvx: 0, cvy: 0,
+          dead: false, deadF: 0, av: new THREE.Vector3(), nextRow: (P.firstRow != null ? P.firstRow : P.firstRowSec * baseSpeed() * 60), best: loadBest() };
+    for(var i = 0; i < R.obs.length; i++) freeObs(R.obs[i]);
+    R.obs.length = 0;
+    for(var j = 0; j < R.sp.n; j++) R.sp.life[j] = 0;
+    clearTrail(R.thr.L); clearTrail(R.thr.R);
+    R.cardShown = false; R.press = -1; R.lastM = -1;
+    R.elCard.style.opacity = 0; R.elBtn[0].style.opacity = 0; R.elBtn[1].style.opacity = 0; R.elDist.style.opacity = 1;
+    resetRig();
+    var s = gameMode.surfaceState;
+    s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.speed = 0; s.isDrifting = false; s.driftBoost = false;
+    s.driftDirection = 0; s.driftAngle = 0; s.driftBodyAngle = 0; s.aimPitch = 0; s.aimPitchVis = 0; s.slamming = false;
+    s.barrelRoll.active = false; s.barrelRoll.progress = 0;
+    gameMode.physics.isBoosting = false; gameMode.fly.active = false; gameMode.fly.vel.set(0, 0, 0);
+    poseShip(); placeCam(true);
+  }
+  function resetRig(){
+    gameMode.flapMotion = null; gameMode._wingPrevSpeed = null; gameMode.wingSweep = 0;
+    if(gameMode.flapParts) for(var i = 0; i < gameMode.flapParts.length; i++){
+      var f = gameMode.flapParts[i].userData.flap; if(f){ f.theta.set(0, 0, 0); f.omega.set(0, 0, 0); }
+      gameMode.flapParts[i].quaternion.identity();
+    }
+    if(gameMode.shipVisual){ gameMode.shipVisual.rotation.set(0, 0, 0); gameMode.shipVisual.position.set(0, 0, 0); }
+  }
+  function clearTrail(DT){ if(!DT) return; DT.points.length = 0; DT.lastPos = null; DT._prevMount = null; DT.boosting = false; DT.intensity = 0; if(DT.geo) DT.geo.setDrawRange(0, 0); }
+  function loadBest(){ try { return +(localStorage.getItem(BEST_KEY) || 0) || 0; } catch(e){ return 0; } }
+  function saveBest(m){ try { localStorage.setItem(BEST_KEY, String(m)); } catch(e){} }
+
+  // ── Moves. Same numbers as the planet game: jumpImpulse up the floor normal, jumpGravity toward it,
+  // the slam's 0.04. The CLING is the one new move, and it is built from the same parts — a jump's
+  // impulse, aimed at the neighbouring wall, with gravity handed over to that wall.
+  function wantJump(){ if(S.dead) return; if(S.grounded) jump(); else S.jumpBuf = performance.now(); }
+  function jump(){
+    var k = S.face;
+    S.grounded = false; S.airF = 0; S.jumpBuf = -1e9; S.clung = false;
+    S.vx -= dX(k) * JI(); S.vy -= dY(k) * JI();
+  }
+  // ONE cling per jump. A single L-stroke's sideways leg is usually longer than the flick threshold,
+  // and reading it again after the first cling turned one stroke into two wall changes (measured: a
+  // 95 px leg landed the ship 90° round instead of 45°). The rest of that leg is also kept off the
+  // steer for a moment — it was the flick, not an instruction to slide along the new floor.
+  function cling(dir){
+    if(S.dead || S.grounded || S.airF < 2 || S.clung) return;
+    S.clung = true; G.muteT = performance.now() + 250;
+    var nk = (S.face += dir), hw = halfW(), mg = edgeMargin();
+    var vn = S.vx * dX(nk) + S.vy * dY(nk);
+    if(vn < 0){ S.vx -= dX(nk) * vn; S.vy -= dY(nk) * vn; }   // stop flying away from the new wall…
+    S.vx += dX(nk) * JI(); S.vy += dY(nk) * JI();             // …and leap at it
+    // The target moves to where you are across the new wall — the one place it must: left on the old
+    // floor, it would pull the ship straight back over the corner it just left.
+    S.sTgt = nk * pitch() + clamp(S.x * tX(nk) + S.y * tY(nk), -(hw - mg), hw - mg);
+  }
+  function slam(){
+    if(S.dead || S.grounded) return;
+    var k = S.face, vn = S.vx * dX(k) + S.vy * dY(k);
+    if(vn < SLAM_V){ S.vx += dX(k) * (SLAM_V - vn); S.vy += dY(k) * (SLAM_V - vn); }
+  }
+  function land(){
+    var k = S.face, F = pitch(), vn = S.vx * dX(k) + S.vy * dY(k);
+    S.vx -= dX(k) * vn; S.vy -= dY(k) * vn;                   // flat onto the face, as the planet game lands
+    S.grounded = true;
+    // Back onto the track: where along it, and how fast. sTgt is untouched — the thumb never let go of it.
+    S.s = k * F + clamp(S.x * tX(k) + S.y * tY(k), -F / 2, F / 2);
+    S.sv = S.vx * tX(k) + S.vy * tY(k);
+    if(performance.now() - S.jumpBuf < P.jumpBufferMs) jump();
+  }
+
+  // ── One fixed 60 Hz step ──
+  function step(){
+    var a = P.apothem, h = hover(), lim = a - h, hw = halfW(), mg = edgeMargin(), F = pitch();
+    // Forward: spool up — at the planet game's boost acceleration, or faster where that would take
+    // more than a second to reach the run speed (it is +60 km/h a second) — then ride the run speed,
+    // which itself keeps rising the longer you live.
+    var vt = runSpeed();
+    if(!S.dead){ S.v = Math.min(vt, S.v + Math.max(GAME_BASE_MAXSPEED * (60 / 15) / 60, vt / 60)); S.runT += 1 / 60; }
+    else S.v *= S.grounded ? 0.90 : 0.985;
+    var x0 = S.x, y0 = S.y, z0 = S.z;
+    S.z += S.v;
+    if(!S.dead && (R.keyL || R.keyR)) S.sTgt += ((R.keyR ? 1 : 0) - (R.keyL ? 1 : 0)) * F / 10;
+    if(S.grounded && !S.dead){
+      // ON THE TRACK. One spring along the whole 360°; the face is wherever s is.
+      var r = cd(S.s, S.sv, S.sTgt, P.steerHz);
+      S.s = r.x; S.sv = r.v;
+      var p = sPoint(S.s);
+      S.face = p.k; S.x = p.x; S.y = p.y; S.vx = tX(p.k) * S.sv; S.vy = tY(p.k) * S.sv;
+    } else {
+      var k = S.face, kx = dX(k), ky = dY(k), tx = tX(k), ty = tY(k);
+      if(!S.dead){
+        // In the air the thumb's target is still the target: the ship slides toward where it lies
+        // across this floor (as far as the floor goes). It is not clamped or moved — land, and the
+        // track picks it up exactly where it was.
+        var u = S.x * tx + S.y * ty, uv = S.vx * tx + S.vy * ty;
+        var ra = cd(u, uv, clamp(S.sTgt - k * F, -(hw - mg), hw - mg), P.steerHz);
+        S.vx += tx * (ra.x - u - uv); S.vy += ty * (ra.x - u - uv);   // lateral move this frame = the spring's
+      }
+      if(!S.grounded){ S.vx += kx * JG(); S.vy += ky * JG(); S.airF++; }
+      S.x += S.vx; S.y += S.vy;
+      if(S.grounded){
+        // A wreck on the floor: slides to rest on its face; the corners are walls to it.
+        var u2 = S.x * tx + S.y * ty, vl = S.vx * tx + S.vy * ty, uc = clamp(u2, -(hw - mg), hw - mg);
+        if(uc !== u2 && vl * (u2 - uc) > 0) vl = 0;
+        vl *= 0.9;
+        S.x = kx * lim + tx * uc; S.y = ky * lim + ty * uc; S.vx = tx * vl; S.vy = ty * vl;
+      } else {
+        // In the air every face is a wall: the tube is convex, so inside all eight IS the whole test.
+        // The floor's plane is a landing; the rest are slid along.
+        for(var j = 0; j < N; j++){
+          var jx = dX(j), jy = dY(j), dj = S.x * jx + S.y * jy;
+          if(dj <= lim) continue;
+          S.x -= jx * (dj - lim); S.y -= jy * (dj - lim);
+          var vn = S.vx * jx + S.vy * jy;
+          if(fm(j) === fm(k)){
+            if(!S.dead) land();
+            else if(vn > 0){
+              S.vx -= jx * vn * 1.35; S.vy -= jy * vn * 1.35;   // a wreck bounces (restitution 0.35)…
+              S.v *= 0.8; S.av.multiplyScalar(0.7);
+              if(vn < 0.004){ var vn2 = S.vx * jx + S.vy * jy; S.vx -= jx * vn2; S.vy -= jy * vn2; S.grounded = true; }   // …until it lies there
+            }
+          } else if(vn > 0){ S.vx -= jx * vn; S.vy -= jy * vn; }
+          if(S.grounded) break;
+        }
+      }
+    }
+    // The ship's up: on the track it follows the rounded-corner up for where it is; in the air (and as a
+    // wreck) the up of the face gravity holds it to.
+    var ru = cd(S.up, S.upV, (S.grounded && !S.dead) ? upAtS(S.s) : S.face * SECT, P.rollHz);
+    S.up = ru.x; S.upV = ru.v;
+    // The camera rolls with the ship's ANGLE ROUND THE TUBE — the polar angle of the point under it on
+    // its floor — so the whole 360° turns under you at one even rate as you steer, instead of stepping
+    // a face at a time. Measured at the foot, not the ship, so a hop straight up does not roll the view.
+    var kf = S.face, uf = S.x * tX(kf) + S.y * tY(kf);
+    var rc = cd(S.cam, S.camV, kf * SECT + Math.atan(uf / lim), P.camRollHz);
+    S.cam = rc.x; S.camV = rc.v;
+    poseShip();
+    rig();
+    if(!S.dead){ var o = sweptHit(x0, y0, z0); if(o) crash(o); }
+    else S.deadF++;
+    placeCam(false);
+    stepSparks();
+    rows();
+    rebase();
+  }
+
+  // Pose the real ship, then hand gameMode.surfaceState the run's motion: every rig animator reads it.
+  function poseShip(){
+    var sh = gameMode.ship, sv = gameMode.shipVisual, s = gameMode.surfaceState;
+    var upx = -Math.sin(S.up), upy = Math.cos(S.up), rx = Math.cos(S.up), ry = Math.sin(S.up);
+    var lat = S.vx * rx + S.vy * ry, vert = S.vx * upx + S.vy * upy;
+    sh.position.set(S.x, S.y, -(S.z - S.zBase));
+    _u.set(upx, upy, 0);
+    if(!S.dead){
+      // The nose points where the ship is going ALONG the floor; the up-down part is the hop's pitch,
+      // exactly as the planet game splits it (surface-tangent pose + rampPitch on the visual).
+      _f.set(rx * lat, ry * lat, -S.v); if(_f.lengthSq() < 1e-12) _f.set(0, 0, -1); _f.normalize();
+      _m.lookAt(_o, _v.copy(_f).negate(), _u); sh.quaternion.setFromRotationMatrix(_m);
+      if(sv){
+        sv.rotation.set(clamp(S.grounded ? 0 : -vert * 9.0, -0.5, 0.5), 0, clamp(lat * P.bankK, -0.55, 0.55));
+        sv.position.set(0, 0, 0);
+      }
+    } else {
+      // A wreck: no steering, no righting — it tumbles on the spin the impact gave it.
+      var al = S.av.length();
+      if(al > 1e-6){ _q.setFromAxisAngle(_v.copy(S.av).divideScalar(al), al); sh.quaternion.premultiply(_q); }
+      S.av.multiplyScalar(S.grounded ? 0.86 : 0.985);
+      if(sv){ sv.rotation.x *= 0.9; sv.rotation.z *= 0.9; }
+      _f.set(0, 0, -1).applyQuaternion(sh.quaternion);
+    }
+    s.speed = S.dead ? Math.abs(S.v) : Math.sqrt(S.v * S.v + lat * lat);
+    s.forward.copy(_f); s.groundNormal.copy(_u);
+    s.airborne = !S.grounded; s.freeFalling = false; s.vertVel = vert;
+    s.isDrifting = false; s.driftBoost = false; s.driftDirection = 0; s.driftBodyAngle = 0;
+  }
+  // The planet game's rig, called in its own order (sweep + recoil before the flap springs that compose
+  // on them; the skin after the springs).
+  function rig(){
+    gameMode.physics.isBoosting = false; gameMode.fly.active = false;
+    updateWingSweep(); updateCockpitSpin(); updateFrontRecoil(); updateShipFlapPhysics(); updateShipSkin();
+    var s = gameMode.surfaceState, sh = gameMode.ship;
+    if(!gameMode.underglow) updateShipUnderglow();   // builds the rig on the hull (its own gate keeps it unlit)
+    var spd = Math.min(1, s.speed / (gameMode.physics.boostMaxSpeed || 0.015));
+    if(gameMode.underglow) updateUnderglowRig(gameMode.underglow, S.grounded && !S.dead, spd, false, sh.scale.x);
+    var on = !S.dead, wtm = gameMode.wingThrusterMounts, scl = sh.scale.x / GAME_BASE_SHIP_SCALE;
+    // The wicks are a fixed LENGTH behind the ship, not a fixed number of frames: a spine point lives
+    // 1/fade frames, so fade = speed / length. (At a frame count, tripling the speed tripled the trail and
+    // ran it back under the lens.) And a step at speed is ~0.09 units, so each step lays samples along the
+    // whole stretch it covered, or the cone is a few straight segments.
+    // Past ~390 km/h one step is longer than the whole wick: points then live one frame (fade 1) and the
+    // samples cover only the last TRAIL_LEN of the step.
+    var fade = clamp(Math.max(S.v, 0) / TRAIL_LEN, 0.17, 1.0);
+    ['L', 'R'].forEach(function(side){
+      var DT = R.thr[side];
+      DT.fade = fade;
+      if(on){
+        if(wtm && wtm[side]) wtm[side].getWorldPosition(_p); else _p.copy(sh.position);
+        _p.addScaledVector(s.forward, -0.004 * scl).addScaledVector(s.groundNormal, -0.002 * scl);
+        var prev = DT._prevMount, dd = prev ? prev.distanceTo(_p) : 0;
+        var f0 = dd > TRAIL_LEN ? 1 - TRAIL_LEN / dd : 0, n = prev ? clamp(Math.ceil(dd * (1 - f0) / 0.012), 1, 10) : 1;
+        // spawnThrusterTrail counts its ignition envelope in CALLS; hold it to one tick per step.
+        var t0 = DT.boosting ? DT.startT : -1;
+        for(var q = 1; q <= n; q++) spawnThrusterTrail(DT, prev ? _v.copy(prev).lerp(_p, f0 + (1 - f0) * q / n) : _p, s.groundNormal);
+        DT.startT = t0 + 1;
+        (DT._prevMount = DT._prevMount || new THREE.Vector3()).copy(_p);
+      } else { DT.boosting = false; DT._prevMount = null; }
+      updateBoostTrailCore(DT, on, s.groundNormal, false);
+    });
+  }
+  var TRAIL_LEN = 0.12;  // world units of wick behind each wingtip. The frame's bottom edge meets the floor
+                         // ~0.2 behind the ship (camBack 0.30, camUp 0.085): at 0.2 the faint old tail ran
+                         // right to the edge of the screen; 0.12 ends the whole wick well inside it.
+
+  // ── The camera: chases the point under the ship on the floor (plus a share of a hop's height),
+  // rolls onto the floor's up, and sits a fixed distance behind. ──
+  function placeCam(snap){
+    var k = S.face, lim = P.apothem - hover();
+    var u = S.x * tX(k) + S.y * tY(k), dn = S.x * dX(k) + S.y * dY(k);
+    var alt = S.dead ? 0 : Math.max(0, lim - dn) * P.camJumpFollow;
+    var txp = dX(k) * (lim - alt) + tX(k) * u, typ = dY(k) * (lim - alt) + tY(k) * u;
+    if(snap){ S.cx = txp; S.cy = typ; S.cvx = S.cvy = 0; S.cam = S.up; S.camV = 0; }
+    else {
+      var c = cd(S.cx, S.cvx, txp, P.camFollowHz); S.cx = c.x; S.cvx = c.v;
+      c = cd(S.cy, S.cvy, typ, P.camFollowHz); S.cy = c.x; S.cvy = c.v;
+    }
+    var cux = -Math.sin(S.cam), cuy = Math.cos(S.cam), z = -(S.z - S.zBase);
+    var sk = R.shake * 0.006;
+    R.cam.up.set(cux, cuy, 0);
+    R.cam.position.set(S.cx + cux * P.camUp + (Math.random() - 0.5) * sk, S.cy + cuy * P.camUp + (Math.random() - 0.5) * sk, z + P.camBack);
+    R.cam.lookAt(S.cx + cux * 0.02, S.cy + cuy * 0.02, z - P.camLook);
+    R.shake *= 0.9;
+  }
+
+  // ── Obstacles ──
+  function wpick(w){ var t = 0, k; for(k in w) t += w[k]; var r = Math.random() * t; for(k in w){ r -= w[k]; if(r <= 0) return k; } return k; }
+  function rows(){
+    var ahead = Math.max(P.ahead, unitsPerSec() * P.aheadSec);
+    while(S.nextRow < S.z + ahead){
+      spawnRow(S.nextRow);
+      // The gap in seconds shrinks with the run's difficulty; in units it is that × the current speed.
+      var gs = (P.rowGapSecMin + Math.random() * (P.rowGapSecMax - P.rowGapSecMin)) * (1 + (P.rowGapEndMul - 1) * difficulty());
+      S.nextRow += unitsPerSec() * gs;
+    }
+    for(var i = R.obs.length - 1; i >= 0; i--) if(R.obs[i].z < S.z - 1.5){ freeObs(R.obs[i]); R.obs.splice(i, 1); }
+  }
+  function spawnRow(z){
+    var d = difficulty(), me = fm(S.face), pick = [], j;
+    for(j = 0; j < N; j++){
+      var p = 0.20 + 0.32 * d, near = Math.min(Math.abs(j - me), N - Math.abs(j - me));
+      if(near === 0) p *= 1.9; else if(near === 1) p *= 1.3;   // the run is on your face: so are the obstacles
+      pick.push(Math.random() < p ? wpick({ bar: 3, pillar: 3, half: 2.2, gate: 0.5 + 1.6 * d }) : null);
+    }
+    // FAIRNESS: a gate is only beaten by a cling, so every gated face keeps one EMPTY neighbour to cling to.
+    for(j = 0; j < N; j++){
+      if(pick[j] !== 'gate') continue;
+      var L = fm(j - 1), Rr = fm(j + 1);
+      if(pick[L] !== null && pick[Rr] !== null) pick[Math.random() < 0.5 ? L : Rr] = null;
+    }
+    for(j = 0; j < N; j++) if(pick[j]) addObs(pick[j], j, z);
+  }
+  function takeMesh(t){ var m = R.pool[t].pop(); if(!m){ m = new THREE.Mesh(R.geo[t], R.mat[t]); R.scene.add(m); } m.visible = true; return m; }
+  function freeObs(o){ o.mesh.visible = false; R.pool[o.mt].push(o.mesh); }
+  function addObs(type, j, z){
+    var hw = halfW(), o = { type: type, face: j, z: z, sector: false };
+    var uc = 0, yc = 0;
+    if(type === 'bar'){
+      o.mt = 'bar'; yc = OB.bar.y;
+      var rb = OB.bar.r * P.hitScale;
+      o.u0 = -hw; o.u1 = hw; o.y0 = yc - rb; o.y1 = yc + rb; o.dz = rb; o.sector = true;
+    } else if(type === 'pillar'){
+      o.mt = 'pillar'; var rp = OB.pillar.r, span = hw - rp - edgeMargin() * 0.5;
+      uc = (Math.random() * 2 - 1) * span; yc = OB.pillar.h / 2;
+      o.u0 = uc - rp * P.hitScale; o.u1 = uc + rp * P.hitScale; o.y0 = 0; o.y1 = OB.pillar.h; o.dz = rp * P.hitScale;
+    } else if(type === 'half'){
+      var left = Math.random() < 0.5, inner = -hw + OB.half.frac * hw;
+      o.mt = left ? 'halfL' : 'halfR';
+      o.u0 = left ? -hw : -inner; o.u1 = left ? inner : hw; o.y0 = 0; o.y1 = OB.half.h; o.dz = OB.half.d / 2; o.sector = true;
+    } else {
+      o.mt = 'gate'; o.u0 = -hw; o.u1 = hw; o.y0 = 0; o.y1 = OB.gate.h; o.dz = OB.gate.d / 2; o.sector = true;
+    }
+    var m = o.mesh = takeMesh(o.mt), a = P.apothem;
+    // Mesh frame: local X = the face's tangent, Y = up off the face, Z = along the tube.
+    m.position.set(dX(j) * a + tX(j) * uc - dX(j) * yc, dY(j) * a + tY(j) * uc - dY(j) * yc, -(z - S.zBase));
+    m.rotation.set(0, 0, j * SECT);
+    R.obs.push(o);
+  }
+  // Ship (an ellipsoid of its measured half-extents) against each obstacle's shape in that obstacle's
+  // face frame. Scaling space by the ellipsoid's axes makes it a unit sphere and leaves an axis-aligned
+  // box axis-aligned, so clamp-and-measure is exact for the boxes. Sector walls clamp their width at
+  // the height being tested.
+  function hitTest(px, py, pz){
+    var a = P.apothem;
+    for(var i = 0; i < R.obs.length; i++){
+      var o = R.obs[i], dz = pz - o.z;
+      if(dz > 0.3 || dz < -0.3) continue;
+      var j = o.face, u = px * tX(j) + py * tY(j), y = a - (px * dX(j) + py * dY(j));
+      var aligned = Math.abs(S.up - j * SECT - Math.round((S.up - j * SECT) / (2 * Math.PI)) * 2 * Math.PI) < SECT * 0.5;
+      var ru = (aligned ? SHIP.hw : (SHIP.hw + SHIP.hh) * 0.5) * P.hitScale;
+      var ry = (aligned ? SHIP.hh : (SHIP.hw + SHIP.hh) * 0.5) * P.hitScale;
+      var rz = SHIP.hl * P.hitScale;
+      var cy = clamp(y, o.y0, o.y1), u0 = o.u0, u1 = o.u1;
+      if(o.sector){ var sh = sectorHalf(cy); u0 = Math.max(u0, -sh); u1 = Math.min(u1, sh); }
+      var cu = clamp(u, u0, u1), cz = clamp(dz, -o.dz, o.dz);
+      var qu = (u - cu) / ru, qy = (y - cy) / ry, qz = (dz - cz) / rz;
+      if(qu * qu + qy * qy + qz * qz < 1) return o;
+    }
+    return null;
+  }
+  // SWEPT. A step at 192 km/h is ~0.09 units — more than the whole window a bar can be hit in
+  // (2 × (bar 0.0145 + ship 0.029) = 0.087) — so testing only where each step ends lets the ship pass
+  // clean through one between two samples. Test along the step instead, no coarser than 0.02 units, and
+  // leave the wreck where it actually struck.
+  function sweptHit(x0, y0, z0){
+    var x1 = S.x, y1 = S.y, z1 = S.z, n = Math.max(1, Math.ceil((z1 - z0) / 0.02));
+    for(var i = 1; i <= n; i++){
+      var f = i / n, px = x0 + (x1 - x0) * f, py = y0 + (y1 - y0) * f, pz = z0 + (z1 - z0) * f;
+      var o = hitTest(px, py, pz);
+      if(o){ S.x = px; S.y = py; S.z = pz; return o; }
+    }
+    return null;
+  }
+
+  // ── The crash: real momentum, not an animation. The forward speed goes into the obstacle (a little
+  // comes back), the hit throws the nose up and the ship off the floor, and it tumbles on that spin
+  // until gravity and the floor have taken it all. The rig reacts to the deceleration on its own. ──
+  function crash(o){
+    var k = S.face, v0 = S.v;
+    S.dead = true; S.deadF = 0; S.grounded = false;
+    S.v = -0.22 * v0;
+    // …capped at a jump's impulse: at run speed the raw share threw the wreck across the tube.
+    var pop = Math.min(v0 * 0.35, JI());
+    S.vx += -dX(k) * pop; S.vy += -dY(k) * pop;
+    var side = (S.x * tX(o.face) + S.y * tY(o.face)) - (o.u0 + o.u1) * 0.5;
+    S.av.set(tX(k), tY(k), 0).multiplyScalar(0.20);                    // nose up, about the ship's right
+    S.av.z += (side >= 0 ? -1 : 1) * 0.10;                             // and a roll away from the side it struck
+    var sh = gameMode.ship;
+    _p.copy(sh.position).addScaledVector(gameMode.surfaceState.forward, SHIP.hl);
+    burst(_p, 70);
+    R.shake = 1; R.flash = Math.max(R.flash, 0.35);
+    // The distance is what was RUN: taken at impact, before the bounce carries the wreck back.
+    var m = S.crashM = Math.floor(S.z * M_PER_UNIT);
+    S.newBest = m > S.best;
+    if(S.newBest){ S.best = m; saveBest(m); }
+  }
+  function burst(p, n){
+    var sp = R.sp, k = S.face;
+    for(var i = 0, made = 0; i < sp.n && made < n; i++){
+      if(sp.life[i] > 0) continue;
+      var th = Math.random() * Math.PI * 2, ph = Math.acos(Math.random() * 2 - 1), s = 0.006 + Math.random() * 0.022;
+      sp.pos[i * 3] = p.x; sp.pos[i * 3 + 1] = p.y; sp.pos[i * 3 + 2] = p.z;
+      sp.vel[i * 3] = Math.sin(ph) * Math.cos(th) * s - dX(k) * 0.008;
+      sp.vel[i * 3 + 1] = Math.sin(ph) * Math.sin(th) * s - dY(k) * 0.008;
+      sp.vel[i * 3 + 2] = Math.cos(ph) * s * 0.6 + S.v * 0.5;
+      sp.max[i] = sp.life[i] = 30 + Math.random() * 30;
+      var hot = Math.random() < 0.35;
+      sp.base[i * 3] = hot ? 1.0 : HAZ_EDGE.r; sp.base[i * 3 + 1] = hot ? 0.92 : HAZ_EDGE.g; sp.base[i * 3 + 2] = hot ? 0.85 : HAZ_EDGE.b;
+      made++;
+    }
+  }
+  function stepSparks(){
+    var sp = R.sp, k = S.face, any = false, gx = dX(k) * JG() * 0.6, gy = dY(k) * JG() * 0.6;
+    for(var i = 0; i < sp.n; i++){
+      if(sp.life[i] <= 0){ sp.col[i * 3] = sp.col[i * 3 + 1] = sp.col[i * 3 + 2] = 0; continue; }
+      any = true; sp.life[i]--;
+      sp.vel[i * 3] += gx; sp.vel[i * 3 + 1] += gy;
+      sp.vel[i * 3] *= 0.97; sp.vel[i * 3 + 1] *= 0.97; sp.vel[i * 3 + 2] *= 0.97;
+      sp.pos[i * 3] += sp.vel[i * 3]; sp.pos[i * 3 + 1] += sp.vel[i * 3 + 1]; sp.pos[i * 3 + 2] += sp.vel[i * 3 + 2];
+      var f = sp.life[i] / sp.max[i]; f *= f;
+      sp.col[i * 3] = sp.base[i * 3] * f; sp.col[i * 3 + 1] = sp.base[i * 3 + 1] * f; sp.col[i * 3 + 2] = sp.base[i * 3 + 2] * f;
+    }
+    if(any || sp.live){ sp.geo.attributes.position.needsUpdate = true; sp.geo.attributes.color.needsUpdate = true; }
+    sp.live = any;
+  }
+  // Keep the world near the origin: past 150 units, slide everything that holds a world z back by 100.
+  // The flap springs measure the ship's motion by position delta, so their last sample moves too —
+  // otherwise one frame would read as a 100-unit lunge.
+  function rebase(){
+    if(S.z - S.zBase < 150) return;
+    var D = 100, i;
+    S.zBase += D;
+    gameMode.ship.position.z += D;
+    if(gameMode.flapMotion && gameMode.flapMotion.prevPos) gameMode.flapMotion.prevPos.z += D;
+    for(i = 0; i < R.obs.length; i++) R.obs[i].mesh.position.z += D;
+    ['L', 'R'].forEach(function(s){ var DT = R.thr[s]; for(var q = 0; q < DT.points.length; q++) DT.points[q].p.z += D; if(DT.lastPos) DT.lastPos.z += D; if(DT._prevMount) DT._prevMount.z += D; });
+    for(i = 0; i < R.sp.n; i++) R.sp.pos[i * 3 + 2] += D;
+    R.cam.position.z += D;
+  }
+
+  // ════════════════════════════════════════ FRAME ════════════════════════════════════════
+  function frame(dt){
+    if(!api.active) return;
+    R.acc += dt; if(R.acc > 0.25) R.acc = 0.25;
+    var n = 0;
+    while(R.acc >= GAME_FIXED_DT && n < 5){ step(); R.acc -= GAME_FIXED_DT; n++; }
+    R.flash = Math.max(0, R.flash - dt / GAME_FLASH_SEC);
+    render();
+    dom();
+  }
+  function cardAmt(){
+    if(!S.dead) return 0;
+    var t = (S.deadF / 60 - P.crashSec) / 0.3;
+    t = clamp(t, 0, 1); return t * t * (3 - 2 * t);
+  }
+  function render(){
+    var W = window.innerWidth, H = window.innerHeight, asp = W / Math.max(1, H);
+    var vf = 2 * Math.atan(Math.tan(P.camHFov * Math.PI / 360) / asp) * 180 / Math.PI;
+    vf = clamp(vf, P.camVFovMin, P.camVFovMax);
+    if(R.cam.aspect !== asp || R.cam.fov !== vf){ R.cam.aspect = asp; R.cam.fov = vf; R.cam.updateProjectionMatrix(); }
+    R.stars.position.copy(R.cam.position);
+    R.tube.position.z = -(Math.floor(S.z) - S.zBase);
+    R.tube.material.uniforms.uFloor.value = S.up;
+    // The fog thins as the run speeds up, so what you can see ahead stays the same TIME away (the view
+    // distance is ∝ 1/density). Every hand-written material and the scene's own fog share the one value.
+    var fogD = P.fog / speedMul();
+    if(fogD !== R.fogD){
+      R.fogD = fogD; R.scene.fog.density = fogD; R.tube.material.uniforms.uFogD.value = fogD;
+      for(var mk in R.mat) if(R.mat[mk].uniforms && R.mat[mk].uniforms.uFogD) R.mat[mk].uniforms.uFogD.value = fogD;
+    }
+    // Key light from over the camera's shoulder; the teal glow rides just above the ship.
+    var sh = gameMode.ship;
+    R.key.position.copy(R.cam.position).addScaledVector(R.cam.up, 0.6).add(_v.set(0, 0, 0.4));
+    R.key.target.position.copy(sh.position);
+    R.glow.position.copy(sh.position).addScaledVector(R.cam.up, 0.12);
+    var card = cardAmt(), vig = 0.55, dim = card * 0.45;
+    var prevAC = renderer.autoClear, prevRT = renderer.getRenderTarget();
+    renderer.autoClear = true;
+    if(card > 0.001){
+      renderer.getDrawingBufferSize(_db);
+      if(!R.rt) R.rt = new THREE.WebGLRenderTarget(_db.x, _db.y, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat });
+      else if(R.rt.width !== _db.x || R.rt.height !== _db.y) R.rt.setSize(_db.x, _db.y);
+      renderer.setRenderTarget(R.rt); renderer.render(R.scene, R.cam);
+      renderer.setRenderTarget(null);
+      var bu = R.blitMat.uniforms;
+      bu.tScene.value = R.rt.texture; bu.uFlash.value = R.flash; bu.uVig.value = vig; bu.uDim.value = dim; bu.uRes.value.set(W, H);
+      renderer.render(R.blitScene, R.ortho);
+      renderer.autoClear = false;
+      frostButtons(card, W, H);
+      renderer.render(R.ui, R.uiCam);
+    } else {
+      renderer.setRenderTarget(null);
+      renderer.render(R.scene, R.cam);
+      renderer.autoClear = false;
+      var fu = R.fxMat.uniforms;
+      fu.uFlash.value = R.flash; fu.uVig.value = vig; fu.uDim.value = 0; fu.uRes.value.set(W, H);
+      renderer.render(R.fxScene, R.ortho);
+    }
+    renderer.autoClear = prevAC; renderer.setRenderTarget(prevRT);
+  }
+  // Card layout, in CSS px — chrome is sized from the frame, never from world units.
+  function layout(W, H){
+    var bw = Math.round(Math.min(W * 0.66, 300)), bh = 56, gap = 14, y0 = Math.round(H * 0.56);
+    R.btns[0].r = { x: Math.round((W - bw) / 2), y: y0, w: bw, h: bh };
+    R.btns[1].r = { x: Math.round((W - bw) / 2), y: y0 + bh + gap, w: bw, h: bh };
+  }
+  function frostButtons(card, W, H){
+    layout(W, H);
+    var DP = DML.P, pr = renderer.getPixelRatio();
+    R.uiCam.left = 0; R.uiCam.right = W; R.uiCam.top = 0; R.uiCam.bottom = -H; R.uiCam.updateProjectionMatrix();
+    for(var i = 0; i < R.btns.length; i++){
+      var b = R.btns[i], r = b.r, u = b.mesh.material.uniforms;
+      b.press += ((R.press === i ? 1 : 0) - b.press) * 0.35;
+      var s = 1 - 0.04 * b.press;
+      b.mesh.scale.set(r.w * s, r.h * s, 1);
+      b.mesh.position.set(r.x + r.w / 2, -(r.y + r.h / 2), 0);
+      // Same feed as DML.feedFrost, in px: 1 unit = 1 CSS px here, so the px params ARE the units.
+      u.tBg.value = R.rt.texture;
+      u.res.value.set(W * pr, H * pr);
+      u.hsize.value.set(r.w * s * 0.5, r.h * s * 0.5);
+      u.rad.value = r.h * s * 0.5;
+      u.aa.value = Math.max(1e-3, DP.plateEdgePx); u.bevelW.value = Math.max(1e-3, DP.plateBevelPx);
+      u.blurPx.value = DP.plateBlur; u.frost.value = DP.plateFrost; u.bevel.value = DP.plateBevel;
+      u.dim.value = DP.plateDim + 0.12 * b.press;
+      u.tint.value.setRGB(DP.plateTint[0], DP.plateTint[1], DP.plateTint[2]);
+      u.opacity.value = DP.plateOpacity * card;
+    }
+  }
+  function dom(){
+    var m = Math.floor(S.z * M_PER_UNIT);
+    if(m !== R.lastM && !S.dead){ R.lastM = m; R.elDist.textContent = m.toLocaleString('en-US') + ' M'; }
+    var card = cardAmt();
+    if(S.dead && !R.cardShown && card > 0){
+      R.cardShown = true;
+      R.elDist.style.opacity = 0;
+      R.elV.textContent = S.crashM.toLocaleString('en-US') + ' M';
+      R.elBest.textContent = S.newBest ? 'NEW BEST' : ('BEST ' + S.best.toLocaleString('en-US') + ' M');
+    }
+    if(R.cardShown){
+      var W = window.innerWidth, H = window.innerHeight;
+      layout(W, H);
+      R.elCard.style.opacity = card;
+      R.elCard.style.top = Math.round(H * 0.30) + 'px';
+      for(var i = 0; i < 2; i++){
+        var r = R.btns[i].r, e = R.elBtn[i];
+        e.style.left = r.x + 'px'; e.style.top = r.y + 'px'; e.style.width = r.w + 'px'; e.style.height = r.h + 'px';
+        e.style.lineHeight = r.h + 'px'; e.style.opacity = card;
+      }
+    }
+  }
+
+  // ════════════════════════════════════════ INPUT ════════════════════════════════════════
+  // One finger drives. Its sideways motion is the steer, 1:1; swipes are read off the same stroke over a
+  // short window, and every recognised swipe re-anchors the stroke — so an up-then-left L reads as a
+  // jump followed by a cling.
+  var G = { id: null, on: false, lx: 0, ly: 0, hist: [], muteT: 0, t0: 0, lArm: 0 };
+  function gStart(x, y){ var t = performance.now(); G.on = true; G.lx = x; G.ly = y; G.hist = [{ x: x, y: y, t: t }]; G.t0 = t; G.lArm = 0; }
+  function gMove(x, y){
+    if(!G.on) return;
+    var dx = x - G.lx; G.lx = x; G.ly = y;
+    var hw = halfW(), W = window.innerWidth, H = window.innerHeight, t0 = performance.now();
+    // One rate everywhere on the track: a face's pitch per steerScreen of screen width, edge or no edge.
+    if(!S.dead && !(t0 < G.muteT)) S.sTgt += dx / (W * P.steerScreen) * pitch();
+    var t = performance.now(), hs = G.hist;
+    hs.push({ x: x, y: y, t: t });
+    while(hs.length > 1 && t - hs[0].t > P.swipeMs) hs.shift();
+    var o = hs[0], sx = x - o.x, sy = y - o.y;
+    if(-sy > P.swipeUp * H && -sy > 1.2 * Math.abs(sx)){ wantJump(); G.lArm = t + P.lStrokeMs; G.hist = [{ x: x, y: y, t: t }]; return; }
+    if(sy > P.swipeUp * H && sy > 1.2 * Math.abs(sx)){ slam(); G.hist = [{ x: x, y: y, t: t }]; return; }
+    // The flick is read over its own, shorter window: a quick sideways snap, not a steer. And it is only
+    // a CLING when it is a swipe — the second leg of the stroke that just jumped (up, then left), or a
+    // fresh touch that opens with it. A thumb already down and steering is steering: at ~47 px a face a
+    // quick dodge in the air is easily flick-fast, and read as a cling it threw the ship onto a wall.
+    for(var i = 0; i < hs.length && t - hs[i].t > P.flickMs; i++){}
+    var of = hs[Math.min(i, hs.length - 1)], fx = x - of.x, fy = y - of.y;
+    var armed = t < G.lArm || t - G.t0 < P.flickStartMs;
+    if(armed && !S.grounded && Math.abs(fx) > P.swipeSide * W && Math.abs(fx) > 1.2 * Math.abs(fy)){
+      cling(fx < 0 ? -1 : 1); G.hist = [{ x: x, y: y, t: t }];
+    }
+  }
+  function gEnd(){ G.on = false; }
+  function btnAt(x, y){
+    if(cardAmt() < 0.6) return -1;
+    for(var i = 0; i < R.btns.length; i++){ var r = R.btns[i].r; if(x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i; }
+    return -1;
+  }
+  function press(x, y){ if(S.dead){ R.press = btnAt(x, y); return; } gStart(x, y); }
+  function release(x, y){
+    if(S.dead){ var b = btnAt(x, y), p = R.press; R.press = -1; if(b >= 0 && b === p) act(R.btns[b].act); return; }
+    gEnd();
+  }
+  function act(a){ if(a === 'restart') restart(); else exit(); }
+  function tStart(e){
+    e.preventDefault(); e.stopPropagation();
+    if(G.id !== null && !S.dead) return;
+    var t = e.changedTouches[0]; G.id = t.identifier; press(t.clientX, t.clientY);
+  }
+  function findT(e){ for(var i = 0; i < e.changedTouches.length; i++) if(e.changedTouches[i].identifier === G.id) return e.changedTouches[i]; return null; }
+  function tMove(e){ e.preventDefault(); e.stopPropagation(); var t = findT(e); if(t && !S.dead) gMove(t.clientX, t.clientY); }
+  function tEnd(e){ e.preventDefault(); e.stopPropagation(); var t = findT(e); if(!t) return; G.id = null; release(t.clientX, t.clientY); }
+  var mouseDown = false;
+  function mDown(e){ e.preventDefault(); mouseDown = true; press(e.clientX, e.clientY); }
+  function mMove(e){ if(mouseDown && !S.dead) gMove(e.clientX, e.clientY); }
+  function mUp(e){ if(!mouseDown) return; mouseDown = false; release(e.clientX, e.clientY); }
+  // Keyboard (a desktop testing a portrait window): ←/→ steer (a fresh press in the air clings),
+  // ↑/W/Space jump, ↓/S slam, Enter/R restart, Esc back to the store.
+  function kDown(e){
+    if(!api.active) return;
+    var k = (e.key || '').toLowerCase();
+    if(k === 'arrowleft' || k === 'a'){ R.keyL = true; if(!e.repeat) cling(-1); }
+    else if(k === 'arrowright' || k === 'd'){ R.keyR = true; if(!e.repeat) cling(1); }
+    else if(k === 'arrowup' || k === 'w' || k === ' '){ if(!e.repeat) wantJump(); }
+    else if(k === 'arrowdown' || k === 's'){ if(!e.repeat) slam(); }
+    else if((k === 'enter' || k === 'r') && S.dead && cardAmt() > 0.6) restart();
+    else if(k === 'escape') exit();
+    else return;
+    e.preventDefault(); e.stopImmediatePropagation();
+  }
+  function kUp(e){
+    if(!api.active) return;
+    var k = (e.key || '').toLowerCase();
+    if(k === 'arrowleft' || k === 'a') R.keyL = false;
+    else if(k === 'arrowright' || k === 'd') R.keyR = false;
+    else return;
+    e.preventDefault(); e.stopImmediatePropagation();
+  }
+
+  // ════════════════════════════════════ IN AND OUT ════════════════════════════════════
+  // Link every program the tube draws — with the ship IN its scene, under its lights — so the first
+  // frame after the whiteout draws instead of compiling. The spin pays for it.
+  function compile(){
+    if(R.compiled) return;
+    var g = gameMode.group, par = g.parent, vis = g.visible;
+    R.scene.add(g); g.visible = true;
+    try {
+      renderer.compile(R.scene, R.cam);
+      renderer.compile(R.fxScene, R.ortho); renderer.compile(R.blitScene, R.ortho); renderer.compile(R.ui, R.uiCam);
+      R.compiled = true;
+    } finally { if(par) par.add(g); g.visible = vis; }
+  }
+  // Called from gamePreloadStep while the wheel spins — the same cadence as the planet preload.
+  function preloadStep(){
+    if(R.preDone || api.active) return;
+    if(R.preWait-- > 0) return;
+    R.preWait = PRELOAD_GAP;
+    try {
+      if(R.preStep === 0){ if(!gameMode.group) buildGameMode(); }
+      else if(R.preStep === 1) build();
+      else if(R.preStep === 2) compile();
+      else { R.preDone = true; return; }
+    } catch(e){ console.warn('runner preload ' + R.preStep + ':', e); }
+    R.preStep++;
+  }
+  function releaseSiteInput(){
+    isDragging = false; selectedFloor = null;
+    if(renderer && renderer.domElement && renderer.domElement.parentElement) renderer.domElement.parentElement.classList.remove('dragging');
+    touchScroll.active = false; touchScroll.locked = null; touchScroll.scrollMomentum = 0;
+  }
+  function start(){
+    if(api.active) return;
+    try { build(); compile(); } catch(e){ console.warn('RUNNER:', e); return; }
+    // The wheel stops dead under the whiteout, exactly as the instant entry stops it, so nothing about
+    // the crescendo is left running for the trip back.
+    var gf = gameMode.galleryFloor;
+    if(gf){ gf.group.userData.velocity = 0; gf.group.userData.rpmSmooth = 0; gf.group.userData.lastAngle = gf.group.rotation.y; }
+    releaseSiteInput();
+    if(!shipSkin._restored){   // the saved skin, on the first entry — as enterGameMode does it
+      shipSkin._restored = true;
+      var sk = skinLoadSaved(); if(sk !== 'default') skinEquip(sk);
+    }
+    R.shipScale0 = gameMode.ship.scale.x;
+    gameMode.ship.scale.setScalar(GAME_BASE_SHIP_SCALE);
+    R.scene.add(gameMode.group); gameMode.group.visible = true;
+    resetRig(); if(gameMode.wingPivots) setWingSweep(gameMode.wingPivots, 0);   // measure the hull at rest
+    measureShip();
+    R.keyL = R.keyR = false; G.id = null; G.on = false; mouseDown = false;
+    resetRun();
+    R.layer.style.display = 'block';
+    R.acc = 0; R.flash = 1;   // in out of the same white the spin ended in
+    api.active = true;
+    console.log('[RUNNER] start — tube a=' + P.apothem + ', ' + P.speedKmh + ' km/h, ship half-extents ' +
+      SHIP.hw.toFixed(4) + ' × ' + SHIP.hh.toFixed(4) + ' × ' + SHIP.hl.toFixed(4));
+  }
+  function restart(){ resetRun(); R.flash = 0.7; }
+  function exit(){
+    if(!api.active) return;
+    api.active = false;
+    R.layer.style.display = 'none';
+    for(var i = 0; i < R.obs.length; i++) freeObs(R.obs[i]);
+    R.obs.length = 0;
+    clearTrail(R.thr.L); clearTrail(R.thr.R);
+    scene.add(gameMode.group); gameMode.group.visible = false;
+    gameMode.ship.scale.setScalar(R.shipScale0 || GAME_BASE_SHIP_SCALE);
+    resetRig();
+    var s = gameMode.surfaceState;
+    s.airborne = false; s.vertVel = 0; s.speed = 0; s.groundNormal.set(0, 1, 0); s.forward.set(0, 0, -1);
+    releaseSiteInput();
+    gameEntryFlash = 1;   // …and back to the store out of the same white
+  }
+  if(AUTOPLAY){
+    (function wait(){ if(typeof renderer !== 'undefined' && renderer && typeof scene !== 'undefined' && scene && typeof DML !== 'undefined') setTimeout(start, 400); else setTimeout(wait, 200); })();
+  }
+
+  api.wanted = function(){ return FORCE || GAME_LOW_FX || window.innerWidth < window.innerHeight; };
+  api.device = function(){ return FORCE || GAME_LOW_FX; };   // a phone/tablet: the planet game is never reached here
+  api.start = start; api.exit = exit; api.restart = restart; api.frame = frame; api.preloadStep = preloadStep;
+  // test surface
+  api._S = function(){ return S; }; api._R = R; api.SHIP = SHIP;
+  api._in = { jump: wantJump, cling: cling, slam: slam, steerTo: function(s){ S.sTgt = s; }, pitch: pitch,
+              obs: function(type, face, dz){ addObs(type, face, S.z + dz); } };
+  return api;
+})();
+
 // ══════════════════════════════════════════════
 // MAIN LOOP
 // ══════════════════════════════════════════════
@@ -101651,6 +102986,8 @@ function animate(){
   var dt = Math.min(1/30, time - (window._lastTime || time));
   window._lastTime = time;
   if(location.search.indexOf('fps')>=0) _perfHud(dt);
+  // MOBILE RUNNER: while the tube is up it owns the frame — none of the storefront below runs.
+  if(RUNNER.active){ RUNNER.frame(dt); return; }
   heroUpdate(dt);   // PUBLIC BUILD: hero row — clear the top wheel, turn the brand mark
 
   // ── KEEP THE GAME WORLD OFF THE WEBSITE'S BACK ────────────────────────────────────────────
