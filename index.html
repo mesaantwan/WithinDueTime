@@ -92024,9 +92024,18 @@ var RUNNER = (function(){
     sidesMin: 4, sidesMax: 16, startSides: 8, holdSides: 0,
     shapeSecMin: 9, shapeSecMax: 18, morphSec: 1.2,
     morphClearBefore: 0.5, morphClearAfter: 0.7,   // no obstacle rows this many seconds either side of a fold
-    // FLATS: after a held tube, this often the course opens onto a flat platform instead of folding.
-    flatChance: 0.3, flatSecMin: 7, flatSecMax: 12, flatWidth: 2.6, flatTaperSec: 1.6,
+    // FLATS → FLOATING ISLANDS: after a held tube, this often the course opens onto an island instead of folding —
+    // hilly ground under plain gravity, rocks and trees, a fall past its edges. Lengths are skewed short (most are
+    // a quick crossing, a few run on and on); widths vary from island to island and wander along each one.
+    flatChance: 0.3, flatSecMin: 8, flatSecMax: 42, flatSecSkew: 1.8, flatWidth: 2.4, flatWidthMax: 4.6, flatTaperSec: 1.6,
     flatClearIn: 0.8, flatClearOut: 0.6,          // no rows this long after the tube opens / before the taper
+    // THE HILLS (see THE ISLANDS). Laid at the run's speed when the island is, so a faster run gets longer hills.
+    islHill: 1.5,         // height scale of the hills (0 = the old flat platform)
+    islRampIn: 1.0, islRunOut: 2.2,   // seconds of level ground after the tube opens / before the taper into the next
+    islSlopeG: 4.0,       // the ground's pull along a slope, × the hop's gravity: downhill gains speed, uphill gives it back
+    islThrust: 0.6,       // under the run speed the engine wins it back at this share of it a second
+    islDrag: 0.35,        // over it, this share of the excess goes a second, on the ground and in the air
+    islMinMul: 0.55, islMaxMul: 2.4,   // an island's speed stays within these × the run speed
     // PATTERNS: a set piece every patGapSec (after the first at firstPatSec), on a held tube with room for it.
     firstPatSec: 6, patGapSecMin: 5, patGapSecMax: 9, onlyPat: '',
     fodder: true,         // the random rows between patterns (off: patterns only — testing)
@@ -92231,8 +92240,9 @@ var RUNNER = (function(){
       if(flat){
         // A FLAT: the tube just ends and the platform carries on from its floor, flatWidth wide, then
         // narrows over its last flatTaperSec to the floor of the tube that follows — that tube's mouth.
-        var len = ups * (P.flatSecMin + Math.random() * (P.flatSecMax - P.flatSecMin));
-        sec = { z0: last.z1, z1: last.z1 + len, kind: 'flat', W: P.flatWidth, nNext: pickSides(last.n), taper: ups * P.flatTaperSec };
+        var len = ups * (P.flatSecMin + Math.pow(Math.random(), P.flatSecSkew) * (P.flatSecMax - P.flatSecMin));
+        sec = { z0: last.z1, z1: last.z1 + len, kind: 'flat', W: P.flatWidth + Math.random() * (P.flatWidthMax - P.flatWidth), nNext: pickSides(last.n), taper: ups * P.flatTaperSec };
+        makeHills(sec, ups);
       }
       else if(last.kind === 'hold' && !P.holdSides) sec = { z0: last.z1, z1: last.z1 + ups * P.morphSec, kind: 'morph', a: last.n, b: pickSides(last.n) };
       else sec = { z0: last.z1, z1: last.z1 + ups * holdSec(), kind: 'hold', n: last.kind === 'morph' ? last.b : (last.kind === 'flat' ? last.nNext : last.n) };
@@ -92240,13 +92250,72 @@ var RUNNER = (function(){
       buildChunk(sec);
     }
     while(c.length > 1 && c[0].z1 < S.z - 8){ disposeChunk(c[0]); c.shift(); }
+    islandParts();   // an island's ground is built a stretch at a time as it comes into sight
   }
-  // A flat's width at z: full, then down to the next tube's floor over the taper (smoothstep).
+  // An island's width at z: its own, wandering along the coast, then down to the next tube's floor over the
+  // taper (smoothstep) — that tube's mouth.
   function flatW(sec, z){
+    var e = sec.edge, w = sec.W * (e ? 1 + 0.15 * Math.sin(z * e[0] + e[1]) + 0.07 * Math.sin(z * e[2] + e[3]) : 1);
     var tz = (z - (sec.z1 - sec.taper)) / sec.taper, end = 2 * halfWn(sec.nNext);
-    if(tz <= 0) return sec.W;
+    if(tz <= 0) return w;
     tz = clamp(tz, 0, 1); tz = tz * tz * (3 - 2 * tz);
-    return sec.W + (end - sec.W) * tz;
+    return w + (end - w) * tz;
+  }
+  // ════════════════════════════════════════ THE ISLANDS ════════════════════════════════════════
+  // (═ THE ISLANDS ═ — patch: .runner-islands/apply.js)
+  // A flat is a floating island: its ground is a row of HILLS laid along it — each a rise and a fall of its own
+  // lengths (a long ramp and a sheer drop, a gentle swell, now and then a hollow), cosine halves meeting with no
+  // slope at the top, so the ground is smooth everywhere and only its CURVATURE changes. Over a crest tighter
+  // than v²/g the ground falls away faster than gravity can bend the ship down after it, and the ship flies —
+  // nothing says "jump here", it is the ground and the speed. Level ground at both ends: the tube's floor runs
+  // straight on, and the next tube's mouth is met level. A gentle lean across, changing along it.
+  function makeHills(sec, ups){
+    var k = ups / (baseSpeed() * 60), hk = Math.min(k, 1.6) * P.islHill, B = [], L = 0;
+    var a = sec.z0 + ups * P.islRampIn, b = sec.z1 - sec.taper - ups * P.islRunOut, z = a + rnd(0.3, 1.5) * k;
+    while(z < b){
+      var up = rnd(1.4, 4.2) * k, dn = (Math.random() < 0.4 ? rnd(0.6, 1.2) : rnd(1.2, 3.6)) * k;
+      var h = (Math.random() < 0.16 ? -rnd(0.08, 0.2) : rnd(0.12, 0.6)) * hk;
+      if(z + up + dn > b) break;
+      B.push(z, z + up, z + up + dn, h); L = Math.max(L, up + dn);
+      z += up + dn * rnd(0.35, 1.0) + (Math.random() < 0.25 ? rnd(1, 4) * k : 0);   // overlapping tails; now and then a level stretch
+    }
+    sec.hb = new Float64Array(B); sec.hn = B.length / 4; sec.hL = L; sec.hA = a; sec.hB = b;
+    sec.tilt = [rnd(0.02, 0.05) * hk, rnd(0.15, 0.4) / k, rnd(0, TAU)];
+    sec.edge = [rnd(0.25, 0.6) / k, rnd(0, TAU), rnd(0.9, 1.6) / k, rnd(0, TAU)];
+  }
+  // The island's ground height over its base (the old flat floor) at (x, z).
+  function islH(sec, x, z){
+    if(!sec.hb || z <= sec.hA || z >= sec.hB) return 0;
+    var hb = sec.hb, lo = 0, hi = sec.hn - 1, i = -1, h = 0;
+    while(lo <= hi){ var m = (lo + hi) >> 1; if(hb[m * 4] <= z){ i = m; lo = m + 1; } else hi = m - 1; }
+    for(var j = i; j >= 0 && hb[j * 4] > z - sec.hL; j--){
+      var s = hb[j * 4], c = hb[j * 4 + 1], e = hb[j * 4 + 2];
+      if(z >= e) continue;
+      var u = z < c ? (c - z) / (c - s) : (z - c) / (e - c);
+      h += hb[j * 4 + 3] * (0.5 + 0.5 * Math.cos(Math.PI * u));
+    }
+    var t = sec.tilt, en = smooth(sec.hA, sec.hA + 3, z) * (1 - smooth(sec.hB - 3, sec.hB, z));
+    return h + t[0] * x * Math.sin(z * t[1] + t[2]) * en;
+  }
+  var ISL_E = 0.02, _isl = { x: 0, z: 0 };
+  function islSlope(sec, x, z, out){
+    out.x = (islH(sec, x + ISL_E, z) - islH(sec, x - ISL_E, z)) / (2 * ISL_E);
+    out.z = (islH(sec, x, z + ISL_E) - islH(sec, x, z - ISL_E)) / (2 * ISL_E);
+    return out;
+  }
+  // The ride line over the ground at (x, z): an island's hills, else the flat/tube floor's level. (The height
+  // above ground anything needs on an island is S.y − groundAt(S.x, S.z).)
+  function groundAt(x, z){ var sec = sectionAt(z); return -(P.apothem - hover()) + (sec.kind === 'flat' ? islH(sec, x, z) : 0); }
+  // ── An island's speed. The engine holds the run speed from below and drag takes the excess above, as in a
+  // tube — but between them the ground's slope pulls along it (downhill on, uphill back), and a landing keeps only
+  // the part of the ship's velocity that runs along the ground it meets (stepFlat): come down onto a down-slope
+  // fast — a slam — and the fall turns into speed; land on a face rising at you and it is lost. ──
+  function islSpeed(vt){
+    if(S.v > vt) S.v = vt + (S.v - vt) * Math.exp(-P.islDrag / 60);
+    else S.v = Math.min(vt, S.v + vt * P.islThrust / 60);
+    var sec = sectionAt(S.z);
+    if(S.grounded && sec.kind === 'flat'){ var hz = islSlope(sec, S.x, S.z, _isl).z; S.v -= P.islSlopeG * JG() * hz / (1 + hz * hz); }
+    S.v = clamp(S.v, vt * P.islMinMul, vt * P.islMaxMul);
   }
   function sectionAt(z){
     var c = S.course;
@@ -92326,7 +92395,7 @@ var RUNNER = (function(){
     sc.add(new THREE.AmbientLight(0x6b78a8, 0.55));
     R.key = new THREE.DirectionalLight(0xe6ecff, 1.0); sc.add(R.key); sc.add(R.key.target);
     R.glow = new THREE.PointLight(0x10c4b2, 0.7, 1.4, 2.0); sc.add(R.glow);   // the seams' teal on the hull
-    buildTubeKit(); buildStars(); kit(8); kitPillar(); buildCoins(); buildSling(); buildShield(); buildPat2(); buildCores(); buildPlume();
+    buildTubeKit(); buildIsland(); buildStars(); kit(8); kitPillar(); buildCoins(); buildSling(); buildShield(); buildPat2(); buildCores(); buildPlume();
     BULK_GEO = new THREE.CircleGeometry(0.56, 48);   // one bulkhead standing by, so the warm-up links its program
     var w0 = { mesh: new THREE.Mesh(BULK_GEO, bulkMat()) }; w0.mesh.visible = false; w0.mesh.frustumCulled = false; w0.mesh.renderOrder = 1; sc.add(w0.mesh); R.wallPool.push(w0); buildSparks(); buildOverlay(); buildLayer();
     // Wing thrusters: the planet game's candle trails, our own two states so its pair is never touched.
@@ -92463,29 +92532,107 @@ var RUNNER = (function(){
     out[k] = (Hj * Math.cos(pi) - Hi * Math.cos(pj)) / det;
     out[k + 1] = (Math.sin(pi) * Hj - Math.sin(pj) * Hi) / det;
   }
-  // A flat's chunk: one wall (normal 0, at the apothem — the tube floor carried on), full width, then the
-  // taper into the next tube's mouth. Lanes about every 0.3 units, so the platform reads as a surface.
+  // An island's mesh: a group at the section's whole-unit z, its ground built in ISL_SEG stretches as they come
+  // into sight and dropped behind (an island can run hundreds of units). Each stretch: the top as a grid (rows
+  // every ISL_DZ — a drop can be under a unit long), smooth normals off the hills' own slopes; a cliff down each
+  // edge, tucking in under it; and the underside between.
+  var ISL_SEG = 12, ISL_DZ = 0.1, ISL_NX = 14;
   function buildFlatChunk(sec){
-    var zO = Math.floor(sec.z0), K = 14, pos = [], aU = [], aW = [], aPh = [], aN = [], idx = [], a = P.apothem;
-    var zs = [sec.z0];
-    for(var k = 0; k < K; k++) zs.push(sec.z1 - sec.taper + sec.taper * k / (K - 1));
-    for(k = 0; k < zs.length; k++){
-      var w = flatW(sec, zs[k]) * 0.5, n = Math.max(3, Math.round(2 * w / 0.3));
-      pos.push(-w, -a, -(zs[k] - zO), w, -a, -(zs[k] - zO));
-      aU.push(-w, w); aW.push(w, w); aPh.push(0, 0); aN.push(n, n);
-      if(k) idx.push((k - 1) * 2, (k - 1) * 2 + 1, k * 2 + 1, (k - 1) * 2, k * 2 + 1, k * 2);
+    var g = sec.mesh = new THREE.Group();
+    sec.zO = Math.floor(sec.z0); sec.parts = [];
+    g.position.z = -(sec.zO - S.zBase);
+    R.scene.add(g);
+  }
+  function islandParts(){
+    var c = S.course, lo = S.z - 6, hi = S.z + maxAhead() + 14;
+    for(var q = 0; q < c.length; q++){
+      var sec = c[q];
+      if(sec.kind !== 'flat' || !sec.parts) continue;
+      for(var s = 0, nS = Math.ceil((sec.z1 - sec.z0) / ISL_SEG); s < nS; s++){
+        var za = sec.z0 + s * ISL_SEG, zb = Math.min(sec.z1, za + ISL_SEG), pt = sec.parts[s];
+        if(pt == null && zb > lo && za < hi){ pt = sec.parts[s] = islandSeg(sec, za, zb); sec.mesh.add(pt); }
+        else if(pt && zb < lo){ sec.mesh.remove(pt); pt.geometry.dispose(); sec.parts[s] = false; }
+      }
+    }
+  }
+  function islandSeg(sec, za, zb){
+    var K = Math.max(2, Math.ceil((zb - za) / ISL_DZ) + 1), NX = ISL_NX, RV = NX + 5, a = P.apothem, NV = K * RV;
+    var pos = new Float32Array(NV * 3), nor = new Float32Array(NV * 3), aK = new Float32Array(NV), aU = new Float32Array(NV), idx = [];
+    function put(v, x, y, z, nx, ny, nz, kk, u){
+      var l = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      pos[v * 3] = x; pos[v * 3 + 1] = y; pos[v * 3 + 2] = z; nor[v * 3] = nx / l; nor[v * 3 + 1] = ny / l; nor[v * 3 + 2] = nz / l; aK[v] = kk; aU[v] = u;
+    }
+    for(var k = 0; k < K; k++){
+      var z = za + (zb - za) * k / (K - 1), half = flatW(sec, z) / 2, zl = -(z - sec.zO), v0 = k * RV, i;
+      for(i = 0; i <= NX; i++){
+        var x = -half + 2 * half * i / NX;
+        islSlope(sec, x, z, _isl);
+        put(v0 + i, x, -a + islH(sec, x, z), zl, -_isl.x, 1, _isl.z, 0, x / half);   // (world z runs the other way: +slope)
+      }
+      // the cliffs: down from each edge and in under it, deeper and shallower along the coast
+      var dep = 0.32 + 0.3 * (0.5 + 0.5 * Math.sin(z * 1.3 + sec.edge[1])), hl = islH(sec, -half, z), hr = islH(sec, half, z);
+      put(v0 + NX + 1, -half, -a + hl, zl, -1, 0.2, 0, 1, -1);
+      put(v0 + NX + 2, -half * 0.72, -a + hl - dep, zl, -0.6, -0.8, 0, 1, -1);
+      put(v0 + NX + 3, half, -a + hr, zl, 1, 0.2, 0, 1, 1);
+      put(v0 + NX + 4, half * 0.72, -a + hr - dep, zl, 0.6, -0.8, 0, 1, 1);
+      if(!k) continue;
+      var p0 = v0 - RV;
+      for(i = 0; i < NX; i++) idx.push(p0 + i, p0 + i + 1, v0 + i + 1, p0 + i, v0 + i + 1, v0 + i);
+      var qd = [NX + 1, NX + 2, NX + 4, NX + 3, NX + 2, NX + 4];   // left cliff, right cliff, underside
+      for(var j = 0; j < 6; j += 2){ var A = qd[j], Bq = qd[j + 1]; idx.push(p0 + A, p0 + Bq, v0 + Bq, p0 + A, v0 + Bq, v0 + A); }
     }
     var g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-    g.setAttribute('aU', new THREE.Float32BufferAttribute(aU, 1));
-    g.setAttribute('aW', new THREE.Float32BufferAttribute(aW, 1));
-    g.setAttribute('aPhi', new THREE.Float32BufferAttribute(aPh, 1));
-    g.setAttribute('aN', new THREE.Float32BufferAttribute(aN, 1));
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+    g.setAttribute('aK', new THREE.BufferAttribute(aK, 1));
+    g.setAttribute('aU', new THREE.BufferAttribute(aU, 1));
     g.setIndex(idx);
-    var m = sec.mesh = new THREE.Mesh(g, R.tubeMat);
-    m.frustumCulled = false; m.renderOrder = -1;
-    m.position.z = -(zO - S.zBase);
-    R.scene.add(m);
+    var m = new THREE.Mesh(g, R.islMat);
+    m.frustumCulled = false;
+    return m;
+  }
+  // The island's two materials — the ground, and the rocks/trees/logs on it. Lit by one fixed sun in the shader
+  // (no new scene light: a change in light count relinks every lit program), fogged exactly as the tube is.
+  var SUN = new THREE.Vector3(0.4, 0.55, 0.75).normalize();   // low, from behind the camera: climbs lit, drops in shade
+  function buildIsland(){
+    R.islMat = new THREE.ShaderMaterial({
+      uniforms: { uFogD: { value: P.fog }, uFogCol: { value: new THREE.Color(BG) }, uSun: { value: SUN } },
+      vertexShader: [
+        'attribute float aK, aU; varying float vK, vU, vH, vWZ; varying vec3 vN, vView;',
+        'void main(){ vK = aK; vU = aU; vH = position.y + ' + P.apothem.toFixed(4) + '; vN = normal;',
+        '  vec4 w = modelMatrix * vec4(position, 1.0); vWZ = w.z; vec4 mv = viewMatrix * w; vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
+      ].join('\n'),
+      fragmentShader: [
+        'uniform float uFogD; uniform vec3 uFogCol, uSun; varying float vK, vU, vH, vWZ; varying vec3 vN, vView;',
+        'void main(){',
+        '  vec3 n = normalize(vN); float dif = max(dot(n, uSun), 0.0);',
+        '  vec3 grass = mix(vec3(0.09, 0.26, 0.11), vec3(0.30, 0.52, 0.19), smoothstep(-0.15, 0.45, vH));',   // lighter up on the crests
+        '  grass = mix(grass, vec3(0.30, 0.25, 0.16), smoothstep(0.35, 0.7, 1.0 - n.y));',                    // steep faces: bare earth
+        '  float pz = fwidth(vWZ), band = step(0.5, fract(vWZ * 0.5));',                                     // mown bands, a unit each: the speed you see
+        '  grass *= 1.0 + 0.07 * (band * 2.0 - 1.0) * (1.0 - smoothstep(0.15, 0.5, pz));',
+        '  grass = mix(grass, vec3(0.52, 0.66, 0.30), smoothstep(0.94, 1.0, abs(vU)));',                     // the lip of the coast
+        '  vec3 rock = vec3(0.24, 0.21, 0.19) * (0.8 + 0.2 * sin(vH * 40.0 + vWZ * 3.0));',
+        '  vec3 col = mix(grass, rock, vK) * (0.32 + 0.85 * dif);',
+        '  float d = length(vView), fog = exp(-uFogD * uFogD * d * d);',
+        '  gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);',
+        '}'
+      ].join('\n'),
+      side: THREE.DoubleSide, extensions: { derivatives: true }
+    });
+    R.natMat = new THREE.ShaderMaterial({
+      uniforms: { uFogD: { value: P.fog }, uFogCol: { value: new THREE.Color(BG) }, uSun: { value: SUN } },
+      vertexShader: 'attribute vec3 aCol; varying vec3 vCol, vW, vView;\nvoid main(){ vCol = aCol; vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; vec4 mv = viewMatrix * w; vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
+      fragmentShader: [
+        'uniform float uFogD; uniform vec3 uFogCol, uSun; varying vec3 vCol, vW, vView;',
+        'void main(){',
+        '  vec3 n = normalize(cross(dFdx(vW), dFdy(vW))); if(dot(n, cameraPosition - vW) < 0.0) n = -n;',   // faceted: each face its own normal
+        '  vec3 col = vCol * (0.34 + 0.85 * max(dot(n, uSun), 0.0));',
+        '  float d = length(vView), fog = exp(-uFogD * uFogD * d * d);',
+        '  gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);',
+        '}'
+      ].join('\n'),
+      extensions: { derivatives: true }
+    });
   }
   function buildChunk(sec){
     if(sec.kind === 'flat') return buildFlatChunk(sec);
@@ -92520,7 +92667,13 @@ var RUNNER = (function(){
     m.position.z = -(zO - S.zBase);
     R.scene.add(m);
   }
-  function disposeChunk(sec){ if(!sec.mesh) return; R.scene.remove(sec.mesh); sec.mesh.geometry.dispose(); sec.mesh = null; }
+  function disposeChunk(sec){
+    if(!sec.mesh) return;
+    R.scene.remove(sec.mesh);
+    if(sec.parts){ sec.parts.forEach(function(p){ if(p) p.geometry.dispose(); }); sec.parts = null; }
+    else sec.mesh.geometry.dispose();
+    sec.mesh = null;
+  }
 
   // Stars on a shell round the camera (re-centred each frame, so the sky is at infinity).
   function buildStars(){
@@ -92660,21 +92813,52 @@ var RUNNER = (function(){
     }
     return K;
   }
-  // A flat's own obstacles: BLOCKS (tall, steer round) and HURDLES (low bars, hop) of a few set widths,
-  // a kit record per size made the first time one is needed — same shader sources, no new links.
-  var FLAT_BLOCK_W = [0.14, 0.26, 0.4, 0.6], FLAT_BAR_W = [0.3, 0.5, 0.8];
-  function fkit(type, w){
-    var key = type + w, K = R.fk[key];
+  // An island's own obstacles: ROCKS (the two smallest sizes are a hop, the rest steer round), TREES (steer) and
+  // fallen LOGS (hop). Low-poly, one shared material, vertex colours; a kit record {geo, mat, pool} per kind/size/
+  // variant made the first time one is needed. Origin at the foot, so a mesh stands on the ground at its spot.
+  var ROCK_R = [0.06, 0.09, 0.13, 0.19, 0.27], TREE_S = [0.8, 1.0, 1.3], LOG_W = [0.3, 0.5, 0.8];
+  function natKit(type, s, v){
+    var key = type + s + '_' + (v || 0), K = R.fk[key];
     if(K) return K;
-    if(type === 'block'){
-      var hh = OB.gate.h, g = prismGeo([[-w / 2, 0], [w / 2, 0], [w / 2, hh], [-w / 2, hh]], OB.gate.d);
-      K = { geo: g, mat: prismMat(g, 1), pool: [] };
+    var parts = [];
+    if(type === 'rock'){
+      // an icosphere with its corners pushed in and out (by corner, so faces stay joined), squat, half buried
+      var g = new THREE.IcosahedronGeometry(1, 1), pa = g.attributes.position, jit = {};
+      for(var i = 0; i < pa.count; i++){
+        var x = pa.getX(i), y = pa.getY(i), z = pa.getZ(i), kk = x.toFixed(3) + ',' + y.toFixed(3) + ',' + z.toFixed(3);
+        var f = jit[kk] || (jit[kk] = 0.8 + Math.random() * 0.4);
+        pa.setXYZ(i, x * f * s, (y * f * 0.75 + 0.45) * s, z * f * 0.95 * s);
+      }
+      parts.push({ g: g, col: new THREE.Color(0x6e6a64), top: new THREE.Color(0x56703c) });
+    } else if(type === 'tree'){
+      var tr = new THREE.CylinderGeometry(0.009 * s, 0.014 * s, 0.09 * s, 6); tr.translate(0, 0.045 * s, 0);
+      parts.push({ g: tr, col: new THREE.Color(0x4a3222) });
+      [[0.075, 0.13, 0.115], [0.058, 0.11, 0.185], [0.038, 0.09, 0.245]].forEach(function(c){
+        var cg = new THREE.ConeGeometry(c[0] * s, c[1] * s, 7); cg.translate(0, c[2] * s, 0);
+        parts.push({ g: cg, col: new THREE.Color(v ? 0x2c5a2a : 0x1f4a2c) });
+      });
     } else {
-      var gb = new THREE.CylinderGeometry(OB.bar.r, OB.bar.r, w, 20, 1, false); gb.rotateZ(Math.PI / 2);
-      K = { geo: gb, mat: cylMat(new THREE.Vector3(1, 0, 0), OB.bar.r, w / 2, 1), pool: [] };
+      var lg = new THREE.CylinderGeometry(0.022, 0.022, s, 9, 1); lg.rotateZ(Math.PI / 2); lg.translate(0, 0.02, 0);
+      parts.push({ g: lg, col: new THREE.Color(0x5a3c26), cap: new THREE.Color(0xb08a5c) });
     }
-    if(R.fogD) K.mat.uniforms.uFogD.value = R.fogD;
-    return (R.fk[key] = K);
+    var ps = [], cs = [], A = new THREE.Vector3(), Bv = new THREE.Vector3(), Cv = new THREE.Vector3();
+    parts.forEach(function(p){
+      var g = p.g.index ? p.g.toNonIndexed() : p.g, ar = g.attributes.position.array;
+      for(var t = 0; t + 8 < ar.length; t += 9){
+        A.fromArray(ar, t); Bv.fromArray(ar, t + 3).sub(A); Cv.fromArray(ar, t + 6).sub(A);
+        var nr = Bv.cross(Cv).normalize(), c = p.col, vv = 0.85 + Math.random() * 0.3;
+        if(p.top && nr.y > 0.55) c = p.top;                   // moss on the tops
+        if(p.cap && Math.abs(nr.x) > 0.7) c = p.cap;          // a log's cut ends
+        for(var q = 0; q < 9; q++) ps.push(ar[t + q]);
+        for(q = 0; q < 3; q++) cs.push(c.r * vv, c.g * vv, c.b * vv);
+      }
+      if(g !== p.g) g.dispose();
+      p.g.dispose();
+    });
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(ps, 3));
+    geo.setAttribute('aCol', new THREE.Float32BufferAttribute(cs, 3));
+    return (R.fk[key] = { geo: geo, mat: R.natMat, pool: [] });
   }
   // The pillar does not depend on the wall's width: one for every shape.
   function kitPillar(){
@@ -92939,7 +93123,8 @@ var RUNNER = (function(){
     // drag's: the excess decays, quickly in the air and slowly on the ground.
     var vt = runSpeed();
     if(!S.dead){
-      if(S.v > vt) S.v = vt + (S.v - vt) * Math.exp(-(S.grounded ? P.dragGround : P.dragAir) / 60);
+      if(S.mode === 'flat') islSpeed(vt);   // an island's own: the slopes' (see THE ISLANDS)
+      else if(S.v > vt) S.v = vt + (S.v - vt) * Math.exp(-(S.grounded ? P.dragGround : P.dragAir) / 60);
       else S.v = Math.min(vt, S.v + Math.max(GAME_BASE_MAXSPEED * (60 / 15) / 60, vt / 60));
       S.runT += 1 / 60;
       S.progT += Math.max(1, S.v / vt) / 60;   // the progress clock (see speedMul)
@@ -93003,6 +93188,7 @@ var RUNNER = (function(){
   function toTube(){
     var lim = P.apothem - hover();
     S.mode = 'tube';
+    if(!S.grounded) S.y = Math.min(S.y, 0.5 * lim);   // (still up off an island's last hill: inside the tube it meets)
     S.th = polar(S.x, S.y, S.up);
     S.thTgt = S.th + (S.fxTgt - S.fx) / lim;
     if(S.grounded) S.thV = S.fxV / lim;
@@ -93071,14 +93257,17 @@ var RUNNER = (function(){
     return holeAt(p, (x * Math.cos(p) + y * Math.sin(p)) / halfWn(sh.reg), z);
   }
   function stepFlat(sec, lh, y0){
-    var lim = P.apothem - lh, half = flatW(sec, S.z) / 2, floorY = -lim;
+    var half = flatW(sec, S.z) / 2;
     S.g = downNear(S.g);
     if(S.grounded && !S.dead){
       var r = cd(S.fx, S.fxV, S.fxTgt, P.steerHz);
       S.fx = r.x; S.fxV = r.v;
-      S.vx = S.fx - S.x; S.vy = 0; S.x = S.fx; S.y = floorY;
-      // OFF THE EDGE: nothing under the ship any more. It goes on at the speed it had, and drops.
-      if(Math.abs(S.x) > half){ S.grounded = false; S.airF = 2; }
+      S.vx = S.fx - S.x; S.x = S.fx;
+      var gy = groundAt(S.x, S.z), yb = S.y + S.vy - JG();
+      // OFF THE EDGE: nothing under the ship any more. OVER A CREST: the ground falls away faster than gravity can
+      // bend the ship's path down after it. Either way it goes on as it was going — up a ramp, that is up — and drops.
+      if(Math.abs(S.x) > half || yb > gy + 0.001){ S.grounded = false; S.airF = 2; S.vy -= JG(); S.y += S.vy; return; }
+      S.vy = gy - S.y; S.y = gy;   // riding the ground: its rise this step is the ship's (a jump keeps it)
       return;
     }
     if(!S.dead){
@@ -93089,16 +93278,21 @@ var RUNNER = (function(){
     S.vy -= JG();
     S.x += S.vx; S.y += S.vy;
     S.rest = false;
-    // The platform is a landing only where it IS: under the ship, coming down onto it from above.
-    if(S.y <= floorY && y0 >= floorY - 0.01 && Math.abs(S.x) <= half){
-      S.y = floorY;
+    // The ground is a landing only where it IS: under the ship (not far below it — that is under the island).
+    var gy2 = groundAt(clamp(S.x, -half, half), S.z);
+    if(Math.abs(S.x) <= half && S.y <= gy2 && S.y > gy2 - 0.15){
       if(!S.dead){
-        S.grounded = true; S.fx = S.x; S.fxV = S.vx; S.vy = 0;
+        // TOUCHDOWN: keep what runs along the ground, lose what goes into it — a fast fall onto a down-slope is speed.
+        islSlope(sec, S.x, S.z, _isl);
+        var vt = runSpeed(), hz = _isl.z;
+        S.v = clamp((S.v + S.vy * hz) / (1 + hz * hz), vt * P.islMinMul, vt * P.islMaxMul);
+        S.y = gy2; S.vy = hz * S.v + _isl.x * S.vx;
+        S.grounded = true; S.fx = S.x; S.fxV = S.vx;
         if(performance.now() - S.jumpBuf < P.jumpBufferMs) jump();
       } else {
-        S.vy = S.vy < -0.004 ? -S.vy * 0.35 : 0; S.vx *= 0.9; S.av.multiplyScalar(0.7); S.rest = true;
+        S.y = gy2; S.vy = S.vy < -0.004 ? -S.vy * 0.35 : 0; S.vx *= 0.9; S.av.multiplyScalar(0.7); S.rest = true;
       }
-    } else if(S.y < floorY - 0.12) fall();
+    } else if(S.y < gy2 - 0.12) fall();
   }
   // ── A fall is a death with nothing to hit: the ship goes on under the gravity it had — out through the
   // gap, or down past the platform's edge — tumbling slowly, and the camera lets it go. ──
@@ -93134,10 +93328,21 @@ var RUNNER = (function(){
     if(!S.dead){
       // The nose points where the ship is going ALONG the floor; the up-down part is the hop's pitch,
       // exactly as the planet game splits it (surface-tangent pose + rampPitch on the visual).
-      _f.set(rx * lat, ry * lat, -S.v); if(_f.lengthSq() < 1e-12) _f.set(0, 0, -1); _f.normalize();
+      _f.set(rx * lat, ry * lat, -S.v);
+      var isl = S.mode === 'flat';
+      if(isl){
+        // ON AN ISLAND the nose follows the real path — up a ramp, over a crest, down into a dive — and the up is
+        // the ground's normal under it (the sky's in the air), eased so a landing settles rather than snaps.
+        var sc0 = sectionAt(S.z);
+        _f.y += S.vy;
+        if(S.grounded && sc0.kind === 'flat'){ islSlope(sc0, S.x, S.z, _isl); _v.set(-_isl.x, 1, _isl.z).normalize(); } else _v.set(0, 1, 0);
+        S.nrm = S.nrm || new THREE.Vector3(0, 1, 0);
+        S.nrm.lerp(_v, S.grounded ? 0.35 : 0.08).normalize(); _u.copy(S.nrm);
+      } else if(S.nrm) S.nrm.set(0, 1, 0);
+      if(_f.lengthSq() < 1e-12) _f.set(0, 0, -1); _f.normalize();
       _m.lookAt(_o, _v.copy(_f).negate(), _u); sh.quaternion.setFromRotationMatrix(_m);
       if(sv){
-        sv.rotation.set(clamp(S.grounded ? 0 : -vert * 9.0, -0.5, 0.5), 0, clamp(lat * P.bankK, -0.55, 0.55));
+        sv.rotation.set(isl ? 0 : clamp(S.grounded ? 0 : -vert * 9.0, -0.5, 0.5), 0, clamp(lat * P.bankK, -0.55, 0.55));
         sv.position.set(0, 0, 0);
       }
     } else {
@@ -93200,13 +93405,14 @@ var RUNNER = (function(){
   function placeCam(snap){
     var lim = P.apothem - hover(), z = -(S.z - S.zBase), flat = S.mode === 'flat';
     var gx = Math.sin(S.g), gy = -Math.cos(S.g), fd = 0;
-    if(!(S.grounded && !S.dead) && !S.fell) fd = flat ? Math.max(0, S.y + lim) : footDist(shapeAt(S.z), S.x, S.y, S.g);
-    var keep = S.dead ? 0 : fd * (1 - (S.sl && S.sl.phase !== 'run' ? 1 : P.camJumpFollow));   // ride up with a share of the hop (all of a slingshot's flight)
+    if(!(S.grounded && !S.dead) && !S.fell) fd = flat ? Math.max(0, S.y - groundAt(S.x, S.z)) : footDist(shapeAt(S.z), S.x, S.y, S.g);
+    // (on an island only a hop's worth is left below: a long flight off a crest takes the camera up with it)
+    var keep = S.dead ? 0 : (flat ? Math.min(fd, 0.14) : fd) * (1 - (S.sl && S.sl.phase !== 'run' ? 1 : P.camJumpFollow));   // ride up with a share of the hop (all of a slingshot's flight)
     var txp = S.x + gx * keep, typ = S.y + gy * keep;
     if(snap){ S.cx = txp; S.cy = typ; S.cvx = S.cvy = 0; S.cam = S.th; S.camV = 0; }
     else if(!S.fell){                                               // a fall: let the ship go, the camera stays
       var c = cd(S.cx, S.cvx, txp, P.camFollowHz); S.cx = c.x; S.cvx = c.v;
-      c = cd(S.cy, S.cvy, typ, P.camFollowHz); S.cy = c.x; S.cvy = c.v;
+      c = cd(S.cy, S.cvy, typ, flat ? 10 : P.camFollowHz); S.cy = c.x; S.cvy = c.v;   // (stiffer on hills: a slope is fast vertical motion)
     }
     // The tube camera's place eases between a tube's axis and a flat's overlook as the ground changes.
     var tY = flat ? -P.apothem + P.flatCamUp : 0, tB = flat ? P.flatCamBack : P.tubeCamBack, tL = flat ? -P.apothem : 0;
@@ -93222,9 +93428,28 @@ var RUNNER = (function(){
     // (pulling the slingshot back brings the ship a quarter of the way toward the lens)
     var px = S.cx + cux * P.camUp, py = S.cy + cuy * P.camUp, pz = z + P.camBack - (S.sl && S.sl.phase === 'aim' ? S.sl.pull * P.slingPull * 0.25 : 0);
     var lx = S.cx + cux * 0.02, ly = S.cy + cuy * 0.02, lz = z - P.camLook;
+    // On an island the camera never goes into a hill behind it (it rises over, and tips down at the ship), and it
+    // looks down a slope it is about to run down — and up one it is about to climb.
+    // Behind the ship it sits back along the slope it came down (or up), as if on the path itself: level, a
+    // descent left it at grass height looking into the hill.
+    var lkT = 0, cbT = 0;
+    if(flat && !S.fell){
+      var g0 = groundAt(S.cx, S.z);
+      cbT = groundAt(S.cx, S.z - P.camBack) - g0;
+      lkT = 0.5 * (groundAt(S.cx, S.z + P.camLook) - g0);
+    }
+    var cb = cd(S.cbY || 0, S.cbV || 0, cbT, 4); S.cbY = snap ? cbT : cb.x; S.cbV = snap ? 0 : cb.v;
+    py += S.cbY;
+    if(flat && !S.fell){
+      var gB = groundAt(S.cx, S.z - P.camBack) + 0.045;
+      if(py < gB){ ly -= (gB - py) * 0.8; py = gB; }
+    }
+    var lk = cd(S.lkY || 0, S.lkV || 0, lkT, 3); S.lkY = snap ? lkT : lk.x; S.lkV = snap ? 0 : lk.v;
+    ly += S.lkY;
     if(S.fell){ lx += (S.x - lx) * 0.5; ly += (S.y - ly) * 0.5; lz = z; }   // and watch it go
     // tube pose
-    var qx = 0, qy = S.tcY, qz = z + S.tcB, mx = 0, my = S.tcL, mz = z - 2.2;
+    var il = flat ? S.cy + lim : 0;   // (over an island: up and down with its hills)
+    var qx = 0, qy = S.tcY + il, qz = z + S.tcB, mx = 0, my = S.tcL + il, mz = z - 2.2;
     R.cam.up.set(-Math.sin(ang), Math.cos(ang), 0);
     R.cam.position.set(px + (qx - px) * e + (Math.random() - 0.5) * sk, py + (qy - py) * e + (Math.random() - 0.5) * sk, pz + (qz - pz) * e);
     R.cam.lookAt(lx + (mx - lx) * e, ly + (my - ly) * e, lz + (mz - lz) * e);
@@ -93643,7 +93868,7 @@ var RUNNER = (function(){
     if(S.mode === 'flat'){
       var half = flatW(sectionAt(S.z), S.z) / 2 - SHIP.hw;
       S.x = clamp(S.x, -half, half); S.fx = S.x; S.fxV = 0; S.fxTgt = clamp(S.fxTgt, -half, half);
-      S.y = -lim; S.vx = 0; S.vy = JI(); S.g = downNear(S.g);
+      S.y = groundAt(S.x, S.z); S.vx = 0; S.vy = JI(); S.g = downNear(S.g);
     } else {
       var sh = shapeAt(S.z); rideAt(sh, S.th, _ra);
       S.x = _ra.x; S.y = _ra.y;                       // (copied out before upAt re-uses the scratch)
@@ -93744,10 +93969,10 @@ var RUNNER = (function(){
       speed: new THREE.ShaderMaterial({ uniforms: { uCol: { value: SPEED_COL }, uT: { value: 0 }, uFogD: { value: P.fog }, uSize: { value: 0.12 } }, vertexShader: BB,
         fragmentShader: GL + 'void main(){ float r = length(vUv);\n' +
           '  float glow = exp(-r * 4.0) * 0.8 + exp(-r * 11.0) * 0.9;\n' +
-          '  float c = fract((vUv.y - abs(vUv.x) * 0.85) * 2.2 - uT * 2.6);\n' +
+          '  float c = fract((vUv.y + abs(vUv.x) * 0.85) * 2.2 - uT * 2.6);\n' +
           '  float chev = smoothstep(0.30, 0.18, abs(c - 0.5)) * smoothstep(0.62, 0.34, abs(vUv.x)) * smoothstep(0.95, 0.55, r);\n' +
           '  vec3 col = uCol * (glow + chev * 0.75) + vec3(exp(-r * 16.0) * 0.6);\n' +
-          '  gl_FragColor = vec4(col * exp(-uFogD * uFogD * vD * vD), 1.0); }',
+          '  gl_FragColor = vec4(col * exp(-uFogD * uFogD * vD * vD) * smoothstep(1.0, 0.8, r), 1.0); }',   // (to nothing before the quad's edge: on a bright island its rays showed a square)
         transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }),
       charge: new THREE.ShaderMaterial({ uniforms: { uCol: { value: CHARGE_COL }, uT: { value: 0 }, uFogD: { value: P.fog }, uSize: { value: 0.13 } }, vertexShader: BB,
         fragmentShader: GL + 'void main(){ float r = length(vUv), a = atan(vUv.y, vUv.x);\n' +
@@ -93755,7 +93980,7 @@ var RUNNER = (function(){
           '  float glow = (exp(-r * 4.0) * 0.8 + exp(-r * 10.0)) * pulse;\n' +
           '  float rays = pow(abs(cos(a * 3.0 + uT * 2.2)), 16.0) * exp(-r * 2.6) * 0.9 + pow(abs(cos(a * 2.0 - uT * 1.4)), 30.0) * exp(-r * 3.2) * 0.5;\n' +
           '  vec3 col = uCol * (glow + rays) + vec3(exp(-r * 13.0) * 0.8 * pulse);\n' +
-          '  gl_FragColor = vec4(col * exp(-uFogD * uFogD * vD * vD), 1.0); }',
+          '  gl_FragColor = vec4(col * exp(-uFogD * uFogD * vD * vD) * smoothstep(1.0, 0.8, r), 1.0); }',   // (to nothing before the quad's edge: on a bright island its rays showed a square)
         transparent: true, depthWrite: false, blending: THREE.AdditiveBlending })
     };
     // …and the solid at its heart: a crystal (speed) or a cut gem (charge), lit from inside at the rim.
@@ -93834,7 +94059,7 @@ var RUNNER = (function(){
     var lim = P.apothem - hover(), it = { kind: kind, z: z, x: 0, y: 0, up: 0, spin: Math.random() * TAU, bob: Math.random() * TAU };
     if(sec.kind === 'flat'){
       var half = flatW(sec, z) / 2 - 0.08;
-      it.x = clamp(S.x + (th - S.th) * 0.6, -half, half); it.y = -lim + P.coreLift;
+      it.x = clamp(S.x + (th - S.th) * 0.6, -half, half); it.y = groundAt(it.x, z) + P.coreLift;
     } else {
       var sh = shapeInto(z, _shC);
       if(sh.reg) th = Math.round(th / sh.span) * sh.span;          // the middle of a wall
@@ -94914,7 +95139,7 @@ var RUNNER = (function(){
   // ── DOUBLE JUMP: in the air, a swipe up is another hop — the fall stopped and a hop's impulse up from where
   // the ship is — unless the ship is about to touch down, when it is the landing's buffered jump as before. ──
   function nearLanding(){
-    if(S.mode === 'flat') return S.vy < 0 && S.y + (P.apothem - hover()) < 0.025;
+    if(S.mode === 'flat') return S.vy < 0 && S.y - groundAt(S.x, S.z) < 0.025;   // (height above an island's ground)
     var gx = Math.sin(S.g), gy = -Math.cos(S.g);
     return S.vx * gx + S.vy * gy > 0 && footDist(shapeAt(S.z), S.x, S.y, S.g) < 0.025;
   }
@@ -95277,38 +95502,42 @@ var RUNNER = (function(){
     }
     return false;
   }
-  // ── A flat's row: blocks, hurdles and pillars scattered across it, never in one clear lane (~4 ship spans,
-  // placed somewhere you can reach from where you are), so every row has a way through on the ground. ──
+  // ── An island's row: rocks, trees and fallen logs scattered across it (more on a wider island), never in one
+  // clear lane (~4 ship spans, placed somewhere you can reach from where you are), so every row has a way through
+  // on the ground. Each stands on the ground where it is — its hit box rides up and down with the hills. ──
   function spawnFlatRow(z, sec){
     var d = difficulty(), half = flatW(sec, z) / 2 - 0.04, lane = 0.34;
     var lc = clamp(S.x + (Math.random() * 2 - 1) * 0.9, -half + lane / 2, half - lane / 2);
-    var count = Math.round(2 + 4 * d + Math.random() * 2), placed = [], tries = 0;
-    while(placed.length < count && tries++ < 40){
-      var type = wpick({ block: 3, fbar: 2, pillar: 2.5 });
-      var w = type === 'block' ? FLAT_BLOCK_W[Math.floor(Math.random() * FLAT_BLOCK_W.length)]
-            : type === 'fbar' ? FLAT_BAR_W[Math.floor(Math.random() * FLAT_BAR_W.length)] : OB.pillar.r * 2;
+    var count = Math.round((2 + 4 * d + Math.random() * 2) * Math.max(1, half / 1.26)), placed = [], tries = 0;
+    while(placed.length < count && tries++ < 60){
+      var type = wpick({ rock: 3.2, tree: 3, log: 1.4 }), s, w;
+      if(type === 'rock'){ s = ROCK_R[Math.floor(Math.random() * ROCK_R.length)]; w = 2 * s; }
+      else if(type === 'tree'){ s = TREE_S[Math.floor(Math.random() * TREE_S.length)]; w = 0.15 * s; }
+      else { s = LOG_W[Math.floor(Math.random() * LOG_W.length)]; w = s; }
       if(w > 2 * half) continue;
       var xc = (Math.random() * 2 - 1) * (half - w / 2), x0 = xc - w / 2, x1 = xc + w / 2, ok = !(x1 > lc - lane / 2 && x0 < lc + lane / 2);
       for(var i = 0; ok && i < placed.length; i++) if(x1 + 0.06 > placed[i][0] && x0 - 0.06 < placed[i][1]) ok = false;
       if(!ok) continue;
       placed.push([x0, x1]);
-      addFlatObs(type, xc, w, z);
+      addFlatObs(type, xc, s, z, sec);
     }
   }
-  function addFlatObs(type, xc, w, z){
-    var o = { type: type, face: 0, n: 0, phi: 0, z: z, sector: false, mt: type }, yc = 0;
-    if(type === 'block'){
-      o.kr = fkit('block', w); o.u0 = xc - w / 2; o.u1 = xc + w / 2; o.y0 = 0; o.y1 = OB.gate.h; o.dz = OB.gate.d / 2;
-    } else if(type === 'fbar'){
-      var rb = OB.bar.r * P.hitScale; yc = OB.bar.y;
-      o.kr = fkit('fbar', w); o.u0 = xc - w / 2; o.u1 = xc + w / 2; o.y0 = yc - rb; o.y1 = yc + rb; o.dz = rb;
+  function addFlatObs(type, xc, s, z, sec){
+    var o = { type: type, face: 0, n: 0, phi: 0, z: z, sector: false, mt: type }, hc = islH(sec, xc, z), hs = P.hitScale;
+    if(type === 'rock'){
+      o.kr = natKit('rock', s, Math.floor(Math.random() * 3));
+      o.u0 = xc - 0.8 * s; o.u1 = xc + 0.8 * s; o.y0 = hc; o.y1 = hc + 1.1 * s; o.dz = 0.75 * s;
+    } else if(type === 'tree'){
+      o.kr = natKit('tree', s, Math.random() < 0.5 ? 1 : 0);
+      o.u0 = xc - 0.05 * s; o.u1 = xc + 0.05 * s; o.y0 = hc; o.y1 = hc + 0.29 * s; o.dz = 0.05 * s;
     } else {
-      var rp = OB.pillar.r * P.hitScale; yc = OB.pillar.h / 2;
-      o.kr = R.pil; o.u0 = xc - rp; o.u1 = xc + rp; o.y0 = 0; o.y1 = OB.pillar.h; o.dz = rp;
+      var rb = 0.022 * hs;
+      o.kr = natKit('log', s, 0);
+      o.u0 = xc - s / 2; o.u1 = xc + s / 2; o.y0 = hc + 0.02 - rb; o.y1 = hc + 0.02 + rb; o.dz = rb;
     }
     var m = o.mesh = takeMesh(o);
-    m.position.set(xc, -P.apothem + yc, -(z - S.zBase));
-    m.rotation.set(0, 0, 0);
+    m.position.set(xc, -P.apothem + hc, -(z - S.zBase));
+    m.rotation.set(0, type === 'log' ? 0 : Math.random() * TAU, 0);
     R.obs.push(o);
   }
   // Every obstacle carries its kit record {geo, mat, pool}: a tube wall's kit for its shape, the shared
@@ -95408,7 +95637,8 @@ var RUNNER = (function(){
         var x = x0;
         if(kind < 0.4){} else if(kind < 0.75) x = x0 + slide * i; else x = x0 + Math.sin(i * 0.9) * 0.25;
         var fh = flatW(fsec, z) / 2 - 0.06;
-        S.coins.push({ z: z, x: clamp(x, -fh, fh), y: -lim + P.coinLift, up: 0,
+        x = clamp(x, -fh, fh);
+        S.coins.push({ z: z, x: x, y: groundAt(x, z) + P.coinLift, up: 0,
                        spin: Math.random() * TAU, pulled: false, rx: 0, ry: 0, rz: 0, vx: 0, vy: 0, vz: 0 });
         continue;
       }
@@ -95564,6 +95794,7 @@ var RUNNER = (function(){
     R.fogD = fogD; R.scene.fog.density = fogD; R.tubeMat.uniforms.uFogD.value = fogD; R.pil.mat.uniforms.uFogD.value = fogD;
     for(var n in R.kits) for(var mk in R.kits[n].mat) R.kits[n].mat[mk].uniforms.uFogD.value = fogD;
     for(var fk in R.fk) R.fk[fk].mat.uniforms.uFogD.value = fogD;
+    if(R.islMat){ R.islMat.uniforms.uFogD.value = fogD; R.natMat.uniforms.uFogD.value = fogD; }
     if(R.strut) R.strut.mat.uniforms.uFogD.value = fogD; if(R.panels) R.panels.material.uniforms.uFogD.value = fogD;
   }
   // The gaps near enough to be seen go to the tube shader, in world z (they are kept in run z).
@@ -95850,13 +96081,14 @@ var RUNNER = (function(){
     var g = gameMode.group, par = g.parent, vis = g.visible;
     R.scene.add(g); g.visible = true;
     var tmp = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), R.tubeMat); R.scene.add(tmp);
+    var tmpI = new THREE.Mesh(tmp.geometry, R.islMat), tmpN = new THREE.Mesh(tmp.geometry, R.natMat); R.scene.add(tmpI); R.scene.add(tmpN);   // (THE ISLANDS)
     R.coinMesh.count = 1;
     R.sling.forEach(function(q){ q.mesh.visible = true; }); R.shield.visible = true; coresShow(true); plumeShow(true);
     try {
       renderer.compile(R.scene, R.cam);
       renderer.compile(R.fxScene, R.ortho); renderer.compile(R.blitScene, R.ortho); renderer.compile(R.ui, R.uiCam);
       R.compiled = true;
-    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); tmp.geometry.dispose(); R.coinMesh.count = 0; R.sling.forEach(function(q){ q.mesh.visible = false; }); R.shield.visible = false; coresShow(false); plumeShow(false); }
+    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); R.scene.remove(tmpI); R.scene.remove(tmpN); tmp.geometry.dispose(); R.coinMesh.count = 0; R.sling.forEach(function(q){ q.mesh.visible = false; }); R.shield.visible = false; coresShow(false); plumeShow(false); }
   }
   // Called from gamePreloadStep while the wheel spins — the same cadence as the planet preload.
   function preloadStep(){
