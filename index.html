@@ -92041,6 +92041,12 @@ var RUNNER = (function(){
     islTufts: 4.0,        // grass tufts per square unit of island top (one in islFlower carries a flower)
     islFlower: 7,
     bgIslands: 9,         // other islands floating out in the dark around one you are on
+    // THE SKY: the storefront's clouds (CSKY) behind the whole run, marched from a camera of the runner's own — its
+    // position is the run's × skyK (cloud space is big: one run unit is skyK of it) at height skyY0 in the deck.
+    sky: true, skyK: 6, skyY0: -14,
+    // THE HOLO PANELS: every tube wall is the storefront's product panel — pale blue glass, edges glowing in,
+    // scanlines, rolling bands, a refresh line — one panel per wall per panelLen units of tube.
+    holoAlpha: 0.34, panelLen: 1.0,
     // PATTERNS: a set piece every patGapSec (after the first at firstPatSec), on a held tube with room for it.
     firstPatSec: 6, patGapSecMin: 5, patGapSecMax: 9, onlyPat: '',
     fodder: true,         // the random rows between patterns (off: patterns only — testing)
@@ -92121,6 +92127,7 @@ var RUNNER = (function(){
   var _rsq = Q.match(/[?&]runspeed=([\d.]+)/); if(_rsq) P.speedKmh = +_rsq[1];
   var _rsd = Q.match(/[?&]runsides=(\d+)/); if(_rsd) P.holdSides = P.startSides = Math.max(3, Math.min(32, +_rsd[1]));
   var _rfl = /[?&]runflat(?:[=&]|$)/.test(Q);   // testing: a flat straight after the first tube
+  if(/[?&]runsky=0/.test(Q)) P.sky = false;   // testing: the old dark space
   var _rpt = Q.match(/[?&]runpattern=(\w+)/); if(_rpt) P.onlyPat = _rpt[1];   // testing: only this pattern, early and often
   if(P.onlyPat){ P.firstPatSec = 3; P.patGapSecMin = P.patGapSecMax = 2.5; }
   var _rlv = (function(){ var q = Q.match(/[?&]runlives=(\d+)/); return q ? +q[1] : null; })();   // testing: this many lives
@@ -92401,6 +92408,7 @@ var RUNNER = (function(){
     sc.add(new THREE.AmbientLight(0x6b78a8, 0.55));
     R.key = new THREE.DirectionalLight(0xe6ecff, 1.0); sc.add(R.key); sc.add(R.key.target);
     R.glow = new THREE.PointLight(0x10c4b2, 0.7, 1.4, 2.0); sc.add(R.glow);   // the seams' teal on the hull
+    R.skyCam = new THREE.PerspectiveCamera(70, 1, 0.1, 1000); R.skyCol = new THREE.Color(); R.darkCol = new THREE.Color(BG);
     buildTubeKit(); buildIsland(); buildStars(); kit(8); kitPillar(); buildCoins(); buildSling(); buildShield(); buildPat2(); buildCores(); buildPlume();
     BULK_GEO = new THREE.CircleGeometry(0.56, 48);   // one bulkhead standing by, so the warm-up links its program
     var w0 = { mesh: new THREE.Mesh(BULK_GEO, bulkMat()) }; w0.mesh.visible = false; w0.mesh.frustumCulled = false; w0.mesh.renderOrder = 1; sc.add(w0.mesh); R.wallPool.push(w0); buildSparks(); buildOverlay(); buildLayer();
@@ -92445,7 +92453,10 @@ var RUNNER = (function(){
         // bars, whose light is on the floor under them (wall φ or 99 for a whole row, world z, across from, to).
         uChk: { value: new THREE.Vector4() }, uBar: { value: BA }, uBN: { value: 0 },
         // THE CHOICE HALLWAY (see THE UPGRADES): (world z from, to, on (2 = picked), the wall you are on) + each wall's colour
-        uCh: { value: new THREE.Vector4() }, uChC0: { value: new THREE.Color() }, uChC1: { value: new THREE.Color() }, uChC2: { value: new THREE.Color() }
+        uCh: { value: new THREE.Vector4() }, uChC0: { value: new THREE.Color() }, uChC1: { value: new THREE.Color() }, uChC2: { value: new THREE.Color() },
+        // THE HOLO PANELS (see THE SKY): the clock, panels per unit of tube, and whether a sky is behind (the far
+        // tube then fades out into it rather than into a fog colour)
+        uHT: { value: 0 }, uPanL: { value: 1 / P.panelLen }, uSky: { value: 0 }
       },
       vertexShader: [
         'attribute float aU, aW, aPhi, aN; varying float vU, vW, vPhi, vN, vZ, vWZ; varying vec2 vXY; varying vec3 vView;',
@@ -92457,7 +92468,7 @@ var RUNNER = (function(){
         'uniform vec4 uHA[' + P.holeMax + ']; uniform vec2 uHB[' + P.holeMax + '];',
         'uniform vec4 uPit; uniform vec4 uSA[6]; uniform vec4 uSB[6];',
         'uniform vec4 uChk; uniform vec4 uBar[' + BAR_MAX + ']; uniform float uBN;',
-        'uniform vec4 uCh; uniform vec3 uChC0, uChC1, uChC2;',
+        'uniform vec4 uCh; uniform vec3 uChC0, uChC1, uChC2; uniform float uHT, uPanL, uSky;',
         'varying float vU, vW, vPhi, vN, vZ, vWZ; varying vec2 vXY; varying vec3 vView;',
         'float ln(float d, float w){ return exp(-max(d, 0.0) / max(w, 1e-6)); }',
         'void main(){',
@@ -92510,19 +92521,44 @@ var RUNNER = (function(){
         '  float flr = smoothstep(uFlrCos, 1.0, cos(vPhi - uFloor));',      // the wall that is the floor
         '  rim = min(rim, prim);',
         '  float hr = ln(rim, pu * 1.6 + pz * 0.6) + 0.4 * ln(rim, pu * 8.0 + pz * 3.0);',
-        '  vec3 col = uBase + uSeam * seam * (0.55 + 0.9 * flr) + uRing * ring * (0.45 + 0.55 * flr) + uSeam * lane * (0.4 + flr) + uHole * hr * 1.2 + uHole * bgl * 0.42;',
-        '  float a = clamp(uAlpha + 0.8 * max(max(max(max(seam, ring), lane), hr), bgl * 0.8), 0.0, 1.0);',
+        // THE HOLO PANEL — the storefront's product panel (createPanel's VHS treatment), ported: each wall, each
+        // panelLen of tube, is one panel. Pale blue-grey glass, edges glowing inward, scanlines (faded out as they go
+        // sub-pixel — the shirts' sub-Nyquist trap), two rolling dark bands, grain, flicker, a refresh line sweeping.
+        // Every wall runs out of phase (vPhi) so the tube is not one big synchronised screen.
+        '  vec2 puv = vec2(vU / max(vW, 1e-5) * 0.5 + 0.5, fract(vWZ * uPanL));',
+        '  float edgeMask = 1.0 - smoothstep(0.0, 0.18, puv.x) * smoothstep(1.0, 0.82, puv.x) * smoothstep(0.0, 0.22, puv.y) * smoothstep(1.0, 0.78, puv.y);',
+        '  float edgePulse = 0.6 + 0.4 * sin(uHT * 1.5 + puv.y * 3.0 + vPhi * 2.0);',
+        '  vec3 edgeCol = mix(vec3(0.3, 0.5, 0.9), vec3(0.15, 0.7, 0.85), puv.y);',
+        '  float sAA = 1.0 - smoothstep(0.25, 0.6, fwidth(puv.y * 46.0));',
+        '  float scan = pow(sin(puv.y * 289.0 + uHT * 4.0) * 0.5 + 0.5, 8.0) * (0.6 + 0.4 * sin(puv.y * 6.28 + uHT * 0.8)) * 0.22 * sAA;',
+        '  float bp = fract(uHT * (0.055 + 0.02 * sin(uHT * 0.3)) + vPhi * 0.13), bd = abs(puv.y - bp); bd = min(bd, 1.0 - bd);',
+        '  float bp2 = fract(uHT * 0.13 + 0.33 + vPhi * 0.21), bd2 = abs(puv.y - bp2); bd2 = min(bd2, 1.0 - bd2);',
+        '  float band = (1.0 - smoothstep(0.0, 0.05, bd)) * 0.18 + (1.0 - smoothstep(0.0, 0.02, bd2)) * 0.08;',
+        '  float rp = abs(puv.y - fract(uHT * 0.08 + vPhi * 0.37)); rp = min(rp, 1.0 - rp);',
+        '  float refresh = (1.0 - smoothstep(0.0, 0.015, rp)) * 0.18;',
+        '  float gn = fract(sin(dot(floor(puv * vec2(120.0, 90.0)) + floor(uHT * 10.0), vec2(127.1, 311.7))) * 43758.5453) - 0.5;',
+        '  float flick = (0.96 + 0.04 * sin(uHT * 14.0 + sin(uHT * 4.3) * 6.0)) * (0.98 + 0.02 * sin(uHT * 53.0));',
+        '  vec3 glass = mix(vec3(0.56, 0.64, 0.82), vec3(0.74, 0.80, 0.94), puv.y);',                       // 0x8899bb glass, lit
+        '  vec3 col = (glass * (0.92 + 0.12 * flr) + edgeMask * edgePulse * edgeCol * 0.5 + scan * vec3(0.4, 0.6, 1.0) + gn * 0.05 * vec3(0.4, 0.55, 0.8) - band + refresh * vec3(0.7, 0.85, 1.0)) * flick;',
+        // the panel borders crisp — the wall corners and the rings — so the paneling reads at speed; the floor keeps the accent
+        '  float brd = max(seam, ring);',
+        '  col = mix(col, vec3(0.88, 0.95, 1.0), brd * 0.55) + uSeam * seam * 0.3 * flr + uHole * hr * 1.2 + uHole * bgl * 0.42;',
+        '  float a = clamp(uAlpha + edgeMask * 0.22 + 0.12 * flr + 0.55 * brd + 0.8 * max(hr, bgl * 0.8), 0.0, 1.0);',
+        // (on the sky a hazard edge or a bar's light ADDED to the pale glass went pink-white: mixed in as a saturated red instead)
+        '  if(uSky > 0.5) col = mix(col, vec3(0.86, 0.08, 0.2), clamp(hr * 0.75 + bgl * 0.55, 0.0, 0.85));',
         // The choice hallway: each of the triangle's walls in its upgrade's colour — its lines and a faint wash,
         // brighter on the wall you are on; once the pick is made the other two let go of theirs.
         '  if(uCh.z > 0.5 && vWZ <= uCh.x && vWZ >= uCh.y){',
         '    float ck = mod(floor(vPhi / 2.0943951 + 0.5), 3.0), csel = 1.0 - step(0.5, abs(ck - uCh.w));',
         '    vec3 tc = ck < 0.5 ? uChC0 : (ck < 1.5 ? uChC1 : uChC2);',
         '    float fe = clamp(min(uCh.x - vWZ, vWZ - uCh.y) / 1.5, 0.0, 1.0) * (uCh.z > 1.5 ? 0.25 + 0.75 * csel : 1.0);',
-        '    vec3 cc = uBase + tc * (seam * (0.65 + 0.7 * csel) + lane * (1.0 + 1.6 * csel) + ring * (0.25 + 0.2 * csel) + 0.018 + 0.032 * csel);',
+        '    vec3 cc = uSky > 0.5 ? mix(mix(col, tc, 0.35 + 0.25 * csel), tc * 0.55, clamp(seam * 0.6 + lane * (0.7 + 0.6 * csel), 0.0, 0.85))',   // (on the sky: tinted glass, its rules inked in the colour)
+        '                     : uBase + tc * (seam * (0.65 + 0.7 * csel) + lane * (1.0 + 1.6 * csel) + ring * (0.25 + 0.2 * csel) + 0.018 + 0.032 * csel);',
         '    col = mix(col, cc, fe); a = mix(a, clamp(a + 0.08 + 0.12 * csel, 0.0, 1.0), fe);',
         '  }',
         '  float d = length(vView), fog = exp(-uFogD * uFogD * d * d);',
-        '  gl_FragColor = vec4(mix(uFogCol, col, fog), mix(1.0, a, fog));',
+        // Against the sky the far tube fades OUT (into the clouds behind it); against the dark it fades into the fog colour.
+        '  gl_FragColor = uSky > 0.5 ? vec4(mix(uFogCol, col, 0.35 + 0.65 * fog), a * fog) : vec4(mix(uFogCol, col, fog), mix(1.0, a, fog));',
         '}'
       ].join('\n'),
       transparent: true, depthWrite: false, side: THREE.DoubleSide, extensions: { derivatives: true }
@@ -92761,6 +92797,51 @@ var RUNNER = (function(){
         b.mesh.position.set(b.x, b.y + Math.sin(S.runT * 0.5 + b.ph) * 0.04 * b.s, -(b.z - S.zBase));
       }
     }
+  }
+  // ════════════════════════════════════════ THE SKY ════════════════════════════════════════
+  // The storefront's own cloud sky (CSKY: the same generator, march, TAA and composite) behind the whole run. CSKY is
+  // pointed at the runner's scene and a camera of the runner's (CSKY.view) for as long as the run is up, and handed
+  // back on exit. That camera looks where the chase camera looks; its position is the run's scaled by skyK into the
+  // cloud field's own units, at height skyY0 in the deck — so the clouds stream past at the speed you are going and
+  // roll with the tube as you roll round it. Fog turns to the sky's colour (the far world hazes into the air), the
+  // stars and the dark end-cap go, and the far tube fades out into the clouds instead of into a colour.
+  function skyOn(){
+    R.skyOn = P.sky && typeof CSKY !== 'undefined' && !!CSKY.view && CSKY.P.on;
+    if(!R.skyOn) return;
+    CSKY.view(R.scene, R.skyCam);
+    CSKY.skyBase(R.skyCol);
+    R.scene.background = R.skyCol;
+    R.stars.visible = false; R.cap.visible = false;
+    R.tubeMat.uniforms.uSky.value = 1;
+    syncFogCol();
+  }
+  function skyOff(){
+    if(!R.skyOn) return;
+    R.skyOn = false;
+    CSKY.view(null);
+    R.scene.background = new THREE.Color(BG);
+    R.stars.visible = true; R.cap.visible = true;
+    R.tubeMat.uniforms.uSky.value = 0;
+    syncFogCol();
+  }
+  // Every hand-written material carries its own uFogCol, and kits are made lazily — so the colour is pushed to all of
+  // them by walking the scene (on, off, and every half second for anything made since).
+  function syncFogCol(){
+    var c = R.skyOn ? R.skyCol : R.darkCol;
+    R.scene.fog.color.copy(c);
+    R.scene.traverse(function(o){ var m = o.material; if(m && m.uniforms && m.uniforms.uFogCol) m.uniforms.uFogCol.value.copy(c); });
+  }
+  function skyTick(dt){
+    R.tubeMat.uniforms.uHT.value = performance.now() * 0.001;
+    R.tubeMat.uniforms.uAlpha.value = P.holoAlpha;
+    if(!R.skyOn) return;
+    var c = R.skyCam, K = P.skyK;
+    if(c.fov !== R.cam.fov || c.aspect !== R.cam.aspect){ c.fov = R.cam.fov; c.aspect = R.cam.aspect; c.updateProjectionMatrix(); }
+    c.quaternion.copy(R.cam.quaternion);
+    c.position.set(R.cam.position.x * K, P.skyY0 + R.cam.position.y * K, (R.cam.position.z - S.zBase) * K);
+    c.updateMatrixWorld(true);
+    CSKY.update(dt);
+    if((R.skyN = (R.skyN || 0) + 1) % 30 === 0) syncFogCol();
   }
   function islDebrisTick(){
     if(!R.debris) return;
@@ -93755,7 +93836,7 @@ var RUNNER = (function(){
           '  float I = core * (0.75 + 0.45 * uE) + glow * (0.35 + 0.75 * uE) + halo * (0.12 + 0.22 * uE);',
           '  vec3 col = c * I + vec3(core * 0.3 * min(uE, 1.0));',                         // white-hot under tension
           '  float fog = exp(-uFogD * uFogD * dot(vView, vView)), nf = smoothstep(0.1, 0.3, -vView.z);',   // and out of the way right at the lens
-          '  gl_FragColor = vec4(col * fog * nf, 1.0);',
+          '  gl_FragColor = vec4(col * fog * nf, clamp(I, 0.0, 1.0) * 0.85 * fog * nf);',   // (premultiplied: see glowOver)
           '}'
         ].join('\n'),
         transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, extensions: { derivatives: true }
@@ -94003,7 +94084,7 @@ var RUNNER = (function(){
     if(pill && sl){
       var T2 = slingTier(sl.lvl), nm = 'SLINGSHOT ' + ROMAN[sl.lvl - 1];
       R.elHint.style.opacity = pill.amt.toFixed(3); R.elHint.style.top = (pill.r.y - (R.slingUsed ? 34 : 58)) + 'px';
-      if(R.elHintName.textContent !== nm){ R.elHintName.textContent = nm; R.elHintName.style.color = 'rgba(' + T2.rgb + ',0.95)'; R.elHintName.style.textShadow = '0 0 12px rgba(' + T2.rgb + ',0.5)'; }
+      if(R.elHintName.textContent !== nm){ R.elHintName.textContent = nm; R.elHintName.style.color = 'rgba(' + T2.rgb + ',0.95)'; R.elHintName.style.textShadow = '0 0 12px rgba(' + T2.rgb + ',0.5), ' + HALO; }
       R.elHintHow.style.display = R.slingUsed ? 'none' : '';
     } else R.elHint.style.opacity = 0;
     // how the shot went
@@ -94013,7 +94094,7 @@ var RUNNER = (function(){
       if(R.elResult._v !== sl.result){
         R.elResult._v = sl.result; R.elResult.textContent = sl.result;
         var rc = sl.result === 'PERFECT' ? '80,232,140' : (sl.result === 'CLOSE' ? '242,245,250' : '150,170,205');
-        R.elResult.style.color = 'rgba(' + rc + ',0.95)'; R.elResult.style.textShadow = '0 0 16px rgba(' + rc + ',0.5)';
+        R.elResult.style.color = 'rgba(' + rc + ',0.95)'; R.elResult.style.textShadow = '0 0 16px rgba(' + rc + ',0.5), ' + HALO;
       }
       R.elResult.style.top = Math.round(H * 0.3) + 'px';
       R.elResult.style.transform = 'scale(' + (1 + 0.3 * Math.max(0, sl.resT - 1.3)).toFixed(3) + ')';
@@ -94026,7 +94107,7 @@ var RUNNER = (function(){
       R.lastTier = tk;
       R.elCoinDot.style.background = dotBg(tk);
       R.elCoins.style.color = R.elTier.style.color = 'rgba(' + TT.rgb + ',0.95)';
-      R.elCoins.style.textShadow = R.elTier.style.textShadow = '0 0 10px rgba(' + TT.rgb + ',0.45)';
+      R.elCoins.style.textShadow = R.elTier.style.textShadow = '0 0 10px rgba(' + TT.rgb + ',0.45), ' + HALO;
     }
     if(TT.prism){ var hc = 'hsl(' + Math.round(performance.now() * 0.08 % 360) + ',90%,76%)'; R.elCoins.style.color = R.elTier.style.color = hc; }
     R.elTier.style.opacity = (R.cardShown ? 0 : clamp(R.tierToast / 0.6, 0, 1) * (1 - shop)).toFixed(3);
@@ -94108,7 +94189,7 @@ var RUNNER = (function(){
         '  float f = 1.0 - abs(dot(normalize(vN), normalize(-vView)));',
         '  float rim = pow(f, 2.4), band = 0.5 + 0.5 * sin(vP.y * 150.0 - uT * 7.0);',
         '  vec3 col = uCol * (rim * (0.85 + 0.9 * uHit) + 0.06 + 0.16 * band * rim) + vec3(rim * uHit * 0.7);',
-        '  gl_FragColor = vec4(col * uA, 1.0);',
+        '  gl_FragColor = vec4(col * uA, clamp(max(col.r, max(col.g, col.b)), 0.0, 1.0) * 0.8 * uA);',
         '}'
       ].join('\n'),
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
@@ -94189,7 +94270,7 @@ var RUNNER = (function(){
           '  float c = fract((vUv.y + abs(vUv.x) * 0.85) * 2.2 - uT * 2.6);\n' +
           '  float chev = smoothstep(0.30, 0.18, abs(c - 0.5)) * smoothstep(0.62, 0.34, abs(vUv.x)) * smoothstep(0.95, 0.55, r);\n' +
           '  vec3 col = uCol * (glow + chev * 0.75) + vec3(exp(-r * 16.0) * 0.6);\n' +
-          '  gl_FragColor = vec4(col * exp(-uFogD * uFogD * vD * vD) * smoothstep(1.0, 0.8, r), 1.0); }',   // (to nothing before the quad's edge: on a bright island its rays showed a square)
+          '  float k = exp(-uFogD * uFogD * vD * vD) * smoothstep(1.0, 0.8, r); gl_FragColor = vec4(col * k, clamp(max(col.r, max(col.g, col.b)), 0.0, 1.0) * 0.85 * k); }',   // (to nothing before the quad's edge: on a bright island its rays showed a square)
         transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }),
       charge: new THREE.ShaderMaterial({ uniforms: { uCol: { value: CHARGE_COL }, uT: { value: 0 }, uFogD: { value: P.fog }, uSize: { value: 0.13 } }, vertexShader: BB,
         fragmentShader: GL + 'void main(){ float r = length(vUv), a = atan(vUv.y, vUv.x);\n' +
@@ -94197,16 +94278,16 @@ var RUNNER = (function(){
           '  float glow = (exp(-r * 4.0) * 0.8 + exp(-r * 10.0)) * pulse;\n' +
           '  float rays = pow(abs(cos(a * 3.0 + uT * 2.2)), 16.0) * exp(-r * 2.6) * 0.9 + pow(abs(cos(a * 2.0 - uT * 1.4)), 30.0) * exp(-r * 3.2) * 0.5;\n' +
           '  vec3 col = uCol * (glow + rays) + vec3(exp(-r * 13.0) * 0.8 * pulse);\n' +
-          '  gl_FragColor = vec4(col * exp(-uFogD * uFogD * vD * vD) * smoothstep(1.0, 0.8, r), 1.0); }',   // (to nothing before the quad's edge: on a bright island its rays showed a square)
+          '  float k = exp(-uFogD * uFogD * vD * vD) * smoothstep(1.0, 0.8, r); gl_FragColor = vec4(col * k, clamp(max(col.r, max(col.g, col.b)), 0.0, 1.0) * 0.85 * k); }',   // (to nothing before the quad's edge: on a bright island its rays showed a square)
         transparent: true, depthWrite: false, blending: THREE.AdditiveBlending })
     };
     // …and the solid at its heart: a crystal (speed) or a cut gem (charge), lit from inside at the rim.
-    var SOLID = function(col){ return new THREE.ShaderMaterial({ uniforms: { uCol: { value: col }, uFogD: { value: P.fog } },
+    var SOLID = function(col){ return new THREE.ShaderMaterial({ uniforms: { uCol: { value: col }, uFogD: { value: P.fog }, uFogCol: { value: new THREE.Color(BG) } },
       vertexShader: 'varying vec3 vN, vView; void main(){ vN = normalize(normalMatrix * normal); vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
-      fragmentShader: 'uniform vec3 uCol; uniform float uFogD; varying vec3 vN, vView;\n' +
+      fragmentShader: 'uniform vec3 uCol, uFogCol; uniform float uFogD; varying vec3 vN, vView;\n' +
         'void main(){ float f = 1.0 - abs(dot(normalize(vN), normalize(-vView)));\n' +
         '  vec3 col = mix(vec3(0.95), uCol, 0.35 + 0.65 * f) * (0.55 + 0.6 * f);\n' +
-        '  float d = length(vView); gl_FragColor = vec4(mix(vec3(0.008, 0.016, 0.04), col, exp(-uFogD * uFogD * d * d)), 1.0); }' }); };
+        '  float d = length(vView); gl_FragColor = vec4(mix(uFogCol, col, exp(-uFogD * uFogD * d * d)), 1.0); }' }); };
     R.coreSolid = { speed: { geo: new THREE.OctahedronGeometry(0.016, 0), mat: SOLID(SPEED_COL) }, charge: { geo: new THREE.IcosahedronGeometry(0.016, 0), mat: SOLID(CHARGE_COL) } };
     R.coreSolid.speed.geo.scale(0.8, 1.35, 0.8);
     ['speed', 'charge'].forEach(function(k){ for(var i = 0; i < 2; i++) R.itemPool[k].push(makeItemMesh(k)); });
@@ -94221,7 +94302,7 @@ var RUNNER = (function(){
         '  float rim = pow(f, 1.8), streak = 0.5 + 0.5 * sin(vP.z * 260.0 - uT * 40.0 + sin(atan(vP.y, vP.x) * 5.0) * 2.0);',
         '  float tail = smoothstep(-0.05, 0.05, vP.z);',                       // brighter toward the back
         '  vec3 col = uCol * (rim * (0.7 + 0.6 * streak) * (0.6 + 0.6 * tail) + 0.08) + vec3(pow(f, 4.0) * 0.25);',
-        '  gl_FragColor = vec4(col * uA, 1.0);',
+        '  gl_FragColor = vec4(col * uA, clamp(max(col.r, max(col.g, col.b)), 0.0, 1.0) * 0.8 * uA);',
         '}'
       ].join('\n'),
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
@@ -94373,6 +94454,7 @@ var RUNNER = (function(){
     R.coreMat.speed.uniforms.uT.value = R.coreMat.charge.uniforms.uT.value = t;
     R.coreMat.speed.uniforms.uFogD.value = R.coreMat.charge.uniforms.uFogD.value = fd;
     R.coreSolid.speed.mat.uniforms.uFogD.value = R.coreSolid.charge.mat.uniforms.uFogD.value = fd;
+    R.coreSolid.speed.mat.uniforms.uFogCol.value.copy(R.scene.fog.color); R.coreSolid.charge.mat.uniforms.uFogCol.value.copy(R.scene.fog.color);
     for(i = 0; i < R.items.length; i++){
       var it = R.items[i], b = Math.sin(it.bob) * 0.004, g = it.mesh;
       g.position.set(it.x - Math.sin(it.up) * b, it.y + Math.cos(it.up) * b, -(it.z - S.zBase));
@@ -94412,7 +94494,7 @@ var RUNNER = (function(){
   function coreToast(text, rgb){
     if(!R.elCoreToast) return;
     R.elCoreToast.textContent = text;
-    R.elCoreToast.style.color = 'rgba(' + rgb + ',0.97)'; R.elCoreToast.style.textShadow = '0 0 16px rgba(' + rgb + ',0.6)';
+    R.elCoreToast.style.color = 'rgba(' + rgb + ',0.97)'; R.elCoreToast.style.textShadow = '0 0 16px rgba(' + rgb + ',0.6), ' + HALO;
     R.coreToastT = 1.4;
   }
   function coresDom(W, H, shop){
@@ -94424,6 +94506,8 @@ var RUNNER = (function(){
       var bar = el('div', 'position:relative;height:4px;margin-top:7px;border-radius:2px;background:rgba(255,150,60,0.18);overflow:hidden;', R.elCharge);
       R.elChargeFill = el('div', 'position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:rgb(255,160,70);box-shadow:0 0 8px rgba(255,140,40,0.8);', bar);
       R.coreToastT = 0;
+      [R.elReach, R.elHint, R.elLives, R.elCharge].forEach(function(e){ if(e) e.style.textShadow = (e.style.textShadow ? e.style.textShadow + ', ' : '') + HALO; });
+      R.elReachV.style.textShadow = '0 0 14px rgba(16,196,178,0.35), ' + HALO;
     }
     R.coreToastT = Math.max(0, (R.coreToastT || 0) - 1 / 60);
     var a = R.cardShown ? 0 : clamp(R.coreToastT / 0.5, 0, 1) * (1 - shop);
@@ -94456,6 +94540,8 @@ var RUNNER = (function(){
     D.maxPoints = 64; D.ramp = 4; D.shockT = -1; D.boosting = false; D.startT = 0; D.intensity = 0;
     ensureBoostTrailMesh(D);
     R.scene.add(D.mesh);
+    D.mesh.material.blending = THREE.NormalBlending;   // its own copy: purple over the sky, not white (see glowOver)
+    glowOver();
     R.plume = D; R.plumePrev = null; R.plumeZB = null;
   }
   function plumeTick(){
@@ -94489,6 +94575,16 @@ var RUNNER = (function(){
     updateBoostTrailCore(D, on, s.groundNormal, S.chargeT > 0 && !S.dead);
   }
   function plumeReset(){ if(R.plume) clearGameBoostTrail(R.plume); R.plumePrev = null; R.plumeZB = null; }
+  // GLOWS THAT READ ON ANY BACKGROUND. Built additive for black space, they washed out to white on THE SKY (the sling
+  // rings lost their colour, a speed core vanished into the blue). Each now outputs its light PREMULTIPLIED with a
+  // coverage alpha ~ its brightness, drawn src + dst·(1 − a): over black that is exactly the old additive (dst = 0),
+  // over bright sky the glow covers what is behind it in proportion and keeps its own colour.
+  function glowOver(){
+    var M = R.sling.map(function(q){ return q.mesh.material; }).concat([R.coreMat.speed, R.coreMat.charge, R.shield.material, R.aura.material]);
+    M.forEach(function(m){ m.blending = THREE.CustomBlending; m.blendEquation = THREE.AddEquation; m.blendSrc = THREE.OneFactor; m.blendDst = THREE.OneMinusSrcAlphaFactor; });
+  }
+  // A dark halo under light type, so the readouts read on bright sky too (invisible on the dark tube).
+  var HALO = '0 1px 3px rgba(0,10,24,0.6), 0 0 2px rgba(0,10,24,0.45)';
   function plumeShow(on){}   // (the beam alone keeps nothing hidden that the preload would need to link)
 
   // ════════════════════════════════════════ THE PATTERNS ════════════════════════════════════════
@@ -94921,10 +95017,10 @@ var RUNNER = (function(){
   function laserMat(){
     if(R.laserMat) return R.laserMat;
     return (R.laserMat = new THREE.ShaderMaterial({
-      uniforms: { uCol: { value: LASER_COL }, uFogD: { value: P.fog } },
+      uniforms: { uCol: { value: LASER_COL }, uFogD: { value: P.fog }, uInk: { value: 0 } },
       vertexShader: 'varying vec3 vN, vView, vAx; void main(){ vN = normalMatrix * normal; vAx = normalize((modelViewMatrix * vec4(0.0, 0.0, 1.0, 0.0)).xyz); vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
-        'uniform vec3 uCol; uniform float uFogD; varying vec3 vN, vView, vAx;',
+        'uniform vec3 uCol; uniform float uFogD, uInk; varying vec3 vN, vView, vAx;',
         'void main(){',
         // Across the beam: 1 down its middle, 0 at its edge — measured against the view's part ACROSS the beam's
         // axis, since a beam runs down the tube, nearly along the line of sight (plain n·v is ~0 all along it).
@@ -94932,6 +95028,7 @@ var RUNNER = (function(){
         '  float f = clamp(abs(dot(normalize(vN), v)) / max(length(vp), 1e-3), 0.0, 1.0);',
         '  float core = pow(f, 14.0), glow = f * f;',
         '  vec3 col = uCol * (0.18 + 1.1 * glow) + vec3(1.0, 0.86, 0.9) * core;',
+        '  if(uInk > 0.5){ float fi = exp(-uFogD * uFogD * dot(vView, vView)); gl_FragColor = vec4(mix(vec3(0.6, 0.02, 0.17), vec3(1.0, 0.5, 0.66), core), clamp((0.12 + 0.95 * glow) * fi, 0.0, 1.0)); return; }',   // (INK: a crimson beam)
         '  float fog = exp(-uFogD * uFogD * dot(vView, vView));',
         '  gl_FragColor = vec4(col * fog, 1.0);',
         '}'
@@ -94954,7 +95051,7 @@ var RUNNER = (function(){
         L.meshes[b].scale.set(1, 1, L.z1 - L.z0);
       }
     }
-    if(R.laserMat) R.laserMat.uniforms.uFogD.value = R.fogD || P.fog;
+    if(R.laserMat){ R.laserMat.uniforms.uFogD.value = R.fogD || P.fog; inkSet(R.laserMat); }
   }
   // The ship against each beam, in that beam's own frame on the wall: across it and up off the wall.
   function laserHit(px, py, pz){
@@ -94986,17 +95083,19 @@ var RUNNER = (function(){
     R.pnCol = new THREE.InstancedBufferAttribute(new Float32Array(PANEL_MAX * 4), 4);
     g.setAttribute('aSz', R.pnSz); g.setAttribute('aCol', R.pnCol);
     var m = new THREE.ShaderMaterial({
-      uniforms: { uFogD: { value: P.fog } },
+      uniforms: { uFogD: { value: P.fog }, uInk: { value: 0 } },
       vertexShader: [
         'attribute vec2 aSz; attribute vec4 aCol; varying vec2 vQ, vSz; varying vec4 vCol; varying vec3 vView;',
         'void main(){ vQ = uv; vSz = aSz; vCol = aCol; vec4 mv = modelViewMatrix * instanceMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
       ].join('\n'),
       fragmentShader: [
-        'uniform float uFogD; varying vec2 vQ, vSz; varying vec4 vCol; varying vec3 vView;',
+        'uniform float uFogD, uInk; varying vec2 vQ, vSz; varying vec4 vCol; varying vec3 vView;',
         'void main(){',
         '  vec2 q = min(vQ, 1.0 - vQ) * vSz; float e = min(q.x, q.y), w = fwidth(e) + 1e-5;',   // to the panel's edge
         '  float I = exp(-e / (w * 1.5)) + 0.45 * exp(-e / (w * 9.0)) + vCol.a;',
-        '  gl_FragColor = vec4(vCol.rgb * I * exp(-uFogD * uFogD * dot(vView, vView)), 1.0);',
+        '  float pf = exp(-uFogD * uFogD * dot(vView, vView));',
+        '  if(uInk > 0.5){ float lit = max(vCol.r, max(vCol.g, vCol.b)); gl_FragColor = vec4(vCol.rgb / max(lit, 1e-3) * 0.42, clamp(I * lit * 0.95 * pf, 0.0, 1.0)); return; }',   // (INK: its hue, deep)
+        '  gl_FragColor = vec4(vCol.rgb * I * pf, 1.0);',
         '}'
       ].join('\n'),
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, extensions: { derivatives: true }
@@ -95027,6 +95126,7 @@ var RUNNER = (function(){
   }
   var TEAL = [0.063, 0.769, 0.698];
   function drawPanels(){
+    inkSet(R.panels.material);
     var L = R.pn, n = Math.min(L.length, PANEL_MAX), a = P.apothem;
     for(var i = 0; i < n; i++){
       var q = L[i], c, s, I;
@@ -95384,6 +95484,7 @@ var RUNNER = (function(){
     R.flash = Math.max(R.flash, 0.22);
     if(typeof ckptSpinKick === 'function') ckptSpinKick(1.4);
     coreToast(upgName(key, lvl), U.rgb);
+    if(R.skyOn && R.elCoreToast) R.elCoreToast.style.textShadow = '0 0 4px rgba(0,8,24,0.95), 0 0 14px rgba(0,8,24,0.55)';   // (INK: a pale colour reads on the sky)
   }
   function choiceReset(){
     if(!S) return;
@@ -95433,11 +95534,11 @@ var RUNNER = (function(){
     for(var i = 0; i < 3; i++){
       var mat = new THREE.ShaderMaterial({
         uniforms: { uIcon: { value: R.upgTex.magnet }, uCol: { value: new THREE.Color() }, uT: { value: 0 }, uA: { value: 0 },
-                    uSel: { value: 0 }, uFogD: { value: P.fog }, uSize: { value: 0.17 } },
+                    uSel: { value: 0 }, uFogD: { value: P.fog }, uSize: { value: 0.17 }, uInk: { value: 0 } },
         vertexShader: 'uniform float uSize; varying vec2 vUv; varying float vD;\n' +
           'void main(){ vec4 mv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0); mv.xy += position.xy * uSize; vUv = position.xy * 2.0; vD = length(mv.xyz); gl_Position = projectionMatrix * mv; }',
         fragmentShader: [
-          'uniform sampler2D uIcon; uniform vec3 uCol; uniform float uT, uA, uSel, uFogD; varying vec2 vUv; varying float vD;',
+          'uniform sampler2D uIcon; uniform vec3 uCol; uniform float uT, uA, uSel, uFogD, uInk; varying vec2 vUv; varying float vD;',
           'void main(){',
           '  float r = length(vUv), ang = atan(vUv.y, vUv.x);',
           '  float halo = exp(-r * 3.4) * 0.5 + exp(-r * 9.0) * 0.35;',
@@ -95445,6 +95546,11 @@ var RUNNER = (function(){
           '  vec2 iu = vUv * 0.72 + 0.5;',                                             // the icon, inside the ring
           '  float ic = (iu.x > 0.0 && iu.x < 1.0 && iu.y > 0.0 && iu.y < 1.0) ? texture2D(uIcon, iu).a : 0.0;',
           '  vec3 col = uCol * (halo * (0.55 + 0.6 * uSel) + ring * (0.6 + 0.6 * uSel)) + mix(uCol, vec3(1.0), 0.55) * ic * (0.9 + 0.3 * uSel);',
+          '  if(uInk > 0.5){',
+          '    float disc = 1.0 - smoothstep(0.86, 0.98, r), rg = clamp(ring * 1.3, 0.0, 1.0);',
+          '    vec3 ci = mix(vec3(0.03, 0.06, 0.14), uCol, rg); ci = mix(ci, mix(uCol, vec3(1.0), 0.45), ic);',
+          '    gl_FragColor = vec4(ci, clamp(max(disc * 0.62, max(rg, ic)) * uA * exp(-uFogD * uFogD * vD * vD), 0.0, 1.0)); return;',
+          '  }',
           '  gl_FragColor = vec4(col * uA * exp(-uFogD * uFogD * vD * vD), 1.0);',
           '}'
         ].join('\n'),
@@ -95481,7 +95587,7 @@ var RUNNER = (function(){
       m.visible = a > 0.003;
       m.position.set(x, y, -(zi - S.zBase));
       mu.uIcon.value = R.upgTex[key]; mu.uCol.value.copy(R.upgCol[key]); mu.uT.value = t + i;
-      mu.uA.value = a; mu.uSel.value = it.sel; mu.uFogD.value = R.fogD || P.fog; mu.uSize.value = 0.17 * sc * (1 + 0.12 * it.sel);
+      inkSet(m.material); mu.uA.value = a; mu.uSel.value = it.sel; mu.uFogD.value = R.fogD || P.fog; mu.uSize.value = 0.17 * sc * (1 + 0.12 * it.sel);
       tk.x = x; tk.y = y; tk.z = -(zi - S.zBase); tk.a = a;
     }
   }
@@ -95569,6 +95675,7 @@ var RUNNER = (function(){
     if(num !== R.hudNum){ R.hudNum = num; R.hudPulse = 1; }
     R.hudPulse = Math.max(0, R.hudPulse - dt * 3.2);
     var rr = 24;
+    if(R.skyOn){ c.globalAlpha = A; c.fillStyle = 'rgba(4,10,24,0.55)'; c.beginPath(); c.arc(cx, cy, rr + 12, 0, TAU); c.fill(); }   // (INK: a dark seat on the sky)
     c.globalAlpha = A;
     c.lineWidth = 1; c.strokeStyle = 'rgba(' + BLUES + ',0.5)';
     c.beginPath(); c.arc(cx, cy, rr, 0, TAU); c.stroke();
@@ -95609,6 +95716,7 @@ var RUNNER = (function(){
           for(j = 0; j < 6; j += 2) Lt += Math.abs(pts[j + 2] - pts[j]) + Math.abs(pts[j + 3] - pts[j + 1]);
           var left = Lt * pl;
           c.strokeStyle = 'rgba(' + U.rgb + ',' + (0.55 + 0.4 * sel).toFixed(3) + ')'; c.lineWidth = 1 + 0.5 * sel; c.lineCap = 'butt';
+          if(R.skyOn){ c.shadowColor = 'rgba(0,8,24,0.95)'; c.shadowBlur = 5; } else c.shadowBlur = 0;   // (INK: the leader reads on the sky)
           c.beginPath(); c.moveTo(sx, sy);
           for(j = 0; j < 6 && left > 0; j += 2){
             var dx = pts[j + 2] - pts[j], dy = pts[j + 3] - pts[j + 1], sl = Math.abs(dx) + Math.abs(dy), q = sl > 0 ? Math.min(1, left / sl) : 1;
@@ -95622,6 +95730,7 @@ var RUNNER = (function(){
         }
       }
       // the card: a corner-cut box — teal when it is the wall you are on, blue otherwise
+      c.shadowBlur = 0;
       var cut = 6, sc2 = sel > 0.5 ? TEALS : BLUES;
       c.beginPath(); c.moveTo(bx + cut, by); c.lineTo(bx + bw, by); c.lineTo(bx + bw, by + bh - cut); c.lineTo(bx + bw - cut, by + bh); c.lineTo(bx, by + bh); c.lineTo(bx, by + cut); c.closePath();
       c.fillStyle = 'rgba(' + (sel > 0.5 ? '6,40,44' : '4,10,24') + ',' + (0.62 + 0.1 * sel).toFixed(3) + ')'; c.fill();
@@ -95652,6 +95761,7 @@ var RUNNER = (function(){
   // One line of HUD type: bold caps, tracked, shrunk to fit maxW if given.
   function hudText(c, s, x, y, px, ls, col, align, maxW){
     c.textAlign = align || 'left'; c.textBaseline = 'middle'; c.fillStyle = col; c.shadowBlur = 0;
+    if(R.skyOn){ c.shadowColor = 'rgba(0,8,24,0.9)'; c.shadowBlur = 4; }
     if(R.hudLS) c.letterSpacing = ls;
     var size = px;
     c.font = '700 ' + size + 'px Arial,Helvetica,sans-serif';
@@ -95962,7 +96072,7 @@ var RUNNER = (function(){
       var p = R.twinParts[i];
       p.m.matrix.multiplyMatrices(_tm1, p.src.matrixWorld); p.m.matrixWorld.copy(p.m.matrix); p.m.visible = p.src.visible !== false;
     }
-    R.twinMat.uniforms.uA.value = 0.55 + 0.12 * Math.sin(performance.now() * 0.004);
+    R.twinMat.uniforms.uA.value = 0.55 + 0.12 * Math.sin(performance.now() * 0.004); inkSet(R.twinMat);
   }
 
   // ── SAFE LINE: a pattern lays its guide as control points (z, th) and hop centres while it spawns (gp / gh, which
@@ -96008,30 +96118,31 @@ var RUNNER = (function(){
       var m = R.guides[i], u = m.material.uniforms;
       if(S.z > m.userData.z1 + 2){ dropGuide(m); R.guides.splice(i, 1); continue; }
       m.position.z = -(m.userData.z0 - S.zBase);
-      u.uT.value = t; u.uZs.value = S.z - m.userData.z0 + 0.15; u.uFogD.value = R.fogD || P.fog;
+      u.uT.value = t; u.uZs.value = S.z - m.userData.z0 + 0.15; u.uFogD.value = R.fogD || P.fog; inkSet(m.material);
     }
   }
 
   function buildUpg2(){
     // the twin's ghost material and the guide's, each on a hidden mesh now so the warm-up links their programs
     R.twinMat = new THREE.ShaderMaterial({
-      uniforms: { uCol: { value: new THREE.Color(0.72, 0.84, 1.0) }, uA: { value: 0.6 } },
+      uniforms: { uCol: { value: new THREE.Color(0.72, 0.84, 1.0) }, uA: { value: 0.6 }, uInk: { value: 0 } },
       vertexShader: 'varying vec3 vN, vView; void main(){ vN = normalize(normalMatrix * normal); vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
-      fragmentShader: 'uniform vec3 uCol; uniform float uA; varying vec3 vN, vView;\n' +
-        'void main(){ float f = 1.0 - abs(dot(normalize(vN), normalize(-vView))); vec3 col = uCol * (pow(f, 2.2) * 0.9 + 0.07); gl_FragColor = vec4(col * uA, 1.0); }',
+      fragmentShader: 'uniform vec3 uCol; uniform float uA, uInk; varying vec3 vN, vView;\n' +
+        'void main(){ float f = 1.0 - abs(dot(normalize(vN), normalize(-vView))); vec3 col = uCol * (pow(f, 2.2) * 0.9 + 0.07); if(uInk > 0.5){ gl_FragColor = vec4(vec3(0.08, 0.14, 0.28), clamp((pow(f, 2.2) * 0.85 + 0.14) * uA * 1.2, 0.0, 1.0)); return; } gl_FragColor = vec4(col * uA, 1.0); }',
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide
     });
     R.guideMat = new THREE.ShaderMaterial({
-      uniforms: { uT: { value: 0 }, uFogD: { value: P.fog }, uZs: { value: 0 } },
+      uniforms: { uT: { value: 0 }, uFogD: { value: P.fog }, uZs: { value: 0 }, uInk: { value: 0 } },
       vertexShader: 'attribute vec2 aS; varying vec2 vS; varying vec3 vView; void main(){ vS = aS; vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
-        'uniform float uT, uFogD, uZs; varying vec2 vS; varying vec3 vView;',
+        'uniform float uT, uFogD, uZs, uInk; varying vec2 vS; varying vec3 vView;',
         'void main(){',
         '  float across = 1.0 - smoothstep(0.3, 1.0, abs(vS.y));',
         '  float dash = 0.5 + 0.5 * smoothstep(0.2, 0.45, abs(fract(vS.x * 2.5 - uT * 1.6) - 0.5));',   // dashes running forward
         '  float near = smoothstep(0.0, 0.6, vS.x - uZs);',                                            // gone under the ship
         '  float fog = exp(-uFogD * uFogD * dot(vView, vView));',
         '  float core = pow(1.0 - abs(vS.y), 4.0);',
+        '  if(uInk > 0.5){ gl_FragColor = vec4(mix(vec3(0.0, 0.34, 0.36), vec3(0.0, 0.52, 0.5), core), clamp((across * 0.85 + core * 0.15) * dash * near * fog, 0.0, 1.0)); return; }',   // (INK: deep teal)
         '  gl_FragColor = vec4((vec3(0.063, 0.769, 0.698) * across * 1.5 + vec3(0.55, 1.0, 0.92) * core * 0.45) * dash * near * fog, 1.0);',
         '}'
       ].join('\n'),
@@ -96059,8 +96170,24 @@ var RUNNER = (function(){
       R.elNear.style.top = Math.round(H * 0.37) + 'px';
       R.elNear.style.transform = 'scale(' + (1 + 0.3 * Math.max(0, R.nearT - 0.6)).toFixed(3) + ')';
     }
+    // INK on the sky: dark shadows under my readouts (their own glow shadows against the dark)
+    if(R.inkShown !== !!R.skyOn){
+      R.inkShown = !!R.skyOn;
+      var ish = R.skyOn ? '0 0 3px rgba(0,8,24,0.85), 0 0 8px rgba(0,8,24,0.5)' : '';
+      R.elUpg.style.textShadow = ish; R.elCombo.style.textShadow = ish;
+      R.elNear.style.textShadow = R.skyOn ? '0 0 4px rgba(0,8,24,0.9)' : '0 0 12px rgba(255,90,130,0.6)';
+      R.elUpgList.style.filter = R.skyOn ? 'drop-shadow(0 0 2px rgba(0,8,24,0.9))' : '';
+    }
   }
 
+  // ── INK: on the sky the background behind everything is bright (~0.6–0.95), and an additive glow there only
+  // pushes toward white — it vanishes. So while R.skyOn, each of these materials draws its DEEP colour with normal
+  // blending and its glow as alpha (uInk 1); against the dark (sky off) they stay additive light (uInk 0).
+  function inkSet(mat){
+    var ink = !!R.skyOn, b = ink ? THREE.NormalBlending : THREE.AdditiveBlending;
+    if(mat.uniforms.uInk) mat.uniforms.uInk.value = ink ? 1 : 0;
+    if(mat.blending !== b) mat.blending = b;
+  }
   // A pillar at an exact place across wall j (the fodder's are random).
   function addPillar(j, z, n, uc){
     var hw = halfWn(n), rp = OB.pillar.r, phi = j * TAU / n, o = { type: 'pillar', face: j, n: n, phi: phi, z: z, sector: false, mt: 'pillar', kr: R.pil };
@@ -96446,6 +96573,7 @@ var RUNNER = (function(){
     R.fovKick += (fk - R.fovKick) * Math.min(1, dt * 5);
     R.tierToast = Math.max(0, R.tierToast - dt);
     for(var rk in R.rowShake) R.rowShake[rk] = Math.max(0, R.rowShake[rk] - dt * 2.2);
+    R.dt = dt;
     render();
     dom();
   }
@@ -96476,6 +96604,7 @@ var RUNNER = (function(){
   }
   function render(){
     var W = window.innerWidth, H = window.innerHeight, asp = W / Math.max(1, H);
+    skyTick(R.dt || 1 / 60);   // (THE SKY: the clouds marched from this frame's view — the camera was placed in step)
     // The lens: the chase camera's, widening into the tube camera's as the pinch takes it there.
     var e = R.zoom * R.zoom * (3 - 2 * R.zoom), hf = P.camHFov + (P.tubeCamHFov - P.camHFov) * e;
     var vf = 2 * Math.atan(Math.tan(hf * Math.PI / 360) / asp) * 180 / Math.PI;
@@ -96794,6 +96923,7 @@ var RUNNER = (function(){
     resetRun();
     R.layer.style.display = 'block';
     R.acc = 0; R.flash = 1;   // in out of the same white the spin ended in
+    skyOn();
     api.active = true;
     console.log('[RUNNER] start — a=' + P.apothem + ', ' + P.speedKmh + ' km/h, sides ' + P.sidesMin + '–' + P.sidesMax +
       ', ship half-extents ' + SHIP.hw.toFixed(4) + ' × ' + SHIP.hh.toFixed(4) + ' × ' + SHIP.hl.toFixed(4));
@@ -96802,6 +96932,7 @@ var RUNNER = (function(){
   function exit(){
     if(!api.active) return;
     api.active = false;
+    skyOff();   // (the clouds go back to the storefront)
     R.layer.style.display = 'none';
     for(var i = 0; i < R.obs.length; i++) freeObs(R.obs[i]);
     R.obs.length = 0; R.holes.length = 0; R.pits.length = 0; freeWalls(true); clearPat2(); R.pinch = null;
@@ -97803,6 +97934,12 @@ function _atlas(){
   return tex;
 }
 
+// THE RUNNER'S VIEW (CSKY.view): the mobile runner draws this same sky behind its own scene, from a camera of its
+// own. Everything in here that read the site's camera / scene reads these instead; null = the storefront, unchanged.
+var _VW = null;
+function _cam(){ return _VW ? _VW.cam : camera; }
+function _scn(){ return _VW ? _VW.scene : scene; }
+
 function _build(){
   if(M.built || M.failed) return M.built;
   if(!renderer || !scene || !camera) return false;
@@ -97879,7 +98016,7 @@ function _build(){
     M.mesh.frustumCulled = false;
     M.mesh.renderOrder = -10000;    // first thing drawn; everything else overwrites it
     M.mesh.visible = false;
-    scene.add(M.mesh);
+    _scn().add(M.mesh);
     M.t0 = performance.now();
     M.rate = P.speedIdle;
     M.built = true;
@@ -97925,6 +98062,7 @@ function _size(){
 // three numbers that describe "how far into the spin are we", and they are globals. Reading them
 // means the clouds can never disagree with the lens flare, the god rays or the backdrop.
 function _spin(){
+  if(_VW) return 0;   // (the runner has no crescendo: its sky is plain day)
   var g = (typeof godrayIntensity === 'number') ? godrayIntensity : 0;
   var m = (typeof mainPower === 'number') ? mainPower : 0;
   var c = (typeof crystalScreenBright === 'number') ? crystalScreenBright : 0;
@@ -97934,6 +98072,7 @@ function _spin(){
 // from, so the clouds speed up on exactly the motion the visitor is making with their hand,
 // not on a proxy for it. It idles a few rpm on its own, hence the small deadband at the call.
 function _wheelRpm(){
+  if(_VW) return 0;
   var f = (typeof gameMode !== 'undefined') ? gameMode.galleryFloor : null;
   if(f && f.group && f.group.userData) return f.group.userData.rpmSmooth || 0;
   return 0;
@@ -97959,7 +98098,7 @@ function _sunset(dt){
   // sun sat — just past the top edge of the widened background — or turning this feature on would
   // move the shipped composition before a single swipe. See the sun-direction block for why the
   // floor is derived from the widened half-FOV rather than hard-coded.
-  var half = ((typeof camera !== 'undefined' ? camera.fov : 75) * 0.5) * Math.PI/180;
+  var half = ((typeof camera !== 'undefined' ? _cam().fov : 75) * 0.5) * Math.PI/180;
   var elMin = Math.atan(Math.tan(half) * Math.max(1, P.fovMul || 1) * Math.max(0, P.sunEdge)) * 180/Math.PI;
   var elDay = Math.max(P.sunEl, elMin);
 
@@ -97972,7 +98111,7 @@ function _sunset(dt){
   // THE HORIZON IS THE CLOUD DECK. tTop mirrors cShape's own mix(uTowerLo, 0.98, cov).
   var tTop = P.towerLo + (0.98 - P.towerLo) * P.cov;
   var deckTopY = P.hWorld + _skyY() + P.hSpan * (tTop - 0.5);
-  var camY = (typeof camera !== 'undefined') ? camera.position.y : 0;
+  var camY = (typeof camera !== 'undefined') ? _cam().position.y : 0;
   var hEl = Math.atan2(deckTopY - camY, Math.max(1, P.setDist)) * 180/Math.PI - P.setDrop;
   M.setHorizon = hEl;
 
@@ -97997,6 +98136,7 @@ function _sunset(dt){
 }
 
 function _wantsOn(){
+  if(_VW) return P.on && P.opacity > 0.001 && M.tier < CS_OFF;   // the runner wants it whatever the game state
   if(!P.on || P.opacity <= 0.001 || M.tier >= CS_OFF) return false;
   if(typeof GAME_LOW_FX !== 'undefined' && GAME_LOW_FX && !P.mobile) return false;
   if(typeof gameMode !== 'undefined' && (gameMode.active || M.hidden)) return false;
@@ -98097,10 +98237,10 @@ function update(dt){
   // SLOW on purpose: scroll arrives as discrete wheel events with gaps between them, so a
   // symmetric filter drops back to the idle rate inside the gaps and reintroduces exactly the
   // judder this exists to remove.
-  var dpos = (_camPrev.x > 1e8) ? 0 : _camPrev.distanceTo(camera.position);
-  var dq = Math.abs(_qPrev.dot(camera.quaternion));
+  var dpos = (_camPrev.x > 1e8) ? 0 : _camPrev.distanceTo(_cam().position);
+  var dq = Math.abs(_qPrev.dot(_cam().quaternion));
   var dang = 2 * Math.acos(Math.min(1, dq));
-  _camPrev.copy(camera.position); _qPrev.copy(camera.quaternion);
+  _camPrev.copy(_cam().position); _qPrev.copy(_cam().quaternion);
   // PER FRAME, NOT PER SECOND — deliberately no dt in this. The staleness being corrected for is
   // how far the image moves BETWEEN TWO MARCHES, which is a per-frame quantity; and the site
   // clamps dt to 1/30, so a rate expressed per second reads ~7x high on a machine running at
@@ -98109,7 +98249,7 @@ function update(dt){
   M.moveT = (moveTgt > M.moveT) ? moveTgt : M.moveT + (moveTgt - M.moveT) * Math.min(1, dt * 3);
 
   // ── background: the site's own crescendo colour, used as the sky the clouds sit against ──
-  if(scene.background && scene.background.isColor) _bg.copy(scene.background);
+  if(_scn().background && _scn().background.isColor) _bg.copy(_scn().background);
   else _bg.setHex(typeof SITE_BG === 'number' ? SITE_BG : 0x6fb8e0);
   var bgLum = 0.299*_bg.r + 0.587*_bg.g + 0.114*_bg.b;
   // HOW MUCH DAYLIGHT IS LEFT. Measured against SITE_BG's own luminance, not a constant: the
@@ -98122,7 +98262,7 @@ function update(dt){
 
   // ── light ──
   _sunWorld(_sun);
-  _sd.copy(_sun).sub(camera.position);
+  _sd.copy(_sun).sub(_cam().position);
   if(_sd.lengthSq() < 1e-6) _sd.set(0, 1, 0);
   _sd.normalize();
   if(P.sunLock < 0.999){
@@ -98173,9 +98313,9 @@ function update(dt){
   var w = crysAmb / Math.max(1e-4, skyAmb + crysAmb);
 
   var u = M.mCloud.uniforms;
-  u.uInvProj.value.copy(camera.projectionMatrixInverse);
-  u.uCamW.value.copy(camera.matrixWorld);
-  u.uCamPos.value.copy(camera.position);
+  u.uInvProj.value.copy(_cam().projectionMatrixInverse);
+  u.uCamW.value.copy(_cam().matrixWorld);
+  u.uCamPos.value.copy(_cam().position);
   u.uTime.value = M.ct;
   u.uD0.value = P.dIn; u.uD1.value = Math.max(P.dIn + 1, P.dOut);
   // THE REVEAL. M.rev runs 0 -> 1 on WALL time from the first complete march (a phone loading the
@@ -98265,7 +98405,7 @@ function update(dt){
   // WHERE THE SUN LANDS ON SCREEN. Projected along the LIGHT DIRECTION, not at a world object —
   // there is nothing out there to point at. Deliberately outside the frame (uSunEl 38 puts it
   // at ~1.2 in NDC), which is why the halo reads as sky and not as a lens flare.
-  _tmp.copy(camera.position).addScaledVector(_sd, 1e4).project(camera);
+  _tmp.copy(_cam().position).addScaledVector(_sd, 1e4).project(_cam());
   _sunUV.set(_tmp.x*0.5 + 0.5, _tmp.y*0.5 + 0.5);
   // AND THE SAME SUN IN CLOUD-RT SPACE, which stops being screen space the moment fovMul leaves
   // 1.0: the march runs at `wide` x the camera's FOV and the composite blits that RT 1:1 into the
@@ -98282,7 +98422,7 @@ function update(dt){
   //   0.73, and with haloR 0.52 half-heights that white core swallowed the entire blue band the
   //   clouds need to read white against. Widening the sky is allowed to show more sky; it is not
   //   allowed to move the sun into the shot.
-  var behindCam = _sd.dot(_fwd.set(0,0,-1).applyQuaternion(camera.quaternion)) <= 0.0;
+  var behindCam = _sd.dot(_fwd.set(0,0,-1).applyQuaternion(_cam().quaternion)) <= 0.0;
 
   // The reveal changes the field every frame, so it is marched at the spin rate while it runs.
   var interval = 1000 / Math.max(4, Math.max(P.hz + (P.hzSpin - P.hz) * Math.max(spinT, revealing ? 1 : 0),
@@ -98294,7 +98434,7 @@ function update(dt){
     M.frame = (M.frame + 1) % 64;
     u.uFrame.value = taa ? M.frame : 0;
     if(taa && P.taaSub > 0){
-      var _hs = CS_HALTON[M.frame % CS_HALTON.length], _pe = camera.projectionMatrix.elements;
+      var _hs = CS_HALTON[M.frame % CS_HALTON.length], _pe = _cam().projectionMatrix.elements;
       // One cloud-RT texel in vRay units: vRay spans 2*tan(half-FOV) = 2/proj[0] across M.w texels.
       u.uSub.value.set((_hs[0] - 0.5) * P.taaSub * 2 / (_pe[0] * M.w),
                        (_hs[1] - 0.5) * P.taaSub * 2 / (_pe[5] * M.h));
@@ -98303,7 +98443,7 @@ function update(dt){
     var src = M.rtCloud;
     if(taa){
       var ru = M.mRes.uniforms;
-      ru.uInvProj.value.copy(camera.projectionMatrixInverse);
+      ru.uInvProj.value.copy(_cam().projectionMatrixInverse);
       ru.tCur.value = M.rtCloud.texture;
       ru.tHist.value = M.rtHist[M.hi].texture;
       ru.uCamW.value.copy(u.uCamW.value); ru.uCamPos.value.copy(u.uCamPos.value);
@@ -98325,14 +98465,14 @@ function update(dt){
     }
     // The camera this march saw — the next resolve reprojects from it.
     M.prevCamW.copy(u.uCamW.value); M.prevView.copy(M.prevCamW).invert();
-    M.prevProj.copy(camera.projectionMatrix); M.prevWide = wide; M.prevCt = M.ct;
+    M.prevProj.copy(_cam().projectionMatrix); M.prevWide = wide; M.prevCt = M.ct;
     // Everything downstream reads the RESOLVED sky: the composite, and the shafts, whose occluder
     // is this texture's transmittance — a noisy one fanned out into noisy rays.
     M.comp.uniforms.tCloud.value = src.texture;
     M.mShaft.uniforms.tCloud.value = src.texture;
     if(P.shOn && M.rtShaft){
       var su = M.mShaft.uniforms;
-      su.uInvProj.value.copy(camera.projectionMatrixInverse);
+      su.uInvProj.value.copy(_cam().projectionMatrixInverse);
       su.uSunUV.value.copy(_sunUVc);
       su.uAspect.value = window.innerWidth / Math.max(1, window.innerHeight);
       su.uHalo.value = P.shHalo; su.uDensity.value = P.shDensity;
@@ -98466,6 +98606,13 @@ return {
                             az:+M.setAz.toFixed(2), horizon:+M.setHorizon.toFixed(2),
                             glow:+M.setGlow.toFixed(3), night:+M.setNight.toFixed(3) }; },
   mesh: function(){ return M.mesh; },
+  // Point the sky at another scene + camera (the mobile runner), or back at the storefront's (null). The composite
+  // quad moves to that scene; the history belonged to the other view, so it starts again.
+  view: function(scn, cam){
+    _VW = scn ? { scene: scn, cam: cam } : null;
+    if(M.mesh){ if(M.mesh.parent) M.mesh.parent.remove(M.mesh); _scn().add(M.mesh); }
+    M.histValid = false; M.cloudValid = false; M.last = -1e9; _camPrev.set(1e9, 0, 0);
+  },
   _M: function(){ return M; },   // harness hook: render targets + tier state
 
   onResize: function(){ if(M.built){ M.w = 0; _size(); } },
