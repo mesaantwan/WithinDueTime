@@ -92036,6 +92036,11 @@ var RUNNER = (function(){
     islThrust: 0.6,       // under the run speed the engine wins it back at this share of it a second
     islDrag: 0.35,        // over it, this share of the excess goes a second, on the ground and in the air
     islMinMul: 0.55, islMaxMul: 2.4,   // an island's speed stays within these × the run speed
+    // THE ISLAND CAMERA: higher and further back than the tube's, on a slow spring — it glides over the hills
+    islCamUp: 0.17, islCamBack: 0.52, islCamHz: 2.2, islCamClear: 0.1, islCamLook: 1.3,
+    islTufts: 4.0,        // grass tufts per square unit of island top (one in islFlower carries a flower)
+    islFlower: 7,
+    bgIslands: 9,         // other islands floating out in the dark around one you are on
     // PATTERNS: a set piece every patGapSec (after the first at firstPatSec), on a held tube with room for it.
     firstPatSec: 6, patGapSecMin: 5, patGapSecMax: 9, onlyPat: '',
     fodder: true,         // the random rows between patterns (off: patterns only — testing)
@@ -92282,6 +92287,7 @@ var RUNNER = (function(){
     sec.hb = new Float64Array(B); sec.hn = B.length / 4; sec.hL = L; sec.hA = a; sec.hB = b;
     sec.tilt = [rnd(0.02, 0.05) * hk, rnd(0.15, 0.4) / k, rnd(0, TAU)];
     sec.edge = [rnd(0.25, 0.6) / k, rnd(0, TAU), rnd(0.9, 1.6) / k, rnd(0, TAU)];
+    sec.dep = rnd(1.1, 2.0) * sec.W / 3.4; sec.seed = rnd(0, 100);   // how far its rock hangs below; its noise
   }
   // The island's ground height over its base (the old flat floor) at (x, z).
   function islH(sec, x, z){
@@ -92533,10 +92539,17 @@ var RUNNER = (function(){
     out[k + 1] = (Math.sin(pi) * Hj - Math.sin(pj) * Hi) / det;
   }
   // An island's mesh: a group at the section's whole-unit z, its ground built in ISL_SEG stretches as they come
-  // into sight and dropped behind (an island can run hundreds of units). Each stretch: the top as a grid (rows
-  // every ISL_DZ — a drop can be under a unit long), smooth normals off the hills' own slopes; a cliff down each
-  // edge, tucking in under it; and the underside between.
-  var ISL_SEG = 12, ISL_DZ = 0.1, ISL_NX = 14;
+  // into sight and dropped behind (an island can run hundreds of units). (═ THE ISLANDS rev 2 ═)
+  //
+  // WHAT MAKES IT A FLOATING ISLAND, stretch by stretch, all in one mesh and one draw:
+  //  · the TOP — the hills as a grid (rows every ISL_DZ: a drop can be under a unit long), normals off the hills'
+  //    own slopes, grass coloured by height, patches of noise and a lighter lip along the coast;
+  //  · a DIRT BAND under the lip — the turf's edge, cut;
+  //  · the UNDERSIDE — rock hanging below, deepest under the middle and tapering to a point-ish keel (a bowl and a
+  //    cone mixed), roughened by noise across and along, darker the deeper it goes;
+  //  · STONE ROOTS — cones hanging off the underside, and now and then a teal CRYSTAL among them (the site's accent);
+  //  · GRASS TUFTS and flowers scattered over the top — a few blades each, too small to hit, enough to read speed.
+  var ISL_SEG = 12, ISL_DZ = 0.1, ISL_NX = 14, ISL_NU = 14, ISL_BAND = 0.07;
   function buildFlatChunk(sec){
     var g = sec.mesh = new THREE.Group();
     sec.zO = Math.floor(sec.z0); sec.parts = [];
@@ -92555,72 +92568,223 @@ var RUNNER = (function(){
       }
     }
   }
+  // Smooth value noise (0..1) — the coast's rock, the grass's patches.
+  function hash2(i, j, s){ var h = Math.sin(i * 127.1 + j * 311.7 + s * 74.7) * 43758.5453; return h - Math.floor(h); }
+  function vnoise(x, z, s){
+    var i = Math.floor(x), j = Math.floor(z), fx = x - i, fz = z - j;
+    fx = fx * fx * (3 - 2 * fx); fz = fz * fz * (3 - 2 * fz);
+    var a = hash2(i, j, s), b = hash2(i + 1, j, s), c = hash2(i, j + 1, s), d = hash2(i + 1, j + 1, s);
+    return a + (b - a) * fx + (c - a) * fz + (a - b - c + d) * fx * fz;
+  }
+  // How far the rock hangs below the rim at across-fraction u (−1 … 1) and z: a bowl and a cone mixed, deeper
+  // under the island's middle stretch than at its ends (where it meets the tubes), rough in both directions.
+  function islDepth(sec, u, z){
+    var au = Math.min(1, Math.abs(u)), en = smooth(sec.z0, sec.z0 + 5, z) * (1 - smooth(sec.z1 - 5, sec.z1, z));
+    var prof = 0.55 * Math.pow(1 - au * au, 1.3) + 0.45 * Math.pow(1 - au, 1.4);
+    var n = vnoise(u * 2.2 + 7, z * 0.8, sec.seed) * 0.7 + vnoise(u * 6, z * 2.6, sec.seed + 3) * 0.3;
+    return 0.03 + sec.dep * (0.2 + 0.8 * en) * (0.78 + 0.22 * Math.sin(z * 0.23 + sec.seed)) * prof * (0.55 + 0.9 * n);
+  }
+  var GR_LO = [0.09, 0.25, 0.10], GR_HI = [0.30, 0.52, 0.18], GR_DRY = [0.44, 0.50, 0.17], GR_LIP = [0.52, 0.66, 0.30], EARTH = [0.32, 0.25, 0.15];
+  var FLOWERS = [[0.95, 0.93, 0.85], [0.98, 0.82, 0.25], [0.95, 0.45, 0.62], [0.62, 0.48, 0.95], [0.35, 0.85, 0.95]];
+  function mix3(o, a, b, t){ o[0] = a[0] + (b[0] - a[0]) * t; o[1] = a[1] + (b[1] - a[1]) * t; o[2] = a[2] + (b[2] - a[2]) * t; return o; }
   function islandSeg(sec, za, zb){
-    var K = Math.max(2, Math.ceil((zb - za) / ISL_DZ) + 1), NX = ISL_NX, RV = NX + 5, a = P.apothem, NV = K * RV;
-    var pos = new Float32Array(NV * 3), nor = new Float32Array(NV * 3), aK = new Float32Array(NV), aU = new Float32Array(NV), idx = [];
-    function put(v, x, y, z, nx, ny, nz, kk, u){
-      var l = Math.sqrt(nx * nx + ny * ny + nz * nz);
-      pos[v * 3] = x; pos[v * 3 + 1] = y; pos[v * 3 + 2] = z; nor[v * 3] = nx / l; nor[v * 3 + 1] = ny / l; nor[v * 3 + 2] = nz / l; aK[v] = kk; aU[v] = u;
-    }
+    var K = Math.max(2, Math.ceil((zb - za) / ISL_DZ) + 1), NX = ISL_NX, NU = ISL_NU, a = P.apothem;
+    var pos = [], col = [], kk = [], idx = [], topN = [], c3 = [0, 0, 0], RVT = NX + 1;
+    function vtx(x, y, z, r, g, b, k){ pos.push(x, y, z); col.push(r, g, b); kk.push(k); return kk.length - 1; }
+    var rowTop = [], rowL = [], rowR = [], rowU = [];
     for(var k = 0; k < K; k++){
-      var z = za + (zb - za) * k / (K - 1), half = flatW(sec, z) / 2, zl = -(z - sec.zO), v0 = k * RV, i;
+      var z = za + (zb - za) * k / (K - 1), half = flatW(sec, z) / 2, zl = -(z - sec.zO), i;
+      // the top
+      rowTop.push(kk.length);
       for(i = 0; i <= NX; i++){
-        var x = -half + 2 * half * i / NX;
+        var x = -half + 2 * half * i / NX, h = islH(sec, x, z), u = x / half;
         islSlope(sec, x, z, _isl);
-        put(v0 + i, x, -a + islH(sec, x, z), zl, -_isl.x, 1, _isl.z, 0, x / half);   // (world z runs the other way: +slope)
+        var ny = 1 / Math.sqrt(1 + _isl.x * _isl.x + _isl.z * _isl.z);
+        mix3(c3, GR_LO, GR_HI, clamp((h + 0.15) / 0.75, 0, 1));
+        var pn = vnoise(x * 1.3 + 3, z * 0.9, sec.seed), fn = vnoise(x * 6, z * 5, sec.seed + 9);
+        mix3(c3, c3, GR_DRY, smooth(0.62, 0.85, pn) * 0.7);
+        mix3(c3, c3, EARTH, smooth(0.35, 0.7, 1 - ny));
+        mix3(c3, c3, GR_LIP, smooth(0.93, 1.0, Math.abs(u)));
+        var f = 0.86 + 0.28 * fn;
+        topN.push(vtx(x, -a + h, zl, c3[0] * f, c3[1] * f, c3[2] * f, 0), -_isl.x * ny, ny, _isl.z * ny);
       }
-      // the cliffs: down from each edge and in under it, deeper and shallower along the coast
-      var dep = 0.32 + 0.3 * (0.5 + 0.5 * Math.sin(z * 1.3 + sec.edge[1])), hl = islH(sec, -half, z), hr = islH(sec, half, z);
-      put(v0 + NX + 1, -half, -a + hl, zl, -1, 0.2, 0, 1, -1);
-      put(v0 + NX + 2, -half * 0.72, -a + hl - dep, zl, -0.6, -0.8, 0, 1, -1);
-      put(v0 + NX + 3, half, -a + hr, zl, 1, 0.2, 0, 1, 1);
-      put(v0 + NX + 4, half * 0.72, -a + hr - dep, zl, 0.6, -0.8, 0, 1, 1);
+      // the dirt band under each edge, then the underside from left to right
+      var hl = islH(sec, -half, z), hr = islH(sec, half, z), dl = 0.9 + 0.2 * vnoise(z * 3, 1, sec.seed);
+      rowL.push(vtx(-half, -a + hl, zl, 0.38, 0.26, 0.15, 2)); vtx(-half + 0.012, -a + hl - ISL_BAND * dl, zl, 0.30, 0.20, 0.12, 2);
+      rowR.push(vtx(half, -a + hr, zl, 0.38, 0.26, 0.15, 2)); vtx(half - 0.012, -a + hr - ISL_BAND * dl, zl, 0.30, 0.20, 0.12, 2);
+      rowU.push(kk.length);
+      for(i = 0; i <= NU; i++){
+        var uu = -1 + 2 * i / NU, ux = uu * (half - 0.012), rim = hl + (hr - hl) * (uu * 0.5 + 0.5) - ISL_BAND * dl;
+        var dd = islDepth(sec, uu, z), dt = clamp(dd / (sec.dep * 1.2), 0, 1), rn = 0.82 + 0.3 * vnoise(uu * 9, z * 4, sec.seed + 5);
+        vtx(ux, -a + rim - dd, zl, (0.30 - 0.13 * dt) * rn, (0.25 - 0.10 * dt) * rn, (0.21 - 0.05 * dt) * rn, 1);
+      }
+      // THE ENDS: an island begins and ends in a face of rock across its whole section (a fan from its middle) —
+      // open, the tube's view into it was a hollow shell.
+      if((k === 0 && za <= sec.z0 + 1e-6) || (k === K - 1 && zb >= sec.z1 - 1e-6)){
+        var loop = [], cx = 0, cyy = 0;
+        for(i = 0; i <= NX; i++) loop.push(rowTop[k] + i);
+        loop.push(rowR[k], rowR[k] + 1);
+        for(i = NU; i >= 0; i--) loop.push(rowU[k] + i);
+        loop.push(rowL[k] + 1, rowL[k]);
+        var cap0 = kk.length;
+        for(i = 0; i < loop.length; i++){ var lv = loop[i]; cx += pos[lv * 3]; cyy += pos[lv * 3 + 1]; vtx(pos[lv * 3], pos[lv * 3 + 1], zl, 0.27, 0.22, 0.19, 1); }
+        var cc = vtx(cx / loop.length, cyy / loop.length, zl, 0.18, 0.16, 0.16, 1);
+        for(i = 0; i < loop.length; i++) idx.push(cap0 + i, cap0 + (i + 1) % loop.length, cc);
+      }
       if(!k) continue;
-      var p0 = v0 - RV;
-      for(i = 0; i < NX; i++) idx.push(p0 + i, p0 + i + 1, v0 + i + 1, p0 + i, v0 + i + 1, v0 + i);
-      var qd = [NX + 1, NX + 2, NX + 4, NX + 3, NX + 2, NX + 4];   // left cliff, right cliff, underside
-      for(var j = 0; j < 6; j += 2){ var A = qd[j], Bq = qd[j + 1]; idx.push(p0 + A, p0 + Bq, v0 + Bq, p0 + A, v0 + Bq, v0 + A); }
+      var t0 = rowTop[k - 1], t1 = rowTop[k];
+      for(i = 0; i < NX; i++) idx.push(t0 + i, t0 + i + 1, t1 + i + 1, t0 + i, t1 + i + 1, t1 + i);
+      var L0 = rowL[k - 1], L1 = rowL[k], R0 = rowR[k - 1], R1 = rowR[k];
+      idx.push(L0, L0 + 1, L1 + 1, L0, L1 + 1, L1, R0, R1, R1 + 1, R0, R1 + 1, R0 + 1);
+      var u0 = rowU[k - 1], u1 = rowU[k];
+      for(i = 0; i < NU; i++) idx.push(u0 + i, u1 + i, u1 + i + 1, u0 + i, u1 + i + 1, u0 + i + 1);
+      // the band's bottom meets the underside's ends
+      idx.push(L0 + 1, u0, u1, L0 + 1, u1, L1 + 1, R0 + 1, R1 + 1, u1 + NU, R0 + 1, u1 + NU, u0 + NU);
+    }
+    // stone roots hanging off the underside, now and then a crystal among them
+    function cone(x, y, z, r, len, sides, rgb, tip, k){
+      var b0 = kk.length, tw = Math.random() * TAU;
+      for(var j = 0; j < sides; j++){ var an = tw + j * TAU / sides, rr = r * (0.8 + 0.4 * Math.random()); vtx(x + Math.cos(an) * rr, y + 0.02, z + Math.sin(an) * rr, rgb[0], rgb[1], rgb[2], k); }
+      var ti = vtx(x + (Math.random() - 0.5) * r, y - len, z + (Math.random() - 0.5) * r, tip[0], tip[1], tip[2], k);
+      for(j = 0; j < sides; j++) idx.push(b0 + j, b0 + (j + 1) % sides, ti);
+    }
+    var nRoot = Math.max(1, Math.round((zb - za) / 2.2));
+    for(var q = 0; q < nRoot; q++){
+      var rz = za + Math.random() * (zb - za), rh = flatW(sec, rz) / 2, ru = (Math.random() * 2 - 1) * 0.55;
+      var rim2 = islH(sec, ru * rh, rz) - ISL_BAND, dep = islDepth(sec, ru, rz);
+      cone(ru * rh, -a + rim2 - dep, -(rz - sec.zO), (0.05 + Math.random() * 0.1) * rh / 1.5, (0.25 + Math.random() * 0.7) * (0.3 + dep * 0.5), 6, [0.22, 0.19, 0.17], [0.12, 0.11, 0.12], 1);
+      if(Math.random() < 0.35){
+        var cu = ru + (Math.random() - 0.5) * 0.3;
+        cone(cu * rh, -a + islH(sec, cu * rh, rz) - ISL_BAND - islDepth(sec, cu, rz) * 0.9, -(rz - sec.zO) + (Math.random() - 0.5) * 0.4, 0.025 + Math.random() * 0.03, 0.12 + Math.random() * 0.2, 4, [0.10, 0.62, 0.58], [0.55, 1.0, 0.95], 3);
+      }
+    }
+    // grass tufts and flowers on the top: three blades each, rooted in the ground where they stand
+    var area = (zb - za) * sec.W, nT = Math.round(area * P.islTufts), blades = [];
+    for(q = 0; q < nT; q++){
+      var tz = za + Math.random() * (zb - za), th2 = flatW(sec, tz) / 2 - 0.02, tx = (Math.random() * 2 - 1) * th2;
+      var ty = -a + islH(sec, tx, tz), tzl = -(tz - sec.zO), ht = 0.016 + Math.random() * 0.02, g0 = 0.6 + 0.4 * Math.random();
+      for(var bl = 0; bl < 3; bl++){
+        var ang = Math.random() * Math.PI, ca = Math.cos(ang) * 0.006, sa = Math.sin(ang) * 0.006, lx = (Math.random() - 0.5) * 0.012, lz = (Math.random() - 0.5) * 0.012;
+        var b0 = vtx(tx - ca, ty, tzl - sa, 0.08 * g0, 0.22 * g0, 0.07 * g0, 4);
+        vtx(tx + ca, ty, tzl + sa, 0.08 * g0, 0.22 * g0, 0.07 * g0, 4);
+        vtx(tx + lx, ty + ht, tzl + lz, 0.32 * g0, 0.58 * g0, 0.22 * g0, 4);
+        idx.push(b0, b0 + 1, b0 + 2); blades.push(b0);
+      }
+      if(q % P.islFlower === 0){
+        var fc = FLOWERS[Math.floor(Math.random() * FLOWERS.length)], fy = ty + ht * 0.9, fr = 0.006;
+        var f0 = vtx(tx - fr, fy, tzl, fc[0], fc[1], fc[2], 4); vtx(tx + fr, fy, tzl, fc[0], fc[1], fc[2], 4);
+        vtx(tx, fy, tzl - fr, fc[0], fc[1], fc[2], 4); vtx(tx, fy, tzl + fr, fc[0], fc[1], fc[2], 4);
+        idx.push(f0, f0 + 2, f0 + 1, f0, f0 + 1, f0 + 3); blades.push(f0, f0 + 2);
+      }
     }
     var g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    g.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-    g.setAttribute('aK', new THREE.BufferAttribute(aK, 1));
-    g.setAttribute('aU', new THREE.BufferAttribute(aU, 1));
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('aCol', new THREE.Float32BufferAttribute(col, 3));
+    g.setAttribute('aK', new THREE.Float32BufferAttribute(kk, 1));
     g.setIndex(idx);
+    g.computeVertexNormals();
+    // the top's normals are the hills' own (exact, and the same either side of a stretch's seam); blades face up
+    var nm = g.attributes.normal.array;
+    for(q = 0; q < topN.length; q += 4){ var v = topN[q]; nm[v * 3] = topN[q + 1]; nm[v * 3 + 1] = topN[q + 2]; nm[v * 3 + 2] = topN[q + 3]; }
+    for(q = 0; q < blades.length; q++) for(var e = 0; e < 3; e++){ var w = blades[q] + e; nm[w * 3] = 0; nm[w * 3 + 1] = 1; nm[w * 3 + 2] = 0; }
     var m = new THREE.Mesh(g, R.islMat);
     m.frustumCulled = false;
     return m;
   }
-  // The island's two materials — the ground, and the rocks/trees/logs on it. Lit by one fixed sun in the shader
-  // (no new scene light: a change in light count relinks every lit program), fogged exactly as the tube is.
-  var SUN = new THREE.Vector3(0.4, 0.55, 0.75).normalize();   // low, from behind the camera: climbs lit, drops in shade
-  function buildIsland(){
-    R.islMat = new THREE.ShaderMaterial({
-      uniforms: { uFogD: { value: P.fog }, uFogCol: { value: new THREE.Color(BG) }, uSun: { value: SUN } },
-      vertexShader: [
-        'attribute float aK, aU; varying float vK, vU, vH, vWZ; varying vec3 vN, vView;',
-        'void main(){ vK = aK; vU = aU; vH = position.y + ' + P.apothem.toFixed(4) + '; vN = normal;',
-        '  vec4 w = modelMatrix * vec4(position, 1.0); vWZ = w.z; vec4 mv = viewMatrix * w; vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
-      ].join('\n'),
-      fragmentShader: [
-        'uniform float uFogD; uniform vec3 uFogCol, uSun; varying float vK, vU, vH, vWZ; varying vec3 vN, vView;',
-        'void main(){',
-        '  vec3 n = normalize(vN); float dif = max(dot(n, uSun), 0.0);',
-        '  vec3 grass = mix(vec3(0.09, 0.26, 0.11), vec3(0.30, 0.52, 0.19), smoothstep(-0.15, 0.45, vH));',   // lighter up on the crests
-        '  grass = mix(grass, vec3(0.30, 0.25, 0.16), smoothstep(0.35, 0.7, 1.0 - n.y));',                    // steep faces: bare earth
-        '  float pz = fwidth(vWZ), band = step(0.5, fract(vWZ * 0.5));',                                     // mown bands, a unit each: the speed you see
-        '  grass *= 1.0 + 0.07 * (band * 2.0 - 1.0) * (1.0 - smoothstep(0.15, 0.5, pz));',
-        '  grass = mix(grass, vec3(0.52, 0.66, 0.30), smoothstep(0.94, 1.0, abs(vU)));',                     // the lip of the coast
-        '  vec3 rock = vec3(0.24, 0.21, 0.19) * (0.8 + 0.2 * sin(vH * 40.0 + vWZ * 3.0));',
-        '  vec3 col = mix(grass, rock, vK) * (0.32 + 0.85 * dif);',
-        '  float d = length(vView), fog = exp(-uFogD * uFogD * d * d);',
-        '  gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);',
-        '}'
-      ].join('\n'),
-      side: THREE.DoubleSide, extensions: { derivatives: true }
-    });
-    R.natMat = new THREE.ShaderMaterial({
-      uniforms: { uFogD: { value: P.fog }, uFogCol: { value: new THREE.Color(BG) }, uSun: { value: SUN } },
+  // ── THE ISLANDS OUT THERE: while you are on an island (or about to be), others float in the dark around it —
+  // far off to the sides, above and below, turning slowly and bobbing, passing as you go. Three shapes, each one
+  // mesh: a domed grass top with a few trees, a dirt rim, and a long rocky keel hanging to a point; faceted, lit
+  // by the same sun, in their own lighter fog (the run's would hide anything that far out). Laid 60–90 units ahead,
+  // where that fog still hides them, so they come up out of the dark instead of appearing.
+  function bgIslandGeo(){
+    var SG = 15, RG = [[0, 0.16, 0], [0.35, 0.13, 0], [0.7, 0.06, 0], [1, 0, 0], [0.97, -0.13, 2], [0.85, -0.45, 1], [0.62, -0.95, 1], [0.38, -1.5, 1], [0.15, -2.0, 1], [0.0, -2.6, 1]];
+    var ring = [], ps = [], cs = [], r, j;
+    var lump = [];
+    for(j = 0; j < SG; j++) lump.push(0.85 + 0.3 * Math.random());
+    for(r = 0; r < RG.length; r++){
+      var pts = [];
+      for(j = 0; j < SG; j++){
+        var an = j * TAU / SG + (r ? (Math.random() - 0.5) * 0.15 : 0), rad = RG[r][0] * lump[j] * (r > 4 ? 0.8 + 0.4 * Math.random() : 1);
+        pts.push([Math.cos(an) * rad, RG[r][1] * (r > 4 ? 0.85 + 0.3 * Math.random() : 1) + (r < 3 ? (Math.random() - 0.5) * 0.06 : 0), Math.sin(an) * rad]);
+      }
+      ring.push(pts);
+    }
+    function tri(p, q, s, c){ var v = 0.85 + Math.random() * 0.3; ps.push(p[0], p[1], p[2], q[0], q[1], q[2], s[0], s[1], s[2]); for(var t = 0; t < 3; t++) cs.push(c[0] * v, c[1] * v, c[2] * v); }
+    for(r = 0; r + 1 < RG.length; r++){
+      var kind = RG[r + 1][2], dt = r / RG.length;
+      var c = kind === 0 ? [0.22, 0.45, 0.16] : (kind === 2 ? [0.36, 0.24, 0.14] : [0.30 - 0.15 * dt, 0.25 - 0.12 * dt, 0.21 - 0.08 * dt]);
+      for(j = 0; j < SG; j++){
+        var a0 = ring[r][j], a1 = ring[r][(j + 1) % SG], b0 = ring[r + 1][j], b1 = ring[r + 1][(j + 1) % SG];
+        tri(a0, a1, b1, c); tri(a0, b1, b0, c);
+      }
+    }
+    var nTree = 2 + Math.floor(Math.random() * 4);
+    for(var t = 0; t < nTree; t++){
+      var ta = Math.random() * TAU, tr = Math.random() * 0.6, tx = Math.cos(ta) * tr, tz = Math.sin(ta) * tr, ty = 0.14 - tr * 0.12, sc = 0.18 + Math.random() * 0.14;
+      for(j = 0; j < 5; j++){   // trunk
+        var q0 = j * TAU / 5, q1 = (j + 1) * TAU / 5, w = 0.06 * sc;
+        tri([tx + Math.cos(q0) * w, ty, tz + Math.sin(q0) * w], [tx + Math.cos(q1) * w, ty, tz + Math.sin(q1) * w], [tx, ty + sc * 0.6, tz], [0.29, 0.20, 0.13]);
+      }
+      [[0.42, 0.35, 0.8], [0.3, 0.75, 0.65]].forEach(function(cn){   // two cones of canopy
+        var br = cn[0] * sc, by = ty + cn[1] * sc, top = by + cn[2] * sc, gc = Math.random() < 0.5 ? [0.12, 0.30, 0.15] : [0.17, 0.36, 0.16];
+        for(var k2 = 0; k2 < 7; k2++){
+          var e0 = k2 * TAU / 7, e1 = (k2 + 1) * TAU / 7;
+          tri([tx + Math.cos(e0) * br, by, tz + Math.sin(e0) * br], [tx + Math.cos(e1) * br, by, tz + Math.sin(e1) * br], [tx, top, tz], gc);
+        }
+      });
+    }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(ps, 3));
+    geo.setAttribute('aCol', new THREE.Float32BufferAttribute(cs, 3));
+    return geo;
+  }
+  function islDecorTick(){
+    if(!R.bg) return;
+    var c = S.course, near = null;
+    for(var q = 0; q < c.length; q++) if(c[q].kind === 'flat' && c[q].z1 > S.z - 5 && c[q].z0 < S.z + 95){ near = c[q]; break; }
+    for(q = 0; q < R.bg.length; q++){
+      var b = R.bg[q];
+      if(b.on && (b.z < S.z - 6 || b.z > S.z + 200)){ b.on = false; b.mesh.visible = false; }
+      var first = R.bg.every(function(o){ return !o.on; });
+      if(!b.on && near && (first || Math.random() < 0.04)){
+        var z = S.z + (first ? rnd(18, 90) : rnd(60, 90));
+        if(z < near.z0 - 10 || z > near.z1 + 12) continue;
+        var s = rnd(0.6, 2.6), side = Math.random() < 0.5 ? -1 : 1;
+        b.z = z; b.s = s; b.x = side * (near.W * 0.65 + 1.2 + s + rnd(0, 5)); b.y = -P.apothem + rnd(-4.0, 1.2);
+        b.ph = rnd(0, TAU); b.spin = rnd(-0.0015, 0.0015);
+        b.mesh.geometry = R.bgGeo[Math.floor(Math.random() * R.bgGeo.length)];
+        b.mesh.scale.setScalar(s); b.mesh.rotation.y = rnd(0, TAU);
+        b.on = true; b.mesh.visible = true;
+      }
+      if(b.on){
+        b.mesh.rotation.y += b.spin;
+        b.mesh.position.set(b.x, b.y + Math.sin(S.runT * 0.5 + b.ph) * 0.04 * b.s, -(b.z - S.zBase));
+      }
+    }
+  }
+  function islDebrisTick(){
+    if(!R.debris) return;
+    var c = S.course;
+    for(var q = 0; q < R.debris.length; q++){
+      var d = R.debris[q];
+      if(d.on && (d.z < S.z - 3 || d.z > S.z + 200)){ d.on = false; d.mesh.visible = false; }
+      if(!d.on && Math.random() < 0.08){
+        var z = S.z + rnd(14, 40), sec = sectionAt(z);
+        if(sec.kind !== 'flat' || z > sec.z1 - sec.taper) continue;
+        var half = flatW(sec, z) / 2, s = rnd(0.03, 0.22);
+        d.z = z; d.s = s; d.x = (Math.random() < 0.5 ? -1 : 1) * (half + s + rnd(0.15, 1.6)); d.y = -P.apothem + islH(sec, 0, z) - rnd(0.15, 1.4);
+        d.ph = rnd(0, TAU); d.mesh.scale.setScalar(s); d.mesh.rotation.set(rnd(0, TAU), rnd(0, TAU), 0); d.spin = rnd(-0.01, 0.01);
+        d.on = true; d.mesh.visible = true;
+      }
+      if(d.on){ d.mesh.rotation.y += d.spin; d.mesh.position.set(d.x, d.y + Math.sin(S.runT * 0.8 + d.ph) * 0.02, -(d.z - S.zBase)); }
+    }
+  }
+  // The island's materials. Lit by one fixed sun in the shader (no new scene light: a change in light count relinks
+  // every lit program), fogged exactly as the tube is. Low, from behind the camera: climbs lit, drops in shade.
+  var SUN = new THREE.Vector3(0.4, 0.55, 0.75).normalize();
+  function natLikeMat(fogD, side){
+    return new THREE.ShaderMaterial({
+      uniforms: { uFogD: { value: fogD }, uFogCol: { value: new THREE.Color(BG) }, uSun: { value: SUN } },
       vertexShader: 'attribute vec3 aCol; varying vec3 vCol, vW, vView;\nvoid main(){ vCol = aCol; vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; vec4 mv = viewMatrix * w; vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
         'uniform float uFogD; uniform vec3 uFogCol, uSun; varying vec3 vCol, vW, vView;',
@@ -92631,8 +92795,57 @@ var RUNNER = (function(){
         '  gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);',
         '}'
       ].join('\n'),
-      extensions: { derivatives: true }
+      side: side || THREE.FrontSide, extensions: { derivatives: true }
     });
+  }
+  function buildIsland(){
+    R.islMat = new THREE.ShaderMaterial({
+      uniforms: { uFogD: { value: P.fog }, uFogCol: { value: new THREE.Color(BG) }, uSun: { value: SUN } },
+      vertexShader: [
+        'attribute float aK; attribute vec3 aCol; varying float vK; varying vec3 vCol, vN, vView, vWP;',
+        'void main(){ vK = aK; vCol = aCol; vN = normal;',
+        '  vec4 w = modelMatrix * vec4(position, 1.0); vWP = w.xyz; vec4 mv = viewMatrix * w; vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
+      ].join('\n'),
+      fragmentShader: [
+        'uniform float uFogD; uniform vec3 uFogCol, uSun; varying float vK; varying vec3 vCol, vN, vView, vWP;',
+        'void main(){',
+        '  vec3 n = normalize(vN); if(dot(n, cameraPosition - vWP) < 0.0 && vK > 0.5) n = -n;',
+        '  float dif = max(dot(n, uSun), 0.0);',
+        '  vec3 base = vCol;',
+        '  if(vK < 0.5){',                                                                       // the grass: mown bands a unit each — the speed you see
+        '    float pz = fwidth(vWP.z), band = step(0.5, fract(vWP.z * 0.5));',
+        '    base *= 1.0 + 0.07 * (band * 2.0 - 1.0) * (1.0 - smoothstep(0.15, 0.5, pz));',
+        '  } else if(vK < 1.5){',                                                                // the rock: strata, wandering
+        '    base *= 0.84 + 0.16 * sin(vWP.y * 26.0 + sin(vWP.z * 1.7 + vWP.x * 2.3) * 2.5);',
+        '  }',
+        '  vec3 col = base * (0.30 + 0.85 * dif);',
+        '  if(vK > 2.5 && vK < 3.5) col = base * (0.75 + 0.35 * dif) + vec3(0.02, 0.22, 0.20);',   // a crystal glows on its own
+        '  float d = length(vView), fog = exp(-uFogD * uFogD * d * d);',
+        '  gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);',
+        '}'
+      ].join('\n'),
+      side: THREE.DoubleSide, extensions: { derivatives: true }
+    });
+    R.natMat = natLikeMat(P.fog);
+    R.bgMat = natLikeMat(0.019, THREE.DoubleSide);
+    // DEBRIS: rocks drifting in the void beside the island you are on, below its rim — the nearest thing that
+    // says there is nothing under you. One small jittered stone, a pool of meshes.
+    var dg = new THREE.IcosahedronGeometry(1, 0), da = dg.attributes.position, dj = {}, dc = [];
+    for(var di = 0; di < da.count; di++){
+      var dx = da.getX(di), dy = da.getY(di), dz = da.getZ(di), dk = dx.toFixed(3) + dy.toFixed(3) + dz.toFixed(3), df = dj[dk] || (dj[dk] = 0.7 + Math.random() * 0.5);
+      da.setXYZ(di, dx * df, dy * df * 0.8, dz * df);
+    }
+    for(di = 0; di < da.count; di += 3){ var dv = 0.7 + Math.random() * 0.5, top = di % 9 === 0; for(var de = 0; de < 3; de++) dc.push((top ? 0.22 : 0.28) * dv, (top ? 0.36 : 0.24) * dv, (top ? 0.15 : 0.21) * dv); }
+    dg.setAttribute('aCol', new THREE.Float32BufferAttribute(dc, 3));
+    R.debris = [];
+    for(di = 0; di < 16; di++){ var dm = new THREE.Mesh(dg, R.bgMat); dm.visible = false; dm.frustumCulled = false; R.scene.add(dm); R.debris.push({ mesh: dm, on: false, z: 0 }); }
+    R.bgGeo = [bgIslandGeo(), bgIslandGeo(), bgIslandGeo()];
+    R.bg = [];
+    for(var i = 0; i < P.bgIslands; i++){
+      var m = new THREE.Mesh(R.bgGeo[i % 3], R.bgMat);
+      m.visible = false; m.frustumCulled = false;
+      R.scene.add(m); R.bg.push({ mesh: m, on: false, z: 0 });
+    }
   }
   function buildChunk(sec){
     if(sec.kind === 'flat') return buildFlatChunk(sec);
@@ -93098,11 +93311,17 @@ var RUNNER = (function(){
   }
   function slam(){
     if(S.dead || S.grounded) return;
+    if(flipWanted()) return;   // (GRAVITY FLIP — THE UPGRADES II)
+    S.slamF = true;            // (its landing: GROUND POUND, SPRING SLAM)
     var gx = Math.sin(S.g), gy = -Math.cos(S.g), vn = S.vx * gx + S.vy * gy;
     if(vn < SLAM_V){ S.vx += gx * (SLAM_V - vn); S.vy += gy * (SLAM_V - vn); }
   }
   function land(){
     S.grounded = true;
+    // The floor takes the velocity going INTO it, so a jump on this same step (the buffered one, or a SPRING SLAM)
+    // leaves from rest. Before, the fall's own speed stayed and ate the jump: a swipe-up just before touchdown did nothing.
+    var lgx = Math.sin(S.g), lgy = -Math.cos(S.g), lvn = S.vx * lgx + S.vy * lgy;
+    if(lvn > 0){ S.vx -= lgx * lvn; S.vy -= lgy * lvn; }
     // Back onto the track: where round it, and how fast. thTgt is untouched — the thumb never let go of it.
     S.th = polar(S.x, S.y, S.th);
     S.thV = (S.x * S.vy - S.y * S.vx) / Math.max(1e-6, S.x * S.x + S.y * S.y);
@@ -93162,6 +93381,7 @@ var RUNNER = (function(){
     if(S.sl) slingTick();
     itemsTick();
     plumeTick();
+    islDecorTick(); islDebrisTick();   // (the islands out in the dark, the rocks beside you: THE ISLANDS)
     rows();
     rebase();
   }
@@ -93412,7 +93632,7 @@ var RUNNER = (function(){
     if(snap){ S.cx = txp; S.cy = typ; S.cvx = S.cvy = 0; S.cam = S.th; S.camV = 0; }
     else if(!S.fell){                                               // a fall: let the ship go, the camera stays
       var c = cd(S.cx, S.cvx, txp, P.camFollowHz); S.cx = c.x; S.cvx = c.v;
-      c = cd(S.cy, S.cvy, typ, flat ? 10 : P.camFollowHz); S.cy = c.x; S.cvy = c.v;   // (stiffer on hills: a slope is fast vertical motion)
+      c = cd(S.cy, S.cvy, typ, P.camFollowHz); S.cy = c.x; S.cvy = c.v;
     }
     // The tube camera's place eases between a tube's axis and a flat's overlook as the ground changes.
     var tY = flat ? -P.apothem + P.flatCamUp : 0, tB = flat ? P.flatCamBack : P.tubeCamBack, tL = flat ? -P.apothem : 0;
@@ -93428,27 +93648,24 @@ var RUNNER = (function(){
     // (pulling the slingshot back brings the ship a quarter of the way toward the lens)
     var px = S.cx + cux * P.camUp, py = S.cy + cuy * P.camUp, pz = z + P.camBack - (S.sl && S.sl.phase === 'aim' ? S.sl.pull * P.slingPull * 0.25 : 0);
     var lx = S.cx + cux * 0.02, ly = S.cy + cuy * 0.02, lz = z - P.camLook;
-    // On an island the camera never goes into a hill behind it (it rises over, and tips down at the ship), and it
-    // looks down a slope it is about to run down — and up one it is about to climb.
-    // Behind the ship it sits back along the slope it came down (or up), as if on the path itself: level, a
-    // descent left it at grass height looking into the hill.
-    var lkT = 0, cbT = 0;
-    if(flat && !S.fell){
-      var g0 = groundAt(S.cx, S.z);
-      cbT = groundAt(S.cx, S.z - P.camBack) - g0;
-      lkT = 0.5 * (groundAt(S.cx, S.z + P.camLook) - g0);
-    }
-    var cb = cd(S.cbY || 0, S.cbV || 0, cbT, 4); S.cbY = snap ? cbT : cb.x; S.cbV = snap ? 0 : cb.v;
-    py += S.cbY;
-    if(flat && !S.fell){
-      var gB = groundAt(S.cx, S.z - P.camBack) + 0.045;
-      if(py < gB){ ly -= (gB - py) * 0.8; py = gB; }
-    }
-    var lk = cd(S.lkY || 0, S.lkV || 0, lkT, 3); S.lkY = snap ? lkT : lk.x; S.lkV = snap ? 0 : lk.v;
-    ly += S.lkY;
+    // ON AN ISLAND the chase camera rides higher and further back, its height on a slow spring of its own (S.iy):
+    // it glides over the hills instead of bobbing with each one — the ship rises and falls in the frame and the hills
+    // pass under it. It never drops under the ground behind it, and looks at that same smoothed line, so the view
+    // does not pitch with the ground either. Eased in and out (S.icK) where the island meets a tube.
+    var icT = flat && !S.fell ? 1 : 0, ick = cd(S.icK || 0, S.icV || 0, icT, 1.2);
+    S.icK = snap ? icT : clamp(ick.x, 0, 1); S.icV = snap ? 0 : ick.v;
+    if(S.icK > 1e-3){
+      var ik = S.icK * S.icK * (3 - 2 * S.icK), back = P.camBack + (P.islCamBack - P.camBack) * ik;
+      var gB = groundAt(S.cx, S.z - back), hT = Math.max(S.y + P.islCamUp, gB + P.islCamClear);
+      if(S.iy == null || snap){ S.iy = hT; S.iyV = 0; }
+      else if(!S.fell){ var ih = cd(S.iy, S.iyV, hT, P.islCamHz); S.iy = ih.x; S.iyV = ih.v; }
+      var iy = Math.max(S.iy, gB + 0.05);
+      py += (iy - py) * ik; pz += (back - P.camBack) * ik;
+      ly += (S.iy - P.islCamUp - 0.02 - ly) * ik; lz -= (P.islCamLook - P.camLook) * ik;
+    } else S.iy = null;
     if(S.fell){ lx += (S.x - lx) * 0.5; ly += (S.y - ly) * 0.5; lz = z; }   // and watch it go
     // tube pose
-    var il = flat ? S.cy + lim : 0;   // (over an island: up and down with its hills)
+    var il = flat ? (S.iy != null ? S.iy - P.islCamUp : S.cy) + lim : 0;   // (over an island: its smoothed line)
     var qx = 0, qy = S.tcY + il, qz = z + S.tcB, mx = 0, my = S.tcL + il, mz = z - 2.2;
     R.cam.up.set(-Math.sin(ang), Math.cos(ang), 0);
     R.cam.position.set(px + (qx - px) * e + (Math.random() - 0.5) * sk, py + (qy - py) * e + (Math.random() - 0.5) * sk, pz + (qz - pz) * e);
@@ -94095,7 +94312,7 @@ var RUNNER = (function(){
       burst(_p, 30, true, SPEED_COL); R.fovKick = Math.max(R.fovKick, 7);
       coreToast('SPEED  ·  ' + Math.round(P.speedKmh * speedMul()) + ' KM/H', '110,180,255');
     } else {
-      S.chargeT = P.chargeSec;
+      S.chargeT = S.chargeMax = chargeDur();   // (LONG CHARGE — THE UPGRADES II)
       burst(_p, 44, true, CHARGE_COL); R.flash = Math.max(R.flash, 0.3); R.shake = Math.max(R.shake, 0.6);
       coreToast('CHARGE', '255,150,60');
     }
@@ -94180,7 +94397,7 @@ var RUNNER = (function(){
     var on = S.chargeT > 0 && !S.dead, u = R.aura.material.uniforms;
     R.aura.visible = on;
     if(on){
-      var age = P.chargeSec - S.chargeT, last = S.chargeT < 0.6 ? (Math.floor(S.chargeT * 14) % 2 ? 0.3 : 1) : 1;
+      var age = (S.chargeMax || P.chargeSec) - S.chargeT, last = S.chargeT < 0.6 ? (Math.floor(S.chargeT * 14) % 2 ? 0.3 : 1) : 1;
       u.uA.value = Math.min(1, age / 0.1) * last; u.uT.value = t;
       R.aura.position.copy(sh.position).addScaledVector(gameMode.surfaceState.forward, -0.012);
       R.aura.quaternion.copy(sh.quaternion);
@@ -94214,7 +94431,7 @@ var RUNNER = (function(){
     if(a > 0){ R.elCoreToast.style.top = Math.round(H * 0.25) + 'px'; R.elCoreToast.style.transform = 'scale(' + (1 + 0.35 * Math.max(0, R.coreToastT - 1.1)).toFixed(3) + ')'; }
     var on = S.chargeT > 0 && !S.dead;
     R.elCharge.style.opacity = on ? (1 - shop).toFixed(3) : 0;
-    if(on) R.elChargeFill.style.width = (S.chargeT / P.chargeSec * 100).toFixed(1) + '%';
+    if(on) R.elChargeFill.style.width = (Math.min(1, S.chargeT / (S.chargeMax || P.chargeSec)) * 100).toFixed(1) + '%';
   }
 
   // ════════════════════════════════════════ THE PLUME ════════════════════════════════════════
@@ -94352,13 +94569,13 @@ var RUNNER = (function(){
   // units — smoothstep between — so what you see is exactly what you will meet.
   var _cut = [{ x: 0, y: 0, r: 0 }];
   function wallCut(w){
-    if(w.holes) return w.holes;
+    if(w.holes){ var km = keyMul(); return km === 1 ? w.holes : w.holes.map(function(h){ return { x: h.x, y: h.y, r: h.r * km }; }); }   // (BULKHEAD KEY)
     var I = w.iris, dz = w.z - S.z, e = clamp((I.open - dz) / (I.open - I.close), 0, 1);
     e = e * e * (3 - 2 * e);
-    _cut[0].x = I.x * e; _cut[0].y = I.y * e; _cut[0].r = 0.62 + (I.rMin - 0.62) * e;
+    _cut[0].x = I.x * e; _cut[0].y = I.y * e; _cut[0].r = 0.62 + (I.rMin * keyMul() - 0.62) * e;
     return _cut;
   }
-  function bladeAng(w, i){ var B = w.blades; return B.b0 + i * TAU / B.k + B.omega * S.runT; }
+  function bladeAng(w, i){ var B = w.blades; return B.b0 + i * TAU / B.k + B.omega * S.hazT; }   // (the hazard clock: see FREEZE)
   function feedWalls(){
     for(var i = 0; i < R.walls.length; i++){
       var w = R.walls[i], u = w.mesh.material.uniforms, j;
@@ -94466,14 +94683,17 @@ var RUNNER = (function(){
   var PATTERNS = {
     // THE BULKHEADS — giant walls, each with three openings you fit through; one of them is threaded with
     // coins. Then another, with its openings somewhere else.
+    // (gp/gh lay the SAFE LINE's guide — see THE UPGRADES II — and do nothing unless it was taken.)
     bulkheads: { w: 3, min: 4, max: 16, sec: function(d){ return 0.6 + (3 + (d > 0.6 ? 1 : 0)) * (0.85 - 0.2 * d) + 0.3; },
       spawn: function(z, n, d, ups){
-        var cnt = 3 + (d > 0.6 ? 1 : 0), gap = ups * (0.85 - 0.2 * d), r = 0.08 + 0.03 * (1 - d), zz = z + ups * 0.6, near = S.th;
+        var cnt = 3 + (d > 0.6 ? 1 : 0), gap = ups * (0.85 - 0.2 * d), r = 0.08 + 0.03 * (1 - d), zz = z + ups * 0.6, near = S.th, gth = S.th;
+        gp(z, S.th);
         for(var k = 0; k < cnt; k++){
           var ths = spreadAngles(3, 0.9, near, Math.PI);
           addWall(zz, n, { holes: ths.map(function(t){ return { th: t, r: r }; }) });
           var lucky = ths[Math.floor(Math.random() * ths.length)];
           coinLine(function(){ return lucky; }, zz - ups * 0.3, zz + ups * 0.12, ups);
+          gth = nearestAng(ths, gth); gp(zz - ups * 0.32, gth); gp(zz + 0.04, gth);   // (the guide: the nearest opening)
           near = ths[0];
           zz += gap;
         }
@@ -94484,11 +94704,13 @@ var RUNNER = (function(){
     iris: { w: 2.5, min: 4, max: 16, sec: function(d){ return 3.6 + (d > 0.5 ? 1.2 : 0); },
       spawn: function(z, n, d, ups){
         var span = TAU / n, cnt = d > 0.5 ? 2 : 1, zz = z + ups * 3.2, th = S.th;
+        gp(z, S.th);
         for(var k = 0; k < cnt; k++){
           th = th + (Math.random() < 0.5 ? -1 : 1) * span * (1.2 + Math.random() * 1.6);
           addWall(zz, n, { iris: { th: th, rMin: 0.075 + 0.03 * (1 - d), open: ups * 2.8, close: ups * 0.35 } });
           var tt = th;
           coinLine(function(){ return tt; }, zz - ups * 0.45, zz + ups * 0.15, ups);
+          gp(zz - ups * 0.6, tt); gp(zz + 0.05, tt);
           zz += ups * 1.2;
         }
         return zz - ups * 1.2 + ups * 0.4;
@@ -94504,6 +94726,7 @@ var RUNNER = (function(){
                   w0: Math.max(0.3, span * 0.75), w1: 0.10 + 0.07 * (1 - d) };
         R.pits.push({ z0: z0, z1: z1, strips: [s] });
         coinLine(function(zc){ return stripAt(s, zc); }, z0 + ups * 0.15, z1 - ups * 0.1, ups * 1.3);
+        gp(z, S.th); for(var gz = z0; gz <= z1; gz += ups * 0.08) gp(gz, stripAt(s, gz));
         return z1 + ups * 0.4;
       } },
     // THE FORK — three paths over a pit; all but one run out. One carries coins — sometimes the safe one,
@@ -94522,6 +94745,7 @@ var RUNNER = (function(){
         R.pits.push({ z0: z0, z1: z1, strips: strips });
         var cs = strips[coined];
         coinLine(function(){ return cs.th0; }, z0 + ups * 0.15, Math.min(cs.zB, z1) - ups * 0.12, ups);
+        gp(z, S.th); gp(z0 - ups * 0.05, ang[safe]); gp(z1, ang[safe]);   // (the guide takes the path that goes all the way)
         return z1 + ups * 0.4;
       } },
     // THE CORKSCREW — rows of gates with one wall open, and the open wall steps one round the tube each
@@ -94529,11 +94753,13 @@ var RUNNER = (function(){
     corkscrew: { w: 2, min: 5, max: 10, sec: function(d){ return 0.4 + (6 + Math.round(3 * d)) * (0.55 - 0.12 * d) + 0.3; },
       spawn: function(z, n, d, ups){
         var rowsN = 6 + Math.round(3 * d), gap = ups * (0.55 - 0.12 * d), dir = Math.random() < 0.5 ? -1 : 1, j0 = wallIdx(S.th, n), zz = z + ups * 0.4;
+        gp(z, S.th);
         for(var k = 0; k < rowsN; k++){
           var open = ((j0 + dir * k) % n + n) % n;
           for(var j = 0; j < n; j++) if(j !== open) addObs('gate', j, zz, n);
           var th = Math.round(S.th / (TAU / n)) * (TAU / n) + dir * k * (TAU / n);
           placeCoin(th, zz - gap * 0.3); placeCoin(th, zz);
+          gp(zz - gap * 0.55, th); gp(zz + 0.03, th);
           zz += gap;
         }
         return zz - gap + ups * 0.3;
@@ -94544,8 +94770,11 @@ var RUNNER = (function(){
     slalom: { w: 1.5, min: 4, max: 10, sec: function(d){ return 0.4 + (6 + Math.round(3 * d)) * (0.42 - 0.08 * d) + 0.3; },
       spawn: function(z, n, d, ups){
         var cnt = 6 + Math.round(3 * d), gap = ups * (0.42 - 0.08 * d), zz = z + ups * 0.4, left = Math.random() < 0.5;
+        var span = TAU / n, jg = Math.round(S.th / span), lim = P.apothem - hover(), uo = 0.55 * halfWn(n) * (1 - hover() / P.apothem);
+        gp(z, S.th);
         for(var k = 0; k < cnt; k++){
           for(var j = 0; j < n; j++) addObs('half', j, zz, n, { left: left });
+          var go = jg * span + Math.atan((left ? 1 : -1) * uo / lim); gp(zz - gap * 0.45, go); gp(zz + 0.03, go);   // (the open side)
           left = !left; zz += gap;
         }
         return zz - gap + ups * 0.3;
@@ -94555,20 +94784,30 @@ var RUNNER = (function(){
     hurdles: { w: 1.5, min: 4, max: 10, sec: function(d){ return 0.5 + 5 * (0.8 - 0.15 * d) + 0.3; },
       spawn: function(z, n, d, ups){
         var gap = ups * (0.8 - 0.15 * d), zz = z + ups * 0.5, th = Math.round(S.th / (TAU / n)) * (TAU / n);
+        gp(z, S.th); gp(z + ups * 0.3, th);
         for(var k = 0; k < 5; k++){
           for(var j = 0; j < n; j++) addObs('bar', j, zz, n);
           for(var c = -2; c <= 2; c++){ var f = c / 2.5; placeCoin(th, zz + c * ups * 0.1, P.coinLift + 0.11 * (1 - f * f)); }
+          gh(zz);
           zz += gap;
         }
+        gp(zz - gap + ups * 0.3, th);
         return zz - gap + ups * 0.3;
       } },
-    // THE BLADES — walls made of turning blades: be where they are not when you reach each one.
+    // THE BLADES — walls made of turning blades: be where they are not when you reach each one. (They turn on the
+    // hazard clock, S.hazT — FREEZE slows it.)
     blades: { w: 1.5, min: 4, max: 16, sec: function(d){ return 0.8 + 3 * 0.9 + 0.3; },
       spawn: function(z, n, d, ups){
-        var zz = z + ups * 0.8, dir = Math.random() < 0.5 ? -1 : 1;
+        var zz = z + ups * 0.8, dir = Math.random() < 0.5 ? -1 : 1, gth = S.th;
+        gp(z, S.th);
         for(var k = 0; k < 3; k++){
-          var kb = 2 + (d > 0.5 && Math.random() < 0.5 ? 1 : 0);
-          addWall(zz, n, { blades: { k: kb, half: Math.PI / kb * (0.42 + 0.12 * d), omega: dir * (0.8 + 0.9 * d), b0: Math.random() * TAU } });
+          var kb = 2 + (d > 0.5 && Math.random() < 0.5 ? 1 : 0), B = { k: kb, half: Math.PI / kb * (0.42 + 0.12 * d), omega: dir * (0.8 + 0.9 * d), b0: Math.random() * TAU };
+          addWall(zz, n, { blades: B });
+          if(GD){   // the guide: the gap the ship will meet, at the moment it gets there
+            var hc = hazAt(arriveT(zz)), cands = [];
+            for(var q = 0; q < kb; q++) cands.push(B.b0 + q * TAU / kb + B.omega * hc + TAU / (2 * kb));
+            gth = nearestAng(cands, gth); gp(zz - ups * 0.35, gth); gp(zz + 0.04, gth);
+          }
           dir = -dir; zz += ups * 0.9;
         }
         return zz - ups * 0.9 + ups * 0.3;
@@ -94636,7 +94875,7 @@ var RUNNER = (function(){
   function pistonH(o, t){
     var M = o.mov;
     if(M.kind === 'rise') return M.H * smooth(M.zA, M.zB, S.z);
-    var c = ((t == null ? S.runT : t) - M.t0) / M.T + M.ph; c -= Math.round(c);   // −½ … ½: 0 = the middle of the open phase
+    var c = ((t == null ? S.hazT : t) - M.t0) / M.T + M.ph; c -= Math.round(c);   // −½ … ½: 0 = the middle of the open phase
     return M.H * (c >= 0 ? smooth(0.18, 0.26, c) : smooth(0.18, 0.34, -c));
   }
   function pistonSet(o){
@@ -94705,7 +94944,7 @@ var RUNNER = (function(){
     if(!m){ m = new THREE.Mesh(R.laserGeo, laserMat()); m.frustumCulled = false; m.renderOrder = 2; R.scene.add(m); }
     m.visible = true; return m;
   }
-  function laserAng(L, b){ return L.th0 + b * TAU / L.k + L.om * (S.runT - L.t0); }
+  function laserAng(L, b){ return L.th0 + b * TAU / L.k + L.om * (S.hazT - L.t0); }
   function feedLasers(){
     for(var i = 0; i < R.lasers.length; i++){
       var L = R.lasers[i], sh = regShape(L.n);
@@ -94890,6 +95129,7 @@ var RUNNER = (function(){
     var lm = takeLaser(); lm.visible = false; R.laserPool.push(lm);                       // standing by, so the warm-up
     var K = strutKit(), sm = new THREE.Mesh(K.geo, K.mat); sm.visible = false; R.scene.add(sm); K.pool.push(sm);   // links their programs
     buildChoice();   // (THE UPGRADES: the three tokens, standing by)
+    buildUpg2();     // (THE UPGRADES II: the twin's and the guide's materials, standing by)
   }
   function clearPat2(){ if(!R.lasers) return; freeLasers(true); R.pn.length = 0; R.panels.count = 0; choiceReset(); }
 
@@ -94897,35 +95137,40 @@ var RUNNER = (function(){
     // THE CRUSHER — rows of pistons on every wall, pumping on one beat: odd walls down while even walls are up,
     // then the other way. The rows are laid where the ship will be on the beat, so at each one half the walls
     // are open — the other half from the row before, or the same half again: watch the beat, switch or stay.
-    // Coins zig-zag through the open walls.
-    crusher: { w: 2, min: 4, max: 12, sec: function(d){ return 1.0 + 2 * (3 + Math.round(2 * d)) * (0.55 - 0.12 * d) + 0.5; },   // (rows ≤ 2 half-beats apart)
+    // Coins zig-zag through the open walls. (The beat is on the hazard clock, S.hazT: FREEZE slows it, and the
+    // rows are laid that much further apart.)
+    crusher: { w: 2, min: 4, max: 12, sec: function(d){ return 1.0 + 2 * (3 + Math.round(2 * d)) * (0.55 - 0.12 * d) / hazRate() + 0.5; },   // (rows ≤ 2 half-beats apart)
       spawn: function(z, n, d, ups){
-        var span = TAU / n, rowsN = 4 + Math.round(2 * d), hp = 0.55 - 0.12 * d, z0 = z + ups * 1.0, t0 = arriveT(z0);
+        var span = TAU / n, rowsN = 4 + Math.round(2 * d), hp = 0.55 - 0.12 * d, z0 = z + ups * 1.0, t0 = hazAt(arriveT(z0));
         var M = 0, zz = z0, jc = Math.round(S.th / span), dir = Math.random() < 0.5 ? -1 : 1;
         function par(j){ return (((j % n) + n) % n) % 2; }
+        gp(z, S.th);
         for(var k = 0; k < rowsN; k++){
-          if(k){ M += Math.random() < 0.6 ? 1 : 2; zz = zAtT(t0 + M * hp); }
+          if(k){ M += Math.random() < 0.6 ? 1 : 2; zz = zAtT(runAtHaz(t0 + M * hp)); }
           for(var w = 0; w < n; w++) addPiston(w, zz, n, { kind: 'beat', t0: t0, T: 2 * hp, ph: (w % 2) * 0.5 });
           // down at this row: the walls whose parity is M's (an odd tube has two even walls side by side)
           if(par(jc) !== M % 2){ if(Math.random() < 0.25) dir = -dir; jc += dir; if(par(jc) !== M % 2) jc += dir; }
           placeCoin(jc * span, zz - ups * 0.12); placeCoin(jc * span, zz);
+          gp(zz - ups * 0.24, jc * span); gp(zz + 0.03, jc * span);
         }
         return zz + ups * 0.4;
       } },
     // THE LASERS — beams down the tube a bar's height off the walls, turning round it together. You come in
     // halfway between two; hop each as it sweeps under you (or run round with them). A third beam, faster, as
-    // it gets hard. Coin arcs mark where each beam crosses a ship that holds its line.
+    // it gets hard. Coin arcs mark where each beam crosses a ship that holds its line. (Hazard clock: see crusher.)
     lasers: { w: 2, min: 4, max: 16, sec: function(d){ return 0.8 + 3.2 + d + 0.3; },
       spawn: function(z, n, d, ups){
         var k = 2 + (d > 0.4 ? 1 : 0), om = (Math.random() < 0.5 ? -1 : 1) * (1.6 + 0.8 * d);   // ≥ 0.87 s between crossings: a hop is 0.52
-        var z0 = z + ups * 0.8, z1 = z0 + ups * (3.2 + d), tA = arriveT(z0), tB = arriveT(z1);
-        var L = { z0: z0, z1: z1, n: n, k: k, om: om, t0: S.runT, th0: S.th + Math.PI / k - om * (tA - S.runT), meshes: [] };
+        var z0 = z + ups * 0.8, z1 = z0 + ups * (3.2 + d), hA = hazAt(arriveT(z0)), hB = hazAt(arriveT(z1)), rt = hazRate();
+        var L = { z0: z0, z1: z1, n: n, k: k, om: om, t0: S.hazT, th0: S.th + Math.PI / k - om * (hA - S.hazT), meshes: [] };
         for(var b = 0; b < k; b++) L.meshes.push(takeLaser());
         R.lasers.push(L);
         var per = TAU / (k * Math.abs(om)), th = S.th;
-        for(var tc = tA + per / 2; tc < tB - 0.15; tc += per){
-          var zc = zAtT(tc);
+        gp(z, S.th); gp(z1, th);
+        for(var hc = hA + per / 2; hc < hB - 0.15 * rt; hc += per){
+          var zc = zAtT(runAtHaz(hc));
           for(var c = -2; c <= 2; c++){ var f = c / 2.5; placeCoin(th, zc + c * ups * 0.09, P.coinLift + 0.1 * (1 - f * f)); }
+          gh(zc);
         }
         return z1 + ups * 0.3;
       } },
@@ -94936,7 +95181,7 @@ var RUNNER = (function(){
       spawn: function(z, n, d, ups){
         var span = TAU / n, K = 6 + Math.round(2 * d), ell = ups * (0.5 - 0.12 * d), z0 = z + ups * 1.2;
         var lo = Math.round(S.th / span) - (Math.random() < 0.5 ? 1 : 0), dir = Math.random() < 0.5 ? -1 : 1;
-        var p = { z0: z0, z1: z0 + K * ell, strips: [], segs: [], n: n, front: ups * (1.1 - 0.3 * d) }, k;
+        var p = { z0: z0, z1: z0 + K * ell, strips: [], segs: [], n: n, front: ups * (1.1 - 0.3 * d) }, k, sh = S.th;
         for(k = 0; k < K; k++){
           if(k){ if(Math.random() < 0.3) dir = -dir; lo += dir; }
           var zA = z0 + k * ell, zB = zA + ell, sw = span + 0.03;
@@ -94944,10 +95189,13 @@ var RUNNER = (function(){
           p.strips.push({ zA: zA - 0.03, zB: zB + 0.03, th0: (lo + 0.5) * span, drift: 0, amp: 0, freq: 0, w0: sw, w1: sw });
         }
         R.pits.push(p);
+        gp(z, S.th);
         for(k = 0; k + 1 < K; k++){
-          var a = p.segs[k], sh = (p.segs[k + 1].lo === a.lo + 1 ? a.lo + 1 : a.lo) * span;
+          var a = p.segs[k]; sh = (p.segs[k + 1].lo === a.lo + 1 ? a.lo + 1 : a.lo) * span;
           coinLine(function(){ return sh; }, a.zA + ell * 0.45, a.zB + ell * 0.15, ups);
+          gp(a.zA + ell * 0.3, sh); gp(a.zB + ell * 0.02, sh);
         }
+        gp(p.z1, sh);
         return p.z1 + ups * 0.4;
       } },
     // THE MEMORY GATES — the route is shown first: a lit door frame on the one open wall of each row ahead, and
@@ -94958,11 +95206,13 @@ var RUNNER = (function(){
         var span = TAU / n, rowsN = 4 + Math.round(d), gap = ups * (0.45 - 0.07 * d), z0 = z + ups * 1.6;
         var dark = { zA: z0 - ups * (0.75 - 0.15 * d) }; dark.zB = dark.zA + ups * 0.25;
         var j = Math.round(S.th / span) + (Math.random() < 0.5 ? -1 : 1), zz = z0;
+        gp(z, S.th);
         for(var k = 0; k < rowsN; k++){
           if(k) j += (Math.random() < 0.5 ? -1 : 1) * (n >= 8 && Math.random() < 0.4 ? 2 : 1);
           var open = ((j % n) + n) % n;
           for(var w = 0; w < n; w++) if(w !== open) addPiston(w, zz, n, { kind: 'rise', zA: dark.zA, zB: dark.zB });
           addFrame(open * span, zz, n, dark);
+          gp(zz - gap * 0.5, j * span); gp(zz + 0.03, j * span);
           zz += gap;
         }
         var jt = j * span;   // a reward for getting all the way: coins out of the last opening
@@ -94978,12 +95228,14 @@ var RUNNER = (function(){
         var z0 = z + ups * 0.3, zr = z0 + inL + ups * 0.3, z1 = zr + (rowsN - 1) * gap + ups * 0.4 + inL;
         if(!insertSqueeze(z0, z1, sMin, inL, inL)) return z;
         var kS = d < 0.3 ? 2 : 3, sp = Math.PI / kS, off = S.th + sp / 2, path = S.th;
+        gp(z, S.th);
         for(var r = 0; r < rowsN; r++){
           off += (Math.random() < 0.5 ? -1 : 1) * sp * (0.3 + 0.35 * Math.random());
           var zs = zr + r * gap;
           for(var q = 0; q < kS; q++) addStrut(off + q * sp, zs, n);
           path = off + (Math.round((path - off) / sp - 0.5) + 0.5) * sp;   // the gap between spokes nearest the last
           placeCoin(path, zs - gap * 0.35); placeCoin(path, zs);
+          gp(zs - gap * 0.4, path); gp(zs + 0.03, path);
         }
         return z1 + ups * 0.3;
       } },
@@ -94995,9 +95247,11 @@ var RUNNER = (function(){
         var C = { L: L, n: n, ph: Math.random() < 0.5 ? 0 : 1, eps: Math.min(0.08, L * 0.06) };
         R.pits.push({ z0: z0, z1: z1, strips: [], chk: C });
         var j = wallIdx(S.th, n), th = Math.round(S.th / span) * span;
+        gp(z, S.th); gp(z0 - ups * 0.2, th); gp(z1, th);
         for(var k = 0; k < K; k++) if((j + k + C.ph) % 2 === 1){
           var zc = z0 + (k + 0.5) * L;
           for(var c = -1; c <= 1; c++) placeCoin(th, zc + c * L * 0.3, P.coinLift + 0.1 * (1 - c * c * 0.55));
+          gh(zc);
         }
         return z1 + ups * 0.4;
       } }
@@ -95048,7 +95302,7 @@ var RUNNER = (function(){
   function upgMul(k){ return 1 + 0.75 * upgN(k); }                        // core spacing ÷ this
   function magR(){ return P.coinMagnet * (1 + 0.7 * upgN('magnet')); }
   function coinOdds(){ return Math.min(1, P.coinChance + 0.15 * upgN('coins')); }
-  function upgNeed(){ return P.upgFirst + P.upgStep * (S.upgK || 0); }
+  function upgNeed(){ return Math.max(5, Math.round((P.upgFirst + P.upgStep * (S.upgK || 0)) * cheapMul())); }   // (CHEAPER UPGRADES)
   function upgName(key, lvl){ var U = UPG[key]; return U.nameAt ? U.nameAt(lvl - 1) : U.name + (lvl > 1 ? ' ' + ROMAN[lvl - 1] : ''); }
   // A coin taken (from collect): one more on the meter — not while a hallway is coming or running. (It counts COINS,
   // not their worth: far out a coin is worth up to 12×, and the meter would fill 12× as fast. choiceTick opens the
@@ -95059,14 +95313,19 @@ var RUNNER = (function(){
   }
   // Three different upgrades that can still be taken (a maxed one is not offered; speed cores not at top speed).
   function pickUpgrades(n){
-    var pool = [], k, out = [];
+    var pool = [], k, out = [], cols = {};
     for(k in UPG){
-      if(upgN(k) >= UPG[k].max) continue;
+      if(upgN(k) >= UPG[k].max || !upgOK(k)) continue;
       if(k === 'speed' && speedMul() >= P.speedMaxMul - 1e-6) continue;
       pool.push(k);
     }
-    while(out.length < n && pool.length) out.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
-    while(out.length < n) out.push('shield');
+    // three of them — of three different colours where the pool allows: each wall wears its upgrade's colour
+    while(out.length < n && pool.length){
+      var fresh = pool.filter(function(q){ return !cols[UPG[q].rgb]; }), from = fresh.length ? fresh : pool;
+      var pk = from[Math.floor(Math.random() * from.length)];
+      out.push(pk); cols[UPG[pk].rgb] = 1; pool.splice(pool.indexOf(pk), 1);
+    }
+    while(out.length < n) out.push(upgOK('shield') ? 'shield' : 'value');
     return out;
   }
 
@@ -95094,6 +95353,7 @@ var RUNNER = (function(){
   }
   // Each step (from stepMovers): the air jumps come back on landing; the hallway's phases.
   function choiceTick(){
+    upg2Tick();   // (THE UPGRADES II: the hazard clock, the slam's landing, hover, magnets, the twin, combo, near misses)
     if(S.grounded) S.airJ = upgN('djump');
     // the meter full: the hallway — but never while a slingshot shot is being aimed or is in the air (it has to come
     // down on a tube's wall, not in a fold)
@@ -95119,6 +95379,7 @@ var RUNNER = (function(){
     if(key === 'speed' && S.nextSpeed > zz) S.nextSpeed = zz;        // (the next one comes soon after, not as scheduled)
     if(key === 'charge' && S.nextCharge > zz) S.nextCharge = zz;
     if(key === 'djump' && S.grounded) S.airJ = upgN('djump');
+    applyUpg2(key, lvl);
     _p.copy(gameMode.ship.position); burst(_p, 34, true, R.upgCol[key]);
     R.flash = Math.max(R.flash, 0.22);
     if(typeof ckptSpinKick === 'function') ckptSpinKick(1.4);
@@ -95127,7 +95388,7 @@ var RUNNER = (function(){
   function choiceReset(){
     if(!S) return;
     S.upg = { magnet: 0, shield: 0, speed: 0, charge: 0, coins: 0, djump: 0 };
-    S.upgC = 0; S.upgK = 0; S.choice = null; S.airJ = 0;
+    S.upgC = 0; S.upgK = 0; S.choice = null; S.airJ = 0; upg2Reset();
     if(R.chItems) for(var i = 0; i < 3; i++) R.chItems[i].mesh.visible = false;
     R.hudA = 0; R.upgListShown = null;
     if(R.hudCx && R.hudDrawn){ R.hudCx.setTransform(1, 0, 0, 1, 0, 0); R.hudCx.clearRect(0, 0, R.hudCv.width, R.hudCv.height); R.hudDrawn = false; }
@@ -95146,9 +95407,10 @@ var RUNNER = (function(){
   var DJ_COL = new THREE.Color(0.75, 0.53, 1.0);
   function airJump(){
     S.airJ--; S.jumpBuf = -1e9;
-    var gx = Math.sin(S.g), gy = -Math.cos(S.g), vn = S.vx * gx + S.vy * gy;
-    S.vx -= gx * vn; S.vy -= gy * vn;              // the fall (or what is left of the rise) stopped…
-    S.vx -= gx * JI(); S.vy -= gy * JI();          // …and a hop's impulse up, from here
+    // The fall stopped, and a hop's speed up from here — but never LESS than the ship is already rising at (an
+    // island ramp's launch keeps its own: replacing it with a hop's cut the climb from 0.042 to 0.017 a frame).
+    var gx = Math.sin(S.g), gy = -Math.cos(S.g), vn = S.vx * gx + S.vy * gy, up = Math.max(-vn, JI());
+    S.vx -= gx * (vn + up); S.vy -= gy * (vn + up);
     _p.copy(gameMode.ship.position).addScaledVector(gameMode.surfaceState.groundNormal, -0.012);
     burst(_p, 18, true, DJ_COL);
   }
@@ -95240,7 +95502,7 @@ var RUNNER = (function(){
     R.elUpgL = el('span', '', lb, 'UPGRADE'); R.elUpgR = el('span', '', lb, '');
     // What this run has: each upgrade's icon in its colour, its level beside it past the first.
     R.elUpgList = el('div', T + 'left:calc(14px + env(safe-area-inset-left, 0px));top:calc(15px + env(safe-area-inset-top, 0px));' +
-      'display:flex;gap:9px;align-items:center;font-size:9px;letter-spacing:0.08em;', L);
+      'display:flex;flex-wrap:wrap;max-width:132px;gap:6px 9px;align-items:center;font-size:9px;letter-spacing:0.08em;', L);
     R.upgNeedShown = -1; R.upgListShown = null; R.upgColShown = null; R.hudNum = -1; R.hudPulse = 0;
   }
   function upgSvg(key, px){
@@ -95284,6 +95546,7 @@ var RUNNER = (function(){
     // the shop's and the card's, written every frame)
     var v = hall && !S.dead ? 'hidden' : '';
     if(R.elDist.style.visibility !== v){ R.elDist.style.visibility = R.elCoins.style.visibility = v; if(R.elLives) R.elLives.style.visibility = v; if(R.elTier) R.elTier.style.visibility = v; }
+    upg2Dom(W, H);
     hudDraw(W, H);
   }
   // The hallway's HUD, drawn each frame while it is up.
@@ -95396,6 +95659,408 @@ var RUNNER = (function(){
     c.fillText(s, x, y);
   }
 
+  // ════════════════════════════════════════ THE UPGRADES II ════════════════════════════════════════
+  // Seventeen more per-run upgrades, offered in the same choice hallways (see THE UPGRADES):
+  //   COINS  COIN VALUE (every coin worth ×1.5, then ×2) · COMBO (an unbroken run of coins pays more and more;
+  //          a coin you pass within reach and leave breaks it) · CHEAPER UPGRADES (the meter needs 25%, then 44%,
+  //          fewer) · NEAR MISS (skim an obstacle — pass within a hair of it — for coins) · GLASS CANNON (no lives
+  //          for the rest of the run, but every coin worth ×2)
+  //   CORES  LONG CHARGE (a charge lasts ×1.5, then ×2) · CHAIN CHARGE (each thing smashed while charged gives
+  //          charge time back) · CORE MAGNET (cores are pulled in like coins)
+  //   HAZARD FREEZE (blades, pistons and lasers on a slower clock — S.hazT, ×0.7 then ×0.5; the patterns laid on
+  //          a beat are laid from that clock, so they stay fair) · BULKHEAD KEY (bulkhead and iris openings
+  //          bigger) · SAFE LINE (each pattern lays a faint guide line through itself: round to the opening,
+  //          along the path, up in an arc where a hop is due)
+  //   MOVES  QUICK STEER (a stiffer steer) · HOVER (in the air, hold the thumb still: most of gravity is held
+  //          off on the way down) · GRAVITY FLIP (swipe down while still rising: gravity turns to the far wall
+  //          and you fall up onto it — falling, the swipe is a slam as before) · GROUND POUND (a slam's landing
+  //          breaks what is just ahead on your wall) · SPRING SLAM (a slam's landing throws you into a high hop)
+  //          · TWIN SHIP (a ghost of the ship rides the opposite wall and takes the coins it passes)
+  var UPG2 = {
+    value:   { name: 'COIN VALUE', rgb: '255,205,90', max: 2, icon: 'M12 4a8 8 0 1 0 0.01 0z M9 9l6 6 M15 9l-6 6',
+               desc: function(l){ return ['EVERY COIN', 'WORTH ×' + (l ? '2' : '1.5')]; } },
+    combo:   { name: 'COMBO', rgb: '255,205,90', max: 2, icon: 'M4 20v-3 M9 20v-7 M14 20v-11 M19 20v-15',
+               desc: function(l){ return ['UNBROKEN STRINGS', 'PAY UP TO ×' + (l ? '3' : '2')]; } },
+    cheap:   { name: 'CHEAPER UPGRADES', rgb: '255,205,90', max: 2, icon: 'M4 18h16 M8 8l4 4 4-4 M12 3v9',
+               desc: function(l){ return ['THE METER NEEDS', (l ? '44' : '25') + '% FEWER COINS']; } },
+    near:    { name: 'NEAR MISS', rgb: '255,110,150', max: 2, icon: 'M14 4h6v6h-6z M3 21c6-1 10-5 11-11',
+               desc: function(l){ return ['SKIM AN OBSTACLE', '+' + 2 * (l + 1) + ' COINS']; } },
+    glass:   { name: 'GLASS CANNON', rgb: '255,110,150', max: 1, icon: 'M12 3l9 9-9 9-9-9z M12 3l-2 7 4 3-2 8',
+               desc: function(){ return ['NO SHIELDS LEFT,', 'COINS WORTH ×2']; } },
+    longch:  { name: 'LONG CHARGE', rgb: '255,150,60', max: 2, icon: 'M3 7h15v10H3z M21 10v4 M6 10v4 M10 10v4 M14 10v4',
+               desc: function(l){ return ['A CHARGE LASTS', '×' + (l ? '2' : '1.5') + ' AS LONG']; } },
+    chain:   { name: 'CHAIN CHARGE', rgb: '255,150,60', max: 2, icon: 'M9 15l-2 2a3 3 0 0 1-4-4l2-2a3 3 0 0 1 4 0 M15 9l2-2a3 3 0 0 1 4 4l-2 2a3 3 0 0 1-4 0 M9.5 14.5l5-5',
+               desc: function(l){ return ['EACH SMASH WHILE', 'CHARGED: +' + (0.4 * (l + 1)).toFixed(1) + ' S']; } },
+    coremag: { name: 'CORE MAGNET', rgb: '225,236,255', max: 2, icon: 'M5 3v7a5 5 0 0 0 10 0V3 M3 6h4 M13 6h4 M19 14l3 3-3 3-3-3z',
+               desc: function(l){ return ['CORES ARE PULLED', l ? 'IN FROM FURTHER' : 'IN LIKE COINS']; } },
+    guide:   { name: 'SAFE LINE', rgb: '16,196,178', max: 1, icon: 'M4 20h0.01 M8 16h0.01 M12 12h0.01 M16 8h0.01 M20 4h0.01',
+               desc: function(){ return ['A GUIDE LINE', 'THROUGH PATTERNS']; } },
+    twin:    { name: 'TWIN SHIP', rgb: '225,236,255', max: 1, icon: 'M6 9l6-5 6 5 M6 15l6 5 6-5 M12 4v16',
+               desc: function(){ return ['A GHOST TWIN', 'TAKES COINS TOO']; } },
+    freeze:  { name: 'FREEZE', rgb: '140,230,255', max: 2, icon: 'M12 2v20 M3.3 7l17.4 10 M3.3 17l17.4-10',
+               desc: function(l){ return ['BLADES, PISTONS,', 'LASERS ×' + (l ? '0.5' : '0.7') + ' SPEED']; } },
+    key:     { name: 'BULKHEAD KEY', rgb: '140,230,255', max: 2, icon: 'M8 15a4 4 0 1 0 0.01 0z M11 12l9-9 M16 7l3 3 M13.5 9.5l2 2',
+               desc: function(l){ return ['BULKHEAD + IRIS', 'OPENINGS ×' + (1 + 0.3 * (l + 1)).toFixed(1)]; } },
+    flip:    { name: 'GRAVITY FLIP', rgb: '190,135,255', max: 1, icon: 'M8 20V5 M4 9l4-4 4 4 M16 4v15 M12 15l4 4 4-4',
+               desc: function(){ return ['SWIPE DOWN AS YOU', 'RISE: FALL UP']; } },
+    hover:   { name: 'HOVER', rgb: '190,135,255', max: 1, icon: 'M4 9h16 M6 13c2 2 4 2 6 0s4-2 6 0 M8 17c1.3 1.3 2.7 1.3 4 0s2.7-1.3 4 0',
+               desc: function(){ return ['HOLD STILL IN THE', 'AIR TO GLIDE']; } },
+    steer:   { name: 'QUICK STEER', rgb: '110,180,255', max: 2, icon: 'M3 12h18 M7 8l-4 4 4 4 M17 8l4 4-4 4',
+               desc: function(l){ return ['SHARPER STEERING', '×' + (l ? '1.7' : '1.35') + ' RESPONSE']; } },
+    pound:   { name: 'GROUND POUND', rgb: '255,110,150', max: 2, icon: 'M12 3v10 M8 9l4 4 4-4 M4 18h16 M7 18l-2 3 M17 18l2 3',
+               desc: function(l){ return ['A SLAM BREAKS', l ? 'MORE OF WHAT IS AHEAD' : 'WHAT IS JUST AHEAD']; } },
+    spring:  { name: 'SPRING SLAM', rgb: '190,135,255', max: 1, icon: 'M6 20h12 M7 17h10 M7 14h10 M12 3v8 M9 6l3-3 3 3',
+               desc: function(){ return ['A SLAM LANDING', 'BOUNCES YOU HIGH']; } }
+  };
+  for(var _u2 in UPG2) UPG[_u2] = UPG2[_u2];
+
+  // ── The numbers each upgrade turns. ──
+  function cheapMul(){ return [1, 0.75, 0.5625][Math.min(2, upgN('cheap'))]; }
+  function comboMul(){ var l = upgN('combo'); return l ? 1 + 0.04 * Math.min(S.combo || 0, 25 * l) : 1; }
+  function worthMul(){ return (1 + 0.5 * upgN('value')) * (upgN('glass') ? 2 : 1) * comboMul(); }
+  // A coin's worth (or a reward's) through the multipliers, with the fraction carried so the count stays whole.
+  function coinWorth(m, isCoin){
+    if(isCoin && upgN('combo')) S.combo = (S.combo || 0) + 1;
+    S.coinFrac = (S.coinFrac || 0) + m * worthMul();
+    var n = Math.floor(S.coinFrac + 1e-9); S.coinFrac -= n;
+    return n;
+  }
+  function chargeDur(){ return P.chargeSec * (1 + 0.5 * upgN('longch')); }
+  function hazRate(){ return [1, 0.7, 0.5][Math.min(2, upgN('freeze'))]; }
+  function hazAt(tRun){ return S.hazT + (tRun - S.runT) * hazRate(); }      // the hazard clock when the run clock is tRun
+  function runAtHaz(h){ return S.runT + (h - S.hazT) / hazRate(); }          // …and back
+  function keyMul(){ return 1 + 0.3 * upgN('key'); }
+  // Of a list of angles, the one nearest ref — unwrapped next to it.
+  function nearestAng(list, ref){ var b = ref, bd = 1e9; for(var i = 0; i < list.length; i++){ var d = Math.abs(wrapPi(list[i] - ref)); if(d < bd){ bd = d; b = ref + wrapPi(list[i] - ref); } } return b; }
+  // Which upgrades a hallway may offer now (beyond THE UPGRADES' own rules).
+  function upgOK(k){ if(k === 'shield' && upgN('glass')) return false; return true; }
+  // What an upgrade does the moment it is taken (from applyUpg).
+  function applyUpg2(key, lvl){
+    if(key === 'glass'){ S.lives = 0; R.lifePop = 1; }
+    if(key === 'steer') P.steerHz = R.steerHz0 * (1 + 0.35 * lvl);
+    if(key === 'twin') buildTwin();
+    if(key === 'longch' && S.chargeT > 0) S.chargeMax = chargeDur();
+  }
+  function upg2Reset(){
+    S.combo = 0; S.coinFrac = 0; S.hazT = 0; S.slamF = false; S.wasAir = false; S.flipped = false; S.chargeMax = 0;
+    S.nm1 = S.nm2 = null; S.smashSeen = S.smashed || 0; S.hoverF = 0;
+    if(R.steerHz0 == null) R.steerHz0 = P.steerHz;
+    P.steerHz = R.steerHz0;
+    if(R.twin) R.twin.visible = false;
+    if(R.guides){ for(var i = 0; i < R.guides.length; i++) dropGuide(R.guides[i]); R.guides.length = 0; }
+    R.nearT = 0;
+  }
+
+  // ── Every step (from choiceTick, after the physics, before the hit test): the hazard clock, the slam's landing,
+  // hover, the core magnet, the twin's coins, the combo's misses, the near misses, the chain. ──
+  function upg2Tick(){
+    if(!S.dead) S.hazT += hazRate() / 60;
+    if(S.grounded) S.flipped = false;
+    var landedNow = S.wasAir && (S.grounded || S.airF === 0);   // (airF 0: a buffered jump went straight back up)
+    if(landedNow && S.slamF && !S.dead){ S.slamF = false; slamLanded(); }
+    if(S.grounded) S.slamF = false;
+    hoverTick(); coreMagTick(); twinTick(); comboTick(); nearTick(); chainTick();
+    S.wasAir = !S.grounded;
+  }
+  // GROUND POUND / SPRING SLAM — on the landing of a slam (on a tube's wall or an island's ground alike).
+  var POUND_COL = new THREE.Color(1.0, 0.45, 0.6);
+  function slamLanded(){
+    var lp = upgN('pound'), ls = upgN('spring');
+    if(lp) groundPound(lp);
+    if(ls){
+      if(S.grounded) jump();                                    // (a buffered jump may already have gone)
+      S.vx -= Math.sin(S.g) * JI() * 0.6; S.vy += Math.cos(S.g) * JI() * 0.6;   // a hop and a half
+      _p.copy(gameMode.ship.position); burst(_p, 22, true, DJ_COL);
+    }
+  }
+  function groundPound(l){
+    var ups = Math.max(unitsPerSec(), S.v * 60), zr = S.z + ups * (0.15 + 0.25 * l), flat = S.mode === 'flat';   // (0.4 s ahead; 0.65 s)
+    var span = flat ? 0 : shapeAt(S.z).span, i, o, hit = 0;
+    // walked from the end: each smash takes its own entry out of R.obs
+    for(i = R.obs.length - 1; i >= 0; i--){
+      o = R.obs[i];
+      if(!o || o.z < S.z - 0.05 || o.z > zr) continue;
+      var on = flat ? Math.abs((o.u0 + o.u1) / 2 - S.x) < 0.3
+                    : (Math.abs(wrapPi(o.phi - S.g)) < span * 0.6 || (o.type === 'strut' && Math.abs(wrapPi(o.phi + Math.PI - S.g)) < span * 0.6));
+      if(on && R.obs.indexOf(o) >= 0){ smash(o); hit++; }
+    }
+    for(i = 0; i < R.walls.length; i++){ var w = R.walls[i]; if(w.z > S.z && w.z < zr) blastWalls(S.x, S.y, w.z); }
+    // the shock runs along the floor ahead
+    for(var k = 1; k <= 4; k++){ _p.set(S.x, S.y, -(S.z + (zr - S.z) * k / 4 - S.zBase)); burst(_p, 8, false, POUND_COL); }
+    R.shake = Math.max(R.shake, 0.8); R.flash = Math.max(R.flash, 0.12);
+  }
+  // HOVER: airborne, falling, the thumb on the glass and still for a moment — most of gravity is held off, and a
+  // soft terminal speed. (Run after stepTube / stepFlat: it takes back 78% of the gravity that step just added.
+  // Never on the ground — on an island a grounded ship's vy is the ground's own rise.)
+  function hoverTick(){
+    S.hoverA = 0;
+    if(!upgN('hover') || S.grounded || S.dead || (S.sl && S.sl.phase === 'fly')) return;
+    if(!((G.on || mouseDown) && performance.now() - (G.mvT || 0) > 140)) return;
+    var gx = Math.sin(S.g), gy = -Math.cos(S.g), vn = S.vx * gx + S.vy * gy;
+    if(vn <= 0) return;
+    S.vx -= gx * JG() * 0.78; S.vy -= gy * JG() * 0.78;
+    if(vn > 0.0055){ var k = (vn - 0.0055) * 0.25; S.vx -= gx * k; S.vy -= gy * k; }
+    S.hoverA = 1;
+    if((S.hoverF = (S.hoverF || 0) + 1) % 5 === 0){ _p.copy(gameMode.ship.position).addScaledVector(gameMode.surfaceState.groundNormal, -0.016); burst(_p, 2, true, DJ_COL); }
+  }
+  // CORE MAGNET: a core within reach is pulled in, in the ship's frame, on the coins' own spring — THE CORES then
+  // takes it as it comes into its grab.
+  function coreMagTick(){
+    var l = upgN('coremag');
+    if(!l || S.dead || !R.items) return;
+    var Rm = 0.3 + 0.15 * (l - 1);
+    for(var i = 0; i < R.items.length; i++){
+      var it = R.items[i];
+      if(!it.mag){
+        var dx = it.x - S.x, dy = it.y - S.y, dz = it.z - S.z;
+        if(dx * dx + dy * dy + dz * dz >= Rm * Rm) continue;
+        it.mag = { rx: dx, ry: dy, rz: dz, vx: 0, vy: 0, vz: 0 };
+      }
+      var m = it.mag, r = cd(m.rx, m.vx, 0, P.coinPullHz); m.rx = r.x; m.vx = r.v;
+      r = cd(m.ry, m.vy, 0, P.coinPullHz); m.ry = r.x; m.vy = r.v;
+      r = cd(m.rz, m.vz, 0, P.coinPullHz); m.rz = r.x; m.vz = r.v;
+      it.x = S.x + m.rx; it.y = S.y + m.ry; it.z = S.z + m.rz;
+    }
+  }
+  // TWIN SHIP: where the twin is — the opposite wall of a tube (the ride there, at the ship's own height above its
+  // ride), or the mirror place across an island.
+  // (a little AHEAD of the ship, TWIN_AHEAD: beside it, on the ceiling, it is above the chase camera's view)
+  var _tw = { x: 0, y: 0, d: 0 }, _rt = { x: 0, y: 0, r: 0, i: 0 }, TWIN_AHEAD = 0.9;
+  function twinPos(out){
+    if(S.mode === 'flat'){ var zt = S.z + TWIN_AHEAD; out.x = -S.x; out.y = groundAt(-S.x, zt) + (S.y - groundAt(S.x, S.z)); out.d = 0; return out; }
+    var sh = shapeAt(S.z), up1 = S.up;
+    rideAt(sh, S.th, _rt);
+    var hgt = -(S.x - _rt.x) * Math.sin(up1) + (S.y - _rt.y) * Math.cos(up1);
+    rideAt(sh, S.th + Math.PI, _rt);
+    var rx = _rt.x, ry = _rt.y, up2 = upAt(sh, S.th + Math.PI);
+    out.x = rx - Math.sin(up2) * hgt; out.y = ry + Math.cos(up2) * hgt; out.d = up2 - up1;
+    return out;
+  }
+  function twinTick(){
+    if(!upgN('twin') || S.dead) return;
+    twinPos(_tw);
+    var mr = magR(), r2 = mr * mr, list = S.coins;
+    for(var i = list.length - 1; i >= 0; i--){
+      var c = list[i];
+      if(c.pulled) continue;
+      var dx = c.x - _tw.x, dy = c.y - _tw.y, dzA = c.z - (S.z + TWIN_AHEAD), dzB = dzA + S.v;
+      var dzc = (dzA <= 0 && dzB >= 0) ? 0 : (Math.abs(dzA) < Math.abs(dzB) ? dzA : dzB);
+      if(dx * dx + dy * dy + dzc * dzc < r2){ collect(c); list.splice(i, 1); }
+    }
+  }
+  // COMBO: a coin that goes by within reach and is left breaks the run of coins.
+  function comboTick(){
+    if(!upgN('combo') || S.dead) return;
+    var list = S.coins, mr = Math.max(0.3, magR() + 0.12), r2 = mr * mr;
+    for(var i = 0; i < list.length; i++){
+      var c = list[i];
+      if(c.pulled || c.judged || c.z > S.z - 0.12) continue;
+      c.judged = true;
+      var dx = c.x - S.x, dy = c.y - S.y;
+      if(dx * dx + dy * dy < r2) S.combo = 0;
+    }
+  }
+  // NEAR MISS: every obstacle crossed in the step before this one was survived; the ones passed within a hair
+  // (nearGap, measured between the hull's ellipsoid and the obstacle's box) pay out.
+  function nearTick(){
+    var l = upgN('near'), a = S.nm2, b = S.nm1;
+    if(l && !S.dead && a && b && b.z > a.z){
+      var gapMax = 0.03 + 0.015 * (l - 1), i;
+      for(i = 0; i < R.obs.length; i++){
+        var o = R.obs[i];
+        if(o.nm || o.z <= a.z || o.z > b.z) continue;
+        o.nm = true;
+        if(o.mov && o.mov.h < 0.03) continue;                 // (a sunk piston is floor)
+        var f = (o.z - a.z) / (b.z - a.z), px = a.x + (b.x - a.x) * f, py = a.y + (b.y - a.y) * f, g = obsGap(o, px, py);
+        if(g >= 0 && g < gapMax) nearPay(l, o.z, px, py);
+      }
+      for(i = 0; i < R.walls.length; i++){
+        var w = R.walls[i];
+        if(w.nm === w.z || w.z <= a.z || w.z > b.z || w.blades) continue;
+        w.nm = w.z;
+        var fw = (w.z - a.z) / (b.z - a.z), qx = a.x + (b.x - a.x) * fw, qy = a.y + (b.y - a.y) * fw, cut = wallCut(w), best = 1e9;
+        for(var j = 0; j < cut.length; j++) best = Math.min(best, (cut[j].r - SHIP.hw * P.hitScale) - Math.hypot(qx - cut[j].x, qy - cut[j].y));
+        if(best >= 0 && best < gapMax) nearPay(l, w.z, qx, qy);
+      }
+    }
+    S.nm2 = b; S.nm1 = { x: S.x, y: S.y, z: S.z };
+  }
+  // The gap between the hull (the hit test's ellipsoid) and an obstacle, in world units, in the obstacle's plane.
+  function obsGap(o, px, py){
+    var a = P.apothem, dx = Math.sin(o.phi), dy = -Math.cos(o.phi), tx = Math.cos(o.phi), ty = Math.sin(o.phi);
+    var u = px * tx + py * ty, y = a - (px * dx + py * dy);
+    var aligned = (o.type === 'strut' ? Math.abs(wrapPi(2 * (S.up - o.phi))) / 2 : Math.abs(wrapPi(S.up - o.phi))) < Math.PI / o.n;
+    var ru = (aligned ? SHIP.hw : (SHIP.hw + SHIP.hh) * 0.5) * P.hitScale, ry = (aligned ? SHIP.hh : (SHIP.hw + SHIP.hh) * 0.5) * P.hitScale;
+    var cy = clamp(y, o.y0, o.y1), u0 = o.u0, u1 = o.u1;
+    if(o.sector){ var shh = sectorHalf(cy, o.n); u0 = Math.max(u0, -shh); u1 = Math.min(u1, shh); }
+    var du = u - clamp(u, u0, u1), dv = y - cy, d = Math.sqrt(du * du + dv * dv);
+    if(d < 1e-6) return -1;
+    var q = Math.sqrt((du / ru) * (du / ru) + (dv / ry) * (dv / ry));
+    return q > 1 ? d - d / q : -1;
+  }
+  function nearPay(l, z, px, py){
+    var n = coinWorth(2 * l * TIERS[tierAt(z)].mul, false);
+    S.coinN += n; R.coinPulse = 1;
+    _p.set(px, py, -(z - S.zBase)); burst(_p, 12, true, POUND_COL);
+    R.nearN = n; R.nearT = 0.9;
+  }
+  // CHAIN CHARGE: every break while a charge is running (S.smashed counts them all — the shield's too, so it is
+  // gated on the charge) gives charge time back, up to a full charge.
+  function chainTick(){
+    var ds = (S.smashed || 0) - (S.smashSeen || 0); S.smashSeen = S.smashed || 0;
+    var l = upgN('chain');
+    if(l && ds > 0 && S.chargeT > 0 && !S.dead){ S.chargeT = Math.min(S.chargeMax || chargeDur(), S.chargeT + ds * 0.4 * l); R.blastPulse = 1; }
+  }
+  // GRAVITY FLIP (from slam): only while the ship is still rising, on a tube — falling, the swipe is a slam.
+  function flipWanted(){
+    if(!upgN('flip') || S.flipped || S.mode === 'flat' || S.dead || S.grounded) return false;
+    var gx = Math.sin(S.g), gy = -Math.cos(S.g);
+    if(S.vx * gx + S.vy * gy > 0.004) return false;   // (rising, or just over the top of the hop)
+    gravityFlip();
+    return true;
+  }
+  function gravityFlip(){
+    S.flipped = true; S.clung = true; G.muteT = performance.now() + 250;
+    var sh = shapeAt(S.z), want = S.g + Math.PI, best = 1e9, ng = want;
+    for(var i = 0; i < sh.n; i++){ var d = Math.abs(wrapPi(sh.phi[i] - want)); if(d < best){ best = d; ng = want + wrapPi(sh.phi[i] - want); } }
+    S.g = ng;
+    var gx = Math.sin(ng), gy = -Math.cos(ng);
+    S.vx += gx * JI() * 0.5; S.vy += gy * JI() * 0.5;          // a push toward the new floor; gravity does the rest
+    var fd = footDist(sh, S.x, S.y, ng), keep = sh.span * (0.5 - P.cornerBand * 0.5 * 1.15);
+    S.thTgt = ng + clamp(wrapPi(polar(S.x + gx * fd, S.y + gy * fd, S.th) - ng), -keep, keep);
+    _p.copy(gameMode.ship.position); burst(_p, 20, true, DJ_COL);
+  }
+
+  // ── TWIN SHIP's look: a ghost of every hull mesh (the same geometry), posed each frame as the real hull is,
+  // carried round the tube to the opposite wall (or across an island). Fresnel, additive, a faint breath. ──
+  var _tm1 = new THREE.Matrix4(), _tm2 = new THREE.Matrix4();
+  function buildTwin(){
+    if(R.twin) return;
+    R.twin = new THREE.Group(); R.twin.visible = false; R.twin.matrixAutoUpdate = false; R.scene.add(R.twin);
+    R.twinParts = [];
+    var hull = gameMode.hullObjects || [];
+    for(var i = 0; i < hull.length; i++){
+      var o = hull[i];
+      if(!o || !o.isMesh || !o.geometry || !o.geometry.attributes.normal) continue;
+      var m = new THREE.Mesh(o.geometry, R.twinMat); m.matrixAutoUpdate = false; m.frustumCulled = false; m.renderOrder = 4;
+      R.twin.add(m); R.twinParts.push({ m: m, src: o });
+    }
+  }
+  function feedTwin(){
+    if(!R.twin) return;
+    var on = upgN('twin') > 0 && !S.dead && R.twinParts.length > 0 && !(S.sl && S.sl.phase === 'aim');
+    R.twin.visible = on;
+    if(!on) return;
+    var sh = gameMode.ship;
+    sh.updateMatrixWorld(true);
+    twinPos(_tw);
+    // T(twin) · Rz(Δ) · T(−ship): the real hull carried round the axis to the twin's place
+    _tm1.makeTranslation(-sh.position.x, -sh.position.y, 0);
+    _tm2.makeRotationZ(_tw.d); _tm2.multiply(_tm1);
+    _tm1.makeTranslation(_tw.x, _tw.y, -TWIN_AHEAD); _tm1.multiply(_tm2);
+    for(var i = 0; i < R.twinParts.length; i++){
+      var p = R.twinParts[i];
+      p.m.matrix.multiplyMatrices(_tm1, p.src.matrixWorld); p.m.matrixWorld.copy(p.m.matrix); p.m.visible = p.src.visible !== false;
+    }
+    R.twinMat.uniforms.uA.value = 0.55 + 0.12 * Math.sin(performance.now() * 0.004);
+  }
+
+  // ── SAFE LINE: a pattern lays its guide as control points (z, th) and hop centres while it spawns (gp / gh, which
+  // do nothing unless the upgrade is held); the ribbon is built at once on the shapes those z's have — round to an
+  // opening, along a path, up in a hop's own arc where a hop is due. Teal, faint, dashes running forward. ──
+  var GD = null, _shG = { n: 0, phi: new Float64Array(48), h: new Float64Array(48), span: 0, reg: 0 }, _rg = { x: 0, y: 0, r: 0, i: 0 };
+  function guideBegin(){ GD = upgN('guide') ? { pts: [], hops: [] } : null; }
+  function gp(z, th){ if(GD) GD.pts.push({ z: z, th: th }); }
+  function gh(z){ if(GD) GD.hops.push(z); }
+  function guideEnd(){ var g = GD; GD = null; if(g && g.pts.length >= 2) buildGuide(g); }
+  function buildGuide(g){
+    g.pts.sort(function(a, b){ return a.z - b.z; });
+    for(var i = 1; i < g.pts.length; i++) g.pts[i].th = g.pts[i - 1].th + wrapPi(g.pts[i].th - g.pts[i - 1].th);
+    var z0 = g.pts[0].z, z1 = g.pts[g.pts.length - 1].z, ups = Math.max(unitsPerSec(), S.v * 60), half = 0.26 * ups;
+    var N = Math.min(700, Math.max(2, Math.ceil((z1 - z0) / 0.1) + 1)), pos = new Float32Array(N * 6), sv = new Float32Array(N * 4), idx = [], j = 0;
+    for(var k = 0; k < N; k++){
+      var z = z0 + (z1 - z0) * k / (N - 1);
+      while(j + 2 < g.pts.length && g.pts[j + 1].z < z) j++;
+      var A = g.pts[j], B = g.pts[Math.min(j + 1, g.pts.length - 1)], t = B.z > A.z ? clamp((z - A.z) / (B.z - A.z), 0, 1) : 1;
+      t = t * t * (3 - 2 * t);
+      var th = A.th + (B.th - A.th) * t, h = 0;
+      for(var q = 0; q < g.hops.length; q++){ var s = (z - g.hops[q]) / half; if(s > -1 && s < 1) h = Math.max(h, 0.12 * (1 - s * s)); }
+      var sh = shapeInto(z, _shG), ra = rideAt(sh, th, _rg), rx = ra.x, ry = ra.y, up = upAt(sh, th);
+      var L = h - 0.017, ux = -Math.sin(up), uy = Math.cos(up), cx = rx + ux * L, cy = ry + uy * L, tx = Math.cos(up) * 0.012, ty = Math.sin(up) * 0.012, zz = -(z - z0);
+      pos[k * 6] = cx - tx; pos[k * 6 + 1] = cy - ty; pos[k * 6 + 2] = zz; pos[k * 6 + 3] = cx + tx; pos[k * 6 + 4] = cy + ty; pos[k * 6 + 5] = zz;
+      sv[k * 4] = z - z0; sv[k * 4 + 1] = -1; sv[k * 4 + 2] = z - z0; sv[k * 4 + 3] = 1;
+      if(k) idx.push((k - 1) * 2, (k - 1) * 2 + 1, k * 2 + 1, (k - 1) * 2, k * 2 + 1, k * 2);
+    }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('aS', new THREE.BufferAttribute(sv, 2));
+    geo.setIndex(idx);
+    var m = new THREE.Mesh(geo, R.guideMat.clone());   // (same program; its own uniforms)
+    m.frustumCulled = false; m.renderOrder = 2; m.userData.z0 = z0; m.userData.z1 = z1;
+    R.scene.add(m);
+    (R.guides = R.guides || []).push(m);
+  }
+  function dropGuide(m){ R.scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+  function feedGuides(){
+    if(!R.guides || !R.guides.length) return;
+    var t = performance.now() * 0.001;
+    for(var i = R.guides.length - 1; i >= 0; i--){
+      var m = R.guides[i], u = m.material.uniforms;
+      if(S.z > m.userData.z1 + 2){ dropGuide(m); R.guides.splice(i, 1); continue; }
+      m.position.z = -(m.userData.z0 - S.zBase);
+      u.uT.value = t; u.uZs.value = S.z - m.userData.z0 + 0.15; u.uFogD.value = R.fogD || P.fog;
+    }
+  }
+
+  function buildUpg2(){
+    // the twin's ghost material and the guide's, each on a hidden mesh now so the warm-up links their programs
+    R.twinMat = new THREE.ShaderMaterial({
+      uniforms: { uCol: { value: new THREE.Color(0.72, 0.84, 1.0) }, uA: { value: 0.6 } },
+      vertexShader: 'varying vec3 vN, vView; void main(){ vN = normalize(normalMatrix * normal); vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
+      fragmentShader: 'uniform vec3 uCol; uniform float uA; varying vec3 vN, vView;\n' +
+        'void main(){ float f = 1.0 - abs(dot(normalize(vN), normalize(-vView))); vec3 col = uCol * (pow(f, 2.2) * 0.9 + 0.07); gl_FragColor = vec4(col * uA, 1.0); }',
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide
+    });
+    R.guideMat = new THREE.ShaderMaterial({
+      uniforms: { uT: { value: 0 }, uFogD: { value: P.fog }, uZs: { value: 0 } },
+      vertexShader: 'attribute vec2 aS; varying vec2 vS; varying vec3 vView; void main(){ vS = aS; vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
+      fragmentShader: [
+        'uniform float uT, uFogD, uZs; varying vec2 vS; varying vec3 vView;',
+        'void main(){',
+        '  float across = 1.0 - smoothstep(0.3, 1.0, abs(vS.y));',
+        '  float dash = 0.5 + 0.5 * smoothstep(0.2, 0.45, abs(fract(vS.x * 2.5 - uT * 1.6) - 0.5));',   // dashes running forward
+        '  float near = smoothstep(0.0, 0.6, vS.x - uZs);',                                            // gone under the ship
+        '  float fog = exp(-uFogD * uFogD * dot(vView, vView));',
+        '  float core = pow(1.0 - abs(vS.y), 4.0);',
+        '  gl_FragColor = vec4((vec3(0.063, 0.769, 0.698) * across * 1.5 + vec3(0.55, 1.0, 0.92) * core * 0.45) * dash * near * fog, 1.0);',
+        '}'
+      ].join('\n'),
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide
+    });
+    var g = new THREE.PlaneGeometry(0.01, 0.01), a = new THREE.Mesh(g, R.twinMat), b = new THREE.Mesh(g, R.guideMat);
+    a.visible = b.visible = false; R.scene.add(a); R.scene.add(b);
+    R.guides = [];
+  }
+  function feedUpg2(){ feedTwin(); feedGuides(); }
+  // HUD: the combo's multiplier beside the coin count; a near miss's payout.
+  function upg2Dom(W, H){
+    if(!R.elCombo){
+      R.elCombo = el('span', 'display:inline-block;margin-left:8px;font-size:10px;letter-spacing:0.12em;color:rgba(255,205,90,0.8);', R.elCoins, '');
+      R.elNear = el('div', 'position:absolute;pointer-events:none;font-family:Arial,Helvetica,sans-serif;font-weight:700;white-space:nowrap;' +
+        'left:0;right:0;text-align:center;opacity:0;font-size:12px;letter-spacing:0.3em;color:rgba(255,120,160,0.97);text-shadow:0 0 12px rgba(255,90,130,0.6);', R.layer, '');
+    }
+    var txt = upgN('combo') && (S.combo || 0) >= 3 ? '×' + comboMul().toFixed(2).replace(/\.?0+$/, '') : '';
+    if(R.elCombo.textContent !== txt) R.elCombo.textContent = txt;
+    R.nearT = Math.max(0, (R.nearT || 0) - 1 / 60);
+    var a = R.cardShown ? 0 : clamp(R.nearT / 0.35, 0, 1);
+    R.elNear.style.opacity = a.toFixed(3);
+    if(a > 0){
+      var s = 'CLOSE  +' + (R.nearN || 0); if(R.elNear.textContent !== s) R.elNear.textContent = s;
+      R.elNear.style.top = Math.round(H * 0.37) + 'px';
+      R.elNear.style.transform = 'scale(' + (1 + 0.3 * Math.max(0, R.nearT - 0.6)).toFixed(3) + ')';
+    }
+  }
+
   // A pillar at an exact place across wall j (the fodder's are random).
   function addPillar(j, z, n, uc){
     var hw = halfWn(n), rp = OB.pillar.r, phi = j * TAU / n, o = { type: 'pillar', face: j, n: n, phi: phi, z: z, sector: false, mt: 'pillar', kr: R.pil };
@@ -95445,7 +96110,7 @@ var RUNNER = (function(){
       if(skipTo == null && sec.kind === 'hold' && z >= S.nextPat){
         var pk = pickPattern(sec.n), PT = pk && PATTERNS[pk], dd = difficulty();
         if(PT && z + PT.sec(dd) * ups < sec.z1 - ups * P.morphClearBefore){
-          var zEnd = PT.spawn(z, sec.n, dd, ups);
+          guideBegin(); var zEnd = PT.spawn(z, sec.n, dd, ups); guideEnd();   // (SAFE LINE: the pattern lays its guide)
           S.lastPat = pk; S.patLog.push(pk);
           S.nextRow = zEnd + ups * gs * 0.5;
           S.nextPat = zEnd + ups * (P.patGapSecMin + Math.random() * (P.patGapSecMax - P.patGapSecMin));
@@ -95677,7 +96342,7 @@ var RUNNER = (function(){
   function collect(c){
     upgCoin();   // (THE UPGRADES: the meter)
     var tk = c.tier != null ? c.tier : tierAt(c.z);
-    S.coinN += TIERS[tk].mul; R.coinPulse = 1;   // the run's coins are counted in WORTH (what is banked)
+    S.coinN += coinWorth(TIERS[tk].mul, true); R.coinPulse = 1;   // the run's coins are counted in WORTH (what is banked)
     _p.set(c.x, c.y, -(c.z - S.zBase));
     burst(_p, 10, true, R.tierCol[tk]);
     if(typeof ckptSpinKick === 'function') ckptSpinKick(0.6);
@@ -95794,7 +96459,7 @@ var RUNNER = (function(){
     R.fogD = fogD; R.scene.fog.density = fogD; R.tubeMat.uniforms.uFogD.value = fogD; R.pil.mat.uniforms.uFogD.value = fogD;
     for(var n in R.kits) for(var mk in R.kits[n].mat) R.kits[n].mat[mk].uniforms.uFogD.value = fogD;
     for(var fk in R.fk) R.fk[fk].mat.uniforms.uFogD.value = fogD;
-    if(R.islMat){ R.islMat.uniforms.uFogD.value = fogD; R.natMat.uniforms.uFogD.value = fogD; }
+    if(R.islMat){ R.islMat.uniforms.uFogD.value = fogD; R.natMat.uniforms.uFogD.value = fogD; }   // (R.bgMat keeps its own)
     if(R.strut) R.strut.mat.uniforms.uFogD.value = fogD; if(R.panels) R.panels.material.uniforms.uFogD.value = fogD;
   }
   // The gaps near enough to be seen go to the tube shader, in world z (they are kept in run z).
@@ -95819,7 +96484,7 @@ var RUNNER = (function(){
     R.stars.position.copy(R.cam.position);
     R.tubeMat.uniforms.uFloor.value = S.up;
     R.tubeMat.uniforms.uFlrCos.value = Math.cos(0.6 * (S.mode === 'flat' ? TAU / 8 : shapeAt(S.z).span));
-    feedHoles(); feedPits(); feedWalls(); feedBars(); feedLasers(); drawPanels(); feedChoice();
+    feedHoles(); feedPits(); feedWalls(); feedBars(); feedLasers(); drawPanels(); feedChoice(); feedUpg2();
     R.cap.position.set(0, 0, -(S.z + maxAhead() + 10 - S.zBase));
     // The fog thins as the run speeds up, so what you can see ahead stays the same TIME away (the view
     // distance is ∝ 1/density). Every hand-written material and the scene's own fog share the one value.
@@ -95937,10 +96602,10 @@ var RUNNER = (function(){
   // short window, and every recognised swipe re-anchors the stroke — so an up-then-left L reads as a
   // jump followed by a cling.
   var G = { id: null, on: false, lx: 0, ly: 0, hist: [], muteT: 0, t0: 0, lArm: 0 };
-  function gStart(x, y){ var t = performance.now(); G.on = true; G.lx = x; G.ly = y; G.hist = [{ x: x, y: y, t: t }]; G.t0 = t; G.lArm = 0; }
+  function gStart(x, y){ var t = performance.now(); G.on = true; G.lx = x; G.ly = y; G.hist = [{ x: x, y: y, t: t }]; G.t0 = t; G.lArm = 0; G.mvT = t; }
   function gMove(x, y){
     if(!G.on) return;
-    var dx = x - G.lx; G.lx = x; G.ly = y;
+    var dx = x - G.lx; if(Math.abs(dx) > 1.5 || Math.abs(y - G.ly) > 1.5) G.mvT = performance.now(); G.lx = x; G.ly = y;
     if(S.sl && S.sl.phase === 'aim'){ slingDrag(x, y, dx); return; }   // in the slingshot the stroke is the pull and the aim
     var W = window.innerWidth, H = window.innerHeight, t = performance.now();
     // One rate everywhere: a whole turn of the tube per steerTurnScreen of screen width, on any shape.
@@ -96081,14 +96746,14 @@ var RUNNER = (function(){
     var g = gameMode.group, par = g.parent, vis = g.visible;
     R.scene.add(g); g.visible = true;
     var tmp = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), R.tubeMat); R.scene.add(tmp);
-    var tmpI = new THREE.Mesh(tmp.geometry, R.islMat), tmpN = new THREE.Mesh(tmp.geometry, R.natMat); R.scene.add(tmpI); R.scene.add(tmpN);   // (THE ISLANDS)
+    var tmpI = new THREE.Mesh(tmp.geometry, R.islMat), tmpN = new THREE.Mesh(tmp.geometry, R.natMat), tmpB = new THREE.Mesh(tmp.geometry, R.bgMat); R.scene.add(tmpI); R.scene.add(tmpN); R.scene.add(tmpB);   // (THE ISLANDS)
     R.coinMesh.count = 1;
     R.sling.forEach(function(q){ q.mesh.visible = true; }); R.shield.visible = true; coresShow(true); plumeShow(true);
     try {
       renderer.compile(R.scene, R.cam);
       renderer.compile(R.fxScene, R.ortho); renderer.compile(R.blitScene, R.ortho); renderer.compile(R.ui, R.uiCam);
       R.compiled = true;
-    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); R.scene.remove(tmpI); R.scene.remove(tmpN); tmp.geometry.dispose(); R.coinMesh.count = 0; R.sling.forEach(function(q){ q.mesh.visible = false; }); R.shield.visible = false; coresShow(false); plumeShow(false); }
+    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); R.scene.remove(tmpI); R.scene.remove(tmpN); R.scene.remove(tmpB); tmp.geometry.dispose(); R.coinMesh.count = 0; R.sling.forEach(function(q){ q.mesh.visible = false; }); R.shield.visible = false; coresShow(false); plumeShow(false); }
   }
   // Called from gamePreloadStep while the wheel spins — the same cadence as the planet preload.
   function preloadStep(){
@@ -96167,10 +96832,10 @@ var RUNNER = (function(){
               coins: function(dz0, dz1, onLine){ spawnCoins(S.z + dz0, S.z + dz1, onLine); },
               hole: function(face, dz){ var sec = sectionAt(S.z + dz); addHole(face, S.z + dz, sec.kind === 'hold' ? sec.n : 8); return R.holes[R.holes.length - 1]; },
               zoom: function(v){ R.zoomTgt = v; },
-              pattern: function(name, dz){ var sec = sectionAt(S.z + dz); return PATTERNS[name].spawn(S.z + dz, sec.kind === 'hold' ? sec.n : 8, difficulty(), unitsPerSec()); },
+              pattern: function(name, dz){ var sec = sectionAt(S.z + dz); guideBegin(); var ze = PATTERNS[name].spawn(S.z + dz, sec.kind === 'hold' ? sec.n : 8, difficulty(), unitsPerSec()); guideEnd(); return ze; },
               patterns: function(){ return Object.keys(PATTERNS); }, gapAt: function(th, z){ return pitAt(th, z); }, section: function(z){ var c = sectionAt(z == null ? S.z : z); return c.kind + (c.n || c.nNext || '') ; },
               arriveT: function(z){ return arriveT(z); }, pistonH: pistonH, laserAng: laserAng,
-              upg: function(){ return S.upg; }, airJ: function(){ return S.airJ; }, fillMeter: function(){ S.upgC = upgNeed(); }, applyUpg: function(k){ applyUpg(k); },
+              upg: function(){ return S.upg; }, airJ: function(){ return S.airJ; }, fillMeter: function(){ S.upgC = upgNeed(); }, applyUpg: function(k){ applyUpg(k); }, haz: function(){ return { t: S.hazT, r: hazRate() }; }, hold: function(on){ G.on = !!on; G.mvT = performance.now() - 1000; },
               choice: function(){ var C = S.choice; return C ? { opts: C.opts.slice(), sel: C.sel, pick: C.pick, took: C.took, cards: C.cards, zFold: C.zFold, z0: C.z0, zDecide: C.zDecide, z1: C.z1 } : null; } };
   api._sling = { sim: flightSim, v0: slingV0, tiers: TIERS, tierAt: tierAt, owned: slingOwned, power: function(){ return slingPower(S.sl); },
                  grab: function(){ slingGrab(-1, -1); }, letGo: slingLetGo, set: function(o){ for(var k in o) S.sl[k] = o[k]; },
