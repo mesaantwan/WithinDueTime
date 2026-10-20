@@ -92022,7 +92022,7 @@ var RUNNER = (function(){
     speedMaxMul: 3.0,     // as fast as speed cores can take it (576 km/h)
     // THE COURSE: shapes from a square up to 16 sides, held for shapeSec, folding into the next over morphSec.
     sidesMin: 4, sidesMax: 16, startSides: 8, holdSides: 0,
-    shapeSecMin: 9, shapeSecMax: 18, morphSec: 1.2,
+    shapeSecMin: 13, shapeSecMax: 22, morphSec: 1.2,   // (THE DISTRICTS: one district per held tube)
     morphClearBefore: 0.5, morphClearAfter: 0.7,   // no obstacle rows this many seconds either side of a fold
     // FLATS → FLOATING ISLANDS: after a held tube, this often the course opens onto an island instead of folding —
     // hilly ground under plain gravity, rocks and trees, a fall past its edges. Lengths are skewed short (most are
@@ -92050,11 +92050,11 @@ var RUNNER = (function(){
     // THE OPEN TUBE: a held tube this often has an open stretch — whole runs of its panels gone, open sky — of
     // openSecMin–Max seconds. 'arc' keeps only a band of walls (a half-pipe that wanders round), 'scatter' drops runs
     // of panels along every wall. A path of panels always goes through; it ramps in and out over openRamp seconds.
-    openChance: 0.6, openSecMin: 4, openSecMax: 11, openRamp: 1.2,
+    openChance: 0.85, openSecMin: 6, openSecMax: 16, openRamp: 1.2,   // (raised 10-19: THE DISTRICTS' longer holds cut the open share 0.41 → 0.34; the user asked for MORE)
     openDensMin: 0.55, openDensMax: 0.88, openArcMin: 0.3, openArcMax: 0.6,
     openHoldSec: 0.5,     // when the path steps onto a neighbouring wall, both stay this long — time to cross
     // PATTERNS: a set piece every patGapSec (after the first at firstPatSec), on a held tube with room for it.
-    firstPatSec: 6, patGapSecMin: 5, patGapSecMax: 9, onlyPat: '',
+    firstPatSec: 4, patGapSecMin: 5, patGapSecMax: 9, onlyPat: '',
     fodder: true,         // the random rows between patterns (off: patterns only — testing)
     // GAPS in tube walls: a row may cut one in a wall instead of standing something on it.
     holeSecMin: 0.14, holeSecMax: 0.26, holeHalfChance: 0.35, holeMax: 16,
@@ -92260,11 +92260,12 @@ var RUNNER = (function(){
         // A FLAT: the tube just ends and the platform carries on from its floor, flatWidth wide, then
         // narrows over its last flatTaperSec to the floor of the tube that follows — that tube's mouth.
         var len = ups * (P.flatSecMin + Math.pow(Math.random(), P.flatSecSkew) * (P.flatSecMax - P.flatSecMin));
-        sec = { z0: last.z1, z1: last.z1 + len, kind: 'flat', W: P.flatWidth + Math.random() * (P.flatWidthMax - P.flatWidth), nNext: pickSides(last.n), taper: ups * P.flatTaperSec };
+        var _dn = nextDistrict(last);   // (THE DISTRICTS: the tube after the island)
+        sec = { z0: last.z1, z1: last.z1 + len, kind: 'flat', W: P.flatWidth + Math.random() * (P.flatWidthMax - P.flatWidth), nNext: distSides(_dn, last.n), distNext: _dn, taper: ups * P.flatTaperSec };
         makeHills(sec, ups);
       }
-      else if(last.kind === 'hold' && !P.holdSides) sec = { z0: last.z1, z1: last.z1 + ups * P.morphSec, kind: 'morph', a: last.n, b: pickSides(last.n) };
-      else sec = { z0: last.z1, z1: last.z1 + ups * holdSec(), kind: 'hold', n: last.kind === 'morph' ? last.b : (last.kind === 'flat' ? last.nNext : last.n) };
+      else if(last.kind === 'hold' && !P.holdSides){ var _dm = nextDistrict(last); sec = { z0: last.z1, z1: last.z1 + ups * P.morphSec, kind: 'morph', a: last.n, b: distSides(_dm, last.n), dist: _dm }; }   // (THE DISTRICTS)
+      else { sec = { z0: last.z1, z1: last.z1 + ups * holdSec(), kind: 'hold', n: last.kind === 'morph' ? last.b : (last.kind === 'flat' ? last.nNext : last.n) }; sec.dist = holdDist(last, sec.n); }
       c.push(sec);
       buildChunk(sec);
       if(sec.kind === 'hold') maybeOpen(sec, ups);   // (THE OPEN TUBE)
@@ -92456,7 +92457,7 @@ var RUNNER = (function(){
         // A PIT field (see THE PATTERNS): over world z uPit.x → uPit.y every wall is open space except the
         // safe strips — (z from, z to, angle at start, drift per unit) + (wobble amp, wobble freq, half-width
         // at start, at end), all in world z and polar angle round the axis.
-        uPit: { value: new THREE.Vector4() }, uSA: { value: SA }, uSB: { value: SB }, uSN: { value: 0 },
+        uPit: { value: new THREE.Vector4() }, uSA: { value: SA }, uSB: { value: SB }, uSN: { value: 0 }, uPit2: { value: new THREE.Vector4() },
         // …or, uChk.x > 0, a CHECKERBOARD over it (tile length, sides, phase, overlap — see pitAt); and the nearest
         // bars, whose light is on the floor under them (wall φ or 99 for a whole row, world z, across from, to).
         uChk: { value: new THREE.Vector4() }, uBar: { value: BA }, uBN: { value: 0 },
@@ -92477,7 +92478,7 @@ var RUNNER = (function(){
       fragmentShader: [
         'uniform float uFloor, uFlrCos, uFogD, uAlpha, uHN, uSN; uniform vec3 uSeam, uRing, uBase, uFogCol, uHole;',
         'uniform vec4 uHA[' + P.holeMax + ']; uniform vec2 uHB[' + P.holeMax + '];',
-        'uniform vec4 uPit; uniform vec4 uSA[6]; uniform vec4 uSB[6];',
+        'uniform vec4 uPit; uniform vec4 uSA[6]; uniform vec4 uSB[6]; uniform vec4 uPit2;',
         'uniform vec4 uChk; uniform vec4 uBar[' + BAR_MAX + ']; uniform float uBN;',
         'uniform vec4 uCh; uniform vec3 uChC0, uChC1, uChC2; uniform float uHT, uPanL, uSky;',
         'uniform vec4 uOpA[2]; uniform sampler2D uOpT0, uOpT1; uniform float uOpN, uZB;',
@@ -92491,7 +92492,7 @@ var RUNNER = (function(){
         '    float cj = floor(vPhi / (6.2831853 / uChk.y) + 0.5), cd0 = vW - abs(vU);',
         '    if(mod(cj + ck + uChk.z, 2.0) > 0.5){ if(ce > uChk.w) discard; prim = min(uChk.w - ce, cd0) * 1.7; }',
         '    else prim = min(ce + uChk.w, cd0) * 1.7;',
-        '  } else if(uPit.z > 0.5 && vWZ <= uPit.x && vWZ >= uPit.y){',
+        '  } else if((uPit.z > 0.5 && vWZ <= uPit.x && vWZ >= uPit.y) || (uPit2.z > 0.5 && vWZ <= uPit2.x && vWZ >= uPit2.y)){',
         '    float al = atan(vXY.x, -vXY.y), rr = length(vXY), inS = -1e3;',
         '    for(int i = 0; i < 6; i++){',
         '      if(float(i) >= uSN) break;',
@@ -92500,7 +92501,9 @@ var RUNNER = (function(){
         '      float s = A.x - vWZ, th = A.z + A.w * s + B.x * sin(B.y * s);',
         '      float hw = B.z + (B.w - B.z) * clamp(s / max(A.x - A.y, 1e-4), 0.0, 1.0);',
         '      float d = al - th; d -= 6.2831853 * floor(d / 6.2831853 + 0.5);',
-        '      inS = max(inS, (hw - abs(d)) * rr);',
+        '      vec2 pr = (uPit2.z > 0.5 && A.x <= uPit2.x + 0.05) ? uPit2.xy : uPit.xy;',
+        '      float e0 = A.x < pr.x - 0.02 ? A.x - vWZ : 1e3, e1 = A.y > pr.y + 0.02 ? vWZ - A.y : 1e3;',
+        '      inS = max(inS, min((hw - abs(d)) * rr, min(e0, e1)));',
         '    }',
         '    if(inS < 0.0) discard;',
         '    prim = inS;',                                                    // the safe path's edges glow
@@ -92860,7 +92863,7 @@ var RUNNER = (function(){
   var OPEN_NONE = (function(){ var t = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1, THREE.RGBAFormat); t.needsUpdate = true; return t; })();
   function maybeOpen(sec, ups){
     if(!S || sec === S.course[0] || (S.sl && S.sl.phase === 'fly')) return;
-    if(!(_ropen || Math.random() < P.openChance)) return;
+    if(!(_ropen || Math.random() < openChanceOf(sec))) return;   // (THE DISTRICTS: mostly THE DROP's)
     var L = P.panelLen, n = sec.n;
     // (never before the next row is due: a slingshot landing promises a clear run-out, and nextRow is that promise)
     var z0 = Math.ceil(Math.max(sec.z0 + ups * 1.2, S.nextRow) / L) * L, z1 = Math.floor(Math.min(sec.z1 - ups * 0.9, z0 + ups * rnd(P.openSecMin, P.openSecMax)) / L) * L;
@@ -94495,7 +94498,7 @@ var RUNNER = (function(){
     var zi = z + (next - z) * 0.5, sec = sectionAt(zi), ups = rowUps(), kind = null;
     if(sec.kind === 'morph' || sec.choice || zi > sec.z1 - ups * 0.4) return;   // not on a fold, nor into the next section (nor in a choice hallway)
     if(zi >= S.nextCharge){ kind = 'charge'; S.nextCharge = zi + ups * rnd(P.chargeCoreSecMin, P.chargeCoreSecMax) / upgMul('charge'); }
-    else if(zi >= S.nextSpeed && S.nextPat - zi > Math.max(P.ahead, ups * P.aheadSec)){   // (never where a pattern will
+    else if(zi >= S.nextSpeed && beatClear(zi, Math.max(P.ahead, ups * P.aheadSec))){   // (THE DISTRICTS: only beat-timed patterns mind)   // (never where a pattern will
       // already be laid when you reach it: it was timed to the speed you are doing, and its beats would land wrong)
       kind = 'speed'; S.nextSpeed = zi + ups * rnd(P.speedCoreSecMin, P.speedCoreSecMax) / upgMul('speed'); if(speedMul() >= P.speedMaxMul) return;
     }
@@ -94902,21 +94905,34 @@ var RUNNER = (function(){
     return false;
   }
   // The pit stretch nearest ahead goes to the tube shader (patterns never overlap in view).
+  // (THE DISTRICTS: the two nearest — set pieces chain now. A checkerboard always rides uPit; never two of them.)
+  var _pitL = [], _stL = [];
+  function pitEnd(p){ return p.front ? Math.min(p.z1, S.z + p.front) : p.z1; }
   function feedPits(){
-    var u = R.tubeMat.uniforms, best = null;
-    for(var i = 0; i < R.pits.length; i++){ var p = R.pits[i]; if(p.z1 > S.z - 3 && (!best || p.z0 < best.z0)) best = p; }
-    if(!best){ u.uPit.value.z = 0; u.uSN.value = 0; u.uChk.value.x = 0; return; }
-    var zEnd = best.front ? Math.min(best.z1, S.z + best.front) : best.z1;
-    u.uPit.value.set(-(best.z0 - S.zBase), -(zEnd - S.zBase), zEnd > best.z0 ? 1 : 0, 0);
-    if(best.chk){ var C = best.chk; u.uChk.value.set(C.L, C.n, C.ph, C.eps); u.uSN.value = 0; return; }
-    u.uChk.value.x = 0;
-    var n = 0;
-    for(var k = 0; k < best.strips.length && n < 6; k++){
-      var s = best.strips[k];
-      if(s.zB < S.z - 3 || s.zA > zEnd + 0.1) continue;   // (a collapse's long list: only the strips in view)
-      u.uSA.value[n].set(-(s.zA - S.zBase), -(s.zB - S.zBase), s.th0, s.drift);
-      u.uSB.value[n].set(s.amp, s.freq, s.w0, s.w1);
-      n++;
+    var u = R.tubeMat.uniforms, i, k, p, A = null, B = null;
+    _pitL.length = 0;
+    for(i = 0; i < R.pits.length; i++){ p = R.pits[i]; if(p.z1 > S.z - 1.5) _pitL.push(p); }
+    _pitL.sort(function(a, b){ return a.z0 - b.z0; });
+    A = _pitL[0] || null;
+    for(i = 1; i < _pitL.length; i++) if(!(A.chk && _pitL[i].chk)){ B = _pitL[i]; break; }
+    if(B && B.chk){ p = A; A = B; B = p; }
+    if(!A){ u.uPit.value.z = 0; u.uPit2.value.z = 0; u.uSN.value = 0; u.uChk.value.x = 0; return; }
+    var eA = pitEnd(A);
+    u.uPit.value.set(-(A.z0 - S.zBase), -(eA - S.zBase), eA > A.z0 ? 1 : 0, 0);
+    if(B){ var eB = pitEnd(B); u.uPit2.value.set(-(B.z0 - S.zBase), -(eB - S.zBase), eB > B.z0 ? 1 : 0, 0); } else u.uPit2.value.z = 0;
+    if(A.chk){ var C = A.chk; u.uChk.value.set(C.L, C.n, C.ph, C.eps); } else u.uChk.value.x = 0;
+    _stL.length = 0;
+    [A, B].forEach(function(q){
+      if(!q || q.chk) return;
+      var ze = pitEnd(q);
+      for(var j = 0; j < q.strips.length; j++){ var s = q.strips[j]; if(s.zB >= S.z - 1.5 && s.zA <= ze + 0.1) _stL.push(s); }   // (a collapse's long list: only the strips in view)
+    });
+    _stL.sort(function(a, b){ return a.zA - b.zA; });
+    var n = Math.min(6, _stL.length);
+    for(k = 0; k < n; k++){
+      var s2 = _stL[k];
+      u.uSA.value[k].set(-(s2.zA - S.zBase), -(s2.zB - S.zBase), s2.th0, s2.drift);
+      u.uSB.value[k].set(s2.amp, s2.freq, s2.w0, s2.w1);
     }
     u.uSN.value = n;
   }
@@ -95363,8 +95379,8 @@ var RUNNER = (function(){
     for(var i = 0; i < c.length; i++){
       var s = c[i];
       if(s.kind !== 'hold' || z0 < s.z0 || z1 > s.z1) continue;
-      var A = { z0: s.z0, z1: z0, kind: 'hold', n: s.n }, Q = { z0: z0, z1: z1, kind: 'squeeze', n: s.n, sMin: sMin, inL: inL, outL: outL },
-          B = { z0: z1, z1: s.z1, kind: 'hold', n: s.n };
+      var A = { z0: s.z0, z1: z0, kind: 'hold', n: s.n, dist: s.dist, _in: s._in }, Q = { z0: z0, z1: z1, kind: 'squeeze', n: s.n, sMin: sMin, inL: inL, outL: outL },
+          B = { z0: z1, z1: s.z1, kind: 'hold', n: s.n, dist: s.dist, _in: true };
       disposeChunk(s);
       c.splice(i, 1, A, Q, B);
       buildChunk(A); buildChunk(Q); buildChunk(B);
@@ -95526,6 +95542,349 @@ var RUNNER = (function(){
       } }
   };
   for(var _pk in PATTERNS2) PATTERNS[_pk] = PATTERNS2[_pk];
+  // ════════════════════════════════════════ THE DISTRICTS ════════════════════════════════════════
+  // (═ THE DISTRICTS ═ — patch: C:\Users\zacha\.runner-districts\apply.js)
+  // The course is a run of DISTRICTS, one per held tube: each is ONE idea — what you do with your thumb — and
+  // everything in it is built from that idea. Its random rows (the filler) are drawn from its own few obstacles,
+  // its set pieces are its own, its shapes are the ones those set pieces work on, and its glass is tinted its own
+  // colour, so you can tell where you are before anything reaches you.
+  //   THE RHYTHM  — HOP:     bars, trenches · hurdles, skips, lasers, checkerboard
+  //   THE WEAVE   — STEER:   pillars, half walls · thread, bulkheads, slalom, squeeze
+  //   THE ROLL    — WALLS:   gates · corkscrew, zipper, collapse, memory
+  //   THE DROP    — FLOOR:   gaps, open panels · stepping stones, tightrope, fork
+  //   THE MACHINE — TIMING:  pumping pistons · wave, crusher, blades, iris
+  //   THE GAUNTLET — the gun (only while it is equipped): lock, volley, alley, nest
+  //   THE WILDS   — an island: rocks, trees, logs · log steps, boulder gates
+  // HOW THEY FLOW. A district changes at a fold (or across an island): its colour cross-fades over the fold, its
+  // name comes up under the readout just before it, and its first couple of seconds are only its filler — the
+  // obstacle it is about, alone, before its first set piece. Inside a district set pieces and filler take turns,
+  // about half and half by time: after a set piece comes filler as long as it was — or, now and then, a second set
+  // piece CHAINED straight onto it, starting where the first lets you out (the last point of its line), so the two
+  // read as one longer run. Two pit stretches can now be on screen at once (the tube shader takes two), so a chained
+  // pit never pops in behind another.
+  var DISTRICTS = {
+    rhythm:  { name: 'THE RHYTHM', verb: 'HOP THE BEAT', rgb: '255,176,72', sides: [4, 10], open: 0.55, beat: true,
+               pats: { hurdles: 3, skips: 3, lasers: 2, checker: 2.2 },
+               fod: function(d){ return { bar: 4, hole: 1.6 + 1.2 * d, pillar: 0.5 }; }, fullHoles: true },
+    weave:   { name: 'THE WEAVE', verb: 'THREAD THE GAPS', rgb: '110,215,255', sides: [4, 16], open: 0.55,
+               pats: { thread: 3, bulkheads: 3, slalom: 2.2, squeeze: 2 },
+               fod: function(d, n){ return { pillar: 4, half: n > 13 ? 1.6 : 3, bar: 0.4 }; } },
+    roll:    { name: 'THE ROLL', verb: 'CHANGE WALLS', rgb: '195,140,255', sides: [5, 10], open: 0.5,
+               pats: { corkscrew: 3, zipper: 3, collapse: 2.5, memory: 2 },
+               fod: function(d){ return { gate: 2.2 + 1.6 * d, half: 1.2, pillar: 1 }; } },
+    drop:    { name: 'THE DROP', verb: 'MIND THE FLOOR', rgb: '255,120,175', sides: [5, 16], open: 0.95,
+               pats: { stones: 3, tightrope: 3, fork: 2.5 },
+               fod: function(d){ return { hole: 3 + 1.3 * d, bar: 0.6, pillar: 0.6 }; } },
+    machine: { name: 'THE MACHINE', verb: 'WATCH THE TIMING', rgb: '90,235,175', sides: [4, 12], open: 0.5, beat: true,
+               pats: { wave: 3, crusher: 2.5, blades: 2.5, iris: 2.5 },
+               fod: function(d){ return { piston: 2.6 + 1.2 * d, pillar: 1.2, bar: 0.6 }; } },
+    gunnery: { name: 'THE GAUNTLET', verb: 'SHOOT THROUGH', rgb: '255,120,64', sides: [6, 12], open: 0.55, gun: true, w: 0.7,
+               pats: { lock: 2.2, volley: 1.5, alley: 1.4, nest: 1.2 }, fod: null },
+    wilds:   { name: 'THE WILDS', verb: 'OPEN GROUND', rgb: '150,220,120', flat: true, pats: { logsteps: 3, boulders: 3 } }
+  };
+  var DP = {
+    introSec: 1.3,               // a new district opens with this long of its filler alone
+    chainChance: 0.45,            // a set piece is followed straight on by a second one, starting where it let you out
+    chainGapSec: 0.35,           // …this far after it
+    fodMulMin: 0.6, fodMulMax: 0.85,    // then filler for this × as long as the set piece(s) took — with the folds, intros and
+                                       // islands' run-ins (all filler) that comes out about half and half
+    fodSecMin: 1.8, fodSecMax: 6
+  };
+  // Patterns timed to the run's speed at spawn (a speed core taken while one is laid ahead would mistime it).
+  var BEAT_PATS = { crusher: 1, lasers: 1, blades: 1, wave: 1 };
+  var FLOW = { th: null };       // where the last pattern laid let you out (its line's last point — see gp)
+
+  function distOf(sec){
+    if(!sec || sec.boss || sec.choice) return null;
+    if(sec.kind === 'flat') return 'wilds';
+    if(sec.kind !== 'hold') return null;
+    if(sec.dist === undefined) sec.dist = pickDistrict(null, sec.n);
+    return sec.dist;
+  }
+  function distFits(k, n){ var D = DISTRICTS[k]; return !D.flat && (!D.gun || gunOn()) && (n == null || (n >= D.sides[0] && n <= D.sides[1])); }
+  function pickDistrict(prev, n){
+    var w = {}, any = false, k;
+    for(k in DISTRICTS) if(k !== prev && distFits(k, n)){ w[k] = DISTRICTS[k].w || 1; any = true; }
+    if(!any && prev && distFits(prev, n)) return prev;
+    return any ? wpick(w) : null;
+  }
+  // The district of the tube after `last` — never the same one twice running.
+  function nextDistrict(last){
+    var prev = last.kind === 'flat' ? last.distNext : distOf(last);
+    return pickDistrict(prev, P.holdSides || null);
+  }
+  function distSides(k, not){
+    if(P.holdSides || !k) return pickSides(not);
+    var r = DISTRICTS[k].sides, n, tries = 0;
+    do { n = r[0] + Math.floor(Math.random() * (r[1] - r[0] + 1)); } while(n === not && r[1] > r[0] && tries++ < 20);
+    return n;
+  }
+  function holdDist(last, n){
+    var k = last.kind === 'morph' ? last.dist : (last.kind === 'flat' ? last.distNext : (P.holdSides ? nextDistrict(last) : undefined));
+    return k && distFits(k, n) ? k : undefined;   // (undefined: chosen when first asked, to fit whatever shape it is)
+  }
+  function openChanceOf(sec){ var k = distOf(sec); return k ? P.openChance * DISTRICTS[k].open / 0.6 : P.openChance; }
+
+  // The district's own set pieces (undefined: it has none that fit — the old any-pattern pick runs).
+  function distPick(n, sec){
+    var k = distOf(sec);
+    if(!k) return sec && sec.kind === 'flat' ? null : undefined;
+    var D = DISTRICTS[k];
+    for(var pass = 0; pass < 2; pass++){
+      var w = {}, any = false;
+      for(var pk in D.pats){
+        var p = PATTERNS[pk];
+        if(!p || (pass === 0 && pk === S.lastPat) || (p.gun && !gunOn())) continue;
+        if(D.flat ? !p.flat : (p.flat || n < p.min || n > p.max)) continue;
+        w[pk] = D.pats[pk]; any = true;
+      }
+      if(any) return wpick(w);
+    }
+    return D.flat ? null : undefined;
+  }
+  function patFits(PT, z, sec, dd, ups){
+    var L = PT.sec(dd) * ups;
+    if(!!PT.flat !== (sec.kind === 'flat') || (!PT.flat && (sec.n < PT.min || sec.n > PT.max))) return false;   // (a forced ?runpattern on the wrong ground)
+    if(sec.kind === 'flat') return !!sec.hb && z > sec.hA && z + L < Math.min(sec.hB, sec.z1 - sec.taper - ups * P.flatClearOut);
+    return z + L < sec.z1 - ups * P.morphClearBefore && !openIn(z - ups * 0.5, z + L + ups * 0.5);
+  }
+  // A new district opens with its filler alone for a moment (never pulls a due set piece earlier).
+  function distIntro(sec, ups){
+    if(sec._in) return;
+    sec._in = true;
+    if(sec !== S.course[0] && distOf(sec)) S.nextPat = Math.max(S.nextPat, sec.z0 + ups * DP.introSec);
+  }
+  // Lay a pattern from its entry: the ship's angle — or, chained, the angle the last one let you out at.
+  function layPattern(pk, PT, z, sec, dd, ups){
+    var th0 = S.th, zEnd;
+    if(S.chainTh != null) S.th = S.chainTh;
+    FLOW.th = null;
+    guideBegin();   // (SAFE LINE: the pattern lays its guide)
+    try { zEnd = PT.spawn(z, sec.n, dd, ups, sec); } finally { S.th = th0; }
+    if(GD){ var GL = R.guideLog || (R.guideLog = []); GL.push({ k: pk, pts: GD.pts.slice(), hops: GD.hops.slice() }); if(GL.length > 8) GL.shift(); }   // (test surface)
+    guideEnd();
+    (S.patSpans || (S.patSpans = [])).push([z, zEnd, BEAT_PATS[pk] ? 1 : 0]);
+    return zEnd;
+  }
+  // After a set piece: chain a second straight on (once), or filler as long as the set piece(s) took.
+  function afterPattern(z, zEnd, ups, gs){
+    S.patRun = (S.patRun || 0) + Math.max(0.5, (zEnd - z) / ups);
+    if(!S.chained && FLOW.th != null && Math.random() < DP.chainChance){
+      S.chained = true; S.chainTh = FLOW.th;
+      S.nextRow = S.nextPat = zEnd + ups * DP.chainGapSec;
+      return;
+    }
+    S.chained = false; S.chainTh = null;
+    var f = clamp(S.patRun * rnd(DP.fodMulMin, DP.fodMulMax), DP.fodSecMin, DP.fodSecMax);
+    S.patRun = 0;
+    S.nextRow = zEnd + ups * gs * 0.5;
+    S.nextPat = zEnd + ups * f;
+  }
+  // A chain that could not be laid (the tube ran out, a chase began): the filler it owes comes now.
+  function chainBroken(z, ups){
+    if(S.chainTh == null) return;
+    S.chainTh = null; S.chained = false;
+    S.nextPat = Math.max(S.nextPat, z + ups * clamp(S.patRun || 0, DP.fodSecMin, DP.fodSecMax));
+    S.patRun = 0;
+  }
+  // The filler's mix in this district (null: the old mix).
+  function fodderMix(z, n, d){
+    var k = distOf(sectionAt(z)), D = k && DISTRICTS[k];
+    return D && D.fod ? D.fod(d, n) : null;
+  }
+  function fullHoles(z){ var k = distOf(sectionAt(z)); return !!(k && DISTRICTS[k].fullHoles); }
+  // THE MACHINE's filler: a single gate pumping on its own beat (hazard clock) — watch it, or take the wall beside.
+  function fodPiston(j, z, n){ addPiston(j, z, n, { kind: 'beat', t0: S.hazT + Math.random() * 2, T: rnd(1.3, 1.9), ph: 0 }); }
+  // SPEED CORES only where nothing beat-timed is laid (or due) between the core and as far ahead as rows are laid,
+  // and never inside a set piece.
+  function beatClear(zi, look){
+    var L = S.patSpans || [];
+    for(var i = 0; i < L.length; i++){
+      if(L[i][0] < zi && L[i][1] > zi) return false;
+      if(L[i][2] && L[i][1] > zi && L[i][0] < zi + look) return false;
+    }
+    if(S.nextPat < zi + look){ var k = distOf(sectionAt(Math.max(S.nextPat, zi))); if(!k || DISTRICTS[k].beat) return false; }
+    return true;
+  }
+  function pruneSpans(){ var L = S.patSpans; if(L) while(L.length && L[0][1] < S.z - 5) L.shift(); }
+
+  // ── A full-ring floor strip (a pit's strip that covers every wall): pits built of these are TRENCHES across the tube.
+  function ringStrip(zA, zB){ return { zA: zA, zB: zB, th0: 0, drift: 0, amp: 0, freq: 0, w0: 3.3, w1: 3.3 }; }
+  function islCoin(x, z, lift){
+    if(S.coins.length >= COIN_MAX) return;
+    S.coins.push({ z: z, x: x, y: groundAt(x, z) + P.coinLift + (lift || 0), up: 0,
+                   spin: Math.random() * TAU, pulled: false, rx: 0, ry: 0, rz: 0, vx: 0, vy: 0, vz: 0 });
+  }
+
+  var PATTERNS3 = {
+    // THE SKIPS (rhythm) — bars and trenches right across the tube on a phrase: short, short, long. A trench is the
+    // whole tube gone for a moment; a bar is a bar. Both are a hop — it is the beat that is the test.
+    skips: { w: 3, min: 4, max: 12, sec: function(d){ return 0.5 + (5 + Math.round(2 * d)) * (1 - 0.1 * d) + 0.5; },
+      spawn: function(z, n, d, ups){
+        var span = TAU / n, th = Math.round(S.th / span) * span, K = 5 + Math.round(2 * d), sc = 1 - 0.1 * d, PH = [0.7, 0.7, 1.0];
+        var trL = ups * (0.2 + 0.04 * d), zz = z + ups * 0.5, trench = Math.random() < 0.5, cut = [], k, j;
+        gp(z, S.th); gp(zz - ups * 0.35, th);
+        for(k = 0; k < K; k++){
+          if(trench && cut.length < 4) cut.push(zz); else for(j = 0; j < n; j++) addObs('bar', j, zz, n);
+          for(var c = -2; c <= 2; c++){ var f = c / 2.5; placeCoin(th, zz + c * ups * 0.1, P.coinLift + 0.11 * (1 - f * f)); }
+          gh(zz);
+          if(Math.random() < 0.75) trench = !trench;
+          if(k < K - 1) zz += ups * PH[k % 3] * sc;
+        }
+        if(cut.length){
+          var p = { z0: cut[0] - trL / 2 - ups * 0.1, z1: cut[cut.length - 1] + trL / 2 + ups * 0.1, strips: [] }, a = p.z0 - 0.01;
+          for(k = 0; k < cut.length; k++){ p.strips.push(ringStrip(a, cut[k] - trL / 2)); a = cut[k] + trL / 2; }
+          p.strips.push(ringStrip(a, p.z1 + 0.01));
+          R.pits.push(p);
+        }
+        gp(zz + ups * 0.3, th);
+        return zz + ups * 0.4;
+      } },
+    // THE THREAD (weave) — bulkheads close together, ONE opening each, the openings strung along a winding line: you
+    // follow the thread round the tube. It starts where you are.
+    thread: { w: 3, min: 4, max: 16, sec: function(d){ return 0.7 + (5 + Math.round(2 * d)) * (0.5 - 0.08 * d) + 0.3; },
+      spawn: function(z, n, d, ups){
+        var K = 5 + Math.round(2 * d), gap = ups * (0.5 - 0.08 * d), r = 0.1 + 0.025 * (1 - d), zz = z + ups * 0.7;
+        var A = 0.35 + 0.3 * d, ph = Math.random() * TAU, dr = (Math.random() < 0.5 ? -1 : 1) * rnd(0.05, 0.15), th0 = S.th;
+        gp(z, S.th);
+        for(var k = 0; k < K; k++){
+          var th = th0 + A * (Math.sin(ph + k * 0.9) - Math.sin(ph)) + dr * k;
+          addWall(zz, n, { holes: [{ th: th, r: r }] });
+          placeCoin(th, zz - gap * 0.3); placeCoin(th, zz);
+          gp(zz - gap * 0.45, th); gp(zz + 0.03, th);
+          zz += gap;
+        }
+        return zz - gap + ups * 0.3;
+      } },
+    // THE ZIPPER (roll) — gate rows whose one open wall jumps TWO walls each row, back and forth (now and then on
+    // round instead): you cross a gated wall between every pair. The corkscrew's steady turn, made a switchback.
+    zipper: { w: 3, min: 6, max: 10, sec: function(d){ return 0.4 + (5 + Math.round(2 * d)) * (0.75 - 0.12 * d) + 0.3; },
+      spawn: function(z, n, d, ups){
+        var span = TAU / n, rowsN = 5 + Math.round(2 * d), gap = ups * (0.75 - 0.12 * d), zz = z + ups * 0.4, j = Math.round(S.th / span);
+        var dir = Math.random() < 0.5 ? -1 : 1, step = n >= 9 && d > 0.5 ? 3 : 2;
+        gp(z, S.th);
+        for(var k = 0; k < rowsN; k++){
+          if(k){ j += dir * step; dir = -dir; if(Math.random() < 0.3) dir = -dir; }
+          var open = ((j % n) + n) % n;
+          for(var w = 0; w < n; w++) if(w !== open) addObs('gate', w, zz, n);
+          placeCoin(j * span, zz - gap * 0.3); placeCoin(j * span, zz);
+          gp(zz - gap * 0.55, j * span); gp(zz + 0.03, j * span);
+          zz += gap;
+        }
+        return zz - gap + ups * 0.3;
+      } },
+    // THE STEPPING STONES (drop) — the tube falls away but for five whole-wall stones: each the next wall over
+    // (they overlap — step across) or straight on past a gap (hop it). Coins on every stone.
+    stones: { w: 3, min: 5, max: 12, sec: function(d){ return 0.4 + 5 * (0.62 - 0.1 * d) + 4 * 0.25 + 0.4; },
+      spawn: function(z, n, d, ups){
+        var span = TAU / n, L = ups * (0.62 - 0.1 * d), ov = ups * 0.3, hop = ups * (0.2 + 0.05 * d), hw = span * 0.5 + 0.015;
+        var j = Math.round(S.th / span), z0 = z + ups * 0.4, zA = z0 - 0.01, zB = 0, prevB = 0, strips = [];
+        gp(z, S.th); gp(z0, j * span);
+        for(var k = 0; k < 5; k++){
+          if(k){
+            if(Math.random() < 0.55){ var dj = Math.random() < 0.5 ? -1 : 1; zA = prevB - ov; gp(zA + ov * 0.15, j * span); j += dj; gp(prevB - ov * 0.15, j * span); }
+            else { zA = prevB + hop; gp(prevB - 0.02, j * span); gh(prevB + hop * 0.5); gp(zA + 0.02, j * span); }
+          }
+          zB = zA + L;
+          strips.push({ zA: zA, zB: zB, th0: j * span, drift: 0, amp: 0, freq: 0, w0: hw, w1: hw });
+          placeCoin(j * span, zA + L * 0.4); placeCoin(j * span, zA + L * 0.7);
+          prevB = zB;
+        }
+        R.pits.push({ z0: z0, z1: zB - 0.01, strips: strips });
+        gp(zB + ups * 0.2, j * span);
+        return zB + ups * 0.4;
+      } },
+    // THE WAVE (machine) — pistons on every wall, their beats set one after another round the tube: the one open
+    // wall travels round, a wall a row. Ride the wave — late and it has gone on without you. (Hazard clock.)
+    wave: { w: 3, min: 5, max: 12, sec: function(d){ return 1.0 + (5 + Math.round(2 * d)) * (0.45 - 0.08 * d) / hazRate() + 0.5; },
+      spawn: function(z, n, d, ups){
+        var span = TAU / n, rowsN = 5 + Math.round(2 * d), dl = 0.45 - 0.08 * d, T = dl * n, z0 = z + ups * 1.0, t0 = hazAt(arriveT(z0));
+        var j0 = Math.round(S.th / span), dir = Math.random() < 0.5 ? -1 : 1, zz = z0;
+        gp(z, S.th);
+        for(var k = 0; k < rowsN; k++){
+          if(k) zz = zAtT(runAtHaz(t0 + k * dl));
+          for(var w = 0; w < n; w++){ var dw = ((w - j0) % n + n) % n; addPiston(w, zz, n, { kind: 'beat', t0: t0, T: T, ph: -dir * dw / n }); }
+          var jt = (j0 + dir * k) * span;
+          placeCoin(jt, zz - ups * 0.12); placeCoin(jt, zz);
+          gp(zz - ups * 0.24, jt); gp(zz + 0.03, jt);
+        }
+        return zz + ups * 0.4;
+      } },
+    // THE LOG STEPS (wilds) — fallen logs right across the island, on a beat: hop, hop, hop, over the hills.
+    logsteps: { w: 3, flat: true, sec: function(d){ return 0.5 + 5 * (0.85 - 0.12 * d) + 0.3; },
+      spawn: function(z, n, d, ups, sec){
+        sec = sec || sectionAt(z);
+        var gap = ups * (0.85 - 0.12 * d), zz = z + ups * 0.5, Lw = LOG_W[LOG_W.length - 1];
+        for(var k = 0; k < 5; k++){
+          var half = flatW(sec, zz) / 2 - 0.02;
+          for(var x = -half; x < half; x += Lw - 0.02) addFlatObs('log', Math.min(x + Lw / 2, half - Lw / 2), Lw, zz, sec);
+          var cx = clamp(S.x, -half + 0.1, half - 0.1);
+          for(var c = -1; c <= 1; c++) islCoin(cx, zz + c * ups * 0.1, 0.09 * (1 - c * c * 0.6));
+          zz += gap;
+        }
+        return zz - gap + ups * 0.3;
+      } },
+    // THE BOULDER GATES (wilds) — rows of great rocks right across the island, one gap in each, the gap stepping
+    // left and right: too tall to hop, so you weave down the line of gaps.
+    boulders: { w: 3, flat: true, sec: function(d){ return 0.5 + (5 + Math.round(d)) * (0.7 - 0.1 * d) + 0.3; },
+      spawn: function(z, n, d, ups, sec){
+        sec = sec || sectionAt(z);
+        var K = 5 + Math.round(d), gap = ups * (0.7 - 0.1 * d), zz = z + ups * 0.5, gw = 0.44 - 0.06 * d, gx = S.x, s = ROCK_R[ROCK_R.length - 1], st = 1.6 * s;
+        for(var k = 0; k < K; k++){
+          var half = flatW(sec, zz) / 2 - 0.04;
+          if(k) gx += (Math.random() < 0.5 ? -1 : 1) * rnd(0.35, 0.7);
+          gx = clamp(gx, -half + gw / 2 + 0.05, half - gw / 2 - 0.05);
+          for(var x = gx + gw / 2 + 0.8 * s; x - 0.8 * s < half + 0.1; x += st) addFlatObs('rock', x, s, zz, sec);
+          for(x = gx - gw / 2 - 0.8 * s; x + 0.8 * s > -half - 0.1; x -= st) addFlatObs('rock', x, s, zz, sec);
+          islCoin(gx, zz - ups * 0.12); islCoin(gx, zz);
+          zz += gap;
+        }
+        return zz - gap + ups * 0.3;
+      } }
+  };
+  for(var _dk in PATTERNS3) PATTERNS[_dk] = PATTERNS3[_dk];
+
+  // ── The district on screen: the glass's tint (cross-fading over the fold or island where it changes) and its
+  // name, under the readout, just before you reach it. ──
+  function tubeDist(i, dir){
+    var c = S.course;
+    while(c[i] && c[i].kind === 'squeeze') i += dir;
+    return c[i] && c[i].kind === 'hold' ? distOf(c[i]) : null;
+  }
+  function feedDistrict(){
+    if(!S || !S.course) return;
+    var c = S.course, i;
+    // the name, a moment before the district begins (a fold's: the tube after it)
+    var ia = -1, za = S.z + unitsPerSec() * 0.9;
+    for(i = 0; i < c.length; i++) if(za < c[i].z1){ ia = i; break; }
+    if(ia < 0) return;
+    var k = c[ia].kind === 'morph' ? tubeDist(ia + 1, 1) : (c[ia].kind === 'flat' ? 'wilds' : tubeDist(ia, -1));
+    if(k && k !== S.dAnn && !S.dead){ S.dAnn = k; distToast(k); }
+    distToastTick();
+  }
+  function distToast(k){
+    if(!R.elDistr && R.elTier && R.elTier.parentNode){
+      var e = R.elDistr = R.elTier.cloneNode(false);
+      e.style.top = 'calc(108px + env(safe-area-inset-top, 0px))'; e.style.opacity = 0;
+      R.elTier.parentNode.appendChild(e);
+    }
+    if(!R.elDistr) return;
+    var D = DISTRICTS[k], e2 = R.elDistr;
+    e2.innerHTML = '<div style="font-size:11px;letter-spacing:0.34em;">' + D.name + '</div><div style="font-size:9px;letter-spacing:0.28em;opacity:0.7;margin-top:3px;">' + D.verb + '</div>';
+    // inked: the district's colour taken deep, on a soft light seat — it sits over pale sky as often as dark tube
+    var ink = D.rgb.split(',').map(function(v){ return Math.round(+v * 0.55); }).join(',');
+    e2.style.color = 'rgba(' + ink + ',0.97)'; e2.style.textShadow = '0 0 6px rgba(255,255,255,0.85), 0 0 14px rgba(' + D.rgb + ',0.6)';
+    R.dToastT0 = performance.now();
+  }
+  function distToastTick(){
+    var e = R.elDistr;
+    if(!e) return;
+    var t = (performance.now() - (R.dToastT0 || -1e9)) / 1000;
+    var a = t < 0.3 ? t / 0.3 : (t > 2.4 ? Math.max(0, 1 - (t - 2.4) / 0.5) : 1);
+    a *= (R.cardShown ? 0 : 1) * (1 - (R.shopAmt || 0));
+    var v = a.toFixed(3);
+    if(e._o !== v){ e._o = v; e.style.opacity = v; }
+  }
 
   // ════════════════════════════════════════ THE UPGRADES ════════════════════════════════════════
   // PER-RUN UPGRADES. Coins fill a meter (the readout under the coin count: upgFirst coins for the first upgrade,
@@ -96249,7 +96608,7 @@ var RUNNER = (function(){
   // opening, along a path, up in a hop's own arc where a hop is due. Teal, faint, dashes running forward. ──
   var GD = null, _shG = { n: 0, phi: new Float64Array(48), h: new Float64Array(48), span: 0, reg: 0 }, _rg = { x: 0, y: 0, r: 0, i: 0 };
   function guideBegin(){ GD = upgN('guide') ? { pts: [], hops: [] } : null; }
-  function gp(z, th){ if(GD) GD.pts.push({ z: z, th: th }); }
+  function gp(z, th){ FLOW.th = th; if(GD) GD.pts.push({ z: z, th: th }); }   // (THE DISTRICTS: a pattern's last point is where it lets you out)
   function gh(z){ if(GD) GD.hops.push(z); }
   function guideEnd(){ var g = GD; GD = null; if(g && g.pts.length >= 2) buildGuide(g); }
   function buildGuide(g){
@@ -96368,8 +96727,9 @@ var RUNNER = (function(){
     R.obs.push(o);
   }
   // Which pattern next: weighted, never the same twice running, and only ones that work on this shape.
-  function pickPattern(n){
+  function pickPattern(n, sec){
     if(P.onlyPat && PATTERNS[P.onlyPat]) return P.onlyPat;
+    var _dp = distPick(n, sec); if(_dp !== undefined) return _dp;   // (THE DISTRICTS)
     var w = {}, any = false;
     for(var k in PATTERNS){ var p = PATTERNS[k]; if(n >= p.min && n <= p.max && k !== S.lastPat && (!p.gun || gunOn())){ w[k] = p.w; any = true; }   /* (THE ENEMIES: a gun-only pattern needs the gun) */ }
     return any ? wpick(w) : null;
@@ -96402,17 +96762,20 @@ var RUNNER = (function(){
       // The gap in seconds shrinks with the run's difficulty; in units it is that × the current speed.
       var gs = (P.rowGapSecMin + Math.random() * (P.rowGapSecMax - P.rowGapSecMin)) * (1 + (P.rowGapEndMul - 1) * difficulty());
       var next = (skipTo != null ? skipTo : z) + ups * gs;
-      // A PATTERN when one is due — on a held tube with room for all of it before the tube changes.
-      if(skipTo == null && sec.kind === 'hold' && z >= S.nextPat){
-        var pk = pickPattern(sec.n), PT = pk && PATTERNS[pk], dd = difficulty();
-        if(PT && z + PT.sec(dd) * ups < sec.z1 - ups * P.morphClearBefore && !openIn(z - ups * 0.5, z + PT.sec(dd) * ups + ups * 0.5)){
-          guideBegin(); var zEnd = PT.spawn(z, sec.n, dd, ups); guideEnd();   // (SAFE LINE: the pattern lays its guide)
+      // A PATTERN when one is due — one of THIS DISTRICT's, on a held tube (or an island) with room for all of it
+      // before the ground changes; then filler as long as it took, or a second chained on (see THE DISTRICTS).
+      var onGround = sec.kind === 'hold' || sec.kind === 'flat';
+      if(skipTo == null && onGround) distIntro(sec, ups);
+      if(skipTo == null && onGround && z >= S.nextPat){
+        var pk = pickPattern(sec.n, sec), PT = pk && PATTERNS[pk], dd = difficulty();
+        if(PT && patFits(PT, z, sec, dd, ups)){
+          var zEnd = layPattern(pk, PT, z, sec, dd, ups);
           S.lastPat = pk; S.patLog.push(pk);
-          S.nextRow = zEnd + ups * gs * 0.5;
-          S.nextPat = zEnd + ups * (P.patGapSecMin + Math.random() * (P.patGapSecMax - P.patGapSecMin));
+          afterPattern(z, zEnd, ups, gs);
           continue;
         }
       }
+      chainBroken(z, ups);
       if(skipTo == null){
         if(!P.fodder){}
         else if(sec.kind === 'hold'){ if(!foeSlot(z, next, sec)) spawnRow(z, sec.n); }   // (THE ENEMIES: now and then an enemy takes the row's place)
@@ -96423,6 +96786,7 @@ var RUNNER = (function(){
       maybeItem(z, next, skipTo);   // a SPEED or CHARGE CORE in this gap, when one is due (see THE CORES)
       S.nextRow = next;
     }
+    pruneSpans();
     for(var i = R.obs.length - 1; i >= 0; i--) if(R.obs[i].z < S.z - 1.5){ freeObs(R.obs[i]); R.obs.splice(i, 1); }
     for(i = R.holes.length - 1; i >= 0; i--) if(R.holes[i].z1 < S.z - 3) R.holes.splice(i, 1);
     for(i = R.pits.length - 1; i >= 0; i--) if(R.pits[i].z1 < S.z - 3) R.pits.splice(i, 1);
@@ -96434,17 +96798,20 @@ var RUNNER = (function(){
     for(j = 0; j < n; j++){
       var p = 0.20 + 0.32 * d, near = Math.min(Math.abs(j - me), n - Math.abs(j - me));
       if(near === 0) p *= 1.9; else if(near === 1) p *= 1.3;   // the run is on your wall: so are the obstacles
-      pick.push(Math.random() < p ? wpick({ bar: 3, pillar: 3, half: n > 13 ? 1.2 : 2.2, gate: 0.5 + 1.6 * d, hole: 0.7 + 1.3 * d }) : null);
+      pick.push(Math.random() < p ? wpick(fodderMix(z, n, d) || { bar: 3, pillar: 3, half: n > 13 ? 1.2 : 2.2, gate: 0.5 + 1.6 * d, hole: 0.7 + 1.3 * d }) : null);   // (THE DISTRICTS: its own filler)
     }
     // FAIRNESS: a gate is only beaten by a cling or a roll round, so every gated wall keeps one EMPTY
     // neighbour to get to. (A gap is not empty — but it is beaten by a hop, so it needs no such rule.)
     for(j = 0; j < n; j++){
-      if(pick[j] !== 'gate') continue;
+      if(pick[j] !== 'gate' && pick[j] !== 'piston') continue;   // (a pumping piston is a gate half the time)
       var L = (j - 1 + n) % n, Rr = (j + 1) % n;
       if(pick[L] !== null && pick[Rr] !== null) pick[Math.random() < 0.5 ? L : Rr] = null;
     }
     for(j = 0; j < n; j++) if(pick[j]){
       if(R.open.length && openAt(regShape(n), j, z)) continue;   // (a missing panel holds nothing)
+      if(R.open.length && openIn(z - 0.01, z + 0.01) && Math.random() < 0.5) continue;   // (THE DISTRICTS: an open stretch is its own set piece — half the filler)
+      if(pick[j] === 'piston'){ fodPiston(j, z, n); continue; }   // (THE DISTRICTS: THE MACHINE's filler)
+      if(pick[j] === 'hole' && fullHoles(z)){ addHole(j, z, n); var _fh = R.holes[R.holes.length - 1]; _fh.uf0 = -1.5; _fh.uf1 = 1.5; continue; }   // (THE RHYTHM: a gap is always a hop)
       if(pick[j] === 'hole') addHole(j, z, n); else if(!barricadeFor(pick[j], j, z, n)) addObs(pick[j], j, z, n);   // (THE ENEMIES: some gates and half walls are barricades)
     }
   }
@@ -96761,6 +97128,11 @@ var RUNNER = (function(){
     boltLift: 0.055,        // it flies this high off its wall: over a bar, into a gate
     boltHz: 16,             // how hard it steers across the wall onto its target (it never leaves the wall)
     gunLock: 0.16,          // a new target is LOCKED this long before the first shot (the brackets close on it)
+    foeInkPx: 2.2,          // the ink outline round every enemy, CSS pixels
+    foeBoltSize: 0.085,     // their bolts as you see them: the orb's quad, world units (its hit radius stays 0.01)
+    boltWidth: 0.012,       // your tracers' thickness
+    qSteerHz: 3.4,          // a grounded quarry's steering spring (softer than yours: its lane changes are curves its nose leads)
+    flyCruise: 0.15,        // a flyer's cruising height off its wall — it climbs over what stands in its lane (flyLift)
     foeFirstSec: 7,         // the first enemy of a run, this far along its progress clock
     foeGapSecMin: 5.5, foeGapSecMax: 9.0, foeGapEndMul: 0.6,   // seconds between enemies (× down to this at full difficulty)
     foeTokens: 2,           // at most this many enemies winding up or firing at once
@@ -96800,7 +97172,7 @@ var RUNNER = (function(){
     chaseCrashDmg: 0.1,     // …this share of its armour
     chaseSpill: 3,          // a coin out of it every this many hits
     chaseDraftFov: 4,       // the lens opens this many degrees in its slipstream
-    rivalScale: 3.0,        // THE MIRROR: this much bigger than you (on an octagon's wall — it is sized to its wall)
+    rivalScale: 4.2,        // THE MIRROR: this much bigger than you (on an octagon's wall — it is sized to its wall)
     mineDecel: 2.6,         // a dropped mine (a wreck, a plate) keeps the speed it was dropped with, then brakes on the
                             // wall at this many units a second² — from 3.2 ahead it comes at you ~1.6 s after the drop
     // THE GATEKEEPER — the guardian of each coin tier from gkTierFrom (SAPPHIRE) on, and one every gkAfterLast metres past
@@ -96884,7 +97256,23 @@ var RUNNER = (function(){
   // sky's colour comes from syncFogCol, and from the scene's fog at creation). Glows are PREMULTIPLIED (One,
   // OneMinusSrcAlpha, alpha ≈ brightness — THE PLUME's glowOver recipe): additive over the dark, their own colour
   // over THE SKY. Solid parts are opaque and carry a dark rim, so they read on the pale holo walls as on the dark. ──
-  var FOE_EYE = new THREE.Color(1.0, 0.24, 0.42), BOLT_COL = new THREE.Color(0.62, 0.36, 1.0), FOE_MATS = [];
+  //
+  // THE ENEMY'S OWN LOOK. The course's obstacles are dark glass with hazard-red edges; enemies first wore exactly that
+  // (and a pink eye), so on the pale sky and in the dark tube alike a quarry read as one more pink box among the bars
+  // (measured, 10-19 screenshots). An enemy now has a look nothing else on the course has: SOLID ARMOUR in its own
+  // colour, shaded (lit from above its own wall), with a lit trim on every edge and an INK OUTLINE round its silhouette
+  // (a back-face shell pushed out a constant few pixels) — so it reads as a THING on any background, the obstacles as
+  // glass. Its energy (eyes, engines, bolts, hoops, beams, rings) is its colour too. One palette, FP: every enemy
+  // material reads these shared colours, so a palette is swapped in one place (testing: ?runfoepal=a|b|c).
+  var FPAL = {
+    a: { body: [0.20, 0.74, 0.05], shade: [0.03, 0.13, 0.02], trim: [0.80, 1.0, 0.40], eye: [0.70, 1.0, 0.10], hot: [0.97, 1.0, 0.82], ink: [0.012, 0.03, 0.012], rgb: '170,255,50' },   // ACID: green armour, black ink
+    b: { body: [0.07, 0.085, 0.07], shade: [0.012, 0.016, 0.012], trim: [0.55, 1.0, 0.12], eye: [0.62, 1.0, 0.10], hot: [0.95, 1.0, 0.80], ink: [0.50, 1.0, 0.10], rgb: '160,255,40' },  // VOID: black armour, lime light
+    c: { body: [1.0, 0.46, 0.06], shade: [0.30, 0.07, 0.02], trim: [1.0, 0.93, 0.62], eye: [1.0, 0.82, 0.18], hot: [1.0, 1.0, 0.86], ink: [0.06, 0.02, 0.0], rgb: '255,170,40' }      // EMBER: orange armour, black ink
+  };
+  var FP = { body: new THREE.Color(), shade: new THREE.Color(), trim: new THREE.Color(), eye: new THREE.Color(), hot: new THREE.Color(), ink: new THREE.Color(), rgb: '' };
+  function foePal(k){ var p = FPAL[k] || FPAL.a; for(var c in p) if(FP[c] && FP[c].isColor) FP[c].setRGB(p[c][0], p[c][1], p[c][2]); FP.rgb = p.rgb; }
+  foePal((Q.match(/[?&]runfoepal=(\w)/) || [])[1]);
+  var FOE_EYE = FP.eye, BOLT_COL = new THREE.Color(0.62, 0.36, 1.0), FOE_MATS = [];
   function fogC(){ return (R.scene && R.scene.fog) ? R.scene.fog.color.clone() : new THREE.Color(BG); }
   function keep(m){ FOE_MATS.push(m); if(m.uniforms && m.uniforms.uFogCol) m.uniforms.uFogCol.value.copy(fogC()); return m; }
   function premul(m){
@@ -96892,46 +97280,94 @@ var RUNNER = (function(){
     m.blending = THREE.CustomBlending; m.blendEquation = THREE.AddEquation; m.blendSrc = THREE.OneFactor; m.blendDst = THREE.OneMinusSrcAlphaFactor;
     return m;
   }
-  // ARMOUR: the obstacles' own edge-finding prism shader (dark glass, hazard edges, from the prism's own planes) with
-  // PLATE SEAMS across its faces, and an EYE on the face that looks down the tube at you — it heats (uHeat) as the
-  // enemy winds up. eye = [x, y, z, radius] in the prism's frame, or null.
-  function armourMat(g, eye){
+  // ARMOUR: solid, in the enemy's colour, shaded by a light from above its OWN wall (its frame: the same look on every
+  // wall of the tube), with PLATE SEAMS across its faces, a lit TRIM on every edge (found from the prism's own planes, a
+  // pixel or two wide at any distance) and an EYE in a dark socket on the face that looks down the tube at you — it
+  // heats (uHeat) as the enemy winds up, and the trim warms with it. tone: the part's armour brightness (1 the hull,
+  // less for a darker fitting). eye = [x, y, z, radius] in the prism's frame, or null.
+  function armourMat(g, eye, tone){
     var pl = g.userData.planes, NN = [], DD = [];
     for(var i = 0; i < 6; i++){ var q = pl[Math.min(i, pl.length - 1)]; NN.push(new THREE.Vector3(q[0], q[1], q[2])); DD.push(q[3]); }
     return new THREE.ShaderMaterial({
-      uniforms: { uN: { value: NN }, uD: { value: DD }, uEdge: { value: HAZ_EDGE }, uCore: { value: HAZ_CORE }, uEyeCol: { value: FOE_EYE },
+      uniforms: { uN: { value: NN }, uD: { value: DD }, uBody: { value: FP.body }, uShade: { value: FP.shade }, uTrim: { value: FP.trim },
+                  uEyeCol: { value: FP.eye }, uHot: { value: FP.hot }, uTone: { value: tone == null ? 1 : tone },
                   uEye: { value: eye ? new THREE.Vector4(eye[0], eye[1], eye[2], eye[3]) : new THREE.Vector4() },
                   uHeat: { value: 0 }, uHit: { value: 0 }, uT: { value: 0 }, uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
       vertexShader: OB_VERT,
       fragmentShader: [
-        'uniform vec3 uN[6]; uniform float uD[6]; uniform vec3 uEdge, uCore, uEyeCol, uFogCol; uniform vec4 uEye; uniform float uHeat, uHit, uT, uFogD;',
+        'uniform vec3 uN[6]; uniform float uD[6]; uniform vec3 uBody, uShade, uTrim, uEyeCol, uHot, uFogCol; uniform vec4 uEye;',
+        'uniform float uHeat, uHit, uT, uFogD, uTone;',
         'varying vec3 vP, vNl, vN, vView;',
         'void main(){',
         '  float m1 = 1e9, m2 = 1e9;',
         '  for(int i = 0; i < 6; i++){ float e = uD[i] - dot(uN[i], vP); if(e < m1){ m2 = m1; m1 = e; } else if(e < m2){ m2 = e; } }',
         '  float w = length(fwidth(vP)) + 1e-6;',
-        // (the soft glow is held to a few millimetres of the part itself: measured in pixels like the obstacles', it
-        // covered every face of something this small and the whole enemy read as a pink lump)
-        '  float edge = exp(-max(m2, 0.0) / (w * 1.4)) + 0.3 * exp(-max(m2, 0.0) / max(w * 2.5, 0.0035));',
-        '  float rim = pow(1.0 - abs(dot(normalize(vN), normalize(-vView))), 3.0);',
+        '  float edge = 1.0 - smoothstep(w * 0.7, w * 1.9, max(m2, 0.0));',
+        '  vec3 nl = normalize(vNl);',
+        '  float dif = max(dot(nl, vec3(0.30, 0.85, 0.43)), 0.0);',
+        '  float rim = pow(1.0 - abs(dot(normalize(vN), normalize(-vView))), 2.0);',
         // the plates: a grid of seams in each face, faded out before it could alias
-        '  vec2 gp = abs(vNl.z) > 0.5 ? vP.xy : (abs(vNl.x) > abs(vNl.y) ? vP.yz : vP.xz);',
-        '  vec2 gq = gp * vec2(30.0, 34.0), gw = fwidth(gq) + 1e-5, gd = 0.5 - abs(fract(gq) - 0.5);',
-        '  float seam = max(exp(-gd.x / (gw.x * 1.3)), exp(-gd.y / (gw.y * 1.3))) * (1.0 - smoothstep(0.12, 0.3, max(gw.x, gw.y)));',
-        // the eye, on the face toward the run: a white-hot pupil, a hot iris, a glow on the plate round it
-        '  float on = step(0.5, vNl.z) * step(1e-4, uEye.w), ed = length(vP - uEye.xyz);',
+        '  vec2 gp = abs(nl.z) > 0.5 ? vP.xy : (abs(nl.x) > abs(nl.y) ? vP.yz : vP.xz);',
+        '  vec2 gq = gp * vec2(26.0, 30.0), gw = fwidth(gq) + 1e-5, gd = 0.5 - abs(fract(gq) - 0.5);',
+        '  float seam = max(exp(-gd.x / (gw.x * 1.2)), exp(-gd.y / (gw.y * 1.2))) * (1.0 - smoothstep(0.12, 0.3, max(gw.x, gw.y)));',
+        '  vec3 col = mix(uShade, uBody * uTone, 0.3 + 0.7 * dif) * (1.0 - 0.35 * seam);',
+        '  col = mix(col, mix(uTrim, uEyeCol, uHeat * 0.6), clamp(rim * 0.28 + edge * 0.8, 0.0, 1.0));',
+        // the eye, on the face toward the run: a white-hot pupil, a hot iris, in a dark socket
+        '  float on = step(0.5, nl.z) * step(1e-4, uEye.w), ed = length(vP - uEye.xyz);',
         '  float pupil = (1.0 - smoothstep(uEye.w * 0.36, uEye.w * 0.5, ed)) * on;',
         '  float iris = (1.0 - smoothstep(uEye.w * 0.85, uEye.w, ed)) * on;',
-        '  float eg = exp(-max(ed - uEye.w, 0.0) / (uEye.w * (0.55 + 0.75 * uHeat) + 1e-5)) * on;',
-        '  float pulse = 0.78 + 0.22 * sin(uT * (3.0 + 10.0 * uHeat));',
-        '  vec3 col = uCore + uEdge * (edge + rim * 0.25 + seam * 0.14);',
-        '  col = mix(col, uEyeCol * (0.75 + 0.6 * uHeat) * pulse, iris) + vec3(1.0, 0.9, 0.93) * pupil * (0.55 + 0.45 * uHeat) + uEyeCol * eg * (0.22 + 0.6 * uHeat) * (1.0 - iris);',
-        '  col = mix(col, vec3(1.0, 0.95, 0.97), uHit * 0.55);',   // a hit: it flashes white
+        '  float sock = (1.0 - smoothstep(uEye.w * 1.25, uEye.w * 1.5, ed)) * on;',
+        '  float pulse = 0.8 + 0.2 * sin(uT * (3.0 + 10.0 * uHeat));',
+        '  col = mix(col, uShade * 0.35, sock);',
+        '  col = mix(col, uEyeCol * (0.8 + 0.45 * uHeat) * pulse, iris);',
+        '  col = mix(col, uHot, pupil * (0.6 + 0.4 * uHeat));',
+        '  col = mix(col, uHot, uHit * clamp(0.12 + 0.75 * rim + 0.5 * edge, 0.0, 1.0));',   // a hit: its rim and trim flash hot (the armour keeps its colour)
         OB_FOG,
         '}'
       ].join('\n'),
       extensions: { derivatives: true }
     });
+  }
+  // THE INK OUTLINE: the part's own geometry, back faces only, each vertex pushed out from the part's centre (aCen,
+  // baked into its geometry) a constant uPx device pixels on screen — behind the front faces it shows only beyond the
+  // silhouette, as a line round it. (C: from the centre, for the convex prisms; N: along the normal, for round parts.)
+  // Fogged as everything is; shared by every enemy (one program each).
+  function inkMat(byNormal){
+    return keep(new THREE.ShaderMaterial({
+      uniforms: { uInk: { value: FP.ink }, uPx: { value: 4 }, uRes: { value: new THREE.Vector2(1080, 1920) }, uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
+      vertexShader: [
+        'attribute vec3 aCen; uniform float uPx; uniform vec2 uRes; varying vec3 vView;',
+        'void main(){',
+        '  vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz;',
+        '  vec4 c = projectionMatrix * mv;',
+        byNormal ? '  vec4 c2 = projectionMatrix * modelViewMatrix * vec4(position + normal * 0.01, 1.0); vec2 d = c2.xy / c2.w - c.xy / c.w;'
+                 : '  vec4 c2 = projectionMatrix * modelViewMatrix * vec4(aCen, 1.0); vec2 d = c.xy / c.w - c2.xy / c2.w;',
+        '  float L = length(d * uRes);',
+        '  if(L > 1e-5) c.xy += d * uRes / L * uPx * 2.0 / uRes * c.w;',
+        '  gl_Position = c;',
+        '}'
+      ].join('\n'),
+      fragmentShader: 'uniform vec3 uInk, uFogCol; uniform float uFogD; varying vec3 vView; void main(){ float dd = length(vView), fog = exp(-uFogD * uFogD * dd * dd); gl_FragColor = vec4(mix(uFogCol, uInk, fog), 1.0); }',
+      side: THREE.BackSide
+    }));
+  }
+  // Bake a part's centre into its geometry (once): what the ink pushes out from.
+  function cenOf(geo){
+    if(geo.attributes.aCen) return geo;
+    if(!geo.boundingBox) geo.computeBoundingBox();
+    var c = geo.boundingBox.getCenter(new THREE.Vector3()), n = geo.attributes.position.count, a = new Float32Array(n * 3);
+    for(var i = 0; i < n; i++){ a[i * 3] = c.x; a[i * 3 + 1] = c.y; a[i * 3 + 2] = c.z; }
+    geo.setAttribute('aCen', new THREE.Float32BufferAttribute(a, 3));
+    return geo;
+  }
+  function inkOnce(m){ if(!m.userData.inked){ inked(m); m.userData.inked = true; } return m; }
+  // Ink a part: a child of it (so it moves, turns, hides with it).
+  function inked(mesh, byNormal){
+    if(!R.inkC){ R.inkC = inkMat(false); R.inkN = inkMat(true); }
+    if(!byNormal) cenOf(mesh.geometry);
+    var ol = new THREE.Mesh(mesh.geometry, byNormal ? R.inkN : R.inkC);
+    ol.frustumCulled = false; mesh.add(ol);
+    return mesh;
   }
   // A camera-facing GLOW round an eye or a core (premultiplied), and — uRing > 0 — a ring closing in on it as a
   // charge fills.
@@ -96957,15 +97393,15 @@ var RUNNER = (function(){
   // The RING CASTER's arch: a coil whose current runs faster and hotter as it charges; dark once it has fired.
   function coilMat(){
     return new THREE.ShaderMaterial({
-      uniforms: { uHeat: { value: 0 }, uT: { value: 0 }, uSpent: { value: 0 }, uEdge: { value: HAZ_EDGE }, uEyeCol: { value: FOE_EYE },
+      uniforms: { uHeat: { value: 0 }, uT: { value: 0 }, uSpent: { value: 0 }, uEdge: { value: FP.trim }, uEyeCol: { value: FP.eye }, uShade: { value: FP.shade }, uHot: { value: FP.hot },
                   uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
       vertexShader: 'varying vec2 vUv; varying vec3 vN, vView; void main(){ vUv = uv; vN = normalize(normalMatrix * normal); vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
-        'uniform float uHeat, uT, uSpent, uFogD; uniform vec3 uEdge, uEyeCol, uFogCol; varying vec2 vUv; varying vec3 vN, vView;',
+        'uniform float uHeat, uT, uSpent, uFogD; uniform vec3 uEdge, uEyeCol, uShade, uHot, uFogCol; varying vec2 vUv; varying vec3 vN, vView;',
         'void main(){',
         '  float f = 1.0 - abs(dot(normalize(vN), normalize(-vView))), live = 1.0 - uSpent;',
         '  float flow = 0.5 + 0.5 * sin(vUv.x * 40.0 - uT * (4.0 + 22.0 * uHeat));',
-        '  vec3 col = vec3(0.05, 0.02, 0.04) + uEdge * (0.22 + 0.5 * f) * (0.35 + 0.65 * live) + uEyeCol * flow * uHeat * live * 0.9 + vec3(1.0, 0.86, 0.9) * pow(uHeat, 3.0) * flow * live * 0.6;',
+        '  vec3 col = uShade + uEdge * (0.22 + 0.5 * f) * (0.35 + 0.65 * live) + uEyeCol * flow * uHeat * live * 0.9 + uHot * pow(uHeat, 3.0) * flow * live * 0.6;',
         '  float dd = length(vView), fog = exp(-uFogD * uFogD * dd * dd);',
         '  gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);',
         '}'
@@ -96975,13 +97411,13 @@ var RUNNER = (function(){
   // A solid hot core (the caster's), white at its heart as it heats.
   function orbMat(){
     return new THREE.ShaderMaterial({
-      uniforms: { uHeat: { value: 0 }, uCol: { value: FOE_EYE }, uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
+      uniforms: { uHeat: { value: 0 }, uCol: { value: FOE_EYE }, uHot: { value: FP.hot }, uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
       vertexShader: 'varying vec3 vN, vView; void main(){ vN = normalize(normalMatrix * normal); vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
-        'uniform float uHeat, uFogD; uniform vec3 uCol, uFogCol; varying vec3 vN, vView;',
+        'uniform float uHeat, uFogD; uniform vec3 uCol, uHot, uFogCol; varying vec3 vN, vView;',
         'void main(){',
         '  float f = abs(dot(normalize(vN), normalize(-vView)));',
-        '  vec3 col = mix(uCol * (0.45 + 0.6 * uHeat), vec3(1.0, 0.93, 0.96), pow(f, 2.5) * (0.35 + 0.65 * uHeat));',
+        '  vec3 col = mix(uCol * (0.45 + 0.6 * uHeat), uHot, pow(f, 2.5) * (0.35 + 0.65 * uHeat));',
         '  float dd = length(vView), fog = exp(-uFogD * uFogD * dd * dd);',
         '  gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);',
         '}'
@@ -96989,18 +97425,19 @@ var RUNNER = (function(){
     });
   }
   // A HOOP: a band round the tube's polygon a bar's height off every wall, facing down the tube — hot core, deep
-  // body, energy running round it (premultiplied).
+  // body, energy running round it, an ink line along each edge (premultiplied: the glow over the dark ink).
   function hoopMat(){
     return premul(new THREE.ShaderMaterial({
-      uniforms: { uT: { value: 0 }, uA: { value: 1 }, uCol: { value: FOE_EYE }, uFogD: { value: P.fog } },
+      uniforms: { uT: { value: 0 }, uA: { value: 1 }, uCol: { value: FOE_EYE }, uHot: { value: FP.hot }, uInk: { value: FP.ink }, uFogD: { value: P.fog } },
       vertexShader: 'attribute float aB, aA; varying float vB, vA; varying vec3 vView; void main(){ vB = aB; vA = aA; vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
-        'uniform float uT, uA, uFogD; uniform vec3 uCol; varying float vB, vA; varying vec3 vView;',
+        'uniform float uT, uA, uFogD; uniform vec3 uCol, uHot, uInk; varying float vB, vA; varying vec3 vView;',
         'void main(){',
         '  float c = 1.0 - abs(vB), core = pow(c, 5.0), flow = 0.72 + 0.28 * sin(vA * 26.0 - uT * 12.0);',
-        '  float a = clamp(smoothstep(0.0, 0.5, c) * 0.9 + core * 0.1, 0.0, 1.0) * uA * exp(-uFogD * uFogD * dot(vView, vView));',
-        '  vec3 col = mix(uCol * 0.8 * flow, vec3(1.0, 0.94, 0.96), core);',
-        '  gl_FragColor = vec4(col * a, a);',
+        '  float g = clamp(smoothstep(0.18, 0.6, c) * 0.92 + core * 0.08, 0.0, 1.0), ink = smoothstep(0.0, 0.1, c) * (1.0 - g);',
+        '  vec3 col = mix(uCol * 0.85 * flow, uHot, core);',
+        '  float f = uA * exp(-uFogD * uFogD * dot(vView, vView));',
+        '  gl_FragColor = vec4(col * g + uInk * ink, clamp(g + ink * 0.9, 0.0, 1.0)) * f;',
         '}'
       ].join('\n'),
       side: THREE.DoubleSide
@@ -97023,6 +97460,65 @@ var RUNNER = (function(){
         '}'
       ].join('\n')
     });
+  }
+  // THEIR BOLTS, drawn to be seen (premultiplied, one instanced draw each): an ORB facing you — a white-hot core in the
+  // enemy's colour, an ink ring round it (it reads on the pale sky), a soft glow beyond (on the dark); a STREAK behind
+  // it along its motion as you see it, tapering; and its MARK on the wall under it — a ring with a dark spot — as it
+  // comes within a few units of you (its lane and its distance at a glance). Bigger than what they hit with: an orb is
+  // ~4× its hit radius across, and that errs your way.
+  function eOrbMat(){
+    return keep(premul(new THREE.ShaderMaterial({
+      uniforms: { uCol: { value: FP.eye }, uHot: { value: FP.hot }, uInk: { value: FP.ink }, uFogD: { value: P.fog } },
+      vertexShader: 'uniform float uFogD; varying vec2 vUv; varying float vF; void main(){ vec4 mv = modelViewMatrix * vec4(instanceMatrix[3].xyz, 1.0); mv.xy += position.xy * length(instanceMatrix[0].xyz); vUv = position.xy * 2.0; vF = exp(-uFogD * uFogD * dot(mv.xyz, mv.xyz)) * smoothstep(0.14, 0.45, -mv.z); gl_Position = projectionMatrix * mv; }',
+      fragmentShader: [
+        'uniform vec3 uCol, uHot, uInk; varying vec2 vUv; varying float vF;',
+        'void main(){',
+        '  float r = length(vUv); if(r > 1.0) discard;',
+        '  float core = 1.0 - smoothstep(0.2, 0.32, r), body = 1.0 - smoothstep(0.44, 0.5, r);',
+        '  float ink = (1.0 - smoothstep(0.56, 0.62, r)) * (1.0 - body), glow = exp(-max(r - 0.5, 0.0) * 8.0) * (1.0 - body) * (1.0 - ink) * (1.0 - smoothstep(0.85, 1.0, r));',
+        '  gl_FragColor = vec4(mix(uCol, uHot, core) * body + uInk * ink + uCol * glow * 0.7, clamp(body + ink + glow * 0.45, 0.0, 1.0)) * vF;',
+        '}'
+      ].join('\n')
+    })));
+  }
+  function eTrailMat(){
+    return keep(premul(new THREE.ShaderMaterial({
+      uniforms: { uCol: { value: FP.eye }, uHot: { value: FP.hot }, uW: { value: 0.013 }, uFogD: { value: P.fog } },
+      vertexShader: [
+        'attribute vec3 aTail; uniform float uW, uFogD; varying vec2 vQ; varying float vF;',
+        'void main(){',
+        '  vec3 A = instanceMatrix[3].xyz; vec4 mA = modelViewMatrix * vec4(A, 1.0), mB = modelViewMatrix * vec4(A + aTail, 1.0);',
+        '  vec2 d = mB.xy / max(-mB.z, 1e-3) - mA.xy / max(-mA.z, 1e-3);',
+        '  vec2 sd = length(d) > 1e-6 ? normalize(vec2(-d.y, d.x)) : vec2(0.0, 1.0);',
+        '  vec4 mP = mix(mA, mB, position.x); mP.xy += sd * position.y * uW * (1.0 - 0.7 * position.x);',
+        '  vQ = position.xy; vF = exp(-uFogD * uFogD * dot(mP.xyz, mP.xyz)) * smoothstep(0.14, 0.45, -mA.z);',
+        '  gl_Position = projectionMatrix * mP;',
+        '}'
+      ].join('\n'),
+      fragmentShader: [
+        'uniform vec3 uCol, uHot; varying vec2 vQ; varying float vF;',
+        'void main(){',
+        '  float along = 1.0 - vQ.x, across = 1.0 - abs(vQ.y), a = pow(along, 1.5) * smoothstep(0.0, 0.7, across);',
+        '  gl_FragColor = vec4(mix(uCol, uHot, pow(across, 4.0) * along) * a, a * 0.8) * vF;',
+        '}'
+      ].join('\n'),
+      side: THREE.DoubleSide
+    })));
+  }
+  function eMarkMat(){
+    return keep(premul(new THREE.ShaderMaterial({
+      uniforms: { uCol: { value: FP.eye }, uInk: { value: FP.ink }, uFogD: { value: P.fog } },
+      vertexShader: 'uniform float uFogD; varying vec2 vUv; varying float vI, vF; void main(){ vec4 mv = modelViewMatrix * instanceMatrix * vec4(position, 1.0); vUv = position.xy * 2.0; vI = length(instanceMatrix[2].xyz); vF = exp(-uFogD * uFogD * dot(mv.xyz, mv.xyz)); gl_Position = projectionMatrix * mv; }',
+      fragmentShader: [
+        'uniform vec3 uCol, uInk; varying vec2 vUv; varying float vI, vF;',
+        'void main(){',
+        '  float r = length(vUv); if(r > 1.0) discard;',
+        '  float ring = exp(-abs(r - 0.72) * 16.0) * (1.0 - smoothstep(0.9, 1.0, r)), spot = (1.0 - smoothstep(0.05, 0.42, r)) * 0.5;',
+        '  gl_FragColor = vec4(uCol * ring * 0.95 + uInk * spot, clamp(ring * 0.75 + spot, 0.0, 1.0)) * clamp(vI, 0.0, 1.0) * vF;',
+        '}'
+      ].join('\n'),
+      side: THREE.DoubleSide
+    })));
   }
   // A SENTRY's sight line: from its barrel to you, dashes running at you, brightening to the shot (premultiplied).
   function lineMat(){
@@ -97061,7 +97557,7 @@ var RUNNER = (function(){
   }
   // A one-part enemy: an armoured prism with its eye, in a group (so its part can move inside it).
   function makeBody(geo, eye){
-    var g = new THREE.Group(), b = new THREE.Mesh(geo, keep(armourMat(geo, eye)));
+    var g = new THREE.Group(), b = inked(new THREE.Mesh(geo, keep(armourMat(geo, eye))));
     b.frustumCulled = false; g.add(b); g.visible = false; R.scene.add(g);
     return g;
   }
@@ -97075,7 +97571,7 @@ var RUNNER = (function(){
   }
   function lancerRec(n){ var k = 'lancer' + n; return FK[k] || (FK[k] = { pool: [], make: function(){ return makeLancer(n); } }); }
   function makeLancer(n){
-    var g = new THREE.Group(), body = new THREE.Mesh(CAST.lancer, keep(armourMat(CAST.lancer, [0, 0.085, 0.025, 0.014])));
+    var g = new THREE.Group(), body = inked(new THREE.Mesh(CAST.lancer, keep(armourMat(CAST.lancer, [0, 0.085, 0.025, 0.014]))));
     var beam = new THREE.Mesh(beamGeo(n), keep(beamMat(n)));
     beam.renderOrder = 3; beam.visible = false;
     body.frustumCulled = beam.frustumCulled = false;
@@ -97105,9 +97601,10 @@ var RUNNER = (function(){
   // THE SENTRY: a base on its wall, a head on a pivot (turns, then tilts: YXZ) carrying the barrel, its eye and glow.
   function makeSentry(){
     var g = new THREE.Group(), pv = new THREE.Group();
-    var base = new THREE.Mesh(SEN.base, keep(armourMat(SEN.base, null)));
-    var head = new THREE.Mesh(SEN.head, keep(armourMat(SEN.head, [0, 0, 0.031, 0.0135])));
-    var barrel = new THREE.Mesh(SEN.barrel, cylMatF(new THREE.Vector3(0, 0, 1), 0.0085, 0.035, 0.6));
+    var base = inked(new THREE.Mesh(SEN.base, keep(armourMat(SEN.base, null, 0.7))));
+    var head = inked(new THREE.Mesh(SEN.head, keep(armourMat(SEN.head, [0, 0, 0.031, 0.0135]))));
+    var bm = cylMatF(new THREE.Vector3(0, 0, 1), 0.0085, 0.035, 0.6); bm.uniforms.uEdge.value = FP.trim; bm.uniforms.uCore.value = FP.shade;
+    var barrel = inked(new THREE.Mesh(SEN.barrel, bm), true);
     var halo = new THREE.Mesh(SEN.quad, keep(haloMat(0.065)));
     pv.position.set(0, 0.063, 0); pv.rotation.order = 'YXZ';
     barrel.position.set(0, -0.005, 0.064); halo.position.set(0, 0, 0.034); halo.renderOrder = 5;
@@ -97127,9 +97624,9 @@ var RUNNER = (function(){
   function casterRec(n){ var k = 'caster' + n; return FK[k] || (FK[k] = { pool: [], make: function(){ return makeCaster(n); } }); }
   function makeCaster(n){
     var G = casterGeo(n), g = new THREE.Group();
-    var base = new THREE.Mesh(CAST.base, keep(armourMat(CAST.base, null)));
-    var arch = new THREE.Mesh(G.arch, keep(coilMat())); arch.position.set(0, 0.014, 0);
-    var orb = new THREE.Mesh(CAST.orb, keep(orbMat())); orb.position.set(0, 0.014 + G.Ra * 0.5, 0);
+    var base = inked(new THREE.Mesh(CAST.base, keep(armourMat(CAST.base, null))));
+    var arch = inked(new THREE.Mesh(G.arch, keep(coilMat())), true); arch.position.set(0, 0.014, 0);
+    var orb = inked(new THREE.Mesh(CAST.orb, keep(orbMat()))); orb.position.set(0, 0.014 + G.Ra * 0.5, 0);
     var halo = new THREE.Mesh(SEN.quad, keep(haloMat(0.1))); halo.position.copy(orb.position); halo.renderOrder = 5;
     g.add(base); g.add(arch); g.add(orb); g.add(halo);
     [base, arch, orb, halo].forEach(function(m){ m.frustumCulled = false; });
@@ -97172,17 +97669,22 @@ var RUNNER = (function(){
   function buildFoes(){
     partsInit();
     var oct = new THREE.OctahedronGeometry(1, 0);
-    R.ebMesh = new THREE.InstancedMesh(oct, keep(boltMat(new THREE.Color(1.0, 0.93, 0.95), new THREE.Color(1.0, 0.2, 0.36), new THREE.Color(0.16, 0.02, 0.05))), EB_MAX);
+    R.ebMesh = new THREE.InstancedMesh(new THREE.PlaneGeometry(1, 1), eOrbMat(), EB_MAX);
+    var tg = new THREE.PlaneGeometry(1, 2, 1, 1); tg.translate(0.5, 0, 0);
+    R.ebTailA = new THREE.InstancedBufferAttribute(new Float32Array(EB_MAX * 3), 3); tg.setAttribute('aTail', R.ebTailA);
+    R.ebTrail = new THREE.InstancedMesh(tg, eTrailMat(), EB_MAX);
+    R.ebMark = new THREE.InstancedMesh(new THREE.PlaneGeometry(1, 1), eMarkMat(), EB_MAX);
     R.pbMesh = new THREE.InstancedMesh(oct, keep(boltMat(new THREE.Color(0.97, 0.92, 1.0), new THREE.Color(0.56, 0.24, 1.0), new THREE.Color(0.14, 0.03, 0.3))), PB_MAX);
-    R.dartMesh = new THREE.InstancedMesh(oct, keep(boltMat(new THREE.Color(1.0, 0.9, 0.93), new THREE.Color(0.85, 0.12, 0.28), new THREE.Color(0.12, 0.01, 0.04))), 40);
-    [R.ebMesh, R.pbMesh, R.dartMesh].forEach(function(m){ m.count = 0; m.frustumCulled = false; m.renderOrder = 4; R.scene.add(m); });
+    R.dartMesh = new THREE.InstancedMesh(oct, keep(boltMat(FP.hot, FP.eye, FP.ink)), 40);
+    [R.ebMesh, R.ebTrail, R.ebMark, R.pbMesh, R.dartMesh].forEach(function(m){ m.count = 0; m.frustumCulled = false; m.renderOrder = 4; R.scene.add(m); });
+    R.ebMark.renderOrder = 2; R.ebTrail.renderOrder = 3; R.ebMesh.renderOrder = 5;
     R.eb = []; R.pb = []; R.hoops = [];
     R.hoopMat = keep(hoopMat());
     R.lineGeo = new THREE.BoxGeometry(1, 1, 1); R.lineGeo.translate(0, 0, 0.5);
     R.lines = [];
     for(var i = 0; i < 6; i++){ var m = new THREE.Mesh(R.lineGeo, keep(lineMat())); m.visible = false; m.frustumCulled = false; m.renderOrder = 4; R.scene.add(m); R.lines.push(m); }
     // one of each standing by (hidden, in its pool), so the warm-up links every program before a run
-    var s0 = makeSentry(), c0 = makeCaster(8), bk = barrKit(8, 'gate'), b0 = new THREE.Mesh(bk.geo, bk.mat), h0 = hoopTake(8), l0 = makeLancer(8);
+    var s0 = makeSentry(), c0 = makeCaster(8), bk = barrKit(8, 'gate'), b0 = inkOnce(new THREE.Mesh(bk.geo, bk.mat)), h0 = hoopTake(8), l0 = makeLancer(8);
     b0.visible = false; R.scene.add(b0); bk.pool.push(b0);
     FK.sentry.pool.push(s0); casterRec(8).pool.push(c0); h0.visible = false; FK.hoopp8.push(h0); lancerRec(8).pool.push(l0);
     R.foeStandby = [s0, c0, b0, h0, l0, l0.userData.beam];
@@ -97192,7 +97694,7 @@ var RUNNER = (function(){
   function foesShow(on){
     if(!R.foeStandby) return;
     R.foeStandby.forEach(function(m){ m.visible = on; });
-    R.ebMesh.count = R.pbMesh.count = R.dartMesh.count = on ? 1 : 0;
+    R.ebMesh.count = R.ebTrail.count = R.ebMark.count = R.pbMesh.count = R.dartMesh.count = on ? 1 : 0;
     R.lines[0].visible = on;
   }
   // (from resetRun and exit) every bolt, hoop and sight line gone; the run's count and the first enemy's place.
@@ -97203,7 +97705,7 @@ var RUNNER = (function(){
     R.eb.length = 0; R.pb.length = 0;
     for(var i = 0; i < R.hoops.length; i++) freeHoop(R.hoops[i]);
     R.hoops.length = 0;
-    R.ebMesh.count = 0; R.pbMesh.count = 0;
+    R.ebMesh.count = R.ebTrail.count = R.ebMark.count = 0; R.pbMesh.count = 0;
     R.lines.forEach(function(m){ m.visible = false; });
     R.lockT = null; R.lockAge = 0; R.gunCd = 0; R.lockMemT = null;
     if(R.chase) chaseFree(R.chase);
@@ -97248,7 +97750,7 @@ var RUNNER = (function(){
     addObs(type, j, z, n);
     var o = R.obs[R.obs.length - 1], m0 = o.mesh, K = barrKit(n, o.mt);
     m0.visible = false; o.kr.pool.push(m0);                     // (its gate mesh back to the kit)
-    o.kr = K; o.mesh = takeMesh(o); o.mesh.position.copy(m0.position); o.mesh.rotation.copy(m0.rotation);
+    o.kr = K; o.mesh = inkOnce(takeMesh(o)); o.mesh.position.copy(m0.position); o.mesh.rotation.copy(m0.rotation);
     o.type = 'barricade';
     var uc = (o.u0 + o.u1) / 2;
     o.foe = { kind: 'barricade', th: o.phi + Math.atan2(uc, P.apothem - P.boltLift), hwU: (o.u1 - o.u0) / 2, hc: OB.gate.h * 0.5,
@@ -97532,14 +98034,15 @@ var RUNNER = (function(){
   //   · BOMBER — a heavy wing high over its lane, armoured but for its BAY: the bay lights, opens and lets go BOMBS
   //     that land as plates across its wall and the next, skidding back at you (shoot one, or leave the lane) — and
   //     only while it is open does a bolt get in.
-  // (r: its hit radius on an octagon's wall — each quarry is sized to its lane, qScale; lift: a flyer's height off its wall)
+  // (r: its hit radius on an octagon's wall — each quarry is sized to its lane, qScale; minLead: a flyer's own closest —
+  // flying near your eye line, close in it hid the course)
   var QK = {
     courier:   { name: 'COURIER',     after: 0,   w: 1.2, hp: 55, coins: 20, r: 0.09 },
-    minelayer: { name: 'MINELAYER',   after: 20,  w: 1.0, hp: 50, coins: 22, r: 0.1, lift: 0.26 },
+    minelayer: { name: 'MINELAYER',   after: 20,  w: 1.0, hp: 50, coins: 22, r: 0.1, minLead: 1.8 },
     convoy:    { name: 'CONVOY',      after: 40,  w: 1.0, hp: 16, coins: 6, bonus: 16, r: 0.08, n: 4, gap: 0.3 },
     rival:     { name: 'THE MIRROR',  after: 65,  w: 0.9, hp: 70, coins: 34, r: 0.08 },
-    hunters:   { name: 'HUNTER PACK', after: 90,  w: 0.9, hp: 20, coins: 8, bonus: 14, r: 0.07, n: 3, lift: 0.245 },
-    bomber:    { name: 'BOMBER',      after: 115, w: 0.9, hp: 34, coins: 36, r: 0.12, lift: 0.27 }
+    hunters:   { name: 'HUNTER PACK', after: 90,  w: 0.9, hp: 20, coins: 8, bonus: 14, r: 0.07, n: 3, minLead: 1.8 },
+    bomber:    { name: 'BOMBER',      after: 115, w: 0.9, hp: 34, coins: 36, r: 0.11, minLead: 2.4 }
   };
   var QB = {};   // each kind's mind: init(C), step(C, live, dt)
   var SIG_COL = new THREE.Color(1.0, 0.72, 0.28), SLIP_COL = new THREE.Color(0.55, 0.95, 1.0), CARGO_COL = new THREE.Color(1.0, 0.78, 0.3);
@@ -97676,7 +98179,7 @@ var RUNNER = (function(){
       var want = (P.chasePull - C.draft * P.chaseDraft * (chg ? 2 : 1)) * k;
       C.vr += (want - C.vr) * (1 - Math.exp(-dt * 2.2)) + C.kickV; C.kickV = 0;
       C.lead += C.vr / 60;
-      var mn = chg ? 0.3 : P.chaseMin * k, nr = chaseNear(C);
+      var mn = chg ? 0.3 : (C.K.minLead || P.chaseMin) * k, nr = chaseNear(C);
       if(nr < mn){ C.lead += (mn - nr) * 0.12; if(C.vr < 0) C.vr *= 0.85; }
       C.escT = nr > gunRange() ? C.escT + dt : Math.max(0, C.escT - dt * 0.6);
       if(C.escT >= P.chaseEscSec || C.t > P.chaseLife) chaseAway(C, 'ESCAPED');
@@ -97691,7 +98194,7 @@ var RUNNER = (function(){
     C.z = S.z + C.lead;
     R.draftK = C.st === 'run' ? C.draft : 0;
     QB[C.kind].step(C, live && C.st === 'run', dt);
-    for(i = 0; i < C.bodies.length; i++){ f = C.bodies[i]; f.kick = Math.max(0, f.kick - 0.06); f.flash = Math.max(0, f.flash - 0.1); f.k = qScale(f.z); f.r = C.K.r * f.k; }
+    for(i = 0; i < C.bodies.length; i++){ f = C.bodies[i]; f.kick = Math.max(0, f.kick - 0.06); f.flash = Math.max(0, f.flash - 0.2); f.k = qScale(f.z); f.r = C.K.r * f.k; }
   }
   // RAM: charged, you can catch it — on its wall and up to it, the charge hits it like a wall (and knocks it on).
   function ramCheck(C, k){
@@ -97735,10 +98238,12 @@ var RUNNER = (function(){
     killCoins(f.x, f.y, f.z, 3, true);
     var n = laneN(f.z), j = wallIdx(f.th, n);
     if(sectionAt(f.z).kind !== 'hold' || wallGone(n, j, f.z)) return;
-    addObs('bar', j, f.z - f.r - 0.04, n);
-    var o = R.obs[R.obs.length - 1];
-    o.skid = runSpeed() + C.vr / 60; o.skidA = P.mineDecel; o.my = OB.bar.y; o.mu = 0; o.fall = Math.max(0, f.lift + f.h - hover()); o.fallV = 0;
-    placeSkid(o);
+    var k = f.k || 1, hw = Math.min(0.1 * k, halfWn(n) - 0.02), m = FK.scrap.pool.pop() || FK.scrap.make(), phi = j * TAU / n;
+    var o = { type: 'scrap', face: j, n: n, phi: phi, z: f.z - f.r - 0.04, sector: false, mt: 'scrap', kr: FK.scrap, mesh: m,
+              u0: -hw, u1: hw, y0: 0, y1: 0.04 * k, dz: 0.03 * k, my: 0, mu: 0, fall: Math.max(0, f.lift + f.h - hover()), fallV: 0,
+              skid: runSpeed() + C.vr / 60, skidA: P.mineDecel, spin: rnd(-0.02, 0.02) };
+    m.visible = true; m.rotation.set(0, 0, phi); m.scale.set(hw / 0.1, k, k);
+    R.obs.push(o); placeSkid(o);
   }
   // A body brought down: its wreck in pieces, its coins — and the bounty with the last of them.
   function bodyDie(f, how){
@@ -97757,14 +98262,28 @@ var RUNNER = (function(){
   // ── MOVING: a body's ride round the tube (a spring to thTgt) at its height off the wall under it — a grounded one at
   // the hover height plus its hop (the ship's own hop numbers), a flyer at its lift; both on a spring down out of the
   // pass over you. ──
-  function bodyRide(f, hz, lift){
+  function bodyRide(f, hz, lift, liftHz){
     var r = cd(f.th, f.thV, f.thTgt, hz); f.th = r.x; f.thV = r.v;
-    r = cd(f.lift, f.liftV, lift, 1.5); f.lift = r.x; f.liftV = r.v;
+    r = cd(f.lift, f.liftV, lift, liftHz || 1.5); f.lift = r.x; f.liftV = r.v;
     if(f.h > 0 || f.vh > 0){ f.vh -= JG(); f.h += f.vh; if(f.h <= 0){ f.h = 0; f.vh = 0; } }
     var sh = shapeInto(f.z, _shM), q = rideAtH(sh, f.th, f.lift + f.h, _rm);
     f.x = q.x; f.y = q.y; f.up = upAt(sh, f.th);
   }
   function qHop(f){ if(f.h < 0.002 && f.vh <= 0) f.vh = JI(); }
+  // A FLYER THROUGH THE COURSE: it cruises low over its wall (P.flyCruise — under a gate's top, so the course is round
+  // it, not under it) and climbs over whatever stands in its lane as it comes (the tallest thing on its wall within
+  // half a second of travel, plus its own height and a little air), then drops back: an arc over every gate, half wall
+  // and pillar, as anything flying a course would. → the lift it wants now.
+  function flyLift(f, C, cruise){
+    var n = laneN(f.z), j = wallIdx(f.th, n), ups = Math.max(0.1, runSpeed() * 60 + C.vr), top = 0, i;
+    for(i = 0; i < R.obs.length; i++){
+      var o = R.obs[i], dz = o.z - f.z;
+      if(o.n !== n || o.face !== j || dz < -(o.dz + 0.12) || dz > ups * 0.55 || (o.foe && o.foe.dead) || o.skid != null) continue;
+      if(o.y1 > top) top = o.y1;
+    }
+    for(i = 0; i < R.walls.length; i++){ var w = R.walls[i]; if(w.z > f.z - 0.1 && w.z - f.z < ups * 0.55) top = Math.max(top, 0.24); }
+    return top > 0 ? Math.max(cruise, Math.min(0.3, top + 0.035 * (f.k || 1) + 0.03)) : cruise;
+  }
   function grounded(f){ return f.lift < hover() + 0.01; }
   // ITS MIND, after the pilot (a dodge always wins — and a dodge onto another wall makes that wall its own). On your
   // wall it counts; past its patience (shorter as it is hurt) it SIGNALS, then cuts across. Off your wall, now and then
@@ -97852,7 +98371,7 @@ var RUNNER = (function(){
     }
     if(tgt === null){
       var rowZ = null;
-      for(i = 0; i < R.obs.length; i++){ var o = R.obs[i], dd = o.z - B.z; if(dd > -0.02 && dd < ups * 0.6 && o.n === n && o.skid == null && !(o.foe && (o.foe.dead || o.foe.kind === 'dart')) && (rowZ === null || o.z < rowZ)) rowZ = o.z; }
+      for(i = 0; i < R.obs.length; i++){ var o = R.obs[i], dd = o.z - B.z; if(dd > -0.02 && dd < ups * 0.85 && o.n === n && o.skid == null && !(o.foe && (o.foe.dead || o.foe.kind === 'dart')) && (rowZ === null || o.z < rowZ)) rowZ = o.z; }
       if(rowZ !== null && rowZ !== B.rowSeen){ B.rowSeen = rowZ; B.blind = Math.random() < sloppy(B, C); }
       if(rowZ !== null && !B.blind){
         var row = R.obs.filter(function(o){ return Math.abs(o.z - rowZ) < 1e-6 && o.n === n; });
@@ -97951,12 +98470,36 @@ var RUNNER = (function(){
       if(o.fall > 0){ o.fallV += JG() * 1.5; o.fall = Math.max(0, o.fall - o.fallV); if(!o.fall){ _p.copy(o.mesh.position); burst(_p, 6, false); } }
       if(o.skid > 0){
         o.skid = Math.max(0, o.skid - o.skidA / 3600 * hazRate());
-        o.z += o.skid;
-        if(!o.fall && (o.skN = (o.skN || 0) + 1) % 3 === 0){ _p.copy(o.mesh.position); burst(_p, 2, false); }   // it skids: sparks off the wall
+        var stop = skidMeets(o, o.z + o.skid);
+        if(stop && o.type === 'mine'){ skidBlast(o); i--; continue; }
+        if(stop){ o.z = stop.z - stop.dz - o.dz - 0.002; o.skid = 0; o.spin = 0; _p.copy(o.mesh.position); burst(_p, 10, false, FP.eye); }
+        else o.z += o.skid;
+        if(!o.fall && o.skid > 0 && (o.skN = (o.skN || 0) + 1) % 3 === 0){ _p.copy(o.mesh.position); burst(_p, 2, false); }   // it skids: sparks off the wall
       }
       if(o.spin){ o.mesh.rotation.x += o.spin; if(!(o.skid > 0)) o.spin *= 0.9; }
       placeSkid(o);
     }
+  }
+  // What a skidding thing, going on to z1, runs into on its wall: the nearest obstacle ahead of it that stands in its way
+  // across the wall and up it (not another skidding thing, nothing dead). → that obstacle, or null.
+  function skidMeets(o, z1){
+    var best = null;
+    for(var i = 0; i < R.obs.length; i++){
+      var q = R.obs[i];
+      if(q === o || q.skid != null || q.n !== o.n || q.face !== o.face || (q.foe && q.foe.dead) || (q.mov && q.mov.h < 0.02)) continue;
+      var back = q.z - q.dz;
+      if(back < o.z + o.dz - 0.001 || back > z1 + o.dz) continue;
+      if(q.u1 < o.u0 || q.u0 > o.u1 || q.y1 < o.y0 || q.y0 > o.y1) continue;
+      if(!best || q.z < best.z) best = q;
+    }
+    return best;
+  }
+  // A mine that meets something goes off: a blast in the enemy's colour, and it is gone (no coins: nobody shot it).
+  function skidBlast(o){
+    o.foe.dead = true;
+    _p.copy(o.mesh.position); burst(_p, 22, false, FP.eye); burst(_p, 10, false, FP.hot);
+    if(Math.abs(o.z - S.z) < 2) R.shake = Math.max(R.shake, 0.12);
+    freeObs(o); R.obs.splice(R.obs.indexOf(o), 1);
   }
   function placeSkid(o){
     var a = P.apothem - (o.my || 0) - (o.fall || 0), u = o.mu || 0;
@@ -97998,7 +98541,7 @@ var RUNNER = (function(){
     addObs('gate', j, b.z, n);
     var o = R.obs[R.obs.length - 1], m0 = o.mesh, K = barrKit(n, 'gate');
     m0.visible = false; o.kr.pool.push(m0);
-    o.kr = K; o.mesh = takeMesh(o); o.mesh.position.copy(m0.position); o.mesh.rotation.copy(m0.rotation);
+    o.kr = K; o.mesh = inkOnce(takeMesh(o)); o.mesh.position.copy(m0.position); o.mesh.rotation.copy(m0.rotation);
     o.type = 'bomb';
     o.foe = { kind: 'bomb', th: o.phi, hwU: (o.u1 - o.u0) / 2, hc: OB.gate.h * 0.5, hp: FOES.bomb.hp, hpMax: FOES.bomb.hp, dead: false, st: 'idle', t: 0, cool: 0, kick: 0, flash: 0, coins: FOES.bomb.coins, q: b.C };
     o.skid = b.vz; o.skidA = P.mineDecel * 0.9; o.my = 0; o.mu = 0; o.fall = 0;
@@ -98012,7 +98555,7 @@ var RUNNER = (function(){
       f.z = C.z;
       var run = C.st === 'run';
       if(run) laneMind(C, f, laneN(f.z), dt, live, pilot(f, C));
-      bodyRide(f, P.steerHz * 0.85, run ? hover() : 0.3);
+      bodyRide(f, P.qSteerHz, run ? hover() : 0.3);
       if(run && grounded(f) && qMeets(C, f)) return;
       if(!live) return;
       f.cool -= hazRate() / 60;   // SKID MINES while you are in its slipstream (quicker once it is hurt)
@@ -98026,7 +98569,7 @@ var RUNNER = (function(){
       f.z = C.z;
       var run = C.st === 'run';
       if(run) laneMind(C, f, laneN(f.z), dt, live, null);
-      bodyRide(f, 2.6, run ? QK.minelayer.lift : 0.3);
+      bodyRide(f, 2.6, run ? flyLift(f, C, P.flyCruise) : 0.3, 2.4);
       if(!live) return;
       var dh = hazRate() / 60;
       f.mineT -= dh;
@@ -98047,7 +98590,7 @@ var RUNNER = (function(){
         if(tgt == null && live && f.cool <= 0.25 && f.st === 'idle' && f.sig <= 0) f.lane = wallMid(S.th, n);
         laneMind(C, f, n, dt, live, tgt);
       }
-      bodyRide(f, P.steerHz, run ? hover() : 0.3);
+      bodyRide(f, P.qSteerHz * 1.3, run ? hover() : 0.3);
       if(run && grounded(f) && qMeets(C, f)) return;
       if(!live) return;
       var dh = hazRate() / 60;
@@ -98066,7 +98609,7 @@ var RUNNER = (function(){
       if(!E) return;
       E.z = C.z - E.off;
       if(run) laneMind(C, E, laneN(E.z), dt, live, pilot(E, C));
-      bodyRide(E, P.steerHz * 0.55, run ? hover() : 0.3);
+      bodyRide(E, P.qSteerHz * 0.7, run ? hover() : 0.3);
       var Pa = C.path; Pa.push(E.z, E.th, E.h, E.lift);
       if(Pa.length > 4 * 300) Pa.splice(0, 4 * 60);
       for(i = 0; i < C.bodies.length; i++){
@@ -98116,7 +98659,7 @@ var RUNNER = (function(){
         f.z = C.z;
         f.thTgt = C.fc + (m - (L - 1) / 2) * 2 * span; m++;
         f.sig = C.sigT; f.sigTo = f.th + C.sigDir * span;
-        bodyRide(f, 3.0, run ? QK.hunters.lift : 0.3);
+        bodyRide(f, 3.0, run ? flyLift(f, C, P.flyCruise) : 0.3, 2.8);
         if(live) fireBurst(f, dh, 1, 0.34, 1.5, 1.35);
       }
     }
@@ -98130,7 +98673,7 @@ var RUNNER = (function(){
       f.z = C.z;
       var run = C.st === 'run', dh = hazRate() * dt;
       if(run) laneMind(C, f, laneN(f.z), dt, live, null);
-      bodyRide(f, 1.8, run ? QK.bomber.lift : 0.3);
+      bodyRide(f, 1.8, run ? flyLift(f, C, P.flyCruise + 0.09) : 0.3, 2.0);
       if(!live){ if(B.st !== 'shut'){ B.st = 'shut'; B.t = 1.4; } return; }
       B.t -= dh;
       if(B.st === 'shut'){ if(B.t <= 0){ B.st = 'warn'; B.t = 0.55; } }
@@ -98259,7 +98802,7 @@ var RUNNER = (function(){
     addObs('gate', j, B.z - 0.04, 8);
     var o = R.obs[R.obs.length - 1], m0 = o.mesh, K = barrKit(8, 'gate');
     m0.visible = false; o.kr.pool.push(m0);
-    o.kr = K; o.mesh = takeMesh(o); o.mesh.position.copy(m0.position); o.mesh.rotation.copy(m0.rotation);
+    o.kr = K; o.mesh = inkOnce(takeMesh(o)); o.mesh.position.copy(m0.position); o.mesh.rotation.copy(m0.rotation);
     o.gkV = Math.max(S.v, 0);
     R.gkPlates.push(o);
     _p.copy(o.mesh.position); burst(_p, 24); R.shake = Math.max(R.shake, 0.25);
@@ -98315,15 +98858,16 @@ var RUNNER = (function(){
   }
   function ringMat(){
     return premul(new THREE.ShaderMaterial({
-      uniforms: { uT: { value: 0 }, uCol: { value: FOE_EYE }, uFogD: { value: P.fog } },
+      uniforms: { uT: { value: 0 }, uCol: { value: FOE_EYE }, uHot: { value: FP.hot }, uInk: { value: FP.ink }, uFogD: { value: P.fog } },
       vertexShader: 'attribute float aV, aU; varying float vV, vU; varying vec3 vView; void main(){ vV = aV; vU = aU; vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
-        'uniform float uT, uFogD; uniform vec3 uCol; varying float vV, vU; varying vec3 vView;',
+        'uniform float uT, uFogD; uniform vec3 uCol, uHot, uInk; varying float vV, vU; varying vec3 vView;',
         'void main(){',
         '  float e = max(max(smoothstep(0.86, 1.0, vV), smoothstep(0.86, 1.0, abs(vU))), 1.0 - smoothstep(0.0, 0.1, vV));',
+        '  float ink = max(max(smoothstep(0.955, 1.0, vV), smoothstep(0.955, 1.0, abs(vU))), 1.0 - smoothstep(0.0, 0.035, vV));',   // (an ink line round its edges: it reads on the pale sky)
         '  float flow = 0.5 + 0.5 * sin(vV * 16.0 - uT * 9.0);',
-        '  float a = clamp(0.14 + 0.12 * flow + 0.7 * e, 0.0, 1.0) * 0.9 * exp(-uFogD * uFogD * dot(vView, vView));',
-        '  gl_FragColor = vec4(mix(uCol, vec3(1.0, 0.92, 0.95), e * 0.4) * a, a);',
+        '  float a = clamp(0.14 + 0.12 * flow + 0.7 * e, 0.0, 1.0) * 0.9, f = exp(-uFogD * uFogD * dot(vView, vView));',
+        '  gl_FragColor = vec4(mix(mix(uCol, uHot, e * 0.4) * a, uInk, ink), mix(a, 1.0, ink)) * f;',
         '}'
       ].join('\n'),
       side: THREE.DoubleSide
@@ -98369,7 +98913,7 @@ var RUNNER = (function(){
     var PN = []; for(var i = 0; i < 8; i++) PN.push(new THREE.Vector4());
     return new THREE.ShaderMaterial({
       uniforms: { uA: { value: P.apothem }, uRot: { value: 0 }, uT: { value: 0 }, uPhase: { value: 0 }, uLit: { value: 0 }, uDie: { value: 0 }, uPan: { value: PN },
-                  uEdge: { value: HAZ_EDGE }, uCore: { value: HAZ_CORE }, uEye: { value: FOE_EYE }, uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
+                  uEdge: { value: FP.trim }, uCore: { value: FP.shade }, uEye: { value: FP.eye }, uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
       vertexShader: 'varying vec2 vXY; varying vec3 vView; void main(){ vXY = position.xy; vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
         'uniform float uA, uRot, uT, uPhase, uLit, uDie, uFogD; uniform vec4 uPan[8]; uniform vec3 uEdge, uCore, uEye, uFogCol;',
@@ -98427,52 +98971,61 @@ var RUNNER = (function(){
     }
   }
 
-  // ── THE QUARRIES' LOOKS: armoured prisms in the obstacles' own edge-finding shader (each its own materials, so each
-  // heats and flashes on its own), a hot eye at the back — its engine, looking at you — and a SIGNAL either side (an amber
-  // light, blinking on the side it is about to cut to). Wall-sized or near it: at the chase's distances a ship-sized
-  // thing is a few pixels. THE MIRROR is a copy of every hull mesh (the same geometry, as THE TWIN SHIP's ghost is),
-  // posed each frame as the real hull is — turned round its own up to face back, rolled round the tube to its wall, a
-  // size up, at its place ahead — in dark obsidian with a red rim that heats as it turns its nose to you. ──
+  // ── THE QUARRIES' LOOKS. Vehicles, not boxes: each is a few armoured parts (a hull, a cab or a spine, a wing, a rack),
+  // every one in the enemy's armour with its ink outline (each quarry its own materials, so each heats and flashes on
+  // its own); an EYE on the hull's back face — looking at you — between twin ENGINE glows that flare as it surges; a
+  // SIGNAL either side (amber, blinking on the side it is about to cut to); and a GLOW POOL on the wall under it — its
+  // lane, at a glance, wherever it is (a flyer's spreads and dims with its height). Some parts move: the courier's
+  // cargo turns, the minelayer's rotor spins, the bomber's bay doors swing open as the bay opens, a convoy's cars are
+  // coupled by lines of light. Built for an octagon's wall (0.298 across) and scaled to the one it is on (qScale).
+  // THE MIRROR is a copy of every hull mesh (the same geometry, as THE TWIN SHIP's ghost is), posed each frame as the
+  // real hull is — turned round its own up to face back, rolled round the tube to its wall, a size up, at its place
+  // ahead — in the enemy's armour, darker, its rim lit and heating as it turns its nose to you. ──
   var QLOOK = {};
-  function qGroup(parts, hw){
-    var g = new THREE.Group(), U = { mats: [], hw: hw };
-    g.rotation.order = 'ZYX';   // (its pitch and sway in its own frame, then round the tube to its wall)
-    parts.forEach(function(p){ p.frustumCulled = false; g.add(p); if(p.material && p.material.uniforms && p.material.uniforms.uHit) U.mats.push(p.material); });
+  function qGroup(parts, hw, engines){
+    var g = new THREE.Group(), U = { mats: [], hw: hw, eng: [] };
+    g.rotation.order = 'ZYX';   // (its pitch, yaw and sway in its own frame, then round the tube to its wall)
+    parts.forEach(function(p){ p.frustumCulled = false; g.add(p); collectMats(p, U.mats); });
+    (engines || []).forEach(function(e){ var h = qHalo(0.05, e[0], e[1], e[2]); g.add(h); U.eng.push(h); });
     var sg = new THREE.Mesh(SEN.quad, keep(haloMat(0.05))); sg.material.uniforms.uCol.value = SIG_COL; sg.renderOrder = 5; sg.visible = false; sg.frustumCulled = false;
     g.add(sg); U.sig = sg;
+    var pool = new THREE.Mesh(R.poolGeo, R.poolMat); pool.rotation.x = -Math.PI / 2; pool.position.y = -0.019; pool.scale.set(hw * 3.2, hw * 5.2, 1); pool.renderOrder = 2; pool.frustumCulled = false;
+    g.add(pool); U.pool = pool;
     g.userData = U; g.visible = false; R.scene.add(g);
     return g;
   }
-  function qHalo(size, x, y, z){ var h = new THREE.Mesh(SEN.quad, keep(haloMat(size))); h.position.set(x, y, z); h.renderOrder = 5; return h; }
-  QLOOK.courier = function(){
-    var body = new THREE.Mesh(CAST.courier, keep(armourMat(CAST.courier, [0, 0.03, 0.13, 0.024]))), halo = qHalo(0.075, 0, 0.018, 0.136);
-    var cargo = new THREE.Mesh(CAST.cargo, keep(orbMat())); cargo.material.uniforms.uCol.value = CARGO_COL;
-    body.position.y = -0.012; cargo.position.set(0, 0.085, -0.02);
-    var g = qGroup([body, cargo, halo], 0.09); g.userData.halo = halo; g.userData.cargo = cargo;
+  function collectMats(o, L){ if(o.material && o.material.uniforms && o.material.uniforms.uHit) L.push(o.material); for(var i = 0; i < o.children.length; i++) collectMats(o.children[i], L); }
+  function qHalo(size, x, y, z){ var h = new THREE.Mesh(SEN.quad, keep(haloMat(size))); h.position.set(x, y, z); h.renderOrder = 5; h.frustumCulled = false; return h; }
+  function qPart(geo, eye, tone, x, y, z){ var m = inked(new THREE.Mesh(geo, keep(armourMat(geo, eye, tone)))); m.position.set(x || 0, y || 0, z || 0); return m; }
+  QLOOK.courier = function(){   // a hover freighter: hull, a dark cab at the front, the hold — a gold pod — on its back
+    var hull = qPart(CAST.courier, [0, 0.03, 0.13, 0.024], 1, 0, -0.012, 0), cab = qPart(CAST.cab, null, 0.5, 0, 0.052, -0.075);
+    var cargo = inked(new THREE.Mesh(CAST.cargo, keep(orbMat()))); cargo.material.uniforms.uCol.value = CARGO_COL; cargo.position.set(0, 0.09, 0.035);
+    var g = qGroup([hull, cab, cargo], 0.09, [[-0.062, 0.006, 0.134], [0.062, 0.006, 0.134]]); g.userData.cargo = cargo;
     return g;
   };
-  QLOOK.minelayer = function(){
-    var body = new THREE.Mesh(CAST.raider, keep(armourMat(CAST.raider, [0, 0.005, 0.12, 0.026]))), halo = qHalo(0.085, 0, 0.005, 0.126);
-    var rack = new THREE.Mesh(CAST.rack, keep(armourMat(CAST.rack, null))); rack.position.set(0, -0.024, -0.03);
-    var g = qGroup([body, rack, halo], 0.11); g.userData.halo = halo;
+  QLOOK.minelayer = function(){   // a drone: its pod, a rotor ring of energy spinning round it, the mine rack under it
+    var pod = qPart(CAST.raider, [0, 0.005, 0.12, 0.026], 1), rack = qPart(CAST.rack, null, 0.5, 0, -0.024, -0.03);
+    var rotor = inked(new THREE.Mesh(CAST.rotor, keep(coilMat())), true); rotor.position.y = 0.004;
+    var g = qGroup([pod, rack, rotor], 0.12, [[-0.05, 0.004, 0.122], [0.05, 0.004, 0.122]]); g.userData.rotor = rotor;
     return g;
   };
-  QLOOK.convoy = function(){
-    var body = new THREE.Mesh(CAST.car, keep(armourMat(CAST.car, [0, 0.045, 0.1, 0.02]))), halo = qHalo(0.065, 0, 0.033, 0.106);
-    body.position.y = -0.012;
-    var g = qGroup([body, halo], 0.075); g.userData.halo = halo;
-    return g;
+  QLOOK.convoy = function(){   // an armoured hauler: body and a dark roof plate (the cars are coupled by light: feedQuarries)
+    var body = qPart(CAST.car, [0, 0.045, 0.1, 0.02], 1, 0, -0.012, 0), roof = qPart(CAST.roof, null, 0.5, 0, 0.073, 0);
+    return qGroup([body, roof], 0.075, [[-0.05, 0.012, 0.102], [0.05, 0.012, 0.102]]);
   };
-  QLOOK.hunters = function(){
-    var body = new THREE.Mesh(CAST.hunter, keep(armourMat(CAST.hunter, [0, 0.016, 0.075, 0.016]))), halo = qHalo(0.055, 0, 0.016, 0.08);
-    var g = qGroup([body, halo], 0.075); g.userData.halo = halo;
-    return g;
+  QLOOK.hunters = function(){   // an interceptor: a dart of a body over swept wings
+    var body = qPart(CAST.hunter, [0, 0.016, 0.075, 0.016], 1), wing = qPart(CAST.hwing, null, 0.6, 0, 0.004, 0.025);
+    return qGroup([body, wing], 0.13, [[-0.035, 0.008, 0.078], [0.035, 0.008, 0.078]]);
   };
-  QLOOK.bomber = function(){
-    var body = new THREE.Mesh(CAST.wing, keep(armourMat(CAST.wing, [0, 0.018, 0.11, 0.02]))), halo = qHalo(0.07, 0, 0.018, 0.116);
-    var bay = new THREE.Mesh(CAST.bay, keep(orbMat())); bay.position.set(0, -0.006, -0.015);
+  QLOOK.bomber = function(){   // a manta: the wing, its spine, the bay under it — and its two doors, hinged at the bay's sides
+    var wing = qPart(CAST.wing, [0, 0.016, 0.1, 0.019], 1), spine = qPart(CAST.spine, null, 0.6, 0, 0.032, 0);
+    var bay = inked(new THREE.Mesh(CAST.bay, keep(orbMat()))); bay.position.set(0, -0.004, -0.015);
     var bayHalo = qHalo(0.12, 0, -0.018, -0.015);
-    var g = qGroup([body, bay, bayHalo, halo], 0.15); g.userData.halo = halo; g.userData.bay = bay; g.userData.bayHalo = bayHalo;
+    var dl = new THREE.Group(), dr = new THREE.Group();
+    dl.position.set(-0.042, -0.001, -0.015); dr.position.set(0.042, -0.001, -0.015);
+    dl.add(qPart(CAST.doorL, null, 0.55)); dr.add(qPart(CAST.doorR, null, 0.55));
+    var g = qGroup([wing, spine, bay, bayHalo, dl, dr], 0.13, [[-0.065, 0.012, 0.102], [0.065, 0.012, 0.102]]);
+    g.userData.bay = bay; g.userData.bayHalo = bayHalo; g.userData.doors = [dl, dr]; g.userData.door = 0;
     return g;
   };
   function quarryTake(kind){
@@ -98496,7 +99049,9 @@ var RUNNER = (function(){
       for(var i = 0; i < hull.length; i++){
         var o = hull[i];
         if(!o || !o.isMesh || !o.geometry || !o.geometry.attributes.normal) continue;
+        if(!o.geometry.boundingSphere) o.geometry.computeBoundingSphere();
         var pm = new THREE.Mesh(o.geometry, R.mirrorMat); pm.matrixAutoUpdate = false; pm.frustumCulled = false;
+        if(o.geometry.boundingSphere.radius > 0.004) inked(pm, true);   // (the ink on its parts — not on the small fittings)
         m.add(pm); m.userData.parts.push({ m: pm, src: o });
       }
       R.scene.add(m);
@@ -98518,10 +99073,12 @@ var RUNNER = (function(){
     var parts = m.userData.parts;
     for(var k = 0; k < parts.length; k++){ var p = parts[k]; p.m.matrix.multiplyMatrices(_mt3, p.src.matrixWorld); p.m.matrixWorld.copy(p.m.matrix); p.m.visible = p.src.visible !== false; }
   }
-  // Render: each body where it is, banked into its turn (a flyer sways, a runner pitches with its hop), heated as it
-  // winds up, flashed white as it is hit; its signal blinking; the courier's hold, the bomber's bay; falling bombs.
+  // Render: each body where it is — banked into its turn and YAWED into it (its nose leads a lane change, as a driver's
+  // does), a flyer swaying and pitching with its climb, a runner pitching with its hop — heated as it winds up, flashed
+  // white as it is hit; its engines flaring with its pace; its signal blinking; its glow pool on its wall; the moving
+  // parts; the couplings.
   function feedQuarries(t){
-    var C = R.chase, heat = 0, hit = 0, i;
+    var C = R.chase, heat = 0, hit = 0, i, ci = 0;
     for(i = 0; i < R.qBombs.length; i++){ var b = R.qBombs[i]; b.mesh.position.set(b.x, b.y, -(b.z - S.zBase)); }
     if(R.bombMat) R.bombMat.uniforms.uHeat.value = 0.6 + 0.4 * Math.sin(t * 30);
     if(C) for(i = 0; i < C.bodies.length; i++){
@@ -98529,47 +99086,89 @@ var RUNNER = (function(){
       if(!m || f.dead) continue;
       var h = Math.min(1, f.kick + (f.st === 'warn' ? 0.5 + 0.5 * clamp(f.t / 0.4, 0, 1) : (f.st === 'fire' ? 1 : 0.18)));
       if(f.kind === 'rival'){ heat = Math.max(heat, h); hit = Math.max(hit, f.flash); poseMirror(f, m); continue; }
-      var U = m.userData, fly = f.kind === 'minelayer' || f.kind === 'hunters' || f.kind === 'bomber', bank = clamp(f.thV * 40, -0.5, 0.5);
+      var U = m.userData, k = f.k || 1, fly = f.kind === 'minelayer' || f.kind === 'hunters' || f.kind === 'bomber';
+      var lat = f.thV * 60 * (P.apothem - f.lift), fwd = Math.max(1, runSpeed() * 60 + (C.vr || 0)), yaw = clamp(-Math.atan2(lat, fwd) * (fly ? 0.9 : 1.3), -0.6, 0.6);
+      var bank = clamp(f.thV * 40, -0.5, 0.5);
       m.position.set(f.x, f.y, -(f.z - S.zBase));
-      m.rotation.set(fly ? Math.sin(t * 3 + f.idx * 1.7) * 0.06 : clamp(f.vh * 20, -0.35, 0.35), 0, f.up + bank * (fly ? 0.9 : 0.5));
-      m.scale.setScalar(f.k || 1);
-      for(var k = 0; k < U.mats.length; k++){ var u = U.mats[k].uniforms; if(u.uHeat) u.uHeat.value = h; u.uHit.value = f.flash; }
-      if(U.halo) U.halo.material.uniforms.uHeat.value = h;
+      m.rotation.set(fly ? Math.sin(t * 3 + f.idx * 1.7) * 0.06 + clamp(f.liftV * 25, -0.3, 0.3) : clamp(f.vh * 20, -0.35, 0.35), yaw, f.up + bank * (fly ? 0.9 : 0.5));
+      m.scale.setScalar(k);
+      for(var q = 0; q < U.mats.length; q++){ var u = U.mats[q].uniforms; if(u.uHeat) u.uHeat.value = h; u.uHit.value = f.flash; }
+      var eh = clamp(0.4 + 0.12 * (C.vr || 0) + f.kick * 0.5, 0.25, 1);
+      for(q = 0; q < U.eng.length; q++) U.eng[q].material.uniforms.uHeat.value = eh;
       var on = f.sig > 0 && Math.floor(t * 9) % 2 === 0;
       U.sig.visible = on;
       if(on){ U.sig.position.set((wrapPi(f.sigTo - f.th) > 0 ? 1 : -1) * (U.hw + 0.014), 0.02, 0); U.sig.material.uniforms.uHeat.value = 1; }
+      var hy = Math.max(0, f.lift + f.h - hover());   // (its height over a grounded one's: the pool lies on the wall under it, wider the higher it is)
+      U.pool.position.y = (-0.019 - hy) / k;
+      U.pool.scale.set(U.hw * 3.2 * (1 + hy * 3), U.hw * 5.2 * (1 + hy * 2), 1);
       if(U.cargo){ U.cargo.rotation.y = t * 1.6; U.cargo.material.uniforms.uHeat.value = 0.45 + 0.4 * f.flash; }
+      if(U.rotor){ U.rotor.rotation.y = t * 7; U.rotor.material.uniforms.uHeat.value = 0.35 + 0.65 * h; }
       if(U.bay){
         var bs = C.bay ? C.bay.st : 'shut', bh = bs === 'open' ? 1 : (bs === 'warn' ? (Math.floor(t * 12) % 2 ? 0.8 : 0.25) : 0.06);
         U.bay.material.uniforms.uHeat.value = bh; U.bayHalo.material.uniforms.uHeat.value = bh;
         U.bayHalo.material.uniforms.uRing.value = bs === 'warn' ? clamp(1 - C.bay.t / 0.55, 0, 1) : 0;
+        var dw = bs === 'open' ? 1.15 : (bs === 'warn' ? 0.12 + 0.06 * Math.sin(t * 40) : 0);   // (the doors: rattling as it lights, swung down open)
+        U.door += (dw - U.door) * 0.18;
+        U.doors[0].rotation.z = -U.door; U.doors[1].rotation.z = U.door;
+      }
+      // a convoy's coupling: a line of light from this car's front to the back of the car ahead of it
+      if(C.kind === 'convoy' && ci < R.coup.length){
+        var A = null; for(var a2 = i - 1; a2 >= 0; a2--) if(!C.bodies[a2].dead){ A = C.bodies[a2]; break; }
+        if(A){
+          var cm = R.coup[ci++], za = -(A.z - 0.095 * (A.k || 1) - S.zBase), zb = -(f.z + 0.095 * k - S.zBase);
+          cm.position.set(f.x, f.y + 0.03 * k, zb); cm.lookAt(A.x, A.y + 0.03 * (A.k || 1), za);
+          var L = Math.hypot(A.x - f.x, A.y - f.y, za - zb); cm.scale.set(0.006, 0.006, L); cm.material.uniforms.uA.value = 0.85; cm.visible = L > 0.01;
+        }
       }
     }
+    for(; R.coup && ci < R.coup.length; ci++) R.coup[ci].visible = false;
     if(R.mirrorMat){ R.mirrorMat.uniforms.uHeat.value = heat; R.mirrorMat.uniforms.uHit.value = hit; }
+  }
+  function poolMat(){
+    return keep(premul(new THREE.ShaderMaterial({
+      uniforms: { uCol: { value: FP.eye }, uA: { value: 0.42 }, uFogD: { value: P.fog } },
+      vertexShader: 'varying vec2 vUv; varying vec3 vView; void main(){ vUv = uv * 2.0 - 1.0; vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
+      fragmentShader: 'uniform vec3 uCol; uniform float uA, uFogD; varying vec2 vUv; varying vec3 vView; void main(){ float r = length(vUv), g = exp(-r * r * 3.0) * (1.0 - smoothstep(0.7, 1.0, r)); float a = g * uA * exp(-uFogD * uFogD * dot(vView, vView)); gl_FragColor = vec4(uCol * a, a); }',
+      side: THREE.DoubleSide
+    })));
   }
   function buildQuarries(){
     // (on an octagon's wall, 0.298 across; a group's origin is at the hover height — its floor ~0.01 under that)
     CAST.courier = prismGeo([[-0.09, 0], [0.09, 0], [0.066, 0.064], [-0.066, 0.064]], 0.26);
+    CAST.cab = prismGeo([[-0.058, 0], [0.058, 0], [0.044, 0.04], [-0.044, 0.04]], 0.09);
     CAST.cargo = new THREE.IcosahedronGeometry(0.036, 1);
     CAST.raider = prismGeo([[-0.11, -0.02], [0.11, -0.02], [0.066, 0.03], [-0.066, 0.03]], 0.24);
     CAST.rack = prismGeo([[-0.045, -0.016], [0.045, -0.016], [0.045, 0.008], [-0.045, 0.008]], 0.11);
-    CAST.car = prismGeo([[-0.075, 0], [0.075, 0], [0.064, 0.085], [-0.064, 0.085]], 0.2);
-    CAST.hunter = prismGeo([[-0.075, 0], [0.075, 0], [0, 0.052]], 0.15);
-    CAST.wing = prismGeo([[-0.15, 0], [0.15, 0], [0.1, 0.036], [-0.1, 0.036]], 0.22);
+    CAST.rotor = new THREE.TorusGeometry(0.135, 0.008, 6, 36); CAST.rotor.rotateX(Math.PI / 2);
+    CAST.car = prismGeo([[-0.075, 0], [0.075, 0], [0.064, 0.085], [-0.064, 0.085]], 0.19);
+    CAST.roof = prismGeo([[-0.054, 0], [0.054, 0], [0.046, 0.02], [-0.046, 0.02]], 0.12);
+    CAST.hunter = prismGeo([[-0.06, 0], [0.06, 0], [0, 0.05]], 0.16);
+    CAST.hwing = prismGeo([[-0.13, 0], [0.13, 0], [0.11, 0.012], [-0.11, 0.012]], 0.07);
+    CAST.wing = prismGeo([[-0.13, 0], [0.13, 0], [0.086, 0.032], [-0.086, 0.032]], 0.2);
+    CAST.spine = prismGeo([[-0.04, 0], [0.04, 0], [0.03, 0.032], [-0.03, 0.032]], 0.26);
     CAST.bay = new THREE.IcosahedronGeometry(0.04, 1); CAST.bay.scale(1, 0.45, 1.4);
+    CAST.doorL = prismGeo([[0, -0.006], [0.042, -0.006], [0.042, 0], [0, 0]], 0.085);
+    CAST.doorR = prismGeo([[-0.042, -0.006], [0, -0.006], [0, 0], [-0.042, 0]], 0.085);
     CAST.bomb = new THREE.IcosahedronGeometry(0.024, 1);
     FK.mine = { pool: [], make: function(){ return makeBody(CAST.lock, [0, 0.035, 0.02, 0.016]); } };
     FK.wreck = { pool: [], make: function(){ var g = makeBody(CAST.car, null); g.rotation.order = 'ZYX'; return g; } };
+    CAST.scrap = prismGeo([[-0.1, 0], [0.1, 0], [0.08, 0.04], [-0.08, 0.04]], 0.06);
+    FK.scrap = { pool: [], make: function(){ var g = makeBody(CAST.scrap, null); g.rotation.order = 'ZYX'; return g; } };
     R.foes = []; R.qPool = {}; R.mirrorPool = []; R.qBombs = []; R.bombPool = []; R.pops = []; R.chase = null;
+    R.poolGeo = new THREE.PlaneGeometry(1, 1); R.poolMat = poolMat();
     R.bombMat = keep(orbMat());
+    R.coup = [];
+    for(var c = 0; c < 3; c++){ var cm = new THREE.Mesh(R.lineGeo, keep(lineMat())); cm.visible = false; cm.frustumCulled = false; cm.renderOrder = 4; R.scene.add(cm); R.coup.push(cm); }
     R.mirrorMat = keep(new THREE.ShaderMaterial({
-      uniforms: { uHeat: { value: 0 }, uHit: { value: 0 }, uRim: { value: FOE_EYE }, uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
+      uniforms: { uHeat: { value: 0 }, uHit: { value: 0 }, uRim: { value: FP.trim }, uBody: { value: FP.body }, uShade: { value: FP.shade }, uHot: { value: FP.hot },
+                  uFogCol: { value: fogC() }, uFogD: { value: P.fog } },
       vertexShader: 'varying vec3 vN, vView; void main(){ vN = normalize(normalMatrix * normal); vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }',
       fragmentShader: [
-        'uniform float uHeat, uHit, uFogD; uniform vec3 uRim, uFogCol; varying vec3 vN, vView;',
+        'uniform float uHeat, uHit, uFogD; uniform vec3 uRim, uBody, uShade, uHot, uFogCol; varying vec3 vN, vView;',
         'void main(){',
         '  float f = 1.0 - abs(dot(normalize(vN), normalize(-vView)));',
-        '  vec3 col = vec3(0.05, 0.035, 0.065) + uRim * (pow(f, 2.2) * (0.75 + 0.6 * uHeat) + 0.04) + vec3(1.0, 0.85, 0.9) * pow(f, 6.0) * uHeat * 0.6;',
+        // (your hull in the enemy's armour: darker than the rest of them — it is THE MIRROR — its rim lit)
+        '  vec3 col = mix(uBody * 0.85, uShade, f * 0.8) + uRim * (pow(f, 2.2) * (0.6 + 0.6 * uHeat)) + uHot * pow(f, 6.0) * uHeat * 0.6;',
         '  col = mix(col, vec3(1.0, 0.95, 0.97), uHit * 0.55);',
         '  float dd = length(vView), fog = exp(-uFogD * uFogD * dd * dd);',
         '  gl_FragColor = vec4(mix(uFogCol, col, fog), 1.0);',
@@ -98580,6 +99179,7 @@ var RUNNER = (function(){
     // one of each standing by (hidden, in its pool), so the warm-up links every program
     ['courier', 'minelayer', 'convoy', 'hunters', 'bomber'].forEach(function(k){ var m = QLOOK[k](); R.qPool[k] = [m]; R.foeStandby.push(m); });
     var w0 = FK.wreck.make(); FK.wreck.pool.push(w0); R.foeStandby.push(w0);
+    var x0 = FK.scrap.make(); FK.scrap.pool.push(x0); R.foeStandby.push(x0);
     var b0 = new THREE.Mesh(CAST.bomb, R.bombMat); b0.visible = false; b0.frustumCulled = false; R.scene.add(b0); R.bombPool.push(b0); R.foeStandby.push(b0);
   }
 
@@ -98611,9 +99211,30 @@ var RUNNER = (function(){
       b.x += b.vx; b.y += b.vy; b.z += b.vz; b.life++;
       grazeCheck(b);
       var gone = b.z < S.z - 1.2 || b.z > S.z + 80 || b.life > 1200, wall = !gone && outOfTube(b.x, b.y, b.z, 0.004);
-      if(wall){ _p.set(b.x, b.y, -(b.z - S.zBase)); burst(_p, 6, false); }
+      if(wall){ _p.set(b.x, b.y, -(b.z - S.zBase)); burst(_p, 6, false, FP.eye); }
+      else if(!gone && ebCovered(b)){ _p.set(b.x, b.y, -(b.z - S.zBase)); burst(_p, 12, false, FP.eye); wall = true; }
       if(gone || wall) R.eb.splice(i, 1);
     }
+  }
+  // Did this step of one of their bolts run into cover? (Its stretch from z0 to z, against each blocking obstacle it
+  // crossed, at that obstacle's z; and a bulkhead's solid.)
+  function ebCovered(b){
+    var dzs = b.z - b.z0, i, f;
+    for(i = 0; i < R.obs.length; i++){
+      var o = R.obs[i];
+      if(!(blocks(o) || o.type === 'barricade' || o.type === 'bomb') || (o.foe && o.foe.dead) || o.skid != null) continue;
+      var lo = Math.min(b.z0, b.z) - o.dz, hi = Math.max(b.z0, b.z) + o.dz;
+      if(o.z < lo || o.z > hi) continue;
+      f = Math.abs(dzs) > 1e-9 ? clamp((o.z - b.z0) / dzs, 0, 1) : 1;
+      if(inBox(o, b.x0 + (b.x - b.x0) * f, b.y0 + (b.y - b.y0) * f, b.r)) return true;
+    }
+    for(i = 0; i < R.walls.length; i++){
+      var w = R.walls[i];
+      if(w.z < Math.min(b.z0, b.z) || w.z > Math.max(b.z0, b.z)) continue;
+      f = Math.abs(dzs) > 1e-9 ? clamp((w.z - b.z0) / dzs, 0, 1) : 1;
+      if(!wallOpenAt(w, b.x0 + (b.x - b.x0) * f, b.y0 + (b.y - b.y0) * f, 0.003)) return true;
+    }
+    return false;
   }
   // GRAZE (NEAR MISS): the bolt's nearest pass to the hull (its gap, outside the hit ellipsoid); once it is behind you
   // having never touched you, a pass within the near miss's hair pays as a near miss does.
@@ -98950,6 +99571,12 @@ var RUNNER = (function(){
     if(!R.pbMesh) return;
     var t = performance.now() * 0.001, fd = R.fogD || P.fog, i, lines = 0;
     for(i = 0; i < FOE_MATS.length; i++){ var u = FOE_MATS[i].uniforms; if(u.uFogD) u.uFogD.value = fd; if(u.uT) u.uT.value = t; }
+    if(R.inkC){   // (the ink: foeInkPx CSS pixels wide, whatever the drawing buffer)
+      renderer.getDrawingBufferSize(_inkRes);
+      var ipx = P.foeInkPx * renderer.getPixelRatio();
+      R.inkC.uniforms.uRes.value.copy(_inkRes); R.inkN.uniforms.uRes.value.copy(_inkRes);
+      R.inkC.uniforms.uPx.value = R.inkN.uniforms.uPx.value = ipx;
+    }
     for(i = 0; i < R.obs.length; i++){
       var o = R.obs[i], F = o.foe;
       if(!F || F.dead) continue;
@@ -98968,6 +99595,7 @@ var RUNNER = (function(){
       if(bu.uBN.value < BAR_MAX) bu.uBar.value[bu.uBN.value++].set(99, -(h.z - S.zBase), -10, 10);   // (a whole ring: lit on every wall)
     }
   }
+  var _inkRes = new THREE.Vector2();
   function setHit(g, v){
     if(g.material && g.material.uniforms && g.material.uniforms.uHit) g.material.uniforms.uHit.value = v;
     for(var i = 0; i < g.children.length; i++){ var m = g.children[i]; if(m.material && m.material.uniforms && m.material.uniforms.uHit) m.material.uniforms.uHit.value = v; }
@@ -98981,9 +99609,9 @@ var RUNNER = (function(){
     if(R.foeWarmN == null) R.foeWarmN = 3;
     var on = --R.foeWarmN > 0;
     R.foeStandby.forEach(function(m){ m.visible = on; });
-    R.ebMesh.count = R.pbMesh.count = R.dartMesh.count = on ? 1 : R.ebMesh.count;
+    R.ebMesh.count = R.ebTrail.count = R.ebMark.count = R.pbMesh.count = R.dartMesh.count = on ? 1 : R.ebMesh.count;
     if(on) R.lines[0].visible = true;
-    if(!on){ R.foeWarmed = true; R.ebMesh.count = R.eb.length; R.pbMesh.count = R.pb.length; R.dartMesh.count = 0; }
+    if(!on){ R.foeWarmed = true; R.ebMesh.count = R.ebTrail.count = R.eb.length; R.ebMark.count = 0; R.pbMesh.count = R.pb.length; R.dartMesh.count = 0; }
   }
   function sightLine(m, o){
     var a = P.apothem - 0.063, hx = Math.sin(o.phi) * a, hy = -Math.cos(o.phi) * a, hz = o.mesh.position.z, sp = gameMode.ship.position;
@@ -98995,23 +99623,43 @@ var RUNNER = (function(){
     m.material.uniforms.uA.value = 0.25 + 0.6 * clamp(o.foe.t / P.sentryAimSec, 0, 1);
     m.visible = true;
   }
+  var _bn = new THREE.Vector3();
   function drawBolts(){
-    var M = R.ebMesh, n = 0, i;
+    var M = R.ebMesh, Tr = R.ebTrail, Mk = R.ebMark, TA = R.ebTailA.array, n = 0, nm = 0, i, t = performance.now() * 0.001;
     for(i = 0; i < R.eb.length && n < EB_MAX; i++){
-      var b = R.eb[i];
-      _bd.set(b.vx, b.vy, -b.vz); if(_bd.lengthSq() < 1e-12) _bd.set(0, 0, 1); _bd.normalize();
-      _bq.setFromUnitVectors(_zAx, _bd);
-      _bp.set(b.x, b.y, -(b.z - S.zBase)); _bs.set(0.014, 0.014, 0.034);
-      _bm.compose(_bp, _bq, _bs); M.setMatrixAt(n++, _bm);
+      var b = R.eb[i], wz = -(b.z - S.zBase), cd2 = Math.hypot(b.x - R.cam.position.x, b.y - R.cam.position.y, wz - R.cam.position.z);
+      var s = P.foeBoltSize * clamp(0.55 + 0.22 * cd2, 0.7, 1.15) * (1 + 0.08 * Math.sin(t * 24 + i * 1.7));
+      _bq.identity(); _bp.set(b.x, b.y, wz); _bs.set(s, s, s);
+      _bm.compose(_bp, _bq, _bs); M.setMatrixAt(n, _bm); Tr.setMatrixAt(n, _bm);
+      // its streak: back along its motion as you see it (it closes on you at S.v − vz: toward the lens, world +z)
+      var rx = b.vx, ry = b.vy, rz = S.v - b.vz, rl = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1, L = clamp(rl * 60 * 0.07, 0.06, 0.4);
+      TA[n * 3] = -rx / rl * L; TA[n * 3 + 1] = -ry / rl * L; TA[n * 3 + 2] = -rz / rl * L;
+      n++;
+      // its mark on the wall under it (the nearest wall's plane), as it comes within a few units of you
+      var dzy = b.z - S.z;
+      if(dzy > 0.12 && dzy < 3.3){
+        var sh = shapeInto(b.z, _shE), wi = 0, best = 1e9;
+        for(var w = 0; w < sh.n; w++){ var e = sh.h[w] - (b.x * Math.sin(sh.phi[w]) - b.y * Math.cos(sh.phi[w])); if(e < best){ best = e; wi = w; } }
+        if(best < 0.3){
+          var ph = sh.phi[wi], dx = Math.sin(ph), dy = -Math.cos(ph), I = clamp(1 - (dzy - 0.4) / 2.9, 0, 1) * clamp(1.25 - best * 4, 0.2, 1);
+          _bp.set(b.x + dx * (best - 0.004), b.y + dy * (best - 0.004), wz);
+          _bn.set(-dx, -dy, 0); _bq.setFromUnitVectors(_zAx, _bn);
+          var ms = 0.055 + 0.05 * (1 - clamp(dzy / 3.3, 0, 1));
+          _bs.set(ms, ms, Math.max(0.002, I));
+          _bm.compose(_bp, _bq, _bs); Mk.setMatrixAt(nm++, _bm);
+        }
+      }
     }
-    M.count = n; if(n) M.instanceMatrix.needsUpdate = true;
+    M.count = Tr.count = n; Mk.count = nm;
+    if(n){ M.instanceMatrix.needsUpdate = true; Tr.instanceMatrix.needsUpdate = true; R.ebTailA.needsUpdate = true; }
+    if(nm) Mk.instanceMatrix.needsUpdate = true;
     M = R.pbMesh; n = 0;
     for(i = 0; i < R.pb.length && n < PB_MAX; i++){
       var p = R.pb[i], ex = p.x - p.x0, ey = p.y - p.y0, ez = -(p.z - p.z0), L = Math.sqrt(ex * ex + ey * ey + ez * ez);
       if(L < 1e-6){ ex = 0; ey = 0; ez = -1; L = 1; }
       _bd.set(ex / L, ey / L, ez / L); _bq.setFromUnitVectors(_zAx, _bd);
       var len = clamp(L * 0.5, 0.04, 0.32);   // its streak trails back over the step it took (a tracer)
-      _bp.set(p.x - _bd.x * len, p.y - _bd.y * len, -(p.z - S.zBase) - _bd.z * len); _bs.set(0.007, 0.007, len);
+      _bp.set(p.x - _bd.x * len, p.y - _bd.y * len, -(p.z - S.zBase) - _bd.z * len); _bs.set(P.boltWidth, P.boltWidth, len);
       _bm.compose(_bp, _bq, _bs); M.setMatrixAt(n++, _bm);
     }
     M.count = n; if(n) M.instanceMatrix.needsUpdate = true;
@@ -99290,7 +99938,7 @@ var RUNNER = (function(){
     R.stars.position.copy(R.cam.position);
     R.tubeMat.uniforms.uFloor.value = S.up;
     R.tubeMat.uniforms.uFlrCos.value = Math.cos(0.6 * (S.mode === 'flat' ? TAU / 8 : shapeAt(S.z).span));
-    feedOpen(); feedHoles(); feedPits(); feedWalls(); feedBars(); feedLasers(); drawPanels(); feedChoice(); feedUpg2();
+    feedOpen(); feedHoles(); feedPits(); feedWalls(); feedBars(); feedLasers(); drawPanels(); feedChoice(); feedUpg2(); feedDistrict();
     R.cap.position.set(0, 0, -(S.z + maxAhead() + 10 - S.zBase));
     // The fog thins as the run speeds up, so what you can see ahead stays the same TIME away (the view
     // distance is ∝ 1/density). Every hand-written material and the scene's own fog share the one value.
