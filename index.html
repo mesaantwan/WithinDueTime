@@ -92172,7 +92172,7 @@ var RUNNER = (function(){
   // alive, except that ground covered faster than the run speed counts as the time the run would have taken
   // to cover it — so a slingshot lands you as deep into it as a run that got that far on foot. (S.runT stays
   // plain time alive — the turning blades keep real time.)
-  function difficulty(){ return S ? Math.min(1, S.progT / P.rampSec) : 0; }
+  function difficulty(z){ return S ? (LV.on ? lvD(z == null ? S.z : z) : Math.min(1, S.progT / P.rampSec)) : 0; }   // (THE LEVEL: by distance, not time alive — see lvD)
   // Rows and coins are spaced in TIME at the speed the ship is actually doing — after a slingshot that is
   // more than the run speed for a while, so they come further apart until drag has taken it back.
   function rowUps(){ return Math.max(unitsPerSec(), S.v * 60); }
@@ -92245,8 +92245,8 @@ var RUNNER = (function(){
   function holdSec(){ return P.shapeSecMin + Math.random() * (P.shapeSecMax - P.shapeSecMin); }
   function pickSides(not){
     if(P.holdSides) return P.holdSides;
-    var n;
-    do { n = P.sidesMin + Math.floor(Math.random() * (P.sidesMax - P.sidesMin + 1)); } while(n === not);
+    var n, r = lvSides(S ? S.z : null), lo = r ? r[0] : P.sidesMin, hi = r ? r[1] : P.sidesMax, tries = 0;   // (THE LEVEL: the stage's shapes)
+    do { n = lo + Math.floor(Math.random() * (hi - lo + 1)); } while(n === not && hi > lo && tries++ < 20);
     return n;
   }
   function extendCourse(zTo){
@@ -92254,18 +92254,19 @@ var RUNNER = (function(){
     while(c[c.length - 1].z1 < zTo){
       var last = c[c.length - 1], ups = unitsPerSec(), sec;
       // (never under a slingshot shot in the air: it has to come down on a tube's wall)
-      var flat = last.kind === 'hold' && !P.holdSides && !(S.sl && S.sl.phase === 'fly') && !S.boss && !R.chaseHold && (_rfl ? !S.flatDone : Math.random() < P.flatChance);
+      var flat = last.kind === 'hold' && !P.holdSides && !(S.sl && S.sl.phase === 'fly') && !S.boss && !R.chaseHold && !last.fin && (_rfl ? !S.flatDone : Math.random() < lvFlat(last.z1, ups));   // (THE LEVEL: the stage's islands, with room before its end)
       if(flat) S.flatDone = true;
       if(flat){
         // A FLAT: the tube just ends and the platform carries on from its floor, flatWidth wide, then
         // narrows over its last flatTaperSec to the floor of the tube that follows — that tube's mouth.
-        var len = ups * (P.flatSecMin + Math.pow(Math.random(), P.flatSecSkew) * (P.flatSecMax - P.flatSecMin));
-        var _dn = nextDistrict(last);   // (THE DISTRICTS: the tube after the island)
-        sec = { z0: last.z1, z1: last.z1 + len, kind: 'flat', W: P.flatWidth + Math.random() * (P.flatWidthMax - P.flatWidth), nNext: distSides(_dn, last.n), distNext: _dn, taper: ups * P.flatTaperSec };
+        var len = Math.max(ups * 3, lvFlatLen(last.z1, ups * (P.flatSecMin + Math.pow(Math.random(), P.flatSecSkew) * (P.flatSecMax - P.flatSecMin)), ups));   // (THE LEVEL: it ends before the next stage)
+        var _dn = nextDistrict(last, last.z1 + len);   // (THE DISTRICTS: the tube after the island)
+        sec = { z0: last.z1, z1: last.z1 + len, kind: 'flat', W: P.flatWidth + Math.random() * (P.flatWidthMax - P.flatWidth), nNext: distSides(_dn, last.n, last.z1 + len), distNext: _dn, taper: ups * P.flatTaperSec };
         makeHills(sec, ups);
       }
-      else if(last.kind === 'hold' && !P.holdSides){ var _dm = nextDistrict(last); sec = { z0: last.z1, z1: last.z1 + ups * P.morphSec, kind: 'morph', a: last.n, b: distSides(_dm, last.n), dist: _dm }; }   // (THE DISTRICTS)
-      else { sec = { z0: last.z1, z1: last.z1 + ups * holdSec(), kind: 'hold', n: last.kind === 'morph' ? last.b : (last.kind === 'flat' ? last.nNext : last.n) }; sec.dist = holdDist(last, sec.n); }
+      else if(lvFinal(last, ups)) sec = lvFinalSec(last, ups);   // (THE LEVEL: the last stretch to the line, and past it — one held tube)
+      else if(last.kind === 'hold' && !P.holdSides){ var _zh = last.z1 + ups * P.morphSec, _dm = nextDistrict(last, _zh); sec = { z0: last.z1, z1: _zh, kind: 'morph', a: last.n, b: distSides(_dm, last.n, _zh), dist: _dm }; }   // (THE DISTRICTS)
+      else { sec = { z0: last.z1, z1: last.z1 + ups * holdSec(), kind: 'hold', n: last.kind === 'morph' ? last.b : (last.kind === 'flat' ? last.nNext : last.n) }; sec.dist = holdDist(last, sec.n); lvCutHold(sec, ups); }   // (THE LEVEL: a stage opens with a fold)
       c.push(sec);
       buildChunk(sec);
       if(sec.kind === 'hold') maybeOpen(sec, ups);   // (THE OPEN TUBE)
@@ -92291,7 +92292,7 @@ var RUNNER = (function(){
   // nothing says "jump here", it is the ground and the speed. Level ground at both ends: the tube's floor runs
   // straight on, and the next tube's mouth is met level. A gentle lean across, changing along it.
   function makeHills(sec, ups){
-    var k = ups / (baseSpeed() * 60), hk = Math.min(k, 1.6) * P.islHill, B = [], L = 0;
+    var k = ups / (baseSpeed() * 60), hk = Math.min(k, 1.6) * P.islHill * lvHill(sec), B = [], L = 0;   // (THE LEVEL: gentler the first time)
     var a = sec.z0 + ups * P.islRampIn, b = sec.z1 - sec.taper - ups * P.islRunOut, z = a + rnd(0.3, 1.5) * k;
     while(z < b){
       var up = rnd(1.4, 4.2) * k, dn = (Math.random() < 0.4 ? rnd(0.6, 1.2) : rnd(1.2, 3.6)) * k;
@@ -92862,14 +92863,14 @@ var RUNNER = (function(){
   // retired on the spot, visuals and physics together.
   var OPEN_NONE = (function(){ var t = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1, THREE.RGBAFormat); t.needsUpdate = true; return t; })();
   function maybeOpen(sec, ups){
-    if(!S || sec === S.course[0] || (S.sl && S.sl.phase === 'fly')) return;
+    if(!S || sec === S.course[0] || sec.fin || (S.sl && S.sl.phase === 'fly')) return;   // (THE LEVEL: none in the last stretch)
     if(!(_ropen || Math.random() < openChanceOf(sec))) return;   // (THE DISTRICTS: mostly THE DROP's)
     var L = P.panelLen, n = sec.n;
     // (never before the next row is due: a slingshot landing promises a clear run-out, and nextRow is that promise)
     var z0 = Math.ceil(Math.max(sec.z0 + ups * 1.2, S.nextRow) / L) * L, z1 = Math.floor(Math.min(sec.z1 - ups * 0.9, z0 + ups * rnd(P.openSecMin, P.openSecMax)) / L) * L;
     if(z1 - z0 < ups * 2.5 || n < 4) return;
-    var rows = Math.round((z1 - z0) / L), d = difficulty(), mode = Math.random() < 0.5 ? 'arc' : 'scatter';
-    var dens = rnd(P.openDensMin, P.openDensMax) * (0.8 + 0.2 * d);
+    var rows = Math.round((z1 - z0) / L), d = difficulty(z0), mode = Math.random() < 0.5 ? 'arc' : 'scatter';
+    var dens = rnd(P.openDensMin, P.openDensMax) * (0.8 + 0.2 * d) * lvOpenDens(sec);   // (THE LEVEL: sparser when they are new)
     var arcW = Math.max(2, Math.round(n * rnd(P.openArcMin, P.openArcMax)));
     var ramp = Math.max(2, Math.round(ups * P.openRamp / L)), hold = Math.max(2, Math.ceil(ups * P.openHoldSec / L));
     var mask = new Uint8Array(16 * rows * 4), sp = Math.floor(Math.random() * n), prev = -1, prevUntil = -1, lastStep = 0;
@@ -93374,7 +93375,7 @@ var RUNNER = (function(){
     R.ui = new THREE.Scene();
     R.uiCam = new THREE.OrthographicCamera(0, 1, 0, -1, -10, 10);
     R.btns = [];
-    for(var i = 0; i < 12; i++){
+    for(var i = 0; i < 14; i++){   // (THE LEVEL: 14 — the card's FRESH START plate cross-fades with the shop's eight)
       var mat = DML.frostMaterial();
       mat.depthTest = false;
       var mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
@@ -93407,7 +93408,7 @@ var RUNNER = (function(){
     R.elCardCoins = el('div', 'font-size:12px;letter-spacing:0.28em;color:rgba(255,205,90,0.95);margin-top:8px;', R.elCard, '');
     // One label per frost plate (see layout): a button's word, or a shop row's whole content.
     R.elBtn = [];
-    for(var bi = 0; bi < 12; bi++) R.elBtn.push(el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L));
+    for(var bi = 0; bi < 14; bi++) R.elBtn.push(el('div', T + 'text-align:center;font-size:13px;letter-spacing:0.24em;color:#1b2029;opacity:0;', L));
     buildSlingLayer(T);
     L.addEventListener('touchstart', tStart, { passive: false });
     L.addEventListener('touchmove', tMove, { passive: false });
@@ -93468,7 +93469,7 @@ var RUNNER = (function(){
           nextRow: (P.firstRow != null ? P.firstRow : P.firstRowSec * baseSpeed() * 60), best: loadBest(),
           coins: [], coinN: 0, course: null, nextPat: P.firstPatSec * baseSpeed() * 60, lastPat: null, patLog: [] };
     _shZ = NaN; _shS = null;
-    S.course = [{ z0: -20, z1: baseSpeed() * 60 * holdSec(), kind: 'hold', n: P.startSides }];
+    S.course = [{ z0: -20, z1: baseSpeed() * 60 * holdSec(), kind: 'hold', n: lvStartSides(0) }];   // (THE LEVEL: the first stage's shape)
     buildChunk(S.course[0]);
     extendCourse(maxAhead() + 20);
     for(var i = 0; i < R.obs.length; i++) freeObs(R.obs[i]);
@@ -93481,6 +93482,7 @@ var RUNNER = (function(){
     R.elDist.style.opacity = 1; R.elCoins.style.opacity = 1;
     coresReset(); plumeReset(); foesReset();   // (THE ENEMIES)
     slingReset();   // owning a slingshot: the run starts in it, on the axis (see THE SLINGSHOT)
+    lvReset();      // (THE LEVEL: this run's stage state; ?runat= starts it further in)
     resetRig();
     var s = gameMode.surfaceState;
     s.airborne = false; s.freeFalling = false; s.vertVel = 0; s.speed = 0; s.isDrifting = false; s.driftBoost = false;
@@ -93498,8 +93500,8 @@ var RUNNER = (function(){
     if(gameMode.shipVisual){ gameMode.shipVisual.rotation.set(0, 0, 0); gameMode.shipVisual.position.set(0, 0, 0); }
   }
   function clearTrail(DT){ if(!DT) return; DT.points.length = 0; DT.lastPos = null; DT._prevMount = null; DT.boosting = false; DT.intensity = 0; if(DT.geo) DT.geo.setDrawRange(0, 0); }
-  function loadNum(k){ try { return +(localStorage.getItem(k) || 0) || 0; } catch(e){ return 0; } }
-  function saveNum(k, v){ try { localStorage.setItem(k, String(v)); } catch(e){} }
+  function loadNum(k){ try { return +(localStorage.getItem(profKey(k)) || 0) || 0; } catch(e){ return 0; } }   // (THE LEVEL: FRESH START's profile — see profKey)
+  function saveNum(k, v){ try { localStorage.setItem(profKey(k), String(v)); } catch(e){} }
   function loadBest(){ return loadNum(BEST_KEY); }
 
   // ── Moves. Same numbers as the planet game: jumpImpulse up the floor normal, jumpGravity toward it,
@@ -93566,7 +93568,8 @@ var RUNNER = (function(){
     // which itself keeps rising the longer you live. Anything OVER the run speed (a slingshot's) is
     // drag's: the excess decays, quickly in the air and slowly on the ground.
     var vt = runSpeed();
-    if(!S.dead){
+    if(S.won && !S.dead) S.v *= LP.glide;   // (THE LEVEL: over the finish line it glides to a stop)
+    else if(!S.dead){
       if(S.mode === 'flat') islSpeed(vt);   // an island's own: the slopes' (see THE ISLANDS)
       else if(S.v > vt) S.v = vt + (S.v - vt) * Math.exp(-(S.grounded ? P.dragGround : P.dragAir) / 60);
       else S.v = Math.min(vt, S.v + Math.max(GAME_BASE_MAXSPEED * (60 / 15) / 60, vt / 60));
@@ -93595,12 +93598,12 @@ var RUNNER = (function(){
     rig();
     stepMovers();   // (THE PATTERNS II: the pistons where they are now, before anything is tested against them)
     stepFoes();     // (THE ENEMIES: they wind up and fire, their bolts and hoops move — before the hit test)
-    if(!S.dead){
+    if(!S.dead && !S.won){   // (THE LEVEL: past the line nothing can hit you)
       if(S.shieldT > 0) S.shieldT = Math.max(0, S.shieldT - 1 / 60);
       if(S.shieldT > 0 || S.chargeT > 0) shieldSweep(x0, y0, z0);   // shielded or charged: what it meets, it smashes
       else { var o = sweptHit(x0, y0, z0); if(o) crash(o); }
     }
-    else S.deadF++;
+    else if(S.dead) S.deadF++;
     stepCoins();
     placeCam(false);
     stepSparks();
@@ -93609,7 +93612,7 @@ var RUNNER = (function(){
     gunTick();      // (THE ENEMIES: the gun — it fires by itself at what is on your wall)
     plumeTick();
     islDecorTick(); islDebrisTick();   // (the islands out in the dark, the rocks beside you: THE ISLANDS)
-    rows();
+    rows(); levelTick();   // (THE LEVEL: the stages, the finish line)
     rebase();
   }
   // Thumb or key → the steer target, at one rate everywhere: a whole turn of a tube per steerTurnScreen of
@@ -94140,6 +94143,7 @@ var RUNNER = (function(){
   }
   function plateHTML(a, own, bank, h){
     if(a === 'restart') return 'RESTART';
+    if(a === 'fresh') return lvFreshLabel();   // (THE LEVEL)
     if(a === 'life') return lifeRowHTML(bank, h);
     if(a === 'gun') return gunRowHTML(bank, h);   // (THE ENEMIES)
     if(a === 'shop') return 'SHOP';
@@ -94494,7 +94498,7 @@ var RUNNER = (function(){
   }
   // A core in this gap between rows, if one is due: half-way along the gap, off your line.
   function maybeItem(z, next, skipTo){
-    if(skipTo != null || R.items.length >= 6) return;
+    if(skipTo != null || R.items.length >= 6 || !lvCores(z)) return;   // (THE LEVEL: none in the first stage)
     var zi = z + (next - z) * 0.5, sec = sectionAt(zi), ups = rowUps(), kind = null;
     if(sec.kind === 'morph' || sec.choice || zi > sec.z1 - ups * 0.4) return;   // not on a fold, nor into the next section (nor in a choice hallway)
     if(zi >= S.nextCharge){ kind = 'charge'; S.nextCharge = zi + ups * rnd(P.chargeCoreSecMin, P.chargeCoreSecMax) / upgMul('charge'); }
@@ -95010,30 +95014,35 @@ var RUNNER = (function(){
         gp(z, S.th); for(var gz = z0; gz <= z1; gz += ups * 0.08) gp(gz, stripAt(s, gz));
         return z1 + ups * 0.4;
       } },
-    // THE FORK — three paths over a pit; all but one run out. One carries coins — sometimes the safe one,
-    // sometimes bait. You can see the ends coming, and jump across to another path if you are quick.
-    fork: { w: 2, min: 5, max: 16, sec: function(d){ return 0.3 + 3.4 + 0.4; },
+    // THE BRAID — the floor falls away under a fan of paths (four; five when it gets hard) leaving from all round the tube:
+    // they wind across one another — where two cross you can change over — and every one of them comes into the SAME line,
+    // which you follow out. Whichever path you are on, it gets you there; one of them carries the coins.
+    // (It replaced THE FORK — three paths, two of them dead ends, and no way to tell which: a blind guess at speed.)
+    braid: { w: 2.5, min: 4, max: 16, sec: function(d){ return 0.4 + (3.2 + 0.8 * d) + 1.0 + 0.4; },
       spawn: function(z, n, d, ups){
-        // Paths at least ~35° apart (whole walls), so there is always pit between them to choose across —
-        // on a 16-gon, neighbouring walls' paths would touch.
-        var span = TAU / n, L = ups * 3.4, z0 = z + ups * 0.3, z1 = z0 + L, base = Math.round(S.th / span) * span;
-        var sep = span * Math.max(1, Math.ceil(0.62 / span)), ang = [base - sep, base, base + sep], safe = Math.floor(Math.random() * 3), strips = [];
-        var coined = Math.random() < 0.5 ? safe : (safe + 1 + Math.floor(Math.random() * 2)) % 3, hw = 0.16 + 0.06 * (1 - d);
-        for(var k = 0; k < 3; k++){
-          var zB = k === safe ? z1 + 0.01 : z0 + L * (0.35 + 0.45 * Math.random());
-          strips.push({ zA: z0 - 0.01, zB: zB, th0: ang[k], drift: 0, amp: 0, freq: 0, w0: hw, w1: hw });
+        var K = 4 + (d > 0.45 ? 1 : 0), L = ups * (3.2 + 0.8 * d), z0 = z + ups * 0.4, zm = z0 + L, z1 = zm + ups * 1.0;
+        var aEnd = S.th + rnd(-1.2, 1.2), base = S.th + Math.random() * TAU / K, wB = 0.21 - 0.07 * d, strips = [], k, gk = 0, gd = 1e9;
+        for(k = 0; k < K; k++){
+          // each leaves its own place round the tube and arrives at aEnd: a straight drift there, plus a swing that is
+          // zero at both ends (whole half-waves of the stretch), different for each — so they cross on the way in
+          var a0 = aEnd + wrapPi(base + k * TAU / K - aEnd), hw = 1 + Math.floor(Math.random() * 2);
+          strips.push({ zA: z0 - 0.01, zB: zm + 0.02, th0: a0, drift: (aEnd - a0) / L, amp: (Math.random() < 0.5 ? -1 : 1) * rnd(0.18, 0.32) * (0.7 + 0.5 * d),
+                        freq: Math.PI * hw / L, w0: 0.3, w1: wB });
+          var dk = Math.abs(wrapPi(a0 - S.th)); if(dk < gd){ gd = dk; gk = k; }
         }
+        strips.push({ zA: zm - 0.02, zB: z1 + 0.01, th0: aEnd, drift: 0, amp: 0, freq: 0, w0: wB, w1: wB });   // the one line they all come into
         R.pits.push({ z0: z0, z1: z1, strips: strips });
-        var cs = strips[coined];
-        coinLine(function(){ return cs.th0; }, z0 + ups * 0.15, Math.min(cs.zB, z1) - ups * 0.12, ups);
-        gp(z, S.th); gp(z0 - ups * 0.05, ang[safe]); gp(z1, ang[safe]);   // (the guide takes the path that goes all the way)
+        var cs = strips[Math.floor(Math.random() * K)], gs = strips[gk];
+        coinLine(function(zc){ return stripAt(cs, zc); }, z0 + ups * 0.15, zm, ups * 1.5);
+        coinLine(function(){ return aEnd; }, zm + ups * 0.1, z1 - ups * 0.1, ups);
+        gp(z, S.th); for(var gz = z0; gz <= zm; gz += ups * 0.08) gp(gz, stripAt(gs, gz)); gp(z1, aEnd);   // (the guide: the path nearest you)
         return z1 + ups * 0.4;
       } },
     // THE CORKSCREW — rows of gates with one wall open, and the open wall steps one round the tube each
     // row: you roll round with it. Coins in the openings.
-    corkscrew: { w: 2, min: 5, max: 10, sec: function(d){ return 0.4 + (6 + Math.round(3 * d)) * (0.55 - 0.12 * d) + 0.3; },
+    corkscrew: { w: 2, min: 5, max: 10, sec: function(d){ return 0.4 + (4 + Math.round(5 * d)) * (0.55 - 0.12 * d) * tempo(d) + 0.3; },   // (THE LEVEL: fewer, slower rows when it is new)
       spawn: function(z, n, d, ups){
-        var rowsN = 6 + Math.round(3 * d), gap = ups * (0.55 - 0.12 * d), dir = Math.random() < 0.5 ? -1 : 1, j0 = wallIdx(S.th, n), zz = z + ups * 0.4;
+        var rowsN = 4 + Math.round(5 * d), gap = ups * (0.55 - 0.12 * d) * tempo(d), dir = Math.random() < 0.5 ? -1 : 1, j0 = wallIdx(S.th, n), zz = z + ups * 0.4;
         gp(z, S.th);
         for(var k = 0; k < rowsN; k++){
           var open = ((j0 + dir * k) % n + n) % n;
@@ -95048,9 +95057,9 @@ var RUNNER = (function(){
     // THE SLALOM — half-walls down every wall, left, right, left: each covers a little past the middle, so
     // there is no straight line through — you weave. Tighter and longer when it gets hard. (Pillars at
     // ±half a wall were tried first: they left the middle clear, and riding straight down it beat them.)
-    slalom: { w: 1.5, min: 4, max: 10, sec: function(d){ return 0.4 + (6 + Math.round(3 * d)) * (0.42 - 0.08 * d) + 0.3; },
+    slalom: { w: 1.5, min: 4, max: 10, sec: function(d){ return 0.4 + (6 + Math.round(3 * d)) * (0.42 - 0.08 * d) * tempo(d) + 0.3; },
       spawn: function(z, n, d, ups){
-        var cnt = 6 + Math.round(3 * d), gap = ups * (0.42 - 0.08 * d), zz = z + ups * 0.4, left = Math.random() < 0.5;
+        var cnt = 6 + Math.round(3 * d), gap = ups * (0.42 - 0.08 * d) * tempo(d), zz = z + ups * 0.4, left = Math.random() < 0.5;
         var span = TAU / n, jg = Math.round(S.th / span), lim = P.apothem - hover(), uo = 0.55 * halfWn(n) * (1 - hover() / P.apothem);
         gp(z, S.th);
         for(var k = 0; k < cnt; k++){
@@ -95082,7 +95091,7 @@ var RUNNER = (function(){
         var zz = z + ups * 0.8, dir = Math.random() < 0.5 ? -1 : 1, gth = S.th;
         gp(z, S.th);
         for(var k = 0; k < 3; k++){
-          var kb = 2 + (d > 0.5 && Math.random() < 0.5 ? 1 : 0), B = { k: kb, half: Math.PI / kb * (0.42 + 0.12 * d), omega: dir * (0.8 + 0.9 * d), b0: Math.random() * TAU };
+          var kb = 2 + (d > 0.5 && Math.random() < 0.5 ? 1 : 0), B = { k: kb, half: Math.PI / kb * (0.42 + 0.12 * d), omega: dir * (0.8 + 0.9 * d) / ptempo(d), b0: Math.random() * TAU };
           addWall(zz, n, { blades: B });
           if(GD){   // the guide: the gap the ship will meet, at the moment it gets there
             var hc = hazAt(arriveT(zz)), cands = [];
@@ -95424,9 +95433,9 @@ var RUNNER = (function(){
     // are open — the other half from the row before, or the same half again: watch the beat, switch or stay.
     // Coins zig-zag through the open walls. (The beat is on the hazard clock, S.hazT: FREEZE slows it, and the
     // rows are laid that much further apart.)
-    crusher: { w: 2, min: 4, max: 12, sec: function(d){ return 1.0 + 2 * (3 + Math.round(2 * d)) * (0.55 - 0.12 * d) / hazRate() + 0.5; },   // (rows ≤ 2 half-beats apart)
+    crusher: { w: 2, min: 4, max: 12, sec: function(d){ return 1.0 + 2 * (3 + Math.round(2 * d)) * (0.55 - 0.12 * d) * ptempo(d) / hazRate() + 0.5; },   // (THE LEVEL: the beat slow when it is new)   // (rows ≤ 2 half-beats apart)
       spawn: function(z, n, d, ups){
-        var span = TAU / n, rowsN = 4 + Math.round(2 * d), hp = 0.55 - 0.12 * d, z0 = z + ups * 1.0, t0 = hazAt(arriveT(z0));
+        var span = TAU / n, rowsN = 4 + Math.round(2 * d), hp = (0.55 - 0.12 * d) * ptempo(d), z0 = z + ups * 1.0, t0 = hazAt(arriveT(z0));
         var M = 0, zz = z0, jc = Math.round(S.th / span), dir = Math.random() < 0.5 ? -1 : 1;
         function par(j){ return (((j % n) + n) % n) % 2; }
         gp(z, S.th);
@@ -95445,14 +95454,14 @@ var RUNNER = (function(){
     // it gets hard. Coin arcs mark where each beam crosses a ship that holds its line. (Hazard clock: see crusher.)
     lasers: { w: 2, min: 4, max: 16, sec: function(d){ return 0.8 + 3.2 + d + 0.3; },
       spawn: function(z, n, d, ups){
-        var k = 2 + (d > 0.4 ? 1 : 0), om = (Math.random() < 0.5 ? -1 : 1) * (1.6 + 0.8 * d);   // ≥ 0.87 s between crossings: a hop is 0.52
+        var k = 2 + (d > 0.4 ? 1 : 0), om = (Math.random() < 0.5 ? -1 : 1) * (1.6 + 0.8 * d) / ptempo(d);   // ≥ 0.87 s between crossings: a hop is 0.52
         var z0 = z + ups * 0.8, z1 = z0 + ups * (3.2 + d), hA = hazAt(arriveT(z0)), hB = hazAt(arriveT(z1)), rt = hazRate();
         var L = { z0: z0, z1: z1, n: n, k: k, om: om, t0: S.hazT, th0: S.th + Math.PI / k - om * (hA - S.hazT), meshes: [] };
         for(var b = 0; b < k; b++) L.meshes.push(takeLaser());
         R.lasers.push(L);
         var per = TAU / (k * Math.abs(om)), th = S.th;
         gp(z, S.th); gp(z1, th);
-        for(var hc = hA + per / 2; hc < hB - 0.15 * rt; hc += per){
+        for(var hc = hA + per / 2; hc < hB; hc += per){   // (THE LEVEL: every crossing while the beams are there — one in their last 0.15 s went unmarked, and the safe line led into it)
           var zc = zAtT(runAtHaz(hc));
           for(var c = -2; c <= 2; c++){ var f = c / 2.5; placeCoin(th, zc + c * ups * 0.09, P.coinLift + 0.1 * (1 - f * f)); }
           gh(zc);
@@ -95462,11 +95471,11 @@ var RUNNER = (function(){
     // THE COLLAPSE — the floor falls away a little ahead of you, stretch by stretch: each keeps two walls side
     // by side, sharing one with the next — so you keep moving, a wall at a time, onto what is left. Coins run
     // down each shared wall.
-    collapse: { w: 2, min: 5, max: 10, sec: function(d){ return 1.2 + (6 + Math.round(2 * d)) * (0.5 - 0.12 * d) + 0.4; },
+    collapse: { w: 2, min: 5, max: 10, sec: function(d){ return 1.2 + (6 + Math.round(2 * d)) * (0.5 - 0.12 * d) * tempo(d) + 0.4; },
       spawn: function(z, n, d, ups){
-        var span = TAU / n, K = 6 + Math.round(2 * d), ell = ups * (0.5 - 0.12 * d), z0 = z + ups * 1.2;
+        var span = TAU / n, K = 6 + Math.round(2 * d), ell = ups * (0.5 - 0.12 * d) * tempo(d), z0 = z + ups * 1.2;
         var lo = Math.round(S.th / span) - (Math.random() < 0.5 ? 1 : 0), dir = Math.random() < 0.5 ? -1 : 1;
-        var p = { z0: z0, z1: z0 + K * ell, strips: [], segs: [], n: n, front: ups * (1.1 - 0.3 * d) }, k, sh = S.th;
+        var p = { z0: z0, z1: z0 + K * ell, strips: [], segs: [], n: n, front: ups * (1.1 - 0.3 * d) * tempo(d) }, k, sh = S.th;
         for(k = 0; k < K; k++){
           if(k){ if(Math.random() < 0.3) dir = -dir; lo += dir; }
           var zA = z0 + k * ell, zB = zA + ell, sw = span + 0.03;
@@ -95486,14 +95495,14 @@ var RUNNER = (function(){
     // THE MEMORY GATES — the route is shown first: a lit door frame on the one open wall of each row ahead, and
     // nothing else. Then the lights go out and the gates rise on every other wall — and from behind the first
     // row you cannot see the rest. Remember it.
-    memory: { w: 1.8, min: 5, max: 12, sec: function(d){ return 1.6 + (4 + Math.round(d)) * (0.45 - 0.07 * d) + 0.4; },
+    memory: { w: 1.8, min: 5, max: 12, sec: function(d){ return 1.6 + (4 + Math.round(d)) * (0.45 - 0.07 * d) * tempo(d) + 0.4; },
       spawn: function(z, n, d, ups){
-        var span = TAU / n, rowsN = 4 + Math.round(d), gap = ups * (0.45 - 0.07 * d), z0 = z + ups * 1.6;
+        var span = TAU / n, rowsN = 4 + Math.round(d), gap = ups * (0.45 - 0.07 * d) * tempo(d), z0 = z + ups * 1.6;
         var dark = { zA: z0 - ups * (0.75 - 0.15 * d) }; dark.zB = dark.zA + ups * 0.25;
         var j = Math.round(S.th / span) + (Math.random() < 0.5 ? -1 : 1), zz = z0;
         gp(z, S.th);
         for(var k = 0; k < rowsN; k++){
-          if(k) j += (Math.random() < 0.5 ? -1 : 1) * (n >= 8 && Math.random() < 0.4 ? 2 : 1);
+          if(k) j += (Math.random() < 0.5 ? -1 : 1) * (n >= 8 && d > 0.5 && Math.random() < 0.4 ? 2 : 1);   // (THE LEVEL: two walls at a time only once it is hard)
           var open = ((j % n) + n) % n;
           for(var w = 0; w < n; w++) if(w !== open) addPiston(w, zz, n, { kind: 'rise', zA: dark.zA, zB: dark.zB });
           addFrame(open * span, zz, n, dark);
@@ -95551,7 +95560,7 @@ var RUNNER = (function(){
   //   THE RHYTHM  — HOP:     bars, trenches · hurdles, skips, lasers, checkerboard
   //   THE WEAVE   — STEER:   pillars, half walls · thread, bulkheads, slalom, squeeze
   //   THE ROLL    — WALLS:   gates · corkscrew, zipper, collapse, memory
-  //   THE DROP    — FLOOR:   gaps, open panels · stepping stones, tightrope, fork
+  //   THE DROP    — FLOOR:   gaps, open panels · stepping stones, tightrope, braid
   //   THE MACHINE — TIMING:  pumping pistons · wave, crusher, blades, iris
   //   THE GAUNTLET — the gun (only while it is equipped): lock, volley, alley, nest
   //   THE WILDS   — an island: rocks, trees, logs · log steps, boulder gates
@@ -95573,7 +95582,7 @@ var RUNNER = (function(){
                pats: { corkscrew: 3, zipper: 3, collapse: 2.5, memory: 2 },
                fod: function(d){ return { gate: 2.2 + 1.6 * d, half: 1.2, pillar: 1 }; } },
     drop:    { name: 'THE DROP', verb: 'MIND THE FLOOR', rgb: '255,120,175', sides: [5, 16], open: 0.95,
-               pats: { stones: 3, tightrope: 3, fork: 2.5 },
+               pats: { stones: 3, tightrope: 3, braid: 2.5 },
                fod: function(d){ return { hole: 3 + 1.3 * d, bar: 0.6, pillar: 0.6 }; } },
     machine: { name: 'THE MACHINE', verb: 'WATCH THE TIMING', rgb: '90,235,175', sides: [4, 12], open: 0.5, beat: true,
                pats: { wave: 3, crusher: 2.5, blades: 2.5, iris: 2.5 },
@@ -95598,24 +95607,25 @@ var RUNNER = (function(){
     if(!sec || sec.boss || sec.choice) return null;
     if(sec.kind === 'flat') return 'wilds';
     if(sec.kind !== 'hold') return null;
-    if(sec.dist === undefined) sec.dist = pickDistrict(null, sec.n);
+    if(sec.dist === undefined) sec.dist = pickDistrict(null, sec.n, secZ(sec));
     return sec.dist;
   }
   function distFits(k, n){ var D = DISTRICTS[k]; return !D.flat && (!D.gun || gunOn()) && (n == null || (n >= D.sides[0] && n <= D.sides[1])); }
-  function pickDistrict(prev, n){
-    var w = {}, any = false, k;
-    for(k in DISTRICTS) if(k !== prev && distFits(k, n)){ w[k] = DISTRICTS[k].w || 1; any = true; }
+  function pickDistrict(prev, n, z){
+    var w = {}, any = false, k, ST = lvStageZ(z);   // (THE LEVEL: the stage's districts — the one it is about, first)
+    if(ST && ST.lead && lvLeadPending(ST) && distFits(ST.lead, n)) return ST.lead;
+    for(k in DISTRICTS) if(k !== prev && distFits(k, n) && (ST ? ST.dist[k] : !DISTRICTS[k].lvOnly)){ w[k] = ST ? ST.dist[k] : DISTRICTS[k].w || 1; any = true; }
     if(!any && prev && distFits(prev, n)) return prev;
     return any ? wpick(w) : null;
   }
   // The district of the tube after `last` — never the same one twice running.
-  function nextDistrict(last){
+  function nextDistrict(last, z){
     var prev = last.kind === 'flat' ? last.distNext : distOf(last);
-    return pickDistrict(prev, P.holdSides || null);
+    return pickDistrict(prev, P.holdSides || null, z == null ? last.z1 : z);
   }
-  function distSides(k, not){
+  function distSides(k, not, z){
     if(P.holdSides || !k) return pickSides(not);
-    var r = DISTRICTS[k].sides, n, tries = 0;
+    var r = lvSidesIn(DISTRICTS[k].sides, z), n, tries = 0;   // (THE LEVEL: within the stage's shapes too)
     do { n = r[0] + Math.floor(Math.random() * (r[1] - r[0] + 1)); } while(n === not && r[1] > r[0] && tries++ < 20);
     return n;
   }
@@ -95623,10 +95633,10 @@ var RUNNER = (function(){
     var k = last.kind === 'morph' ? last.dist : (last.kind === 'flat' ? last.distNext : (P.holdSides ? nextDistrict(last) : undefined));
     return k && distFits(k, n) ? k : undefined;   // (undefined: chosen when first asked, to fit whatever shape it is)
   }
-  function openChanceOf(sec){ var k = distOf(sec); return k ? P.openChance * DISTRICTS[k].open / 0.6 : P.openChance; }
+  function openChanceOf(sec){ var k = distOf(sec); return (k ? P.openChance * DISTRICTS[k].open / 0.6 : P.openChance) * lvOpen(sec); }   // (THE LEVEL: none before OPEN SKY)
 
   // The district's own set pieces (undefined: it has none that fit — the old any-pattern pick runs).
-  function distPick(n, sec){
+  function distPick(n, sec, z){
     var k = distOf(sec);
     if(!k) return sec && sec.kind === 'flat' ? null : undefined;
     var D = DISTRICTS[k];
@@ -95634,25 +95644,25 @@ var RUNNER = (function(){
       var w = {}, any = false;
       for(var pk in D.pats){
         var p = PATTERNS[pk];
-        if(!p || (pass === 0 && pk === S.lastPat) || (p.gun && !gunOn())) continue;
+        if(!p || (pass === 0 && pk === S.lastPat) || (p.gun && !gunOn()) || !lvPatOK(pk, sec, z)) continue;   // (THE LEVEL: only what the stage has brought in)
         if(D.flat ? !p.flat : (p.flat || n < p.min || n > p.max)) continue;
-        w[pk] = D.pats[pk]; any = true;
+        w[pk] = D.pats[pk] * lvPatW(pk, sec, z); any = true;
       }
       if(any) return wpick(w);
     }
-    return D.flat ? null : undefined;
+    return D.flat || LV.on ? null : undefined;   // (THE LEVEL: none of its own ready yet — then none at all: filler)
   }
   function patFits(PT, z, sec, dd, ups){
     var L = PT.sec(dd) * ups;
     if(!!PT.flat !== (sec.kind === 'flat') || (!PT.flat && (sec.n < PT.min || sec.n > PT.max))) return false;   // (a forced ?runpattern on the wrong ground)
     if(sec.kind === 'flat') return !!sec.hb && z > sec.hA && z + L < Math.min(sec.hB, sec.z1 - sec.taper - ups * P.flatClearOut);
-    return z + L < sec.z1 - ups * P.morphClearBefore && !openIn(z - ups * 0.5, z + L + ups * 0.5);
+    return z + L < sec.z1 - ups * P.morphClearBefore && !openIn(z - ups * 0.5, z + L + ups * 0.5) && lvFits(z + L, ups);   // (THE LEVEL: done before the line)
   }
   // A new district opens with its filler alone for a moment (never pulls a due set piece earlier).
   function distIntro(sec, ups){
     if(sec._in) return;
     sec._in = true;
-    if(sec !== S.course[0] && distOf(sec)) S.nextPat = Math.max(S.nextPat, sec.z0 + ups * DP.introSec);
+    if(sec !== S.course[0] && distOf(sec)) S.nextPat = Math.max(S.nextPat, sec.z0 + ups * DP.introSec * lvIntro(sec));   // (THE LEVEL: longer while you are learning)
   }
   // Lay a pattern from its entry: the ship's angle — or, chained, the angle the last one let you out at.
   function layPattern(pk, PT, z, sec, dd, ups){
@@ -95669,13 +95679,13 @@ var RUNNER = (function(){
   // After a set piece: chain a second straight on (once), or filler as long as the set piece(s) took.
   function afterPattern(z, zEnd, ups, gs){
     S.patRun = (S.patRun || 0) + Math.max(0.5, (zEnd - z) / ups);
-    if(!S.chained && FLOW.th != null && Math.random() < DP.chainChance){
+    if(!S.chained && FLOW.th != null && Math.random() < lvChain(zEnd)){   // (THE LEVEL: the stage's)
       S.chained = true; S.chainTh = FLOW.th;
       S.nextRow = S.nextPat = zEnd + ups * DP.chainGapSec;
       return;
     }
     S.chained = false; S.chainTh = null;
-    var f = clamp(S.patRun * rnd(DP.fodMulMin, DP.fodMulMax), DP.fodSecMin, DP.fodSecMax);
+    var f = clamp(S.patRun * rnd(DP.fodMulMin, DP.fodMulMax), DP.fodSecMin, DP.fodSecMax) * lvRest(zEnd);
     S.patRun = 0;
     S.nextRow = zEnd + ups * gs * 0.5;
     S.nextPat = zEnd + ups * f;
@@ -95690,11 +95700,11 @@ var RUNNER = (function(){
   // The filler's mix in this district (null: the old mix).
   function fodderMix(z, n, d){
     var k = distOf(sectionAt(z)), D = k && DISTRICTS[k];
-    return D && D.fod ? D.fod(d, n) : null;
+    return D && D.fod ? lvFod(z, D.fod(d, n)) : null;   // (THE LEVEL: only what the stage has brought in)
   }
   function fullHoles(z){ var k = distOf(sectionAt(z)); return !!(k && DISTRICTS[k].fullHoles); }
   // THE MACHINE's filler: a single gate pumping on its own beat (hazard clock) — watch it, or take the wall beside.
-  function fodPiston(j, z, n){ addPiston(j, z, n, { kind: 'beat', t0: S.hazT + Math.random() * 2, T: rnd(1.3, 1.9), ph: 0 }); }
+  function fodPiston(j, z, n){ addPiston(j, z, n, { kind: 'beat', t0: S.hazT + Math.random() * 2, T: rnd(1.3, 1.9) * ptempo(mechD('piston', z)), ph: 0 }); }   // (THE LEVEL: slow when they are new)
   // SPEED CORES only where nothing beat-timed is laid (or due) between the core and as far ahead as rows are laid,
   // and never inside a set piece.
   function beatClear(zi, look){
@@ -95742,9 +95752,9 @@ var RUNNER = (function(){
       } },
     // THE THREAD (weave) — bulkheads close together, ONE opening each, the openings strung along a winding line: you
     // follow the thread round the tube. It starts where you are.
-    thread: { w: 3, min: 4, max: 16, sec: function(d){ return 0.7 + (5 + Math.round(2 * d)) * (0.5 - 0.08 * d) + 0.3; },
+    thread: { w: 3, min: 4, max: 16, sec: function(d){ return 0.7 + (5 + Math.round(2 * d)) * (0.5 - 0.08 * d) * tempo(d) + 0.3; },
       spawn: function(z, n, d, ups){
-        var K = 5 + Math.round(2 * d), gap = ups * (0.5 - 0.08 * d), r = 0.1 + 0.025 * (1 - d), zz = z + ups * 0.7;
+        var K = 5 + Math.round(2 * d), gap = ups * (0.5 - 0.08 * d) * tempo(d), r = 0.1 + 0.025 * (1 - d), zz = z + ups * 0.7;
         var A = 0.35 + 0.3 * d, ph = Math.random() * TAU, dr = (Math.random() < 0.5 ? -1 : 1) * rnd(0.05, 0.15), th0 = S.th;
         gp(z, S.th);
         for(var k = 0; k < K; k++){
@@ -95758,9 +95768,9 @@ var RUNNER = (function(){
       } },
     // THE ZIPPER (roll) — gate rows whose one open wall jumps TWO walls each row, back and forth (now and then on
     // round instead): you cross a gated wall between every pair. The corkscrew's steady turn, made a switchback.
-    zipper: { w: 3, min: 6, max: 10, sec: function(d){ return 0.4 + (5 + Math.round(2 * d)) * (0.75 - 0.12 * d) + 0.3; },
+    zipper: { w: 3, min: 6, max: 10, sec: function(d){ return 0.4 + (5 + Math.round(2 * d)) * (0.75 - 0.12 * d) * tempo(d) + 0.3; },
       spawn: function(z, n, d, ups){
-        var span = TAU / n, rowsN = 5 + Math.round(2 * d), gap = ups * (0.75 - 0.12 * d), zz = z + ups * 0.4, j = Math.round(S.th / span);
+        var span = TAU / n, rowsN = 5 + Math.round(2 * d), gap = ups * (0.75 - 0.12 * d) * tempo(d), zz = z + ups * 0.4, j = Math.round(S.th / span);
         var dir = Math.random() < 0.5 ? -1 : 1, step = n >= 9 && d > 0.5 ? 3 : 2;
         gp(z, S.th);
         for(var k = 0; k < rowsN; k++){
@@ -95796,9 +95806,9 @@ var RUNNER = (function(){
       } },
     // THE WAVE (machine) — pistons on every wall, their beats set one after another round the tube: the one open
     // wall travels round, a wall a row. Ride the wave — late and it has gone on without you. (Hazard clock.)
-    wave: { w: 3, min: 5, max: 12, sec: function(d){ return 1.0 + (5 + Math.round(2 * d)) * (0.45 - 0.08 * d) / hazRate() + 0.5; },
+    wave: { w: 3, min: 5, max: 12, sec: function(d){ return 1.0 + (5 + Math.round(2 * d)) * (0.45 - 0.08 * d) * ptempo(d) / hazRate() + 0.5; },
       spawn: function(z, n, d, ups){
-        var span = TAU / n, rowsN = 5 + Math.round(2 * d), dl = 0.45 - 0.08 * d, T = dl * n, z0 = z + ups * 1.0, t0 = hazAt(arriveT(z0));
+        var span = TAU / n, rowsN = 5 + Math.round(2 * d), dl = (0.45 - 0.08 * d) * ptempo(d), T = dl * n, z0 = z + ups * 1.0, t0 = hazAt(arriveT(z0));
         var j0 = Math.round(S.th / span), dir = Math.random() < 0.5 ? -1 : 1, zz = z0;
         gp(z, S.th);
         for(var k = 0; k < rowsN; k++){
@@ -95863,6 +95873,7 @@ var RUNNER = (function(){
     distToastTick();
   }
   function distToast(k){
+    if(lvToastBusy()) return;   // (THE LEVEL: the stage's own name is up)
     if(!R.elDistr && R.elTier && R.elTier.parentNode){
       var e = R.elDistr = R.elTier.cloneNode(false);
       e.style.top = 'calc(108px + env(safe-area-inset-top, 0px))'; e.style.opacity = 0;
@@ -95985,7 +95996,7 @@ var RUNNER = (function(){
     if(S.grounded) S.airJ = upgN('djump');
     // the meter full: the hallway — but never while a slingshot shot is being aimed or is in the air (it has to come
     // down on a tube's wall, not in a fold)
-    if(!S.choice && !S.dead && !S.boss && !R.chase && S.upgC >= upgNeed() && !(S.sl && S.sl.phase !== 'run')) queueChoice();   // (THE ENEMIES: not while a boss or a chase is up)
+    if(!S.choice && !S.dead && !S.boss && !R.chase && S.upgC >= upgNeed() && !(S.sl && S.sl.phase !== 'run') && lvChoiceOK()) queueChoice();   // (THE ENEMIES: not while a boss or a chase is up)
     var C = S.choice;
     if(!C || S.dead) return;
     var k = wallIdx(S.th, 3);
@@ -96223,66 +96234,31 @@ var RUNNER = (function(){
     c.restore();
     var lab = C.pick >= 0 ? upgName(C.opts[C.pick], upgN(C.opts[C.pick]) + (C.took ? 0 : 1)) : (S.z < C.z0 ? 'UPGRADE  ·  CHOOSE A WALL' : 'STEER ONTO ONE');
     hudText(c, lab, cx, cy + rr + 22, 9, '0.3em', C.pick >= 0 ? 'rgba(' + UPG[C.opts[C.pick]].rgb + ',0.95)' : 'rgba(150,175,235,0.9)', 'center');
-    // ── the cards: left · ahead · right as you came in; raised first, THEN traced to their tokens ──
+    // ── THE CARDS: A CAROUSEL (10-21, THE LEVEL). The wall you are on is the BIG card — front and centre, lower down, the
+    // upgrade in full at a size you can read at speed. The other two are small, up behind it: the wall to your left on the
+    // left, the wall to your right on the right, each with a chevron the way you would steer for it. Move onto another
+    // wall and the carousel TURNS — that wall's card comes round to the front, the one you left goes back to its side, the
+    // far one passes behind. On zero the chosen card stays while its token comes to you; the others go at once.
+    // (Before: three equal cards in a row, each traced to its token — hard to tell which one you were about to take.) ──
     if(!C.cards){ c.globalAlpha = 1; return; }
-    var gap = 8, bw = Math.min(122, Math.floor((W - 28 - 2 * gap) / 3)), bh = 82, x0 = Math.round((W - 3 * bw - 2 * gap) / 2), y0 = Math.round(cy + rr + 36);
-    for(var s = 0; s < 3; s++){
-      var k = C.cards[s], key = C.opts[k], U = UPG[key], lvl = upgN(key) + (C.took && k === C.pick ? 0 : 1);
-      var tr = C.hudT - s * 0.07, pr = smooth(0, 0.18, tr), pl = smooth(0.18, 0.62, tr), sel = R.chItems[k].sel;
-      // (on zero the others fade at once, the chosen one as its token comes in — all gone before the toast)
+    var selNow = C.pick >= 0 ? C.pick : (C.sel >= 0 ? C.sel : wallIdx(S.th, 3));
+    if(C.rho == null){ C.rho = selNow; C.rhoV = 0; }
+    var dR = selNow - C.rho; dR -= 3 * Math.round(dR / 3);                       // (the short way round)
+    var wR = TAU * LP.spinHz, cR = C.rhoV - wR * dR, xR = Math.exp(-wR * dt);   // (critically damped, exact for any dt)
+    C.rho = C.rho + dR + (cR * dt - dR) * xR; C.rhoV = (C.rhoV - wR * cR * dt) * xR;
+    var gap = 8, smW = Math.min(122, Math.floor((W - 28 - 2 * gap) / 3)), smH = 82, yS = Math.round(cy + rr + 36);
+    var bigW = Math.min(W - 36, 340), yB = yS + smH + 14, bigH = Math.round(clamp(H * LP.cardBottom - yB, 116, 300));
+    var GL = { cx: cx, gap: gap, smW: smW, smH: smH, yS: yS, bigW: bigW, yB: yB, bigH: bigH }, offs = [0, 0, 0], order = [0, 1, 2];
+    for(var s = 0; s < 3; s++){ var o = s - C.rho; offs[s] = o - 3 * Math.round(o / 3); }
+    order.sort(function(a, b){ return Math.abs(offs[b]) - Math.abs(offs[a]); });   // the far one first: the big card on top
+    for(var oi = 0; oi < 3; oi++){
+      var k = order[oi], key = C.opts[k], lvl = upgN(key) + (C.took && k === C.pick ? 0 : 1);
+      var rank = Math.abs(offs[k]) < 0.5 ? 0 : (offs[k] < 0 ? 1 : 2), pr = smooth(0, 0.18, C.hudT - rank * 0.07);   // (raised in turn: yours, left, right)
       var ca = A * pr * (C.pick < 0 ? 1 : (k === C.pick ? 1 - smooth(0.45, 1, f) : 1 - f));
       if(ca < 0.003) continue;
-      var bx = x0 + s * (bw + gap), by = y0 + (1 - pr) * 8;
-      c.globalAlpha = ca;
-      // the leader: card → its token, right angles only; a dot on the token once it arrives
-      var tk = C.tok[k];
-      if(tk.x != null && pl > 0){
-        _v.set(tk.x, tk.y, tk.z).project(R.cam);
-        if(_v.z < 1){
-          var ax = (_v.x + 1) / 2 * W, ay = (1 - _v.y) / 2 * H, sx = bx + bw / 2, sy = by + bh, ym = sy + 10 + s * 5;
-          var pts = [sx, sy, sx, ym, ax, ym, ax, ay], Lt = 0, j;
-          for(j = 0; j < 6; j += 2) Lt += Math.abs(pts[j + 2] - pts[j]) + Math.abs(pts[j + 3] - pts[j + 1]);
-          var left = Lt * pl;
-          c.strokeStyle = 'rgba(' + U.rgb + ',' + (0.55 + 0.4 * sel).toFixed(3) + ')'; c.lineWidth = 1 + 0.5 * sel; c.lineCap = 'butt';
-          if(R.skyOn){ c.shadowColor = 'rgba(0,8,24,0.95)'; c.shadowBlur = 5; } else c.shadowBlur = 0;   // (INK: the leader reads on the sky)
-          c.beginPath(); c.moveTo(sx, sy);
-          for(j = 0; j < 6 && left > 0; j += 2){
-            var dx = pts[j + 2] - pts[j], dy = pts[j + 3] - pts[j + 1], sl = Math.abs(dx) + Math.abs(dy), q = sl > 0 ? Math.min(1, left / sl) : 1;
-            c.lineTo(pts[j] + dx * q, pts[j + 1] + dy * q); left -= sl;
-          }
-          c.stroke();
-          if(pl >= 1){
-            c.fillStyle = 'rgba(' + U.rgb + ',0.95)'; c.beginPath(); c.arc(ax, ay, 2.5, 0, TAU); c.fill();
-            c.strokeStyle = 'rgba(' + U.rgb + ',0.5)'; c.lineWidth = 1; c.beginPath(); c.arc(ax, ay, 6 + 2 * sel, 0, TAU); c.stroke();
-          }
-        }
-      }
-      // the card: a corner-cut box — teal when it is the wall you are on, blue otherwise
-      c.shadowBlur = 0;
-      var cut = 6, sc2 = sel > 0.5 ? TEALS : BLUES;
-      c.beginPath(); c.moveTo(bx + cut, by); c.lineTo(bx + bw, by); c.lineTo(bx + bw, by + bh - cut); c.lineTo(bx + bw - cut, by + bh); c.lineTo(bx, by + bh); c.lineTo(bx, by + cut); c.closePath();
-      c.fillStyle = 'rgba(' + (sel > 0.5 ? '6,40,44' : '4,10,24') + ',' + (0.62 + 0.1 * sel).toFixed(3) + ')'; c.fill();
-      c.strokeStyle = 'rgba(' + sc2 + ',' + (0.6 + 0.35 * sel).toFixed(3) + ')'; c.lineWidth = 1 + 0.5 * sel; c.stroke();
-      // its icon, name, what it does, and its wall's colour along the foot
-      c.save(); c.translate(bx + bw / 2 - 10, by + 9); c.scale(20 / 24, 20 / 24);
-      c.strokeStyle = 'rgb(' + U.rgb + ')'; c.lineWidth = 2.3; c.lineCap = c.lineJoin = 'round'; c.shadowColor = 'rgba(' + U.rgb + ',0.8)'; c.shadowBlur = 6;
-      c.stroke(R.upgPath[key]); c.restore();
-      hudText(c, upgName(key, lvl), bx + bw / 2, by + 44, 10, '0.12em', '#f2f5fa', 'center', bw - 12);
-      var dl = U.desc(lvl - 1);
-      hudText(c, dl[0], bx + bw / 2, by + 58, 8, '0.1em', 'rgba(175,195,230,0.92)', 'center', bw - 10);
-      hudText(c, dl[1], bx + bw / 2, by + 69, 8, '0.1em', 'rgba(175,195,230,0.92)', 'center', bw - 10);
-      c.fillStyle = 'rgba(' + U.rgb + ',0.9)'; c.fillRect(bx + 12, by + bh - 4, bw - 24, 2);
-      // closed: brackets round it
-      if(pl >= 1){
-        c.strokeStyle = 'rgba(' + sc2 + ',' + (0.55 + 0.4 * sel).toFixed(3) + ')'; c.lineWidth = 1.5;
-        var g = 3, l7 = 7, X0 = bx - g, Y0 = by - g, X1 = bx + bw + g, Y1 = by + bh + g;
-        c.beginPath();
-        c.moveTo(X0, Y0 + l7); c.lineTo(X0, Y0); c.lineTo(X0 + l7, Y0);
-        c.moveTo(X1 - l7, Y0); c.lineTo(X1, Y0); c.lineTo(X1, Y0 + l7);
-        c.moveTo(X1, Y1 - l7); c.lineTo(X1, Y1); c.lineTo(X1 - l7, Y1);
-        c.moveTo(X0 + l7, Y1); c.lineTo(X0, Y1); c.lineTo(X0, Y1 - l7);
-        c.stroke();
-      }
+      carouselRect(offs[k], GL, _cq);
+      _cq.y += (1 - pr) * 8;
+      drawUpgCard(c, _cq, key, lvl, ca * _cq.al, C.pick >= 0 && k === C.pick);
     }
     c.globalAlpha = 1;
   }
@@ -96727,11 +96703,13 @@ var RUNNER = (function(){
     R.obs.push(o);
   }
   // Which pattern next: weighted, never the same twice running, and only ones that work on this shape.
-  function pickPattern(n, sec){
+  function pickPattern(n, sec, z){
     if(P.onlyPat && PATTERNS[P.onlyPat]) return P.onlyPat;
-    var _dp = distPick(n, sec); if(_dp !== undefined) return _dp;   // (THE DISTRICTS)
+    if(!lvPatsOn(sec, z)) return null;   // (THE LEVEL: no set pieces in this stage)
+    var _lp = lvLeadPat(n, sec, z); if(_lp !== undefined) return _lp;   // (THE LEVEL: a stage's first tube opens with its new set piece — filler until there is room for it)
+    var _dp = distPick(n, sec, z); if(_dp !== undefined) return _dp;   // (THE DISTRICTS)
     var w = {}, any = false;
-    for(var k in PATTERNS){ var p = PATTERNS[k]; if(n >= p.min && n <= p.max && k !== S.lastPat && (!p.gun || gunOn())){ w[k] = p.w; any = true; }   /* (THE ENEMIES: a gun-only pattern needs the gun) */ }
+    for(var k in PATTERNS){ var p = PATTERNS[k]; if(n >= p.min && n <= p.max && k !== S.lastPat && (!p.gun || gunOn()) && lvPatOK(k, sec, z)){ w[k] = p.w; any = true; }   /* (THE ENEMIES: a gun-only pattern needs the gun) */ }
     return any ? wpick(w) : null;
   }
   // ── Obstacles ──
@@ -96759,15 +96737,16 @@ var RUNNER = (function(){
     var ahead = Math.max(P.ahead, rowUps() * P.aheadSec);
     while(S.nextRow < S.z + ahead){
       var ups = rowUps(), z = S.nextRow, sec = sectionAt(z), skipTo = clearZone(z, ups);
+      if(lvStop(z, ups)){ S.nextRow = Infinity; break; }   // (THE LEVEL: nothing laid at the finish line or past it)
       // The gap in seconds shrinks with the run's difficulty; in units it is that × the current speed.
-      var gs = (P.rowGapSecMin + Math.random() * (P.rowGapSecMax - P.rowGapSecMin)) * (1 + (P.rowGapEndMul - 1) * difficulty());
+      var gs = (P.rowGapSecMin + Math.random() * (P.rowGapSecMax - P.rowGapSecMin)) * (1 + (P.rowGapEndMul - 1) * difficulty(z)) * lvGap(sec, z);   // (THE LEVEL: wider apart early on)
       var next = (skipTo != null ? skipTo : z) + ups * gs;
       // A PATTERN when one is due — one of THIS DISTRICT's, on a held tube (or an island) with room for all of it
       // before the ground changes; then filler as long as it took, or a second chained on (see THE DISTRICTS).
       var onGround = sec.kind === 'hold' || sec.kind === 'flat';
       if(skipTo == null && onGround) distIntro(sec, ups);
       if(skipTo == null && onGround && z >= S.nextPat){
-        var pk = pickPattern(sec.n, sec), PT = pk && PATTERNS[pk], dd = difficulty();
+        var pk = pickPattern(sec.n, sec, z), PT = pk && PATTERNS[pk], dd = pk ? patD(pk, z) : 0;   // (THE LEVEL: each set piece's own ramp)
         if(PT && patFits(PT, z, sec, dd, ups)){
           var zEnd = layPattern(pk, PT, z, sec, dd, ups);
           S.lastPat = pk; S.patLog.push(pk);
@@ -96794,11 +96773,12 @@ var RUNNER = (function(){
     freeWalls(false); freeLasers(false);
   }
   function spawnRow(z, n){
-    var d = difficulty(), span = TAU / n, me = ((Math.round(S.th / span) % n) + n) % n, pick = [], j;
+    if(lvBlockRow(z, n)) return;   // (THE LEVEL: THE BLOCKS' row — a counted few whole-wall blocks)
+    var d = difficulty(z), span = TAU / n, me = ((Math.round(S.th / span) % n) + n) % n, pick = [], j, dk = lvDens(z);
     for(j = 0; j < n; j++){
-      var p = 0.20 + 0.32 * d, near = Math.min(Math.abs(j - me), n - Math.abs(j - me));
+      var p = (0.20 + 0.32 * d) * dk, near = Math.min(Math.abs(j - me), n - Math.abs(j - me));
       if(near === 0) p *= 1.9; else if(near === 1) p *= 1.3;   // the run is on your wall: so are the obstacles
-      pick.push(Math.random() < p ? wpick(fodderMix(z, n, d) || { bar: 3, pillar: 3, half: n > 13 ? 1.2 : 2.2, gate: 0.5 + 1.6 * d, hole: 0.7 + 1.3 * d }) : null);   // (THE DISTRICTS: its own filler)
+      pick.push(Math.random() < p ? wpick(fodderMix(z, n, d) || lvFod(z, { bar: 3, pillar: 3, half: n > 13 ? 1.2 : 2.2, gate: 0.5 + 1.6 * d, hole: 0.7 + 1.3 * d })) : null);   // (THE DISTRICTS: its own filler)
     }
     // FAIRNESS: a gate is only beaten by a cling or a roll round, so every gated wall keeps one EMPTY
     // neighbour to get to. (A gap is not empty — but it is beaten by a hop, so it needs no such rule.)
@@ -96812,7 +96792,7 @@ var RUNNER = (function(){
       if(R.open.length && openIn(z - 0.01, z + 0.01) && Math.random() < 0.5) continue;   // (THE DISTRICTS: an open stretch is its own set piece — half the filler)
       if(pick[j] === 'piston'){ fodPiston(j, z, n); continue; }   // (THE DISTRICTS: THE MACHINE's filler)
       if(pick[j] === 'hole' && fullHoles(z)){ addHole(j, z, n); var _fh = R.holes[R.holes.length - 1]; _fh.uf0 = -1.5; _fh.uf1 = 1.5; continue; }   // (THE RHYTHM: a gap is always a hop)
-      if(pick[j] === 'hole') addHole(j, z, n); else if(!barricadeFor(pick[j], j, z, n)) addObs(pick[j], j, z, n);   // (THE ENEMIES: some gates and half walls are barricades)
+      if(pick[j] === 'hole') addHole(j, z, n); else if(!(lvFoes(z) && barricadeFor(pick[j], j, z, n))) addObs(pick[j], j, z, n);   // (THE ENEMIES: some gates and half walls are barricades)
     }
   }
   // ── GAPS. A gap is a stretch of one tube wall that is simply not there: the whole width (hop it, or roll
@@ -97760,7 +97740,7 @@ var RUNNER = (function(){
   // From rows(): this fodder row is an enemy's, when one is due — on a held tube, well inside it (a hoop must stay in
   // one shape), never in a choice hallway. Returns true if it took the row.
   function foeSlot(z, next, sec){
-    if(!gunOn() || sec.choice || z < S.nextFoe) return false;
+    if(!gunOn() || sec.choice || z < S.nextFoe || !lvFoes(z)) return false;   // (THE LEVEL: from THE GAPS on)
     var ups = rowUps();
     if(z - sec.z0 < ups * 1.3 || sec.z1 - z < ups * 0.8) return false;
     var kind = pickFoe(sec.n), j = foeWall(sec.n, z);
@@ -98065,7 +98045,7 @@ var RUNNER = (function(){
     R.chaseHold = false;
     var C = R.chase;
     if(C){ R.chaseHold = true; if(C.st === 'gone') chaseEnd(); return; }
-    if(!gunOn() || S.dead || S.mode === 'flat' || (S.sl && S.sl.phase !== 'run') || S.choice || S.boss || S.z < S.nextChase) return;
+    if(!gunOn() || S.dead || S.mode === 'flat' || (S.sl && S.sl.phase !== 'run') || S.choice || S.boss || S.z < S.nextChase || !lvChase(S.z)) return;   // (THE LEVEL: from THE WEAVE on, never near the gate)
     if(_rfo && !quarryKind()) return;   // (testing one stationary kind: no chases)
     var ups = rowUps();
     R.chaseHold = true;
@@ -98704,6 +98684,7 @@ var RUNNER = (function(){
   function nextGuardianM(){
     var L = [], k, q, last = TIERS[TIERS.length - 1].m;
     if(_rfo === 'boss') for(q = 0; q < 20; q++) L.push(250 + q * 1500);
+    else if(LV.on) L.push(lvBossM());   // (THE LEVEL: ONE gatekeeper, holding the finish line — no longer one at every coin tier)
     else { for(k = P.gkTierFrom; k < TIERS.length; k++) L.push(TIERS[k].m); for(q = 1; q <= 20; q++) L.push(last + q * P.gkAfterLast); }
     for(var i = 0; i < L.length; i++) if(!S.gkDone[L[i]]) return L[i];
     return null;
@@ -99882,6 +99863,540 @@ var RUNNER = (function(){
     chaseObj: function(){ return R.chase; }, quarry: QK, clearOK: function(){ return chaseClear(); }
   };
   function tKind(t){ return t.foe ? t.foe.kind : (t.isCore ? 'core' : t.kind); }
+  // ════════════════════════════════════════ THE LEVEL ════════════════════════════════════════
+  // (═ THE LEVEL ═ — patch: C:\Users\zacha\.runner-level\apply.js)
+  // THE RUN HAS AN END: 30,000 m to the finish line, in TWELVE STAGES at fixed milestones (the line along the top of
+  // the screen, a tick at each). What a stage holds is decided by how far in it is, not by how long you have lived:
+  //   THE FIRST THIRD (0–10 km) — LEARN. One new thing at a time, alone first, then with what came before: a pentagon of
+  //     whole-wall BLOCKS (steer round them) · the open wall that TURNS (the corkscrew) · BARS (hop) · HOLES in the floor ·
+  //     POSTS and half walls (weave) · OPEN SKY (missing panels, the first islands). Only the simple set pieces.
+  //   THE SECOND THIRD (10–20 km) — PRESSURE. The timing pieces arrive (pistons, the iris), then, now and then, a complex one.
+  //   THE LAST THIRD (20–30 km) — MASTERY. Every set piece, harder, chained more often. THE GATE: the finish line — held by
+  //     the GATEKEEPER while the gun is equipped (it no longer waits at every coin tier, where a slingshot used to land you
+  //     straight into it).
+  // A stage begins with a fold (a held tube that would cross its start ends there), its name comes up with what to do,
+  // and its first tube is the district it is about. EVERY SET PIECE HAS ITS OWN RAMP: it comes in at its easiest where its
+  // stage brings it in and is at its hardest by dFullM — fewer, slower rows when it is new (tempo), pistons, blades and
+  // lasers well under full speed (ptempo). The filler between thickens with the distance (lvD), wider apart early on.
+  // Testing: ?runlevel=0 (the old endless run) · ?runat=12000 (start the run that far in) · ?runfresh=1 / 0.
+  //
+  // FRESH START — a TEST tool, on the crash card: the runner's whole save (coins, slingshots, lives, the gun, bests) is
+  // switched to a separate profile that starts from nothing, so the game plays as it does for a new player; switch it off
+  // and the real save is back exactly as it was. Every save goes through loadNum / saveNum, which ask profKey.
+  var LP = {
+    levelM: 30000,        // the finish line, metres from the start
+    dFullM: 27000,        // a set piece is at its hardest by here (it starts at its easiest where its stage brings it in)
+    dPow: 1.15,           // the filler's difficulty: (metres / dFullM) ^ dPow — denser rows, closer together
+    finishClearSec: 1.4,  // nothing is laid this long before the line
+    finalSec: 9,          // the last stretch to the line is one held tube: no folds, no islands
+    choiceStopSec: 24,    // no upgrade hallway is begun this close to the line…
+    choiceAfterM: 800,    // …nor in the first this-many metres of a stage (its first tube is its lesson)
+    bossLeadM: 2400,      // THE GATEKEEPER (gun equipped) holds the line: its fight begins this far before it (THE GATE's start)
+    chaseStopM: 1800,     // no chase begins this close to the gatekeeper's mark
+    cutMinSec: 2.5,       // a tube crossing a stage's start ends there — unless this little of it would be left
+    tempoK: 0.45,         // a set piece's decisions come (1 + tempoK) × further apart when it is new, 1× at its hardest
+    ptempoK: 0.9,         // pistons, blades and lasers: (1 + ptempoK) × slower when new
+    glide: 0.965,         // over the line: the speed kept each step as the ship glides to a stop…
+    winCardSec: 1.5,      // …and then the card
+    cardBottom: 0.56,     // THE CAROUSEL (the hallway's cards): the big card's foot, as a share of the screen height
+    spinHz: 3.5,          // …and how quickly the carousel turns to the wall you are on
+    freshTool: true       // the FRESH START toggle on the crash card (a test tool; false: gone)
+  };
+  var LV = { on: !/[?&]runlevel=0/.test(Q), endZ: LP.levelM / M_PER_UNIT, patIntro: {}, fodIntro: {} };
+  var _rat = (function(){ var q = Q.match(/[?&]runat=(\d+)/); return q ? clamp(+q[1], 0, LP.levelM - 300) : 0; })();   // testing: start this far in
+
+  // ── THE STAGES. A field a stage leaves out is the stage before's (lead, fod and unlock are the stage's own):
+  //   dist     the districts its tubes are (weights) — lead: its first tube is this one (what the stage is about), and
+  //            leadPat: that tube's first set piece is the one the stage brings in (no open panels in it until it has come)
+  //   sides    the shapes it holds          gates  THE BLOCKS: blocks a row (a pentagon's), start → end of the stage
+  //   gap      row gaps × (start → end)     dens   filler density ×        pats  set pieces at all
+  //   fod      filler obstacles it brings in (from here on)        unlock  set pieces it brings in (each at its easiest)
+  //   tw       weight of tier 1 / 2 / 3 set pieces (simple · medium · complex)
+  //   open     open-tube chance × (missing panels), openDens their density ×        isl  island chance, hill their size ×
+  //   chain    a second set piece chained on      rest  filler after a set piece ×      intro  a district's filler-only opening ×
+  //   cores / foes / chase   speed + charge cores, stationary enemies, chases (the last two only with the gun)
+  var STAGES = [
+    // ── THE FIRST THIRD: LEARN ──
+    { m: 0, name: 'THE BLOCKS', hint: 'STEER ROUND THEM WITH YOUR THUMB',
+      dist: { blocks: 1 }, lead: 'blocks', sides: [5, 5], gates: [1, 2], gap: [1.75, 1.45], dens: 0.8, pats: false,
+      fod: ['gate'], unlock: [], tw: [1, 0, 0], open: 0, openDens: 0.75, isl: 0, hill: 0.6, chain: 0, rest: 1.8, intro: 2.2,
+      cores: false, foes: false, chase: false },
+    { m: 1500, name: 'THE TURN', hint: 'FOLLOW THE OPEN WALL ROUND',
+      lead: 'blocks', leadPat: 'corkscrew', sides: [5, 6], gates: [2, 3], gap: [1.45, 1.3], pats: true, unlock: ['corkscrew'], cores: true },
+    { m: 3000, name: 'THE HOP', hint: 'SWIPE UP TO HOP THE BARS',
+      dist: { rhythm: 1, blocks: 0.35 }, lead: 'rhythm', leadPat: 'hurdles', gap: [1.35, 1.2], fod: ['bar'], unlock: ['hurdles'] },
+    { m: 4500, name: 'THE GAPS', hint: 'HOP THE HOLES IN THE FLOOR',
+      dist: { drop: 1, rhythm: 0.6, blocks: 0.3 }, lead: 'drop', leadPat: 'stones', sides: [5, 7], gap: [1.25, 1.15], dens: 0.85, fod: ['hole'],
+      unlock: ['skips', 'stones'], rest: 1.7, intro: 2.0, foes: true },
+    { m: 6000, name: 'THE WEAVE', hint: 'STEER BETWEEN THE POSTS',
+      dist: { weave: 1, rhythm: 0.5, drop: 0.5, blocks: 0.3 }, lead: 'weave', leadPat: 'bulkheads', sides: [5, 8], gap: [1.2, 1.1], dens: 0.9,
+      fod: ['pillar', 'half'], unlock: ['bulkheads', 'slalom'], rest: 1.6, intro: 1.8, chase: true },
+    { m: 7500, name: 'OPEN SKY', hint: 'STAY ON THE PANELS THAT ARE LEFT',
+      dist: { weave: 0.8, rhythm: 0.8, drop: 0.9, blocks: 0.5 }, sides: [4, 8], gap: [1.12, 1.05], dens: 0.95,
+      unlock: ['thread', 'logsteps'], open: 0.6, isl: 0.25, chain: 0.12, rest: 1.4, intro: 1.5 },
+    // ── THE SECOND THIRD: PRESSURE ──
+    { m: 10000, name: 'THE MACHINE', hint: 'WAIT FOR THE PISTONS TO DROP',
+      dist: { machine: 1.2, weave: 0.6, rhythm: 0.6, drop: 0.6, roll: 0.5, blocks: 0.35, gunnery: 0.5 }, lead: 'machine', leadPat: 'crusher',
+      sides: [4, 10], gap: [1.05, 1.0], dens: 1, fod: ['piston'], unlock: ['crusher', 'iris', 'zipper', 'lock', 'volley'],
+      tw: [1, 0.8, 0], open: 0.8, openDens: 0.85, isl: 0.3, hill: 0.8, chain: 0.2, rest: 1.2, intro: 1 },
+    { m: 13000, name: 'THE CROSSING', hint: 'EVERY PATH MEETS AGAIN',
+      dist: { drop: 1, machine: 0.8, weave: 0.7, rhythm: 0.7, roll: 0.7, blocks: 0.3, gunnery: 0.6 }, lead: 'drop', leadPat: 'braid',
+      sides: [4, 12], gap: [1, 1], unlock: ['braid', 'boulders', 'alley', 'lasers'], tw: [1, 1, 0.3], open: 1, openDens: 1,
+      hill: 1, chain: 0.28, rest: 1.1 },
+    { m: 16500, name: 'THE DEEP', hint: 'NEW TRAPS: WATCH, THEN MOVE',
+      dist: { roll: 0.9, machine: 0.9, weave: 0.9, rhythm: 0.9, drop: 0.9, blocks: 0.25, gunnery: 0.7 }, sides: [4, 14],
+      unlock: ['checker', 'squeeze', 'wave', 'tightrope', 'nest'], tw: [0.85, 1, 0.55], chain: 0.35, rest: 1 },
+    // ── THE LAST THIRD: MASTERY ──
+    { m: 20000, name: 'THE STORM', hint: 'EVERYTHING, FASTER',
+      dist: { roll: 1, machine: 1, weave: 1, rhythm: 1, drop: 1, blocks: 0.2, gunnery: 0.7 }, sides: [4, 16],
+      unlock: ['blades', 'collapse', 'memory'], tw: [0.7, 1, 1], chain: 0.45 },
+    { m: 25000, name: 'THE LAST MILES', hint: 'HOLD YOUR NERVE', tw: [0.6, 1, 1.25], isl: 0.25, chain: 0.5 },
+    { m: 27500, name: 'THE GATE', hint: 'THE FINISH LINE IS AHEAD', hintGun: 'THE GATEKEEPER HOLDS THE LINE',
+      dist: { roll: 1, machine: 1, weave: 1, rhythm: 1, drop: 1, gunnery: 0.7 }, sides: [5, 10], isl: 0, chain: 0.3, chase: false }
+  ];
+  // How complex each set piece is: 1 simple (the first third has only these) · 2 medium · 3 complex.
+  var PTIER = { corkscrew: 1, hurdles: 1, skips: 1, stones: 1, bulkheads: 1, slalom: 1, thread: 1, logsteps: 1,
+                zipper: 2, iris: 2, crusher: 2, braid: 2, boulders: 2, lock: 2, volley: 2, alley: 2, nest: 2,
+                lasers: 3, checker: 3, squeeze: 3, wave: 3, tightrope: 3, blades: 3, collapse: 3, memory: 3 };
+  (function(){
+    var carry = ['dist', 'sides', 'gates', 'gap', 'dens', 'pats', 'tw', 'open', 'openDens', 'isl', 'hill', 'chain', 'rest', 'intro', 'cores', 'foes', 'chase'];
+    for(var i = 0; i < STAGES.length; i++){
+      var st = STAGES[i], pv = STAGES[i - 1], k;
+      st.i = i;
+      for(k = 0; k < carry.length; k++) if(!(carry[k] in st) && pv) st[carry[k]] = pv[carry[k]];
+      (st.fod || []).forEach(function(t){ if(LV.fodIntro[t] == null) LV.fodIntro[t] = st.m; });
+      (st.unlock || []).forEach(function(p){ if(LV.patIntro[p] == null) LV.patIntro[p] = st.m; });
+      st.fodOK = {}; for(k in LV.fodIntro) st.fodOK[k] = true;   // (everything brought in so far)
+      st.z0 = st.m / M_PER_UNIT; st.z1 = (STAGES[i + 1] ? STAGES[i + 1].m : LP.levelM) / M_PER_UNIT;
+    }
+  })();
+  // THE BLOCKS — the first district: whole-wall blocks (gates) on a counted few walls, never all of them, and a few coins
+  // down the open wall nearest you — the way through, shown. Its set pieces are the gate ones. (THE LEVEL's own district.)
+  DISTRICTS.blocks = { name: 'THE BLOCKS', verb: 'STEER ROUND THEM', rgb: '16,196,178', sides: [4, 8], open: 0.4, lvOnly: true,
+                       pats: { corkscrew: 3, zipper: 2 }, fod: function(){ return { gate: 1 }; } };
+
+  // ── Where in the level. A boundary's own z belongs to the stage it starts (+½ m). A section belongs to the stage its
+  // start is in — or, cut to begin a stage, to that stage (secZ). ──
+  function stageIdx(m){ var i = 0; while(i + 1 < STAGES.length && m >= STAGES[i + 1].m) i++; return i; }
+  function stageAtZ(z){ return STAGES[stageIdx(z * M_PER_UNIT + 0.5)]; }
+  function lvStageZ(z){ return LV.on && z != null ? stageAtZ(z) : null; }
+  function secZ(sec){ return sec.lvz != null ? sec.lvz : sec.z0; }
+  function stageOfSec(sec){ return stageAtZ(secZ(sec)); }
+  function stageT(st, z){ return clamp((z - st.z0) / Math.max(1e-6, st.z1 - st.z0), 0, 1); }
+  function lerpR(r, t){ return r[0] + (r[1] - r[0]) * t; }
+  function lvNextBoundZ(z){ for(var i = 1; i < STAGES.length; i++) if(STAGES[i].z0 > z + 1e-6) return STAGES[i].z0; return Infinity; }
+  function lvBossM(){ return LP.levelM - LP.bossLeadM; }
+
+  // ── DIFFICULTY. The filler's (lvD) rides the distance; a set piece's (patD) rides the distance since its stage brought it
+  // in, so it always arrives at its easiest; the filler's pistons the same from where they come in (mechD). ──
+  function lvD(z){ return Math.pow(clamp(z * M_PER_UNIT / LP.dFullM, 0, 1), LP.dPow); }
+  function patD(pk, z){
+    if(!LV.on) return difficulty();
+    var a = LV.patIntro[pk] != null ? LV.patIntro[pk] : 0;
+    return clamp((z * M_PER_UNIT - a) / Math.max(1, LP.dFullM - a), 0, 1);
+  }
+  function mechD(kind, z){ if(!LV.on) return difficulty(); var a = LV.fodIntro[kind] || 0; return clamp((z * M_PER_UNIT - a) / Math.max(1, LP.dFullM - a), 0, 1); }
+  function tempo(d){ d = clamp(d, 0, 1); return 1 + LP.tempoK * (1 - d) * (1 - d); }     // (1 = the set piece as it always was)
+  function ptempo(d){ d = clamp(d, 0, 1); return 1 + LP.ptempoK * (1 - d) * (1 - d); }
+
+  // ── THE COURSE: shapes, the stage's cut, the last stretch, islands, open tube ──
+  function lvSides(z){ var st = lvStageZ(z); return st ? st.sides : null; }
+  function lvSidesIn(r, z){
+    var st = lvStageZ(z);
+    if(!st) return r;
+    var lo = Math.max(r[0], st.sides[0]), hi = Math.min(r[1], st.sides[1]);
+    return lo <= hi ? [lo, hi] : st.sides;
+  }
+  function lvStartSides(z){ return !LV.on || P.holdSides ? P.startSides : stageAtZ(z || 0).sides[0]; }
+  // A held tube that would run across the start of a stage ends there, so the stage opens with a fold into its own shapes
+  // and districts — unless it would be cut to a sliver, when the whole tube is the next stage's instead.
+  function lvCutHold(sec, ups){
+    if(!LV.on || sec.fin) return;
+    var zb = lvNextBoundZ(sec.z0);
+    if(!(zb < sec.z1)) return;
+    if(zb - sec.z0 >= ups * LP.cutMinSec) sec.z1 = zb;
+    else { sec.lvz = zb; sec.dist = undefined; }
+  }
+  // THE LAST STRETCH: from finalSec before the line the course is one held tube on to past it — no fold, no island.
+  function lvFinal(last, ups){ return LV.on && last.kind !== 'flat' && !last.boss && last.z1 >= LV.endZ - ups * LP.finalSec; }
+  function lvFinalSec(last, ups){
+    var n = last.kind === 'morph' ? last.b : last.n, k = last.dist;
+    return { z0: last.z1, z1: last.z1 + ups * 40, kind: 'hold', n: n, fin: true, dist: k && distFits(k, n) ? k : undefined };
+  }
+  // Islands: the stage's chance, and only with room for one before the next stage (or the last stretch).
+  function lvRoomZ(z, ups){ return Math.min(lvNextBoundZ(z), LV.endZ - ups * LP.finalSec); }
+  function lvFlat(z, ups){
+    if(!LV.on) return P.flatChance;
+    var st = stageAtZ(z);
+    if(st.lead && lvLeadPending(st)) return 0;   // (a stage's first section is its lead tube, never an island)
+    return st.isl && lvRoomZ(z, ups) - z >= ups * (P.flatSecMin + 2) ? st.isl : 0;
+  }
+  function lvFlatLen(z, len, ups){ return LV.on ? Math.min(len, lvRoomZ(z, ups) - z - ups * 0.5) : len; }
+  function lvOpen(sec){ if(!LV.on) return 1; var st = stageOfSec(sec); return lvLeadDue(st, sec) ? 0 : st.open; }
+  // A stage's first tube opens with the set piece the stage brings in — once, on the shape it works on.
+  // A stage's LEAD district: handed to its first tube, and to the next one laid again if a re-laying of the course (an
+  // upgrade hallway, a slingshot) threw that tube away — it counts only once you are in it (lvLeadSeen, from levelTick).
+  function lvSecOf(c){ return c.kind === 'morph' ? stageAtZ(c.z1) : (c.kind === 'flat' ? stageAtZ(c.z1) : stageOfSec(c)); }
+  function lvLeadPending(st){
+    if((S.lvLeadDone || {})[st.i]) return false;
+    for(var i = 0; i < S.course.length; i++){ var c = S.course[i], k = c.kind === 'flat' ? c.distNext : c.dist; if(k === st.lead && lvSecOf(c) === st) return false; }
+    return true;
+  }
+  function lvLeadSeen(){
+    var c = sectionAt(S.z);
+    if(c.kind !== 'hold' || c.choice || c.boss) return;
+    var st = stageOfSec(c);
+    if(st.lead && c.dist === st.lead) (S.lvLeadDone || (S.lvLeadDone = {}))[st.i] = 1;
+  }
+  function lvLeadDue(st, sec){ return !!(st.leadPat && st.lead && !(S.lvLeadPat || {})[st.i] && distOf(sec) === st.lead); }
+  // → the set piece (it fits: laid now, and counted), null (it is due but has no room yet: filler until it has), or
+  // undefined (not due here: the ordinary pick).
+  function lvLeadPat(n, sec, z){
+    if(!LV.on) return undefined;
+    sec = sec || sectionAt(z);
+    var st = stageOfSec(sec), p = st.leadPat && PATTERNS[st.leadPat];
+    if(!p || !lvLeadDue(st, sec) || n < p.min || n > p.max) return undefined;
+    if(!patFits(p, z, sec, patD(st.leadPat, z), rowUps())) return null;
+    (S.lvLeadPat || (S.lvLeadPat = {}))[st.i] = 1;
+    return st.leadPat;
+  }
+  function lvOpenDens(sec){ return LV.on ? stageOfSec(sec).openDens : 1; }
+  function lvHill(sec){ return LV.on ? stageOfSec(sec).hill : 1; }
+
+  // ── THE ROWS ──
+  function lvGap(sec, z){ if(!LV.on) return 1; var st = stageOfSec(sec); return lerpR(st.gap, stageT(st, z)); }
+  function lvDens(z){ return LV.on ? stageOfSec(sectionAt(z)).dens : 1; }
+  // The filler only has what the stage has brought in (a mix left with nothing: a block).
+  function lvFod(z, mix){
+    if(!LV.on || !mix) return mix;
+    var ok = stageOfSec(sectionAt(z)).fodOK, out = null;
+    for(var k in mix) if(ok[k] && mix[k] > 0) (out || (out = {}))[k] = mix[k];
+    return out || { gate: 1 };
+  }
+  function lvStop(z, ups){ return LV.on && z > LV.endZ - ups * LP.finishClearSec; }
+  function lvFits(zEnd, ups){ return !LV.on || zEnd < LV.endZ - ups * LP.finishClearSec; }
+  // THE BLOCKS' row: k whole-wall blocks — a counted few, more through the stage, never every wall. Your own wall is the
+  // first blocked more often than not (the row asks you to move), every block keeps an open neighbour (the filler's rule),
+  // and a few coins run down the open wall nearest you into the gap.
+  function lvBlockRow(z, n){
+    if(!LV.on) return false;
+    var sec = sectionAt(z);
+    if(distOf(sec) !== 'blocks') return false;
+    var st = stageOfSec(sec), g = st.gates || [2, 3], t = stageT(st, z), j, me = wallIdx(S.th, n), order = [], pick = [];
+    var k = clamp(Math.round(Math.floor(g[0] + (g[1] - g[0]) * t + Math.random()) * n / 5), 1, n - 2);
+    for(j = 0; j < n; j++){ order.push(j); pick.push(false); }
+    for(j = n - 1; j > 0; j--){ var q = Math.floor(Math.random() * (j + 1)), tmp = order[j]; order[j] = order[q]; order[q] = tmp; }
+    if(Math.random() < 0.65){ order.splice(order.indexOf(me), 1); order.unshift(me); }
+    for(j = 0; j < k; j++) pick[order[j]] = true;
+    for(j = 0; j < n; j++){ var jl = (j + n - 1) % n, jr = (j + 1) % n; if(pick[j] && pick[jl] && pick[jr]) pick[Math.random() < 0.5 ? jl : jr] = false; }
+    var best = -1, bd = 1e9;
+    for(j = 0; j < n; j++){
+      if(pick[j]){ if(!(R.open.length && openAt(regShape(n), j, z)) && !(lvFoes(z) && barricadeFor('gate', j, z, n))) addObs('gate', j, z, n); continue; }
+      var dj = Math.min(Math.abs(j - me), n - Math.abs(j - me));
+      if(dj < bd){ bd = dj; best = j; }
+    }
+    if(best >= 0){ var ups = rowUps(), th = S.th + wrapPi(best * TAU / n - S.th); for(var c = 0; c < 4; c++) placeCoin(th, z - ups * (0.46 - 0.11 * c)); }
+    return true;
+  }
+
+  // ── SET PIECES: only those the stage has brought in, weighted by how complex they are ──
+  function lvPatsOn(sec, z){ return !LV.on || stageOfSec(sec || sectionAt(z)).pats !== false; }
+  function lvPatOK(pk, sec, z){
+    if(!LV.on) return true;
+    var st = stageOfSec(sec || sectionAt(z)), a = LV.patIntro[pk];
+    return a != null && a <= st.m && st.tw[(PTIER[pk] || 2) - 1] > 0;
+  }
+  function lvPatW(pk, sec, z){ return LV.on ? stageOfSec(sec || sectionAt(z)).tw[(PTIER[pk] || 2) - 1] : 1; }
+  function lvChain(z){ return LV.on ? stageAtZ(z).chain : DP.chainChance; }
+  function lvRest(z){ return LV.on ? stageAtZ(z).rest : 1; }
+  function lvIntro(sec){ return LV.on ? stageOfSec(sec).intro : 1; }
+  function lvCores(z){ return !LV.on || stageAtZ(z).cores; }
+  function lvFoes(z){ return !LV.on || (stageAtZ(z).foes && z * M_PER_UNIT < LP.levelM - 300); }
+  function lvChase(z){ return !LV.on || (stageAtZ(z).chase && z * M_PER_UNIT < lvBossM() - LP.chaseStopM); }
+  // (an upgrade hallway is a long stretch of course: none begun close to the line — nor, with the gun, close to the gatekeeper)
+  function lvChoiceOK(){
+    if(!LV.on) return true;
+    var m = S.z * M_PER_UNIT, st = STAGES[stageIdx(m)];
+    if(st.i > 0 && m - st.m < LP.choiceAfterM) return false;   // (a new stage's opening is its lesson: the hallway waits)
+    return !S.won && S.z < (lvGateDue() ? lvBossM() : LP.levelM) / M_PER_UNIT - rowUps() * LP.choiceStopSec;
+  }
+  function lvGateDue(){ return gunOn() && !(S.gkDone && S.gkDone[lvBossM()]); }   // the gatekeeper still to be met
+
+  // ── EACH STEP (after the rows): a new stage's name, the finish gate coming into sight, the line, the glide. ──
+  function levelTick(){
+    if(!LV.on || !S) return;
+    var si = stageIdx(S.z * M_PER_UNIT);
+    // (not under a white flash — the entry's whiteout would swallow it — nor in the slingshot: on landing)
+    lvLeadSeen();
+    if(si !== S.lvShown && !S.dead && !S.won && !(S.sl && S.sl.phase !== 'run') && R.flash < 0.2){ S.lvShown = si; R.lvToastI = si; R.lvToastT0 = performance.now(); }
+    if(!S.lvFin && !S.boss && !lvGateDue() && S.z < LV.endZ && S.z + maxAhead() > LV.endZ){ S.lvFin = true; lvGate(); }
+    // a chase still running as the gatekeeper's mark comes up breaks off, so it can come
+    if(R.chase && lvGateDue() && S.z * M_PER_UNIT > lvBossM() - 400) chaseAway(R.chase, 'BROKE OFF');
+    // THE LINE: with the gun, not until the gatekeeper has been met (and beaten — while it is up, S.boss holds it)
+    if(!S.won && !S.dead && !S.boss && S.z >= LV.endZ && !lvGateDue()) lvWin();
+    if(S.won && !S.dead && (S.wonT += 1 / 60) >= LP.winCardSec){ S.dead = true; S.deadF = Math.round(P.crashSec * 60); S.av.set(0, 0, 0); }
+  }
+  // THE FINISH GATE: a lit door frame standing on every wall at the line (the memory route's frames, never put out).
+  function lvGate(){
+    var sec = sectionAt(LV.endZ), n = sec.kind === 'morph' ? sec.b : (sec.n || 8), dark = { zA: LV.endZ + 1e4, zB: LV.endZ + 1e4 + 1 };
+    for(var j = 0; j < n; j++) addFrame(j * TAU / n, LV.endZ, n, dark);
+  }
+  var BESTT_KEY = 'chrysolin_runner_besttime';   // (tenths of a second)
+  function lvWin(){
+    S.won = true; S.wonT = 0; S.wonTime = S.runT;
+    finishRun();
+    var bt = loadNum(BESTT_KEY) / 10;
+    S.newBestT = !(bt > 0) || S.wonTime < bt; S.bestT = S.newBestT ? S.wonTime : bt;
+    if(S.newBestT) saveNum(BESTT_KEY, Math.round(S.wonTime * 10));
+    R.flash = Math.max(R.flash, 0.5); R.shake = Math.max(R.shake, 0.35);
+    _p.copy(gameMode.ship.position); burst(_p, 60, true);
+    R.lvToastI = 'win'; R.lvToastT0 = performance.now();   // (the big centre toast: THE FINISH LINE · LEVEL COMPLETE)
+    if(typeof ckptSpinKick === 'function') ckptSpinKick(2.0);
+  }
+  function fmtT(t){ var s = Math.max(0, Math.round(t)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+  // (from resetRun, after the slingshot is set) this run's level state; ?runat= moves the whole start out there.
+  function lvReset(){
+    S.lvShown = -1; S.lvFin = false; S.won = false; S.wonT = 0;
+    if(LV.on && _rat > 0) lvStartAt(_rat);
+  }
+  function lvStartAt(m){
+    var z0 = m / M_PER_UNIT, ups = baseSpeed() * 60, lim = P.apothem - hover(), i;
+    S.course.forEach(disposeChunk); clearOpen();
+    if(S.sl){ S.sl = null; for(i = 0; i < 3; i++) R.sling[i].mesh.visible = false; }   // (testing: no slingshot out here)
+    S.z = z0; S.zBase = z0; S.v = 0; S.x = 0; S.y = -lim; S.vx = S.vy = 0; S.grounded = true; S.airF = 0; S.clung = false;
+    S.g = S.up = S.th = S.thTgt = S.thV = 0;
+    S.course = [{ z0: z0 - 20, z1: z0 + ups * holdSec(), kind: 'hold', n: lvStartSides(z0) }];
+    lvCutHold(S.course[0], ups);
+    buildChunk(S.course[0]);
+    extendCourse(z0 + maxAhead() + 20);
+    S.nextRow = z0 + P.firstRowSec * ups; S.nextPat = z0 + P.firstPatSec * ups;
+    S.nextSpeed = z0 + P.speedCoreFirstSec * ups; S.nextCharge = z0 + P.chargeCoreFirstSec * ups;
+    S.nextFoe = z0 + P.foeFirstSec * ups; S.nextChase = z0 + P.chaseFirstSec * ups;
+    S.progT = m / (ups * M_PER_UNIT);   // as if run there on foot
+    G.muteT = 0;
+  }
+
+  // ── THE CARD: LEVEL COMPLETE (the time, the best time) — or, on a crash, the stage it ended in. ──
+  function lvCard(){
+    if(!LV.on) return;
+    if(!R.elCardStage){
+      R.elCardStage = el('div', 'font-size:10px;letter-spacing:0.3em;color:rgba(150,170,205,0.9);margin-top:9px;', R.elCard, '');
+      R.elCard.insertBefore(R.elCardStage, R.elBest); R.elK._c0 = R.elK.style.color;
+    }
+    if(S.won){
+      R.elK.textContent = 'LEVEL COMPLETE'; R.elK.style.color = 'rgba(16,196,178,0.95)';
+      R.elV.textContent = LP.levelM.toLocaleString('en-US') + ' M';
+      R.elCardStage.textContent = 'TIME  ' + fmtT(S.wonTime);
+      R.elBest.textContent = S.newBestT ? 'NEW BEST TIME' : 'BEST TIME  ' + fmtT(S.bestT);
+    } else {
+      var si = stageIdx(Math.min(S.crashM || 0, LP.levelM - 1));
+      R.elK.textContent = 'DISTANCE'; R.elK.style.color = R.elK._c0;
+      R.elCardStage.textContent = 'STAGE ' + (si + 1) + ' OF ' + STAGES.length + '  ·  ' + STAGES[si].name;
+    }
+  }
+
+  // ── FRESH START (test): the save's profile. ──
+  var FRESH_KEY = 'chrysolin_runner_fresh', FRESH_SFX = '__fresh';
+  function freshKeys(){ return [BEST_KEY, BANK_KEY, SLING_KEY, LIFE_KEY, GUN_KEY, BESTT_KEY]; }
+  function freshWipe(){ freshKeys().forEach(function(k){ try { localStorage.removeItem(k + FRESH_SFX); } catch(e){} }); }
+  var FRESH = (function(){
+    var on = false, q = Q.match(/[?&]runfresh=(\d)/);
+    try { on = localStorage.getItem(FRESH_KEY) === '1'; } catch(e){}
+    if(q){ var want = q[1] === '1'; if(want && !on) freshWipe(); on = want; try { localStorage.setItem(FRESH_KEY, on ? '1' : '0'); } catch(e){} }
+    return on;
+  })();
+  function profKey(k){ return FRESH ? k + FRESH_SFX : k; }
+  // ON: a new, empty profile (wiped every time it is switched on); OFF: the real save, untouched all along. Either way
+  // a new run starts at once.
+  function freshToggle(){
+    FRESH = !FRESH;
+    if(FRESH) freshWipe();
+    try { localStorage.setItem(FRESH_KEY, FRESH ? '1' : '0'); } catch(e){}
+    R.gunSt = null;                                                   // (the gun's state is cached: ask the profile again)
+    for(var i = 0; i < R.elBtn.length; i++) R.elBtn[i]._key = null;   // (the plates' words, written again)
+    R.shop = null;
+    restart();
+  }
+  function lvFreshPlate(L, W, H, y, amt){
+    if(!LP.freshTool) return;
+    var w = Math.round(Math.min(Math.max(W * 0.62, 236), W - 40, 250)), h = 40;
+    L.push({ r: { x: Math.round((W - w) / 2), y: Math.min(y + 6, H - h - 10), w: w, h: h }, act: 'fresh', amt: amt });
+  }
+  function lvFreshLabel(){
+    return '<span style="font-size:10px;letter-spacing:0.26em;">TEST  ·  FRESH START  ·  <span style="color:' +
+      (FRESH ? 'rgb(6,116,106)' : 'rgba(27,32,41,0.5)') + ';">' + (FRESH ? 'ON' : 'OFF') + '</span></span>';
+  }
+
+  // ── THE LINE ALONG THE TOP: the level from start to finish — a tick at each stage (taller at the thirds), the gatekeeper's
+  // mark while the gun is equipped, your best, the chequered flag; filled in the accent up to you. Under its right end,
+  // the stage you are in (and FRESH START while that is on). And a new stage's name in the middle as you enter it:
+  // which stage, what it is, what to do. All onboard HUD: nothing here is pressed. ──
+  function lvBuildBar(){
+    var T = 'position:absolute;pointer-events:none;', L = R.layer, i;
+    var bar = R.elLv = el('div', T + 'left:calc(18px + env(safe-area-inset-left, 0px));right:calc(18px + env(safe-area-inset-right, 0px));' +
+      'top:calc(5px + env(safe-area-inset-top, 0px));height:10px;', L);
+    el('div', T + 'left:0;right:0;top:4px;height:2px;border-radius:1px;background:rgba(170,190,230,0.34);box-shadow:' + HALO + ';', bar);
+    R.elLvFill = el('div', T + 'left:0;top:4px;height:2px;width:0;border-radius:1px;background:rgb(16,196,178);box-shadow:0 0 6px rgba(16,196,178,0.75);', bar);
+    for(i = 1; i < STAGES.length; i++){
+      var third = STAGES[i].m === 10000 || STAGES[i].m === 20000;
+      el('div', T + 'left:' + (STAGES[i].m / LP.levelM * 100).toFixed(3) + '%;top:' + (third ? 0 : 2) + 'px;width:' + (third ? 2 : 1) + 'px;height:' + (third ? 10 : 6) +
+        'px;margin-left:' + (third ? -1 : 0) + 'px;background:rgba(215,228,250,' + (third ? 0.85 : 0.6) + ');box-shadow:0 0 2px rgba(0,10,24,0.5);', bar);
+    }
+    el('div', T + 'right:-4px;top:-1px;width:8px;height:12px;border-radius:1px;background:repeating-conic-gradient(#f2f5fa 0 25%, #1b2029 0 50%) 0 0 / 4px 4px;' +
+      'box-shadow:0 0 3px rgba(0,10,24,0.6);', bar);
+    R.elLvBest = el('div', T + 'top:1px;width:2px;height:8px;margin-left:-1px;background:rgb(255,205,90);box-shadow:0 0 4px rgba(255,190,60,0.8);display:none;', bar);
+    R.elLvBoss = el('div', T + 'left:' + (lvBossM() / LP.levelM * 100).toFixed(3) + '%;top:2px;width:6px;height:6px;margin-left:-3px;transform:rotate(45deg);' +
+      'background:rgb(255,90,130);box-shadow:0 0 5px rgba(255,90,130,0.8);display:none;', bar);
+    R.elLvShip = el('div', T + 'left:0;top:1px;width:8px;height:8px;margin-left:-4px;box-sizing:border-box;transform:rotate(45deg);background:#eafffb;' +
+      'border:2px solid rgb(16,196,178);box-shadow:0 0 6px rgba(16,196,178,0.9);', bar);
+    var F = 'font-family:Arial,Helvetica,sans-serif;font-weight:700;white-space:nowrap;';
+    R.elLvName = el('div', T + F + 'right:0;top:14px;font-size:9px;letter-spacing:0.24em;', bar, '');
+    R.elLvFresh = el('div', T + F + 'right:0;top:27px;font-size:8px;letter-spacing:0.26em;display:none;', bar, 'FRESH START');
+    R.elLvToast = el('div', T + F + 'left:0;right:0;text-align:center;opacity:0;', L);
+    R.elLvToastK = el('div', 'font-size:10px;letter-spacing:0.34em;', R.elLvToast, '');
+    R.elLvToastN = el('div', 'font-size:24px;letter-spacing:0.22em;margin-top:6px;', R.elLvToast, '');
+    R.elLvToastH = el('div', 'font-size:11px;letter-spacing:0.26em;margin-top:8px;', R.elLvToast, '');
+    R.lvInk = null;
+  }
+  // The words' colours. Over THE SKY (the pale holo walls, as the run almost always is) they are INKED — the colour
+  // taken deep, on a soft white glow, as the district's name is; over the old dark space, light with a dark halo.
+  function lvInk(){
+    var ink = !!R.skyOn;
+    if(R.lvInk === ink) return;
+    R.lvInk = ink;
+    var glow = '0 0 6px rgba(255,255,255,0.9), 0 0 12px rgba(255,255,255,0.6)';
+    function st(e, inkCol, lightCol, light){ e.style.color = ink ? inkCol : lightCol; e.style.textShadow = ink ? glow : light; }
+    st(R.elLvName, 'rgba(34,58,104,0.92)', 'rgba(185,205,240,0.95)', HALO);
+    st(R.elLvFresh, 'rgba(150,84,8,0.95)', 'rgba(255,190,90,0.98)', HALO);
+    st(R.elLvToastK, 'rgba(34,58,104,0.92)', 'rgba(185,205,240,0.95)', HALO);
+    st(R.elLvToastN, 'rgba(6,92,84,0.98)', '#f2f5fa', '0 0 14px rgba(16,196,178,0.5), ' + HALO);
+    st(R.elLvToastH, 'rgba(6,110,100,0.95)', 'rgba(16,196,178,0.98)', HALO);
+  }
+  function lvDom(W, H){
+    if(!LV.on || !R.layer || !S) return;
+    if(!R.elLv) lvBuildBar();
+    lvInk();
+    var shop = R.shopAmt || 0, m = Math.max(0, S.z * M_PER_UNIT), p = clamp(m / LP.levelM, 0, 1);
+    var o = (R.cardShown ? 0 : 1 - shop).toFixed(3);
+    if(R.elLv._o !== o){ R.elLv._o = o; R.elLv.style.opacity = o; }
+    var pc = (p * 100).toFixed(2) + '%';
+    if(R.elLvFill._w !== pc){ R.elLvFill._w = pc; R.elLvFill.style.width = pc; R.elLvShip.style.left = pc; }
+    var bm = S.best > 0 && S.best < LP.levelM ? (S.best / LP.levelM * 100).toFixed(2) + '%' : '';
+    if(R.elLvBest._l !== bm){ R.elLvBest._l = bm; R.elLvBest.style.display = bm ? '' : 'none'; if(bm) R.elLvBest.style.left = bm; }
+    var gk = gunOn() && (!(S.gkDone && S.gkDone[lvBossM()]) || !!S.boss) ? 1 : 0;   // the gatekeeper's mark, until it is down
+    if(R.elLvBoss._on !== gk){ R.elLvBoss._on = gk; R.elLvBoss.style.display = gk ? '' : 'none'; }
+    var lab = 'STAGE ' + (stageIdx(m) + 1) + ' OF ' + STAGES.length;
+    if(R.elLvName.textContent !== lab) R.elLvName.textContent = lab;
+    var fr = FRESH ? '' : 'none';
+    if(R.elLvFresh.style.display !== fr) R.elLvFresh.style.display = fr;
+    lvToastTick(W, H, shop);
+  }
+  function lvToastTick(W, H, shop){
+    var e = R.elLvToast;
+    if(R.lvToastI != null && R.lvToastShown !== R.lvToastI){
+      R.lvToastShown = R.lvToastI;
+      if(R.lvToastI === 'win'){ R.elLvToastK.textContent = 'THE FINISH LINE'; R.elLvToastN.textContent = 'LEVEL COMPLETE'; R.elLvToastH.textContent = LP.levelM.toLocaleString('en-US') + ' M'; }
+      else {
+        var st = STAGES[R.lvToastI];
+        R.elLvToastK.textContent = 'STAGE ' + (st.i + 1) + ' OF ' + STAGES.length;
+        R.elLvToastN.textContent = st.name;
+        R.elLvToastH.textContent = gunOn() && st.hintGun ? st.hintGun : st.hint;
+      }
+    }
+    var t = (performance.now() - (R.lvToastT0 || -1e9)) / 1000, C = S.choice;
+    var a = t < 0.35 ? t / 0.35 : (t > 2.9 ? Math.max(0, 1 - (t - 2.9) / 0.5) : 1);
+    a *= (R.cardShown || (S.dead && !S.won) ? 0 : 1 - shop) * ((C && S.z >= C.zFold - C.ups * 0.3) || (S.boss && S.boss.on) ? 0 : 1);
+    var v = a.toFixed(3);
+    if(e._o !== v){ e._o = v; e.style.opacity = v; }
+    if(a > 0){
+      var tp = Math.round(H * 0.32) + 'px';
+      if(e.style.top !== tp) e.style.top = tp;
+      e.style.transform = 'scale(' + (1 + 0.12 * Math.max(0, 1 - t / 0.35)).toFixed(3) + ')';
+    }
+  }
+  // (the district's own name stays down while a stage's is up — or about to be: the district toast runs 0.9 s early)
+  function lvToastBusy(){
+    if(!LV.on || !S) return false;
+    if(R.lvToastT0 != null && performance.now() - R.lvToastT0 < 3400) return true;
+    return stageIdx((S.z + unitsPerSec() * 1.5) * M_PER_UNIT) !== S.lvShown;
+  }
+
+  // ── THE CAROUSEL's geometry and its cards (drawn by hudDraw — see THE UPGRADES). A card at carousel offset o: 0 the BIG
+  // card in front (lower, centred), ±1 a small one up on that side, ±1.5 passing behind (smaller, fading). ──
+  var _cq = { x: 0, y: 0, w: 0, h: 0, al: 1, side: 0 };
+  function carouselRect(o, G2, out){
+    var a = Math.min(1.5, Math.abs(o)), s = o < 0 ? -1 : 1;
+    var fx = G2.cx - G2.bigW / 2, sx = s < 0 ? G2.cx - G2.gap / 2 - G2.smW : G2.cx + G2.gap / 2;
+    if(a <= 1){
+      var t = a * a * (3 - 2 * a);
+      out.x = fx + (sx - fx) * t; out.y = G2.yB + (G2.yS - G2.yB) * t; out.w = G2.bigW + (G2.smW - G2.bigW) * t; out.h = G2.bigH + (G2.smH - G2.bigH) * t; out.al = 1;
+    } else {
+      var u = (a - 1) / 0.5, bw = G2.smW * 0.62, bh = G2.smH * 0.62, bx = G2.cx - bw / 2, by = G2.yS - 6;
+      out.x = sx + (bx - sx) * u; out.y = G2.yS + (by - G2.yS) * u; out.w = G2.smW + (bw - G2.smW) * u; out.h = G2.smH + (bh - G2.smH) * u; out.al = 1 - 0.7 * u;
+    }
+    out.side = a > 0.5 ? s : 0;
+    return out;
+  }
+  // One card: a corner-cut box — teal when it is the wall you are on — its icon, name and what it does, its wall's colour
+  // along the foot. Everything grows with the card (f: 0 small → 1 big); the big one says what to do and wears closed
+  // brackets; a small one has a chevron off its outer edge, the way to steer for it.
+  function drawUpgCard(c, q, key, lvl, ca, took){
+    var U = UPG[key], x = q.x, y = q.y, w = q.w, h = q.h, f = clamp((h - 82) / 150, 0, 1), cut = 6 + 6 * f, front = q.side === 0;
+    var TEALS = '16,196,178', BLUES = '80,120,220', sc2 = front ? TEALS : BLUES;
+    c.globalAlpha = ca; c.shadowBlur = 0;
+    c.beginPath(); c.moveTo(x + cut, y); c.lineTo(x + w, y); c.lineTo(x + w, y + h - cut); c.lineTo(x + w - cut, y + h); c.lineTo(x, y + h); c.lineTo(x, y + cut); c.closePath();
+    c.fillStyle = front ? 'rgba(6,40,44,' + (0.62 + 0.24 * f).toFixed(3) + ')' : 'rgba(4,10,24,0.62)'; c.fill();   // (the big one near opaque: the tokens float right behind it)
+    c.strokeStyle = 'rgba(' + sc2 + ',' + (front ? 0.95 : 0.6) + ')'; c.lineWidth = front ? 1.5 : 1; c.stroke();
+    var is = 20 + 40 * f, nP = 10 + 10 * f, dP = 8 + 4 * f, foot = f > 0.35 ? 22 + 6 * f : 0;
+    var cH = is + (10 + 8 * f) + nP + (8 + 8 * f) + dP + (3 + 3 * f) + dP, y0 = y + Math.max(9, (h - foot - cH) / 2);
+    c.save(); c.translate(x + w / 2 - is / 2, y0); c.scale(is / 24, is / 24);
+    c.strokeStyle = 'rgb(' + U.rgb + ')'; c.lineWidth = 2.3; c.lineCap = c.lineJoin = 'round'; c.shadowColor = 'rgba(' + U.rgb + ',0.8)'; c.shadowBlur = 6 + 8 * f;
+    c.stroke(R.upgPath[key]); c.restore();
+    var ny = y0 + is + (10 + 8 * f) + nP / 2;
+    hudText(c, upgName(key, lvl), x + w / 2, ny, nP, '0.12em', '#f2f5fa', 'center', w - 12);
+    var dl = U.desc(lvl - 1), dy = ny + nP / 2 + (8 + 8 * f) + dP / 2;
+    hudText(c, dl[0], x + w / 2, dy, dP, '0.1em', 'rgba(175,195,230,0.92)', 'center', w - 10);
+    hudText(c, dl[1], x + w / 2, dy + dP + 3 + 3 * f, dP, '0.1em', 'rgba(175,195,230,0.92)', 'center', w - 10);
+    if(foot){
+      c.globalAlpha = ca * clamp((f - 0.35) / 0.3, 0, 1);
+      hudText(c, took ? 'YOURS' : 'STAY ON THIS WALL', x + w / 2, y + h - foot / 2 - 4, 8 + 2 * f, '0.3em', 'rgba(' + TEALS + ',0.95)', 'center', w - 16);
+      c.globalAlpha = ca;
+    }
+    c.shadowBlur = 0;
+    c.fillStyle = 'rgba(' + U.rgb + ',0.9)'; c.fillRect(x + 12, y + h - 4, w - 24, 2 + f);
+    if(q.side){
+      var ex = q.side < 0 ? x - 7 : x + w + 7, ey = y + h / 2, dd = q.side * 5;
+      c.strokeStyle = 'rgba(' + BLUES + ',0.9)'; c.lineWidth = 1.6; c.lineCap = 'round'; c.lineJoin = 'round';
+      if(R.skyOn){ c.shadowColor = 'rgba(0,8,24,0.9)'; c.shadowBlur = 4; }
+      c.beginPath(); c.moveTo(ex - dd * 0.2, ey - 6); c.lineTo(ex + dd, ey); c.lineTo(ex - dd * 0.2, ey + 6); c.stroke();
+      c.shadowBlur = 0;
+    }
+    if(front && f > 0.5){
+      c.globalAlpha = ca * clamp((f - 0.5) / 0.3, 0, 1);
+      c.strokeStyle = 'rgba(' + TEALS + ',0.9)'; c.lineWidth = 1.5; c.lineCap = 'square';
+      var g = 4, l7 = 10, X0 = x - g, Y0 = y - g, X1 = x + w + g, Y1 = y + h + g;
+      c.beginPath();
+      c.moveTo(X0, Y0 + l7); c.lineTo(X0, Y0); c.lineTo(X0 + l7, Y0);
+      c.moveTo(X1 - l7, Y0); c.lineTo(X1, Y0); c.lineTo(X1, Y0 + l7);
+      c.moveTo(X1, Y1 - l7); c.lineTo(X1, Y1); c.lineTo(X1 - l7, Y1);
+      c.moveTo(X0 + l7, Y1); c.lineTo(X0, Y1); c.lineTo(X0, Y1 - l7);
+      c.stroke();
+      c.globalAlpha = ca;
+    }
+  }
+
+  // test surface
+  api._lv = {
+    LP: LP, STAGES: STAGES, LV: LV, PTIER: PTIER, M: M_PER_UNIT,
+    spawn: function(name, z, n, d, ups){ guideBegin(); try { return PATTERNS[name].spawn(z, n, d, ups); } finally { guideEnd(); } },
+    stage: function(m){ return stageIdx(m == null ? S.z * M_PER_UNIT : m); },
+    patD: function(pk, m){ return patD(pk, m / M_PER_UNIT); }, tempo: tempo, ptempo: ptempo, lvD: function(m){ return lvD(m / M_PER_UNIT); },
+    ff: function(n, again){ var i = 0; for(; i < n; i++){ if(S.dead){ if(again) restart(); else break; } step(); } return { steps: i, m: Math.round(S.z * M_PER_UNIT), won: !!S.won, dead: !!S.dead }; },
+    startAt: function(m){ resetRun(); lvStartAt(m); poseShip(); placeCam(true); },
+    fresh: function(){ return FRESH; }, toggleFresh: freshToggle, profKey: profKey,
+    secStage: function(z){ var s = sectionAt(z == null ? S.z : z); return { z0: s.z0, kind: s.kind, n: s.n || s.b || s.nNext, dist: s.dist, fin: !!s.fin, stage: stageOfSec(s).i, lvz: s.lvz != null }; }
+  };
+
   // ════════════════════════════════════════ FRAME ════════════════════════════════════════
   function frame(dt){
     if(!api.active) return;
@@ -99992,6 +100507,7 @@ var RUNNER = (function(){
     if(card > 0.001){
       var bw = Math.round(Math.min(W * 0.66, 300)), bh = 56, gap = 14, y0 = Math.round(H * 0.55);
       ['restart', 'shop', 'store'].forEach(function(a, j){ L.push({ r: { x: Math.round((W - bw) / 2), y: y0 + j * (bh + gap), w: bw, h: bh }, act: a, amt: card }); });
+      lvFreshPlate(L, W, H, y0 + 3 * (bh + gap), card);   // (THE LEVEL: the FRESH START test toggle)
     }
     if(shop > 0.001){
       // The slingshots, then (a little apart) EXTRA LIFE, then BACK — rows as tall as the screen has room for.
@@ -100048,10 +100564,12 @@ var RUNNER = (function(){
       R.elBest.textContent = S.newBest ? 'NEW BEST' : ('BEST ' + S.best.toLocaleString('en-US') + ' M');
       R.elCardCoins.textContent = S.coinN.toLocaleString('en-US') + (S.coinN === 1 ? ' COIN' : ' COINS') +
         '  ·  ' + (S.bank || 0).toLocaleString('en-US') + ' TOTAL';
+      lvCard();   // (THE LEVEL: LEVEL COMPLETE — or the stage it ended in)
     }
     slingDom(window.innerWidth, window.innerHeight, card);   // the plates' words, the shop, the meter, the tier
     foesDom(window.innerWidth, window.innerHeight);   // (THE ENEMIES: the lock brackets, the kills on the card)
     choiceDom(window.innerWidth, window.innerHeight);       // the upgrade meter, the run's upgrades, the hallway's HUD
+    lvDom(window.innerWidth, window.innerHeight);           // (THE LEVEL: the line along the top, a stage's name)
   }
 
   // ════════════════════════════════════════ INPUT ════════════════════════════════════════
@@ -100105,6 +100623,7 @@ var RUNNER = (function(){
   }
   function act(a){
     if(a === 'restart') restart();
+    else if(a === 'fresh') freshToggle();   // (THE LEVEL: the FRESH START test toggle)
     else if(a === 'store') exit();
     else if(a === 'shop') openShop();
     else if(a === 'shopback') R.shop = null;
