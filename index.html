@@ -92128,7 +92128,15 @@ var RUNNER = (function(){
     coreOffMin: 0.6, coreOffMax: 1.6,  // radians round the tube from where you are when it is laid (on a flat: ×0.6 units)
     plumeLen: 0.32,       // THE PLUME: the beam's length behind the engine, world units — about what the chase camera
                           // shows (the frame's bottom edge is ~0.2 behind the ship), so its white → purple → nothing is on screen…
-    plumeStep: 0.01       // …sampled this finely along each step's path
+    plumeStep: 0.01,      // …sampled this finely along each step's path
+    // THE BOOST: double-tap and HOLD the second tap — faster for as long as the finger stays down.
+    boostMul: 1.7,        // the run speed while boosting, × (on top of the cores)
+    boostHz: 2.2,         // how quickly it comes on and goes off again (critically damped)
+    boostWide: 1.1,       // the plume's beam this much wider at full boost…
+    boostLong: 0.75,      // …and this much longer
+    boostFov: 9,          // the lens opens this many degrees
+    boostPass: 0.45,      // a quarry this far BEHIND you is left behind (its chase is over)
+    dblTapMs: 320, tapMs: 230, tapPx: 18, dblTapPx: 110   // the double tap: a tap (this short, this still), then a press this soon, this near
   };
   var _rsq = Q.match(/[?&]runspeed=([\d.]+)/); if(_rsq) P.speedKmh = +_rsq[1];
   var _rsd = Q.match(/[?&]runsides=(\d+)/); if(_rsd) P.holdSides = P.startSides = Math.max(3, Math.min(32, +_rsd[1]));
@@ -93567,14 +93575,18 @@ var RUNNER = (function(){
     // more than a second to reach the run speed (it is +60 km/h a second) — then ride the run speed,
     // which itself keeps rising the longer you live. Anything OVER the run speed (a slingshot's) is
     // drag's: the excess decays, quickly in the air and slowly on the ground.
-    var vt = runSpeed();
+    var vt0 = runSpeed(), vt = vt0 * boostTick();   // (THE BOOST: held, the run speed is boostMul× — see THE BOOST)
     if(S.won && !S.dead) S.v *= LP.glide;   // (THE LEVEL: over the finish line it glides to a stop)
     else if(!S.dead){
       if(S.mode === 'flat') islSpeed(vt);   // an island's own: the slopes' (see THE ISLANDS)
-      else if(S.v > vt) S.v = vt + (S.v - vt) * Math.exp(-(S.grounded ? P.dragGround : P.dragAir) / 60);
+      else if(S.v > vt){
+        if(S.v <= S.vtB + 1e-9) S.v = vt;   // (THE BOOST let go: riding its speed, you come down with it — no coasting)
+        else S.v = vt + (S.v - vt) * Math.exp(-(S.grounded ? P.dragGround : P.dragAir) / 60);
+      }
       else S.v = Math.min(vt, S.v + Math.max(GAME_BASE_MAXSPEED * (60 / 15) / 60, vt / 60));
+      S.vtB = vt;
       S.runT += 1 / 60;
-      S.progT += Math.max(1, S.v / vt) / 60;   // the progress clock (see speedMul)
+      S.progT += Math.max(1, S.v / vt0) / 60;   // the progress clock (see speedMul)
     }
     else S.v *= S.fell ? 0.99 : (S.rest ? 0.90 : 0.985);
     var x0 = S.x, y0 = S.y, z0 = S.z;
@@ -94713,8 +94725,9 @@ var RUNNER = (function(){
     var B = gameMode.boostTrail, D = {};
     for(var k in B){ var v = B[k]; D[k] = Array.isArray(v) ? [] : (v !== null && typeof v === 'object' ? null : v); }
     D.tubeOnly = true; D.maxSparks = 0; D.maxOrb = 0;     // the beam alone
-    D.maxPoints = 64; D.ramp = 4; D.shockT = -1; D.boosting = false; D.startT = 0; D.intensity = 0;
+    D.maxPoints = 96; D.ramp = 4; D.shockT = -1; D.boosting = false; D.startT = 0; D.intensity = 0;
     ensureBoostTrailMesh(D);
+    R.plumeR0 = D.radius;   // (THE BOOST widens it from here)
     R.scene.add(D.mesh);
     D.mesh.material.blending = THREE.NormalBlending;   // its own copy: purple over the sky, not white (see glowOver)
     glowOver();
@@ -94733,13 +94746,15 @@ var RUNNER = (function(){
       if(R.plumePrev) R.plumePrev.z += rz;
     }
     R.plumeZB = S.zBase;
-    var fade = D.fade = Math.min(0.45, Math.max(Math.abs(S.v), 1e-4) / P.plumeLen);
+    var bk = S.boostK || 0, pl = P.plumeLen * (1 + P.boostLong * bk);   // (THE BOOST: longer…
+    D.radius = R.plumeR0 * (1 + P.boostWide * bk);                         // …and wider — each new point takes it)
+    var fade = D.fade = Math.min(0.45, Math.max(Math.abs(S.v), 1e-4) / pl);
     D.spacing = P.plumeStep * 0.5;
     if(on){
       _f.copy(s.forward); if(_f.lengthSq() < 1e-9) _f.set(0, 0, -1); _f.normalize();
       _p.copy(sh.position).addScaledVector(_f, -0.012);      // the engine, as spawnBoostTrail finds it
       // the engine's path this step — its last stretch only, where a step is longer than the beam can show
-      var prev = R.plumePrev, d = prev ? prev.distanceTo(_p) : 0, f0 = d > P.plumeLen * 2 ? 1 - P.plumeLen * 2 / d : 0;
+      var prev = R.plumePrev, d = prev ? prev.distanceTo(_p) : 0, f0 = d > pl * 2 ? 1 - pl * 2 / d : 0;
       var n = prev ? clamp(Math.ceil(d * (1 - f0) / P.plumeStep), 1, 40) : 1, t0 = D.boosting ? D.startT : -1, mark = pts[pts.length - 1];
       for(var q = 1; q <= n; q++) spawnBoostTrailCore(D, prev ? _v.copy(prev).lerp(_p, f0 + (1 - f0) * q / n) : _p, _f);
       D.startT = t0 + 1;                                     // (its ignition envelope counts calls: one tick a step)
@@ -98160,7 +98175,7 @@ var RUNNER = (function(){
       C.vr += (want - C.vr) * (1 - Math.exp(-dt * 2.2)) + C.kickV; C.kickV = 0;
       C.lead += C.vr / 60;
       var mn = chg ? 0.3 : (C.K.minLead || P.chaseMin) * k, nr = chaseNear(C);
-      if(nr < mn){ C.lead += (mn - nr) * 0.12; if(C.vr < 0) C.vr *= 0.85; }
+      if(nr < mn && !boosting()){ C.lead += (mn - nr) * 0.12; if(C.vr < 0) C.vr *= 0.85; }   // (THE BOOST goes through)
       C.escT = nr > gunRange() ? C.escT + dt : Math.max(0, C.escT - dt * 0.6);
       if(C.escT >= P.chaseEscSec || C.t > P.chaseLife) chaseAway(C, 'ESCAPED');
       if(chg) ramCheck(C, k);
@@ -98171,6 +98186,7 @@ var RUNNER = (function(){
       else if(C.endT > 0.9) C.st = 'gone';
     }
     C.lead += runSpeed() - S.v;   // (you were slowed — a life spent, the shield's knock — and it ran on)
+    if((C.st === 'in' || C.st === 'run') && boostPassed(C)) chaseLeft(C);   // (THE BOOST: blown past)
     C.z = S.z + C.lead;
     R.draftK = C.st === 'run' ? C.draft : 0;
     QB[C.kind].step(C, live && C.st === 'run', dt);
@@ -99749,7 +99765,7 @@ var RUNNER = (function(){
   function quarryHud(c, W, H, ink){
     var C = R.chase;
     if(!C || C.st === 'gone') return;
-    var a = C.st === 'away' || C.st === 'down' ? clamp(1 - C.endT / 0.9, 0, 1) : clamp(C.t / 0.35, 0, 1);
+    var a = C.st === 'away' || C.st === 'down' || C.st === 'left' ? clamp(1 - C.endT / 0.9, 0, 1) : clamp(C.t / 0.35, 0, 1);
     if(a < 0.01) return;
     var cx = W / 2, by = (R.elSafe ? R.elSafe.offsetTop : 0) + 116, red = '255,90,130', hasLS = 'letterSpacing' in c, i;
     R.foeDrawn = true;
@@ -100397,6 +100413,31 @@ var RUNNER = (function(){
     secStage: function(z){ var s = sectionAt(z == null ? S.z : z); return { z0: s.z0, kind: s.kind, n: s.n || s.b || s.nNext, dist: s.dist, fin: !!s.fin, stage: stageOfSec(s).i, lvz: s.lvz != null }; }
   };
 
+  // ════════════════════════════════════════ THE BOOST ════════════════════════════════════════
+  // (═ THE BOOST ═ — patch: C:\Users\zacha\.runner-boost\apply.js)
+  // DOUBLE-TAP AND HOLD: tap once, then put the finger straight back down and keep it there — for as long as it stays
+  // down the run speed is boostMul× (over the cores), the plume swells wider and longer and the lens opens. The held
+  // finger still steers, jumps and clings as any other. Let go and the speed comes back down with the boost (it does
+  // not coast on drag, as a slingshot's excess does). Nothing protects you: what you hit still kills you — and a
+  // QUARRY you blow past (it can't hold you off while you boost) is LEFT BEHIND: that chase is over, no coins.
+  // Desktop: hold Shift.
+  function boosting(){ return (S.boostK || 0) > 0.35; }
+  function boostTick(){
+    var on = (G.boost || R.keyBoost) && !S.dead && !S.won && !(S.sl && S.sl.phase === 'aim');
+    if(on && !S.boostOn && R.plume) R.plume.boosting = false;   // the beam re-ignites: fat at the nozzle, then held
+    S.boostOn = on;
+    var r = cd(S.boostK || 0, S.boostKV || 0, on ? 1 : 0, P.boostHz);
+    S.boostK = clamp(r.x, 0, 1); S.boostKV = r.v;
+    return 1 + (P.boostMul - 1) * S.boostK;
+  }
+  // A quarry you are past by boostPass (all of it) while boosting is left behind — it drops away into the fog.
+  function boostPassed(C){ return boosting() && C.t > 0.6 && chaseNear(C) < -P.boostPass; }
+  function chaseLeft(C){
+    C.st = 'left'; C.endT = 0;
+    coreToast('LEFT BEHIND', '170,190,230');
+    for(var i = 0; i < C.bodies.length; i++){ var f = C.bodies[i]; f.st = 'idle'; f.sig = 0; }
+  }
+
   // ════════════════════════════════════════ FRAME ════════════════════════════════════════
   function frame(dt){
     if(!api.active) return;
@@ -100409,7 +100450,7 @@ var RUNNER = (function(){
     R.shopAmt += ((R.shop ? 1 : 0) - R.shopAmt) * ez; if(!R.shop && R.shopAmt < 0.003) R.shopAmt = 0;
     R.aimAmt += ((S.sl && S.sl.phase === 'aim' ? 1 : 0) - R.aimAmt) * ez; if(R.aimAmt < 0.003) R.aimAmt = 0;
     // The lens opens with a slingshot's flight speed (and draws in a touch under the pull's tension).
-    var fk = (S.chargeT > 0 && !S.dead ? 5 : 0) + (R.draftK || 0) * P.chaseDraftFov + (!S.sl ? 0 : S.sl.phase === 'fly' ? P.slingFov * clamp((S.v / runSpeed() - 1) / 6, 0, 1) : (S.sl.phase === 'aim' ? -3 * S.sl.pull : 0));
+    var fk = (S.chargeT > 0 && !S.dead ? 5 : 0) + (S.boostK || 0) * P.boostFov + (R.draftK || 0) * P.chaseDraftFov + (!S.sl ? 0 : S.sl.phase === 'fly' ? P.slingFov * clamp((S.v / runSpeed() - 1) / 6, 0, 1) : (S.sl.phase === 'aim' ? -3 * S.sl.pull : 0));
     R.fovKick += (fk - R.fovKick) * Math.min(1, dt * 5);
     R.tierToast = Math.max(0, R.tierToast - dt);
     for(var rk in R.rowShake) R.rowShake[rk] = Math.max(0, R.rowShake[rk] - dt * 2.2);
@@ -100577,9 +100618,12 @@ var RUNNER = (function(){
   // short window, and every recognised swipe re-anchors the stroke — so an up-then-left L reads as a
   // jump followed by a cling.
   var G = { id: null, on: false, lx: 0, ly: 0, hist: [], muteT: 0, t0: 0, lArm: 0 };
-  function gStart(x, y){ var t = performance.now(); G.on = true; G.lx = x; G.ly = y; G.hist = [{ x: x, y: y, t: t }]; G.t0 = t; G.lArm = 0; G.mvT = t; }
+  function gStart(x, y){ var t = performance.now(); G.on = true; G.lx = x; G.ly = y; G.hist = [{ x: x, y: y, t: t }]; G.t0 = t; G.lArm = 0; G.mvT = t;
+    // (THE BOOST: a press straight after a TAP, near it, is the boost — held as long as this finger is)
+    G.x0 = x; G.y0 = y; G.far = 0; G.boost = t - (G.tapT || -1e9) < P.dblTapMs && Math.hypot(x - G.tapX, y - G.tapY) < P.dblTapPx; if(G.boost) G.tapT = -1e9; }
   function gMove(x, y){
     if(!G.on) return;
+    G.far = Math.max(G.far || 0, Math.hypot(x - G.x0, y - G.y0));
     var dx = x - G.lx; if(Math.abs(dx) > 1.5 || Math.abs(y - G.ly) > 1.5) G.mvT = performance.now(); G.lx = x; G.ly = y;
     if(S.sl && S.sl.phase === 'aim'){ slingDrag(x, y, dx); return; }   // in the slingshot the stroke is the pull and the aim
     var W = window.innerWidth, H = window.innerHeight, t = performance.now();
@@ -100602,7 +100646,11 @@ var RUNNER = (function(){
       cling(fx < 0 ? -1 : 1); G.hist = [{ x: x, y: y, t: t }];
     }
   }
-  function gEnd(){ G.on = false; }
+  function gEnd(){
+    var t = performance.now();   // a short, still touch is a TAP — the first half of a double tap
+    if(!G.boost && G.on && t - G.t0 < P.tapMs && (G.far || 0) < P.tapPx){ G.tapT = t; G.tapX = G.x0; G.tapY = G.y0; } else G.tapT = -1e9;
+    G.on = false; G.boost = false;
+  }
   function btnAt(x, y){
     var L = R.plates || [];
     for(var i = 0; i < L.length; i++){ var p = L[i], r = p.r; if(p.act && p.amt > 0.6 && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i; }
@@ -100649,7 +100697,7 @@ var RUNNER = (function(){
       var t1 = e.touches[0], t2 = e.touches[1];
       R.pinch = { i1: t1.identifier, i2: t2.identifier, z0: R.zoom, r0: R.roll, d0: 1, a0: 0 };
       var q = pinchPts(e); R.pinch.d0 = Math.max(20, q.d); R.pinch.a0 = q.a;
-      G.on = false; G.id = null;
+      G.on = false; G.id = null; G.boost = false; G.tapT = -1e9;
       return;
     }
     if(R.pinch || (G.id !== null && !S.dead)) return;
@@ -100696,6 +100744,7 @@ var RUNNER = (function(){
     else if(k === 'arrowdown' || k === 's'){ if(!e.repeat) slam(); }
     else if((k === 'enter' || k === 'r') && S.dead && cardAmt() > 0.6) restart();
     else if(k === 'escape'){ if(R.shop) R.shop = null; else exit(); }
+    else if(k === 'shift'){ R.keyBoost = true; }   // Shift held: THE BOOST
     else if(k === 'z'){ if(!e.repeat) R.zoomTgt = R.zoomTgt > 0.5 ? 0 : 1; }      // Z: the tube camera
     else if(k === 'q' || k === 'e'){ R.roll += (k === 'e' ? 1 : -1) * 0.12; }     // Q/E: turn it
     else return;
@@ -100710,6 +100759,7 @@ var RUNNER = (function(){
     }
     if(k === 'arrowleft' || k === 'a') R.keyL = false;
     else if(k === 'arrowright' || k === 'd') R.keyR = false;
+    else if(k === 'shift') R.keyBoost = false;
     else return;
     e.preventDefault(); e.stopImmediatePropagation();
   }
