@@ -37355,10 +37355,8 @@ function updateFlightPhysicsAndCamera() {
   // block below), so nothing here touches it.
   var rollAxis = (k.e ? 1 : 0) + (k.q ? -1 : 0);
   var vertAxis  = (k.space ? 1 : 0) + (k.ctrl ? -1 : 0);
-  // FLIGHT BOOST IS FREE. No boostAllowed() gate and no drain (see updateBoostFuel): holding
-  // SHIFT out here is the ordinary way to fly, not a metered resource. What IS metered is the
-  // ENGINE PULSE you spend while holding it — three charges, SPACE to fire one (see PULSE).
-  var isBoosting = (gameMode.wBoost || k.shift || (t.active && t.boost));   // boost: double-tap-W / Shift / touch
+  // FLIGHT BOOST IS FREE. The engine pulse is metered separately.
+  var isBoosting = (gameMode.wBoost || k.shift || (t.active && t.boost));
   gameMode.physics.isBoosting = isBoosting;   // read by the FOV punch, the shake and the trail
 
   // BOOST WIND-UP. Climbs while held, bleeds off when released — so `bRamp` is 0 on the first
@@ -38449,19 +38447,10 @@ function updateSpeedCounter(speedUnits){
 function hideSpeedCounter(){ if(gameSpeedEl) gameSpeedEl.style.display = 'none'; }
 
 // ── Boost fuel + bar ─────────────────────────────────────────────────────────────────
-// Boosting drains the bar over `duration` s; once empty it LOCKS OUT and must recharge fully
-// over `recharge` s before you can boost again. The bar is only on screen while boosting (or
-// while locked out recharging from empty, so you can see the wait).
-// FLIGHT NO LONGER DRAINS IT AT ALL (2026-09-01). This used to give flight a 5× deeper tank,
-// because crossing 1450 units between planets on a 1.5s burn is hopeless; the answer now is that
-// out there boosting is simply free, and the metered thing is the ENGINE PULSE you spend while
-// holding it (see PULSE). The multiplier below is kept because the drain branch is shared, but
-// flight can no longer reach it — surface boosting is, as before, untouched.
+// Surface boost fuel meter; the mobile runner has its own timed boost.
 var BOOST_FLY_DURATION_MUL = 5;
 var boostBar = { fuel: 1, lockout: false, duration: 1.5, recharge: 2.5, barEl: null, fillEl: null };
-function boostDurationNow(){
-  return boostBar.duration * ((gameMode.fly && gameMode.fly.active) ? BOOST_FLY_DURATION_MUL : 1);
-}
+function boostDurationNow(){ return boostBar.duration * ((gameMode.fly && gameMode.fly.active) ? BOOST_FLY_DURATION_MUL : 1); }
 function boostAllowed(){ return boostBar.fuel > 0 && !boostBar.lockout; }
 function ensureBoostBar(){
   if(boostBar.barEl) return;
@@ -38488,10 +38477,6 @@ function updateBoostFuel(dt){
     return;
   }
   var boosting = !!gameMode.physics.isBoosting;
-  // FLIGHT BOOST IS FREE (2026-09-01). Out here the bar stops being a fuel gauge and becomes the
-  // WIND-UP readout instead — the visibility test below already shows it while boostRamp builds,
-  // which is the only thing left out there worth watching. The tank refills as if idle, so
-  // landing never hands you an empty one.
   if(gameMode.fly && gameMode.fly.active) boosting = false;
   if(boosting){
     B.fuel -= dt / boostDurationNow();
@@ -38708,6 +38693,7 @@ function updateGameAudio(){
   }
   if(sfx.bgMusic && !sfxState.musicOn && !sfx.bgMusic._pendingPlay && performance.now() >= sfx.bgMusic._retryAt && sfx.musicVol > 0) sfx.bgMusic.play().then(function(){ sfxState.musicOn = gameAudioActive() && !sfx.bgMusic.paused; }).catch(function(){});
   var boosting = !!gameMode.physics.isBoosting;
+  if(gameMode.fly && gameMode.fly.active) boosting = false;
   if(boosting && !sfxState.wasBoosting){ sfx.boost.currentTime = 0; sfx.boost.play().catch(function(){}); }
   else if(!boosting && sfxState.wasBoosting){ sfx.boost.pause(); if(sfx.boostFadeout && sfx.sfxVol > 0){ sfx.boostFadeout.volume = sfx.boostFadeout._baseVol * sfx.sfxVol; sfx.boostFadeout.currentTime = 0; sfx.boostFadeout.play().catch(function(){}); } }
   sfxState.wasBoosting = boosting;
@@ -50039,7 +50025,8 @@ var CMB = (function(){
     }
     tickHud(now);
   }
-  function resetRun(){ heavy.stacks = 0; heavy.charging = false; glowOff(); rollBuf.dir = 0; hud._stacks = -1; }
+  function resetRun(){
+    heavy.stacks = 0; heavy.charging = false; glowOff(); rollBuf.dir = 0; hud._stacks = -1; }
   function onClearCombat(){   // the game ended under us — drop the room without a teleport (the exit path resets the ship anyway)
     if(room.active){ room.active = false; worldSyncBodies(); var pb = pvpPlanetBody(); if(pb){ if(pb.planetId && typeof worldActivate === 'function') worldActivate(pb.planetId); else fpActivate(pb); } }
     resetRun();
@@ -50844,7 +50831,8 @@ var SHARD = (function(){
     if(globs.length || gel.on){ var Gs = gelApi(true); if(Gs) Gs.sync(); }   // uniforms for every live player body, after both the gel and the globs stepped
     tickHud(now);
   }
-  function resetRun(){ if(gel.on) gelOff('reset'); clearGlobs(); { var _ta = towerApi(true); if(_ta) _ta.clear(); twSummon.storm = twSummon.gravity = twSummon.full = null; } slots.move.state = 'ready'; slots.move.cdEnd = 0; slots.attack.state = 'ready'; slots.attack.cdEnd = 0; hud._dirty = true; }
+  function resetRun(){
+    if(gel.on) gelOff('reset'); clearGlobs(); { var _ta = towerApi(true); if(_ta) _ta.clear(); twSummon.storm = twSummon.gravity = twSummon.full = null; } slots.move.state = 'ready'; slots.move.cdEnd = 0; slots.attack.state = 'ready'; slots.attack.cdEnd = 0; hud._dirty = true; }
   function onClearCombat(){ resetRun(); if(hud.el) hud.el.style.display = 'none'; gameMode._gelZoom = 0; gel.zoom = 0; }
   // The COMBAT LAB panel (V) hosts the params. A registered source shares LOG / SAVE / RESET.
   function panelSource(){ return { title: 'SHARDS', SCHEMA: SCHEMA, P: P, DEF: DEF, LS_KEY: LS_P }; }
@@ -92017,12 +92005,13 @@ var RUNNER = (function(){
   var P = {
     apothem: 0.36,        // tube: axis → every wall, whatever the shape — so the floor is always the same
                           // distance from the middle and the hop, the camera and the cling feel the same
-    speedKmh: 192,        // the run's speed, on the planet game's km/h scale (3× the first cut's 64), until you
+    speedKmh: 326.4,        // the run's speed, on the planet game's km/h scale (3× the first cut's 64), until you
                           // take a SPEED CORE — it no longer rises on its own (see THE CORES)
     speedMaxMul: 3.0,     // as fast as speed cores can take it (576 km/h)
     // THE COURSE: shapes from a square up to 16 sides, held for shapeSec, folding into the next over morphSec.
     sidesMin: 4, sidesMax: 16, startSides: 8, holdSides: 0,
-    shapeSecMin: 13, shapeSecMax: 22, morphSec: 1.2,   // (THE DISTRICTS: one district per held tube)
+    curveChance: 0.80, curveRadiusMin: 1.2, curveRadiusMax: 3.8, curveTurnsMin: 0.55, curveTurnsMax: 2.8, // 20% of held tubes stay straight; varied sweep radius and turn tightness
+    shapeSecMin: 26, shapeSecMax: 50, morphSec: 1.2,   // long held stretches let the route shape build into broad curves and corkscrews
     morphClearBefore: 0.5, morphClearAfter: 0.7,   // no obstacle rows this many seconds either side of a fold
     // FLATS → FLOATING ISLANDS: after a held tube, this often the course opens onto an island instead of folding —
     // hilly ground under plain gravity, rocks and trees, a fall past its edges. Lengths are skewed short (most are
@@ -92037,7 +92026,7 @@ var RUNNER = (function(){
     islDrag: 0.35,        // over it, this share of the excess goes a second, on the ground and in the air
     islMinMul: 0.55, islMaxMul: 2.4,   // an island's speed stays within these × the run speed
     // THE ISLAND CAMERA: higher and further back than the tube's, on a slow spring — it glides over the hills
-    islCamUp: 0.17, islCamBack: 0.52, islCamHz: 2.2, islCamClear: 0.1, islCamLook: 1.3,
+    islCamUp: 0.10, islCamBack: 0.52, islCamHz: 6.0, islCamClear: 0.1, islCamLook: 1.3,
     islTufts: 4.0,        // grass tufts per square unit of island top (one in islFlower carries a flower)
     islFlower: 7,
     bgIslands: 9,         // other islands floating out in the dark around one you are on
@@ -92073,6 +92062,7 @@ var RUNNER = (function(){
                           // ship's angle round the tube (one even turn rate — but on a square that tilts the floor
                           // 45° on screen at a wall's edge). Half and half: continuous, never more than ~22° off.
     camBack: 0.30, camUp: 0.085, camLook: 0.9,
+    cameraDistance: 1.20, cameraZoom: 0.88, cameraPitch: 0, // adjustable on the crash-card settings screen
     camHFov: 50, camVFovMin: 58, camVFovMax: 90,
     camJumpFollow: 0.45,  // share of a hop's height the camera rides up with
     bankK: 16,            // shipVisual roll per unit/frame of sideways speed (lean into the dodge)
@@ -92086,13 +92076,13 @@ var RUNNER = (function(){
     // not how much time you get between decisions: ~1–1.7 s at the start, shrinking to rowGapEndMul of
     // that (0.5–0.8 s) as the run's difficulty ramps up over rampSec.
     rowGapSecMin: 1.0, rowGapSecMax: 1.65, rowGapEndMul: 0.5, firstRowSec: 2.5, firstRow: null,
-    ahead: 30, aheadSec: 4.5,   // rows and coins exist this far ahead: the larger of the two
+    ahead: 46, aheadSec: 11.5,  // show more of the upcoming route before each long bend arrives
     rampSec: 120,         // obstacles get more frequent (denser rows, closer together) over this much time alive
     // COINS: strings in the gaps between rows (and through the folds).
     coinChance: 0.7, coinSpacingSec: 0.075, coinMax: 10,
     coinR: 0.016, coinLift: 0.022,   // size; centre height above the ship's ride line
     coinGrab: 0.034, coinMagnet: 0.10, coinPullHz: 7,
-    fog: 0.075,
+    fog: 0.032,
     crashSec: 1.1,        // the crash plays this long before the card
     hitScale: 0.85,       // collision ellipsoid = the hull's measured half-extents × this
     // MOMENTUM: speed over the run speed is drag's to take — quickly in the air, slowly on the ground — so a
@@ -92113,7 +92103,7 @@ var RUNNER = (function(){
     slingNear: 0.3,
     slingRingR: 0.072, slingGap: 0.034,          // ring radius (the hull spans ~0.06) and the rings' rest spacing
     slingK: 900, slingKA: 3000, slingZeta: 0.22, // the ring chain: spring rates (s⁻², per unit ring mass), damping
-    slingFov: 16,         // degrees the lens opens at full flight speed
+    slingFov: 55,         // degrees the lens opens at full sling pull / flight intensity
     // EXTRA LIVES: each costs lifePriceMul × the one before (1,000, 5,000, 25,000, 125,000, …).
     lifePrice0: 1000, lifePriceMul: 5,
     shieldSec: 1.6,       // a life spent: the shield holds this long — through obstacles, over gaps and pits
@@ -92129,12 +92119,13 @@ var RUNNER = (function(){
     plumeLen: 0.32,       // THE PLUME: the beam's length behind the engine, world units — about what the chase camera
                           // shows (the frame's bottom edge is ~0.2 behind the ship), so its white → purple → nothing is on screen…
     plumeStep: 0.01,      // …sampled this finely along each step's path
-    // THE BOOST: double-tap and HOLD the second tap — faster for as long as the finger stays down.
+    // THE BOOST: double-tap for a 2-second burst, then wait 4 seconds to boost again.
+    boostDurationSec: 2, boostCooldownSec: 4,
     boostMul: 1.7,        // the run speed while boosting, × (on top of the cores)
     boostHz: 2.2,         // how quickly it comes on and goes off again (critically damped)
     boostWide: 1.1,       // the plume's beam this much wider at full boost…
     boostLong: 0.75,      // …and this much longer
-    boostFov: 9,          // the lens opens this many degrees
+    boostFov: 38,         // the lens opens this many degrees
     boostPass: 0.45,      // a quarry this far BEHIND you is left behind (its chase is over)
     dblTapMs: 320, tapMs: 230, tapPx: 18, dblTapPx: 110   // the double tap: a tap (this short, this still), then a press this soon, this near
   };
@@ -92274,7 +92265,7 @@ var RUNNER = (function(){
       }
       else if(lvFinal(last, ups)) sec = lvFinalSec(last, ups);   // (THE LEVEL: the last stretch to the line, and past it — one held tube)
       else if(last.kind === 'hold' && !P.holdSides){ var _zh = last.z1 + ups * P.morphSec, _dm = nextDistrict(last, _zh); sec = { z0: last.z1, z1: _zh, kind: 'morph', a: last.n, b: distSides(_dm, last.n, _zh), dist: _dm }; }   // (THE DISTRICTS)
-      else { sec = { z0: last.z1, z1: last.z1 + ups * holdSec(), kind: 'hold', n: last.kind === 'morph' ? last.b : (last.kind === 'flat' ? last.nNext : last.n) }; sec.dist = holdDist(last, sec.n); lvCutHold(sec, ups); }   // (THE LEVEL: a stage opens with a fold)
+      else { sec = { z0: last.z1, z1: last.z1 + ups * holdSec(), kind: 'hold', n: last.kind === 'morph' ? last.b : (last.kind === 'flat' ? last.nNext : last.n) }; sec.dist = holdDist(last, sec.n); lvCutHold(sec, ups); if(Math.random() < P.curveChance) sec.curve = { amp: P.curveRadiusMin + Math.random() * (P.curveRadiusMax - P.curveRadiusMin), turns: P.curveTurnsMin + Math.random() * (P.curveTurnsMax - P.curveTurnsMin), kind: Math.floor(Math.random() * 4), dir: Math.random() < 0.5 ? -1 : 1, phase: Math.random() * TAU }; }   // (THE LEVEL: a stage opens with a fold; curves lay in the held tube)
       c.push(sec);
       buildChunk(sec);
       if(sec.kind === 'hold') maybeOpen(sec, ups);   // (THE OPEN TUBE)
@@ -92477,12 +92468,13 @@ var RUNNER = (function(){
         uHT: { value: 0 }, uPanL: { value: 1 / P.panelLen }, uSky: { value: 0 },
         // THE OPEN TUBE: up to two zones on screen — (run z from, to, rows, sides) each, their masks, how many, and
         // S.zBase (the masks are kept in run z; the fragment has world z)
-        uOpA: { value: [new THREE.Vector4(), new THREE.Vector4()] }, uOpT0: { value: OPEN_NONE }, uOpT1: { value: OPEN_NONE }, uOpN: { value: 0 }, uZB: { value: 0 }
+        uOpA: { value: [new THREE.Vector4(), new THREE.Vector4()] }, uOpT0: { value: OPEN_NONE }, uOpT1: { value: OPEN_NONE }, uOpN: { value: 0 }, uZB: { value: 0 },
+        uCvOrigin: { value: new THREE.Vector2() }
       },
       vertexShader: [
-        'attribute float aU, aW, aPhi, aN; varying float vU, vW, vPhi, vN, vZ, vWZ; varying vec2 vXY; varying vec3 vView;',
-        'void main(){ vU = aU; vW = aW; vPhi = aPhi; vN = aN; vZ = position.z; vWZ = (modelMatrix * vec4(position, 1.0)).z; vXY = position.xy;',
-        '  vec4 mv = modelViewMatrix * vec4(position, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
+        'attribute float aU, aW, aPhi, aN; attribute vec2 aCurve; uniform vec2 uCvOrigin; varying float vU, vW, vPhi, vN, vZ, vWZ; varying vec2 vXY; varying vec3 vView;',
+        'void main(){ vU = aU; vW = aW; vPhi = aPhi; vN = aN; vZ = position.z; vWZ = (modelMatrix * vec4(position, 1.0)).z; vXY=position.xy-aCurve;',
+        '  vec3 bent=position; bent.xy-=uCvOrigin; vec4 mv = modelViewMatrix * vec4(bent, 1.0); vView = mv.xyz; gl_Position = projectionMatrix * mv; }'
       ].join('\n'),
       fragmentShader: [
         'uniform float uFloor, uFlrCos, uFogD, uAlpha, uHN, uSN; uniform vec3 uSeam, uRing, uBase, uFogCol, uHole;',
@@ -92949,6 +92941,56 @@ var RUNNER = (function(){
     }
     u.uOpN.value = n; u.uZB.value = S.zBase;
   }
+  // Curves are local to their section and ease to zero at both ends, so every climb levels out cleanly
+  // before the next bend. The ship and its engine trails stay in the local frame; the tube and scenery bend around them.
+  function curveOffsetAt(z, out){
+    out.x = 0; out.y = 0;
+    var c = S.course;
+    for(var i = 0; i < c.length; i++){
+      var sec = c[i], cv = sec.curve;
+      if(!cv || z < sec.z0 || z > sec.z1) continue;
+      var u = clamp((z - sec.z0) / Math.max(0.001, sec.z1 - sec.z0), 0, 1), env = Math.pow(Math.sin(Math.PI * u), 2), th = TAU * cv.turns * u + cv.phase;
+      if(cv.kind === 0) out.x += cv.dir * cv.amp * env;
+      else if(cv.kind === 1) out.y += cv.dir * cv.amp * env;
+      else if(cv.kind === 2){ out.x += cv.amp * env * Math.sin(th); out.y += cv.amp * env * Math.cos(th); }
+      else { out.x += cv.dir * cv.amp * env * (1 - Math.cos(th)) * 0.5; out.y += cv.amp * env * Math.sin(th); }
+    }
+    return out;
+  }
+  var _curveA = new THREE.Vector2(), _curveB = new THREE.Vector2();
+  function feedCurves(){
+    var u = R.tubeMat.uniforms;
+    curveOffsetAt(S.z, _curveA); u.uCvOrigin.value.copy(_curveA);
+  }
+  function unbendScene(){
+    if(!R.scene) return;
+    var ch = R.scene.children;
+    for(var i = 0; i < ch.length; i++){
+      var o = ch[i], d = o.userData;
+      if(d && d._curveBend){ o.position.x -= d._curveBend.x; o.position.y -= d._curveBend.y; d._curveBend = null; }
+    }
+    if(R._curveCam){ R.cam.position.x -= R._curveCam.x; R.cam.position.y -= R._curveCam.y; R._curveCam = null; R.cam.updateMatrixWorld(true); }
+  }
+  function bendScene(){
+    if(!R.scene) return;
+    var ch = R.scene.children;
+    for(var i = 0; i < ch.length; i++){
+      var o = ch[i];
+      if(!o || o === gameMode.group || o === R.stars || (R.plume && o === R.plume.mesh) || o === R.cam || o === R.key || o === R.key.target || o === R.glow || !o.position || (o.material === R.tubeMat)) continue;
+      var z = S.zBase - o.position.z;
+      curveOffsetAt(z, _curveA);
+      var dx = _curveA.x - R.tubeMat.uniforms.uCvOrigin.value.x, dy = _curveA.y - R.tubeMat.uniforms.uCvOrigin.value.y;
+      if(Math.abs(dx) + Math.abs(dy) < 1e-6) continue;
+      o.userData = o.userData || {}; o.userData._curveBend = { x: dx, y: dy };
+      o.position.x += dx; o.position.y += dy;
+    }
+    var camZ = S.zBase - R.cam.position.z;
+    curveOffsetAt(camZ, _curveA);
+    var c0 = R.tubeMat.uniforms.uCvOrigin.value;
+    R._curveCam = { x: _curveA.x - c0.x, y: _curveA.y - c0.y };
+    R.cam.position.x += R._curveCam.x; R.cam.position.y += R._curveCam.y;
+    R.cam.updateMatrixWorld(true);
+  }
   function clearOpen(){ if(!R.open) R.open = []; for(var q = 0; q < R.open.length; q++) R.open[q].tex.dispose(); R.open.length = 0; }
   // ════════════════════════════════════════ THE SKY ════════════════════════════════════════
   // The storefront's own cloud sky (CSKY: the same generator, march, TAA and composite) behind the whole run. CSKY is
@@ -93083,18 +93125,20 @@ var RUNNER = (function(){
   function buildChunk(sec){
     if(sec.kind === 'flat') return buildFlatChunk(sec);
     var fold = sec.kind === 'morph', sq = sec.kind === 'squeeze', info = fold ? morphInfo(sec.a, sec.b) : regShape(sec.n);
-    var nF = info.n, K = fold ? 18 : (sq ? 30 : 2), zO = Math.floor(sec.z0);
-    var pos = [], aU = [], aW = [], aPh = [], aN = [], idx = [], V = new Float64Array(nF * 2), H = new Float64Array(nF), k, i;
+    var nF = info.n, K = fold ? 18 : (sq ? 30 : (sec.curve ? clamp(Math.ceil((sec.z1 - sec.z0) / 3), 24, 96) : 2)), zO = Math.floor(sec.z0);
+    var pos = [], aU = [], aW = [], aPh = [], aN = [], aCurve = [], idx = [], V = new Float64Array(nF * 2), H = new Float64Array(nF), k, i;
     for(k = 0; k < K; k++){
       var zk = sq ? squeezeRingZ(sec, k, K) : sec.z0 + (sec.z1 - sec.z0) * k / (K - 1), t = fold ? foldT(sec, zk) : 0;
       for(i = 0; i < nF; i++) H[i] = fold ? (1 - t) * info.hA[i] + t * info.hB[i] : (sq ? P.apothem * squeezeS(sec, zk) : info.h[i]);
+      curveOffsetAt(zk, _curveA); var cox = _curveA.x, coy = _curveA.y;
       for(i = 0; i < nF; i++){ var j = (i + 1) % nF; corner(info.phi[i], H[i], info.phi[j], H[j], V, i * 2); }
       for(i = 0; i < nF; i++){
         var pv = (i - 1 + nF) % nF, ax = V[pv * 2], ay = V[pv * 2 + 1], bx = V[i * 2], by = V[i * 2 + 1];
         var cx = (ax + bx) * 0.5, cy = (ay + by) * 0.5, tx = Math.cos(info.phi[i]), ty = Math.sin(info.phi[i]);
         var ua = (ax - cx) * tx + (ay - cy) * ty, ub = (bx - cx) * tx + (by - cy) * ty, w = Math.abs(ub - ua) * 0.5;
-        pos.push(ax, ay, -(zk - zO), bx, by, -(zk - zO));
+        pos.push(ax + cox, ay + coy, -(zk - zO), bx + cox, by + coy, -(zk - zO));
         aU.push(ua, ub); aW.push(w, w); aPh.push(info.phi[i], info.phi[i]); aN.push(3, 3);
+        aCurve.push(cox, coy, cox, coy);
       }
     }
     for(k = 0; k + 1 < K; k++) for(i = 0; i < nF; i++){
@@ -93107,6 +93151,7 @@ var RUNNER = (function(){
     g.setAttribute('aW', new THREE.Float32BufferAttribute(aW, 1));
     g.setAttribute('aPhi', new THREE.Float32BufferAttribute(aPh, 1));
     g.setAttribute('aN', new THREE.Float32BufferAttribute(aN, 1));
+    g.setAttribute('aCurve', new THREE.Float32BufferAttribute(aCurve, 2));
     g.setIndex(idx);
     var m = sec.mesh = new THREE.Mesh(g, R.tubeMat);
     m.frustumCulled = false; m.renderOrder = -1;
@@ -93409,6 +93454,10 @@ var RUNNER = (function(){
     R.elCoinDot = el('span', 'display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:1px;' +
       'background:radial-gradient(circle at 35% 35%,#fff3c4,#ffc94a 55%,#b07a12);box-shadow:0 0 8px rgba(255,190,60,0.6);', R.elCoins);
     R.elCoinN = el('span', 'display:inline-block;', R.elCoins, '0');
+    R.boostPos = new THREE.Vector3();
+    R.elBoost = el('div', T + 'left:0;top:0;opacity:0;transform:translateX(-50%);padding:6px 11px;border-radius:999px;' +
+      'border:1px solid rgba(197,150,255,0.8);background:rgba(28,14,48,0.78);color:#ead8ff;font-size:10px;letter-spacing:0.2em;' +
+      'text-shadow:0 0 8px rgba(185,115,255,0.9);box-shadow:0 0 14px rgba(155,75,255,0.55);transition:opacity .08s;', L, 'BOOST  2.0s');
     R.elCard = el('div', T + 'left:0;right:0;text-align:center;opacity:0;', L);
     R.elK = el('div', 'font-size:11px;letter-spacing:0.34em;color:rgba(150,170,205,0.85);', R.elCard, 'DISTANCE');
     R.elV = el('div', 'font-size:44px;letter-spacing:0.06em;color:#f2f5fa;margin-top:8px;text-shadow:0 0 18px rgba(16,196,178,0.35);', R.elCard, '0 M');
@@ -93575,7 +93624,7 @@ var RUNNER = (function(){
     // more than a second to reach the run speed (it is +60 km/h a second) — then ride the run speed,
     // which itself keeps rising the longer you live. Anything OVER the run speed (a slingshot's) is
     // drag's: the excess decays, quickly in the air and slowly on the ground.
-    var vt0 = runSpeed(), vt = vt0 * boostTick();   // (THE BOOST: held, the run speed is boostMul× — see THE BOOST)
+    var vt0 = runSpeed(), vt = vt0 * boostTick();   // (THE BOOST: timed burst, the run speed is boostMul× — see THE BOOST)
     if(S.won && !S.dead) S.v *= LP.glide;   // (THE LEVEL: over the finish line it glides to a stop)
     else if(!S.dead){
       if(S.mode === 'flat') islSpeed(vt);   // an island's own: the slopes' (see THE ISLANDS)
@@ -93866,7 +93915,7 @@ var RUNNER = (function(){
   // blends between the two (R.zoom); position, aim and field of view are mixed, and the roll is mixed as an
   // ANGLE, because two up vectors half a turn apart (riding the ceiling) average to nothing. ──
   function placeCam(snap){
-    var lim = P.apothem - hover(), z = -(S.z - S.zBase), flat = S.mode === 'flat';
+    var lim = P.apothem - hover(), z = -(S.z - S.zBase), flat = S.mode === 'flat', dist = P.cameraDistance;
     var gx = Math.sin(S.g), gy = -Math.cos(S.g), fd = 0;
     if(!(S.grounded && !S.dead) && !S.fell) fd = flat ? Math.max(0, S.y - groundAt(S.x, S.z)) : footDist(shapeAt(S.z), S.x, S.y, S.g);
     // (on an island only a hop's worth is left below: a long flight off a crest takes the camera up with it)
@@ -93878,7 +93927,7 @@ var RUNNER = (function(){
       c = cd(S.cy, S.cvy, typ, P.camFollowHz); S.cy = c.x; S.cvy = c.v;
     }
     // The tube camera's place eases between a tube's axis and a flat's overlook as the ground changes.
-    var tY = flat ? -P.apothem + P.flatCamUp : 0, tB = flat ? P.flatCamBack : P.tubeCamBack, tL = flat ? -P.apothem : 0;
+    var tY = flat ? -P.apothem + P.flatCamUp : 0, tB = (flat ? P.flatCamBack : P.tubeCamBack) * dist, tL = flat ? -P.apothem : 0;
     if(snap){ S.tcY = tY; S.tcB = tB; S.tcL = tL; S.tcYV = S.tcBV = S.tcLV = 0; }
     else {
       var e1 = cd(S.tcY, S.tcYV, tY, 1.6); S.tcY = e1.x; S.tcYV = e1.v;
@@ -93889,8 +93938,9 @@ var RUNNER = (function(){
     var ang = S.cam + wrapPi(R.roll - S.cam) * e, cux = -Math.sin(S.cam), cuy = Math.cos(S.cam);
     // chase pose
     // (pulling the slingshot back brings the ship a quarter of the way toward the lens)
-    var px = S.cx + cux * P.camUp, py = S.cy + cuy * P.camUp, pz = z + P.camBack - (S.sl && S.sl.phase === 'aim' ? S.sl.pull * P.slingPull * 0.25 : 0);
-    var lx = S.cx + cux * 0.02, ly = S.cy + cuy * 0.02, lz = z - P.camLook;
+    var lookLift = Math.tan(P.cameraPitch * Math.PI / 180) * (P.camBack + P.camLook) * dist;
+    var px = S.cx + cux * P.camUp, py = S.cy + cuy * P.camUp, pz = z + P.camBack * dist - (S.sl && S.sl.phase === 'aim' ? S.sl.pull * P.slingPull * 0.25 : 0);
+    var lx = S.cx + cux * (0.02 + lookLift), ly = S.cy + cuy * (0.02 + lookLift), lz = z - P.camLook * dist;
     // ON AN ISLAND the chase camera rides higher and further back, its height on a slow spring of its own (S.iy):
     // it glides over the hills instead of bobbing with each one — the ship rises and falls in the frame and the hills
     // pass under it. It never drops under the ground behind it, and looks at that same smoothed line, so the view
@@ -93898,18 +93948,18 @@ var RUNNER = (function(){
     var icT = flat && !S.fell ? 1 : 0, ick = cd(S.icK || 0, S.icV || 0, icT, 1.2);
     S.icK = snap ? icT : clamp(ick.x, 0, 1); S.icV = snap ? 0 : ick.v;
     if(S.icK > 1e-3){
-      var ik = S.icK * S.icK * (3 - 2 * S.icK), back = P.camBack + (P.islCamBack - P.camBack) * ik;
+      var ik = S.icK * S.icK * (3 - 2 * S.icK), back = (P.camBack + (P.islCamBack - P.camBack) * ik) * dist;
       var gB = groundAt(S.cx, S.z - back), hT = Math.max(S.y + P.islCamUp, gB + P.islCamClear);
       if(S.iy == null || snap){ S.iy = hT; S.iyV = 0; }
       else if(!S.fell){ var ih = cd(S.iy, S.iyV, hT, P.islCamHz); S.iy = ih.x; S.iyV = ih.v; }
       var iy = Math.max(S.iy, gB + 0.05);
-      py += (iy - py) * ik; pz += (back - P.camBack) * ik;
-      ly += (S.iy - P.islCamUp - 0.02 - ly) * ik; lz -= (P.islCamLook - P.camLook) * ik;
+      py += (iy - py) * ik; pz += (back - P.camBack * dist) * ik;
+      ly += (S.cy + cuy * (0.02 + lookLift) - ly) * ik; lz -= (P.islCamLook - P.camLook) * dist * ik;   // keep the view aimed at the ship when terrain clearance lifts the camera
     } else S.iy = null;
     if(S.fell){ lx += (S.x - lx) * 0.5; ly += (S.y - ly) * 0.5; lz = z; }   // and watch it go
     // tube pose
     var il = flat ? (S.iy != null ? S.iy - P.islCamUp : S.cy) + lim : 0;   // (over an island: its smoothed line)
-    var qx = 0, qy = S.tcY + il, qz = z + S.tcB, mx = 0, my = S.tcL + il, mz = z - 2.2;
+    var qx = 0, qy = S.tcY + il, qz = z + S.tcB * dist, mx = cux * lookLift, my = S.tcL + il + cuy * lookLift, mz = z - 2.2 * dist;
     R.cam.up.set(-Math.sin(ang), Math.cos(ang), 0);
     R.cam.position.set(px + (qx - px) * e + (Math.random() - 0.5) * sk, py + (qy - py) * e + (Math.random() - 0.5) * sk, pz + (qz - pz) * e);
     R.cam.lookAt(lx + (mx - lx) * e, ly + (my - ly) * e, lz + (mz - lz) * e);
@@ -94160,7 +94210,15 @@ var RUNNER = (function(){
     if(a === 'gun') return gunRowHTML(bank, h);   // (THE ENEMIES)
     if(a === 'shop') return 'SHOP';
     if(a === 'store') return 'BACK TO STORE';
-    if(a === 'shopback') return 'BACK';
+    if(a === 'shopback' || a === 'settings-back') return 'BACK';
+    if(a === 'cam-closer') return 'DISTANCE  −  ' + P.cameraDistance.toFixed(1);
+    if(a === 'cam-farther') return 'DISTANCE  +  ' + P.cameraDistance.toFixed(1);
+    if(a === 'cam-zoom-in') return 'ZOOM  +  ' + P.cameraZoom.toFixed(2);
+    if(a === 'cam-zoom-out') return 'ZOOM  −  ' + P.cameraZoom.toFixed(2);
+    if(a === 'cam-height-down') return 'HEIGHT  −  ' + P.camUp.toFixed(2);
+    if(a === 'cam-height-up') return 'HEIGHT  +  ' + P.camUp.toFixed(2);
+    if(a === 'cam-angle-down') return 'PITCH  ↓  ' + P.cameraPitch.toFixed(0) + '°';
+    if(a === 'cam-angle-up') return 'PITCH  ↑  ' + P.cameraPitch.toFixed(0) + '°';
     var k = +a.slice(3), price = P.slingPrice[k - 1], T = slingTier(k), state, sc;
     if(k === own){ state = 'EQUIPPED'; sc = 'rgb(6,116,106)'; }
     else if(k < own){ state = 'OWNED'; sc = 'rgba(27,32,41,0.5)'; }
@@ -94214,11 +94272,13 @@ var RUNNER = (function(){
       if(!p || !p.act){ if(e._on){ e._on = false; e.style.opacity = 0; } continue; }
       e._on = true;
       var r = p.r, bk = p.act.indexOf('buy') === 0 ? +p.act.slice(3) : 0, row = bk || p.act === 'life' || p.act === 'gun';
-      var price = bk ? P.slingPrice[bk - 1] : (p.act === 'life' ? lifePrice(lifeOwned()) : (p.act === 'gun' ? P.gunPrice : 0));
-      var key = p.act + ':' + own + ':' + lifeOwned() + ':' + gunState() + ':' + (bank >= price ? 1 : 0) + ':' + r.h;
-      if(e._key !== key){ e._key = key; var kf = row && r.w < 340 ? r.w / 340 : 1;   // (narrow phone: the row laid out at 340 px, scaled to fit — the type collided)
-        e.innerHTML = kf < 1 ? '<div style="position:absolute;left:0;top:0;width:340px;height:' + (r.h / kf) + 'px;transform:scale(' + kf + ');transform-origin:0 0;">' +
-          plateHTML(p.act, own, bank, r.h / kf) + '</div>' : plateHTML(p.act, own, bank, r.h); e.style.lineHeight = row ? 'normal' : r.h + 'px'; }
+      var kf = row && r.w < 340 ? r.w / 340 : 1;   // (narrow phone: the row laid out at 340 px, scaled to fit — the type collided)
+      var label = plateHTML(p.act, own, bank, kf < 1 ? r.h / kf : r.h);
+      var html = kf < 1 ? '<div style="position:absolute;left:0;top:0;width:340px;height:' + (r.h / kf) + 'px;transform:scale(' + kf + ');transform-origin:0 0;">' + label + '</div>' : label;
+      // These plates are recycled as menus change. Compare the actual label output each frame so
+      // every value shown stays in sync with its action, even when a state change wasn't in the old cache key.
+      if(e._html !== html){ e._html = html; e.innerHTML = html; }
+      e.style.lineHeight = row ? 'normal' : r.h + 'px';
       var sh = R.rowShake[p.act] || 0;
       e.style.left = Math.round(r.x + Math.sin(sh * 26) * 7 * sh) + 'px'; e.style.top = r.y + 'px';
       e.style.width = r.w + 'px'; e.style.height = r.h + 'px';
@@ -95180,8 +95240,9 @@ var RUNNER = (function(){
   function pistonH(o, t){
     var M = o.mov;
     if(M.kind === 'rise') return M.H * smooth(M.zA, M.zB, S.z);
-    var c = ((t == null ? S.hazT : t) - M.t0) / M.T + M.ph; c -= Math.round(c);   // −½ … ½: 0 = the middle of the open phase
-    return M.H * (c >= 0 ? smooth(0.18, 0.26, c) : smooth(0.18, 0.34, -c));
+    var q = (((t == null ? S.hazT : t) - M.t0) / M.T + M.ph) % 1; if(q < 0) q += 1;
+    var d = Math.abs(q - 0.5);   // keep each raised window shorter than half a cycle so alternating walls cannot both block
+    return M.H * (1 - smooth(0.14, 0.21, d));
   }
   function pistonSet(o){
     var h = pistonH(o);
@@ -100415,15 +100476,20 @@ var RUNNER = (function(){
 
   // ════════════════════════════════════════ THE BOOST ════════════════════════════════════════
   // (═ THE BOOST ═ — patch: C:\Users\zacha\.runner-boost\apply.js)
-  // DOUBLE-TAP AND HOLD: tap once, then put the finger straight back down and keep it there — for as long as it stays
-  // down the run speed is boostMul× (over the cores), the plume swells wider and longer and the lens opens. The held
-  // finger still steers, jumps and clings as any other. Let go and the speed comes back down with the boost (it does
-  // not coast on drag, as a slingshot's excess does). Nothing protects you: what you hit still kills you — and a
-  // QUARRY you blow past (it can't hold you off while you boost) is LEFT BEHIND: that chase is over, no coins.
-  // Desktop: hold Shift.
+  // DOUBLE-TAP: tap once, then tap again nearby within the tap window to start a 2-second boost burst.
+  // The second touch still steers, jumps and clings. The boost then recharges for 4 seconds. Its existing speed,
+  // plume and lens effects remain, and it does not protect you: what you hit still kills you. A quarry you blow past
+  // while boosting is LEFT BEHIND: that chase is over, no coins.
+  // Desktop: press Shift to trigger the same timed burst.
   function boosting(){ return (S.boostK || 0) > 0.35; }
+  function boostStart(t){
+    if(t < (G.boostReadyAt || 0) || S.dead || S.won || (S.sl && S.sl.phase === 'aim')) return false;
+    G.boostUntil = t + P.boostDurationSec * 1000;
+    G.boostReadyAt = G.boostUntil + P.boostCooldownSec * 1000;
+    return true;
+  }
   function boostTick(){
-    var on = (G.boost || R.keyBoost) && !S.dead && !S.won && !(S.sl && S.sl.phase === 'aim');
+    var on = performance.now() < (G.boostUntil || 0) && !S.dead && !S.won && !(S.sl && S.sl.phase === 'aim');
     if(on && !S.boostOn && R.plume) R.plume.boosting = false;   // the beam re-ignites: fat at the nozzle, then held
     S.boostOn = on;
     var r = cd(S.boostK || 0, S.boostKV || 0, on ? 1 : 0, P.boostHz);
@@ -100450,7 +100516,7 @@ var RUNNER = (function(){
     R.shopAmt += ((R.shop ? 1 : 0) - R.shopAmt) * ez; if(!R.shop && R.shopAmt < 0.003) R.shopAmt = 0;
     R.aimAmt += ((S.sl && S.sl.phase === 'aim' ? 1 : 0) - R.aimAmt) * ez; if(R.aimAmt < 0.003) R.aimAmt = 0;
     // The lens opens with a slingshot's flight speed (and draws in a touch under the pull's tension).
-    var fk = (S.chargeT > 0 && !S.dead ? 5 : 0) + (S.boostK || 0) * P.boostFov + (R.draftK || 0) * P.chaseDraftFov + (!S.sl ? 0 : S.sl.phase === 'fly' ? P.slingFov * clamp((S.v / runSpeed() - 1) / 6, 0, 1) : (S.sl.phase === 'aim' ? -3 * S.sl.pull : 0));
+    var fk = (S.chargeT > 0 && !S.dead ? 5 : 0) + (S.boostK || 0) * P.boostFov + (R.draftK || 0) * P.chaseDraftFov + (!S.sl ? 0 : S.sl.phase === 'fly' ? P.slingFov * clamp((S.v / runSpeed() - 1) / 6, 0, 1) : (S.sl.phase === 'aim' ? P.slingFov * clamp(S.sl.pull, 0, 1) : 0));
     R.fovKick += (fk - R.fovKick) * Math.min(1, dt * 5);
     R.tierToast = Math.max(0, R.tierToast - dt);
     for(var rk in R.rowShake) R.rowShake[rk] = Math.max(0, R.rowShake[rk] - dt * 2.2);
@@ -100490,11 +100556,14 @@ var RUNNER = (function(){
     var e = R.zoom * R.zoom * (3 - 2 * R.zoom), hf = P.camHFov + (P.tubeCamHFov - P.camHFov) * e;
     var vf = 2 * Math.atan(Math.tan(hf * Math.PI / 360) / asp) * 180 / Math.PI;
     vf = clamp(vf, P.camVFovMin, P.camVFovMax + (P.tubeCamVFovMax - P.camVFovMax) * e) + R.fovKick;
+    // Apply zoom as optical magnification. This has no configured zoom limit and
+    // keeps the projection valid as the FOV approaches its natural 180° boundary.
+    vf = 2 * Math.atan(Math.tan(clamp(vf, 1, 179) * Math.PI / 360) * P.cameraZoom) * 180 / Math.PI;
     if(R.cam.aspect !== asp || R.cam.fov !== vf){ R.cam.aspect = asp; R.cam.fov = vf; R.cam.updateProjectionMatrix(); }
     R.stars.position.copy(R.cam.position);
     R.tubeMat.uniforms.uFloor.value = S.up;
     R.tubeMat.uniforms.uFlrCos.value = Math.cos(0.6 * (S.mode === 'flat' ? TAU / 8 : shapeAt(S.z).span));
-    feedOpen(); feedHoles(); feedPits(); feedWalls(); feedBars(); feedLasers(); drawPanels(); feedChoice(); feedUpg2(); feedDistrict();
+    feedOpen(); feedCurves(); feedHoles(); feedPits(); feedWalls(); feedBars(); feedLasers(); drawPanels(); feedChoice(); feedUpg2(); feedDistrict();
     R.cap.position.set(0, 0, -(S.z + maxAhead() + 10 - S.zBase));
     // The fog thins as the run speeds up, so what you can see ahead stays the same TIME away (the view
     // distance is ∝ 1/density). Every hand-written material and the scene's own fog share the one value.
@@ -100516,6 +100585,7 @@ var RUNNER = (function(){
     feedFoes(sh);   // (THE ENEMIES)
     var card = cardAmt(), vig = 0.55, dim = card * 0.45 * (1 - R.shopAmt) + R.shopAmt * 0.62;
     var prevAC = renderer.autoClear, prevRT = renderer.getRenderTarget();
+    bendScene();
     renderer.autoClear = true;
     layout(W, H);
     if(R.plates.length){
@@ -100538,6 +100608,7 @@ var RUNNER = (function(){
       fu.uFlash.value = R.flash; fu.uVig.value = vig; fu.uDim.value = 0; fu.uRes.value.set(W, H);
       renderer.render(R.fxScene, R.ortho);
     }
+    unbendScene();
     renderer.autoClear = prevAC; renderer.setRenderTarget(prevRT);
   }
   // The chrome that is up, in CSS px — chrome is sized from the frame, never from world units. Every plate:
@@ -100546,9 +100617,21 @@ var RUNNER = (function(){
   function layout(W, H){
     var L = [], card = cardAmt() * (1 - R.shopAmt), shop = R.shopAmt, aim = R.aimAmt * (1 - R.shopAmt), k;
     if(card > 0.001){
-      var bw = Math.round(Math.min(W * 0.66, 300)), bh = 56, gap = 14, y0 = Math.round(H * 0.55);
-      ['restart', 'shop', 'store'].forEach(function(a, j){ L.push({ r: { x: Math.round((W - bw) / 2), y: y0 + j * (bh + gap), w: bw, h: bh }, act: a, amt: card }); });
-      lvFreshPlate(L, W, H, y0 + 3 * (bh + gap), card);   // (THE LEVEL: the FRESH START test toggle)
+      var bw = Math.round(Math.min(W * 0.72, 300)), bh, gap, y0;
+      if(R.settingsOpen){
+        var gw = Math.round(Math.min(W * 0.92, 360)), cg = 8, cw = Math.floor((gw - cg) / 2), ch = 46, rg = 8;
+        var gx = Math.round((W - gw) / 2), gy = Math.round((H - (5 * ch + 4 * rg)) / 2);
+        var controls = [['cam-closer', 'cam-farther'], ['cam-zoom-out', 'cam-zoom-in'],
+                        ['cam-height-down', 'cam-height-up'], ['cam-angle-down', 'cam-angle-up']];
+        controls.forEach(function(row, ri){
+          row.forEach(function(a, ci){ L.push({ r: { x: gx + ci * (cw + cg), y: gy + ri * (ch + rg), w: cw, h: ch }, act: a, amt: card }); });
+        });
+        L.push({ r: { x: gx, y: gy + 4 * (ch + rg), w: gw, h: ch }, act: 'settings-back', amt: card });
+      } else {
+        bh = 50; gap = 10; y0 = Math.round(H * 0.47);
+        ['restart', 'shop', 'settings', 'store'].forEach(function(a, j){ L.push({ r: { x: Math.round((W - bw) / 2), y: y0 + j * (bh + gap), w: bw, h: bh }, act: a, amt: card }); });
+        lvFreshPlate(L, W, H, y0 + 4 * (bh + gap), card);   // (THE LEVEL: the FRESH START test toggle)
+      }
     }
     if(shop > 0.001){
       // The slingshots, then (a little apart) EXTRA LIFE, then BACK — rows as tall as the screen has room for.
@@ -100597,6 +100680,17 @@ var RUNNER = (function(){
     if(m !== R.lastM && !S.dead){ R.lastM = m; R.elDist.textContent = m.toLocaleString('en-US') + ' M'; }
     if(S.coinN !== R.lastC){ R.lastC = S.coinN; R.elCoinN.textContent = S.coinN.toLocaleString('en-US'); }
     R.elCoins.style.transform = R.coinPulse > 0 ? 'scale(' + (1 + 0.28 * R.coinPulse).toFixed(3) + ')' : '';
+    var boostLeft = Math.max(0, (G.boostUntil - performance.now()) / 1000);
+    if(boostLeft > 0 && !S.dead && !S.won && !R.shop){
+      R.boostPos.set(S.x, S.y, -(S.z - S.zBase)).project(R.cam);
+      var bw = window.innerWidth, bh = window.innerHeight;
+      if(R.boostPos.z > -1 && R.boostPos.z < 1 && Math.abs(R.boostPos.x) < 1 && Math.abs(R.boostPos.y) < 1){
+        R.elBoost.textContent = 'BOOST  ' + boostLeft.toFixed(1) + 's';
+        R.elBoost.style.left = ((R.boostPos.x + 1) * bw / 2) + 'px';
+        R.elBoost.style.top = Math.max(8, Math.min(bh - 34, (1 - R.boostPos.y) * bh / 2 + 28)) + 'px';
+        R.elBoost.style.opacity = '1';
+      } else R.elBoost.style.opacity = '0';
+    } else R.elBoost.style.opacity = '0';
     var card = cardAmt();
     if(S.dead && !R.cardShown && card > 0){
       R.cardShown = true;
@@ -100619,8 +100713,8 @@ var RUNNER = (function(){
   // jump followed by a cling.
   var G = { id: null, on: false, lx: 0, ly: 0, hist: [], muteT: 0, t0: 0, lArm: 0 };
   function gStart(x, y){ var t = performance.now(); G.on = true; G.lx = x; G.ly = y; G.hist = [{ x: x, y: y, t: t }]; G.t0 = t; G.lArm = 0; G.mvT = t;
-    // (THE BOOST: a press straight after a TAP, near it, is the boost — held as long as this finger is)
-    G.x0 = x; G.y0 = y; G.far = 0; G.boost = t - (G.tapT || -1e9) < P.dblTapMs && Math.hypot(x - G.tapX, y - G.tapY) < P.dblTapPx; if(G.boost) G.tapT = -1e9; }
+    // (THE BOOST: a quick second tap starts the timed burst.)
+    G.x0 = x; G.y0 = y; G.far = 0; var dbl = t - (G.tapT || -1e9) < P.dblTapMs && Math.hypot(x - G.tapX, y - G.tapY) < P.dblTapPx; G.boost = dbl && boostStart(t); if(dbl) G.tapT = -1e9; }
   function gMove(x, y){
     if(!G.on) return;
     G.far = Math.max(G.far || 0, Math.hypot(x - G.x0, y - G.y0));
@@ -100656,6 +100750,33 @@ var RUNNER = (function(){
     for(var i = 0; i < L.length; i++){ var p = L[i], r = p.r; if(p.act && p.amt > 0.6 && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i; }
     return -1;
   }
+  // Tap a visible upgrade card to choose it immediately; otherwise the touch remains normal steering/game input.
+  function choiceTap(x, y){
+    var C = S && S.choice;
+    if(!C || S.dead || R.shop || C.pick >= 0 || !C.cards || S.z < C.zFold || R.hudA < 0.12) return false;
+    var W = window.innerWidth, H = window.innerHeight, cx = W / 2;
+    var cy = (R.elSafe.offsetTop || 0) + 46, rr = 24;
+    var gap = 8, smW = Math.min(122, Math.floor((W - 28 - 2 * gap) / 3)), smH = 82;
+    var yS = Math.round(cy + rr + 36), bigW = Math.min(W - 36, 340), yB = yS + smH + 14;
+    var bigH = Math.round(clamp(H * LP.cardBottom - yB, 116, 300));
+    var GL = { cx: cx, gap: gap, smW: smW, smH: smH, yS: yS, bigW: bigW, yB: yB, bigH: bigH };
+    var selNow = C.pick >= 0 ? C.pick : (C.sel >= 0 ? C.sel : wallIdx(S.th, 3));
+    if(C.rho == null) C.rho = selNow;
+    var offs = [0, 0, 0], order = [0, 1, 2], rects = [{}, {}, {}];
+    for(var i = 0; i < 3; i++){ var o = i - C.rho; offs[i] = o - 3 * Math.round(o / 3); carouselRect(offs[i], GL, rects[i]); }
+    order.sort(function(a, b){ return Math.abs(offs[b]) - Math.abs(offs[a]); });
+    // Reverse draw order so an overlapping front card wins the hit.
+    for(var oi = order.length - 1; oi >= 0; oi--){
+      var k = order[oi], r = rects[k];
+      if(x < r.x || x > r.x + r.w || y < r.y || y > r.y + r.h) continue;
+      C.pick = C.sel = k; C.tTake = 0;
+      for(var j = 0; j < 3; j++) if(j !== k && C.tok[j] && C.tok[j].x != null){
+        _p.set(C.tok[j].x, C.tok[j].y, C.tok[j].z); burst(_p, 16, true, R.upgCol[C.opts[j]]);
+      }
+      return true;
+    }
+    return false;
+  }
   // A press on a plate is a button (it acts on release, if still on it). Anywhere else, while running, it is
   // the thumb — and sitting in the slingshot, the pull.
   function press(x, y){
@@ -100671,6 +100792,16 @@ var RUNNER = (function(){
   }
   function act(a){
     if(a === 'restart') restart();
+    else if(a === 'settings') R.settingsOpen = true;
+    else if(a === 'settings-back') R.settingsOpen = false;
+    else if(a === 'cam-farther') P.cameraDistance = clamp(P.cameraDistance + 0.1, 0.7, 2.5);
+    else if(a === 'cam-closer') P.cameraDistance = clamp(P.cameraDistance - 0.1, 0.7, 2.5);
+    else if(a === 'cam-zoom-in') P.cameraZoom = clamp(P.cameraZoom * 0.9, 0.55, 1.5);
+    else if(a === 'cam-zoom-out') P.cameraZoom = clamp(P.cameraZoom / 0.9, 0.55, 1.5);
+    else if(a === 'cam-height-up') P.camUp = clamp(P.camUp + 0.01, 0.02, 0.25);
+    else if(a === 'cam-height-down') P.camUp = clamp(P.camUp - 0.01, 0.02, 0.25);
+    else if(a === 'cam-angle-up') P.cameraPitch = clamp(P.cameraPitch + 1, -12, 12);
+    else if(a === 'cam-angle-down') P.cameraPitch = clamp(P.cameraPitch - 1, -12, 12);
     else if(a === 'fresh') freshToggle();   // (THE LEVEL: the FRESH START test toggle)
     else if(a === 'store') exit();
     else if(a === 'shop') openShop();
@@ -100701,7 +100832,9 @@ var RUNNER = (function(){
       return;
     }
     if(R.pinch || (G.id !== null && !S.dead)) return;
-    var t = e.changedTouches[0]; G.id = t.identifier; press(t.clientX, t.clientY);
+    var t = e.changedTouches[0];
+    if(choiceTap(t.clientX, t.clientY)){ G.id = null; return; }  // cards are direct controls; a tap need not wait for the wall timer
+    G.id = t.identifier; press(t.clientX, t.clientY);
   }
   function findT(e){ for(var i = 0; i < e.changedTouches.length; i++) if(e.changedTouches[i].identifier === G.id) return e.changedTouches[i]; return null; }
   function tMove(e){
@@ -100725,7 +100858,7 @@ var RUNNER = (function(){
     var t = findT(e); if(!t) return; G.id = null; release(t.clientX, t.clientY);
   }
   var mouseDown = false;
-  function mDown(e){ e.preventDefault(); mouseDown = true; press(e.clientX, e.clientY); }
+  function mDown(e){ e.preventDefault(); if(choiceTap(e.clientX, e.clientY)){ mouseDown = false; return; } mouseDown = true; press(e.clientX, e.clientY); }
   function mMove(e){ if(mouseDown && !S.dead) gMove(e.clientX, e.clientY); }
   function mUp(e){ if(!mouseDown) return; mouseDown = false; release(e.clientX, e.clientY); }
   // Keyboard (a desktop testing a portrait window): ←/→ steer (a fresh press in the air clings),
@@ -100744,7 +100877,7 @@ var RUNNER = (function(){
     else if(k === 'arrowdown' || k === 's'){ if(!e.repeat) slam(); }
     else if((k === 'enter' || k === 'r') && S.dead && cardAmt() > 0.6) restart();
     else if(k === 'escape'){ if(R.shop) R.shop = null; else exit(); }
-    else if(k === 'shift'){ R.keyBoost = true; }   // Shift held: THE BOOST
+    else if(k === 'shift'){ if(!e.repeat) boostStart(performance.now()); }   // Shift: THE BOOST
     else if(k === 'z'){ if(!e.repeat) R.zoomTgt = R.zoomTgt > 0.5 ? 0 : 1; }      // Z: the tube camera
     else if(k === 'q' || k === 'e'){ R.roll += (k === 'e' ? 1 : -1) * 0.12; }     // Q/E: turn it
     else return;
@@ -100772,7 +100905,8 @@ var RUNNER = (function(){
     if(R.compiled) return;
     var g = gameMode.group, par = g.parent, vis = g.visible;
     R.scene.add(g); g.visible = true;
-    var tmp = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), R.tubeMat); R.scene.add(tmp);
+    var tg = new THREE.PlaneGeometry(1, 1); tg.setAttribute('aXY', new THREE.Float32BufferAttribute([-0.5, -0.5, 0.5, -0.5, 0.5, 0.5, -0.5, 0.5], 2));
+    var tmp = new THREE.Mesh(tg, R.tubeMat); R.scene.add(tmp);
     var tmpI = new THREE.Mesh(tmp.geometry, R.islMat), tmpN = new THREE.Mesh(tmp.geometry, R.natMat), tmpB = new THREE.Mesh(tmp.geometry, R.bgMat); R.scene.add(tmpI); R.scene.add(tmpN); R.scene.add(tmpB);   // (THE ISLANDS)
     R.coinMesh.count = 1;
     R.sling.forEach(function(q){ q.mesh.visible = true; }); R.shield.visible = true; coresShow(true); plumeShow(true); foesShow(true);
@@ -100780,7 +100914,7 @@ var RUNNER = (function(){
       renderer.compile(R.scene, R.cam);
       renderer.compile(R.fxScene, R.ortho); renderer.compile(R.blitScene, R.ortho); renderer.compile(R.ui, R.uiCam);
       R.compiled = true;
-    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); R.scene.remove(tmpI); R.scene.remove(tmpN); R.scene.remove(tmpB); tmp.geometry.dispose(); R.coinMesh.count = 0; R.sling.forEach(function(q){ q.mesh.visible = false; }); R.shield.visible = false; coresShow(false); plumeShow(false); foesShow(false); }
+    } finally { if(par) par.add(g); g.visible = vis; R.scene.remove(tmp); R.scene.remove(tmpI); R.scene.remove(tmpN); R.scene.remove(tmpB); tg.dispose(); R.coinMesh.count = 0; R.sling.forEach(function(q){ q.mesh.visible = false; }); R.shield.visible = false; coresShow(false); plumeShow(false); foesShow(false); }
   }
   // Called from gamePreloadStep while the wheel spins — the same cadence as the planet preload.
   function preloadStep(){
@@ -100817,7 +100951,7 @@ var RUNNER = (function(){
     R.scene.add(gameMode.group); gameMode.group.visible = true;
     resetRig(); if(gameMode.wingPivots) setWingSweep(gameMode.wingPivots, 0);   // measure the hull at rest
     measureShip();
-    R.keyL = R.keyR = false; G.id = null; G.on = false; mouseDown = false; R.pinch = null;
+    R.keyL = R.keyR = false; R.keyBoost = false; G.id = null; G.on = false; G.boost = false; G.boostUntil = G.boostReadyAt = 0; G.tapT = -1e9; mouseDown = false; R.pinch = null;
     resetRun();
     R.layer.style.display = 'block';
     R.acc = 0; R.flash = 1;   // in out of the same white the spin ended in
