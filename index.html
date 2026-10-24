@@ -92061,8 +92061,8 @@ var RUNNER = (function(){
     camPolarMix: 0.5,     // camera roll: 0 = the ship's up (level on every wall, turning only at corners), 1 = the
                           // ship's angle round the tube (one even turn rate — but on a square that tilts the floor
                           // 45° on screen at a wall's edge). Half and half: continuous, never more than ~22° off.
-    camBack: 0.30, camUp: 0.085, camLook: 0.9,
-    cameraDistance: 1.20, cameraZoom: 0.88, cameraPitch: 0, // adjustable on the crash-card settings screen
+    camBack: 0.30, camUp: 0.06, camLook: 0.9,
+    cameraDistance: 0.70, cameraZoom: 0.84, cameraPitch: 2, // base camera values; adjustable on the crash-card settings screen
     camHFov: 50, camVFovMin: 58, camVFovMax: 90,
     camJumpFollow: 0.45,  // share of a hop's height the camera rides up with
     bankK: 16,            // shipVisual roll per unit/frame of sideways speed (lean into the dodge)
@@ -92957,6 +92957,12 @@ var RUNNER = (function(){
     }
     return out;
   }
+  function curveDeltaAt(z, out){
+    curveOffsetAt(z, out);
+    var origin = R.tubeMat.uniforms.uCvOrigin.value;
+    out.x -= origin.x; out.y -= origin.y;
+    return out;
+  }
   var _curveA = new THREE.Vector2(), _curveB = new THREE.Vector2();
   function feedCurves(){
     var u = R.tubeMat.uniforms;
@@ -92978,8 +92984,9 @@ var RUNNER = (function(){
       var o = ch[i];
       if(!o || o === gameMode.group || o === R.stars || (R.plume && o === R.plume.mesh) || o === R.cam || o === R.key || o === R.key.target || o === R.glow || !o.position || (o.material === R.tubeMat)) continue;
       var z = S.zBase - o.position.z;
-      curveOffsetAt(z, _curveA);
-      var dx = _curveA.x - R.tubeMat.uniforms.uCvOrigin.value.x, dy = _curveA.y - R.tubeMat.uniforms.uCvOrigin.value.y;
+      if(o.userData && o.userData.runnerCurveLocal) continue;
+      curveDeltaAt(z, _curveA);
+      var dx = _curveA.x, dy = _curveA.y;
       if(Math.abs(dx) + Math.abs(dy) < 1e-6) continue;
       o.userData = o.userData || {}; o.userData._curveBend = { x: dx, y: dy };
       o.position.x += dx; o.position.y += dy;
@@ -92987,7 +92994,8 @@ var RUNNER = (function(){
     var camZ = S.zBase - R.cam.position.z;
     curveOffsetAt(camZ, _curveA);
     var c0 = R.tubeMat.uniforms.uCvOrigin.value;
-    R._curveCam = { x: _curveA.x - c0.x, y: _curveA.y - c0.y };
+    // Keep the camera in the ship's local frame; let only a small share of the bend move it.
+    R._curveCam = { x: (_curveA.x - c0.x) * 0.2, y: (_curveA.y - c0.y) * 0.2 };
     R.cam.position.x += R._curveCam.x; R.cam.position.y += R._curveCam.y;
     R.cam.updateMatrixWorld(true);
   }
@@ -93387,6 +93395,7 @@ var RUNNER = (function(){
         .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n  totalEmissiveRadiance *= vTEm;');
     };
     R.coinMesh = new THREE.InstancedMesh(g, m, COIN_MAX);
+    R.coinMesh.userData.runnerCurveLocal = true;
     R.coinMesh.count = 0; R.coinMesh.frustumCulled = false;
     R.scene.add(R.coinMesh);
   }
@@ -94550,7 +94559,7 @@ var RUNNER = (function(){
     var g = new THREE.Group(), so = R.coreSolid[kind];
     var solid = new THREE.Mesh(so.geo, so.mat), bb = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), R.coreMat[kind]);
     solid.frustumCulled = bb.frustumCulled = false; bb.renderOrder = 5;
-    g.add(solid); g.add(bb); g.visible = false; g.userData.solid = solid;
+    g.add(solid); g.add(bb); g.visible = false; g.userData.solid = solid; g.userData.runnerCurveLocal = true;
     R.scene.add(g);
     return g;
   }
@@ -94686,7 +94695,8 @@ var RUNNER = (function(){
     R.coreSolid.speed.mat.uniforms.uFogCol.value.copy(R.scene.fog.color); R.coreSolid.charge.mat.uniforms.uFogCol.value.copy(R.scene.fog.color);
     for(i = 0; i < R.items.length; i++){
       var it = R.items[i], b = Math.sin(it.bob) * 0.004, g = it.mesh;
-      g.position.set(it.x - Math.sin(it.up) * b, it.y + Math.cos(it.up) * b, -(it.z - S.zBase));
+      curveDeltaAt(it.z, _curveA);
+      g.position.set(it.x - Math.sin(it.up) * b + _curveA.x, it.y + Math.cos(it.up) * b + _curveA.y, -(it.z - S.zBase));
       g.rotation.set(0, 0, it.up);
       g.userData.solid.rotation.set(0.3, it.spin, 0);
     }
@@ -97075,7 +97085,8 @@ var RUNNER = (function(){
     for(var i = 0; i < n; i++){
       var c = list[i];
       _q.setFromAxisAngle(_zAx, c.up); _q2.setFromAxisAngle(_yAx, c.spin); _q.multiply(_q2);
-      _p.set(c.x, c.y, -(c.z - S.zBase));
+      curveDeltaAt(c.z, _curveA);
+      _p.set(c.x + _curveA.x, c.y + _curveA.y, -(c.z - S.zBase));
       _m.compose(_p, _q, _sc);
       m.setMatrixAt(i, _m);
       if(c.tier == null){ c.tier = tierAt(c.z); c.ph = Math.random(); }   // its tier: where it was laid
@@ -97732,7 +97743,7 @@ var RUNNER = (function(){
     R.ebMark = new THREE.InstancedMesh(new THREE.PlaneGeometry(1, 1), eMarkMat(), EB_MAX);
     R.pbMesh = new THREE.InstancedMesh(oct, keep(boltMat(new THREE.Color(0.97, 0.92, 1.0), new THREE.Color(0.56, 0.24, 1.0), new THREE.Color(0.14, 0.03, 0.3))), PB_MAX);
     R.dartMesh = new THREE.InstancedMesh(oct, keep(boltMat(FP.hot, FP.eye, FP.ink)), 40);
-    [R.ebMesh, R.ebTrail, R.ebMark, R.pbMesh, R.dartMesh].forEach(function(m){ m.count = 0; m.frustumCulled = false; m.renderOrder = 4; R.scene.add(m); });
+    [R.ebMesh, R.ebTrail, R.ebMark, R.pbMesh, R.dartMesh].forEach(function(m){ m.userData.runnerCurveLocal = true; m.count = 0; m.frustumCulled = false; m.renderOrder = 4; R.scene.add(m); });
     R.ebMark.renderOrder = 2; R.ebTrail.renderOrder = 3; R.ebMesh.renderOrder = 5;
     R.eb = []; R.pb = []; R.hoops = [];
     R.hoopMat = keep(hoopMat());
@@ -99687,7 +99698,7 @@ var RUNNER = (function(){
     for(i = 0; i < R.eb.length && n < EB_MAX; i++){
       var b = R.eb[i], wz = -(b.z - S.zBase), cd2 = Math.hypot(b.x - R.cam.position.x, b.y - R.cam.position.y, wz - R.cam.position.z);
       var s = P.foeBoltSize * clamp(0.55 + 0.22 * cd2, 0.7, 1.15) * (1 + 0.08 * Math.sin(t * 24 + i * 1.7));
-      _bq.identity(); _bp.set(b.x, b.y, wz); _bs.set(s, s, s);
+      _bq.identity(); curveDeltaAt(b.z, _curveA); _bp.set(b.x + _curveA.x, b.y + _curveA.y, wz); _bs.set(s, s, s);
       _bm.compose(_bp, _bq, _bs); M.setMatrixAt(n, _bm); Tr.setMatrixAt(n, _bm);
       // its streak: back along its motion as you see it (it closes on you at S.v − vz: toward the lens, world +z)
       var rx = b.vx, ry = b.vy, rz = S.v - b.vz, rl = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1, L = clamp(rl * 60 * 0.07, 0.06, 0.4);
@@ -99700,7 +99711,7 @@ var RUNNER = (function(){
         for(var w = 0; w < sh.n; w++){ var e = sh.h[w] - (b.x * Math.sin(sh.phi[w]) - b.y * Math.cos(sh.phi[w])); if(e < best){ best = e; wi = w; } }
         if(best < 0.3){
           var ph = sh.phi[wi], dx = Math.sin(ph), dy = -Math.cos(ph), I = clamp(1 - (dzy - 0.4) / 2.9, 0, 1) * clamp(1.25 - best * 4, 0.2, 1);
-          _bp.set(b.x + dx * (best - 0.004), b.y + dy * (best - 0.004), wz);
+          curveDeltaAt(b.z, _curveA); _bp.set(b.x + dx * (best - 0.004) + _curveA.x, b.y + dy * (best - 0.004) + _curveA.y, wz);
           _bn.set(-dx, -dy, 0); _bq.setFromUnitVectors(_zAx, _bn);
           var ms = 0.055 + 0.05 * (1 - clamp(dzy / 3.3, 0, 1));
           _bs.set(ms, ms, Math.max(0.002, I));
@@ -99717,7 +99728,7 @@ var RUNNER = (function(){
       if(L < 1e-6){ ex = 0; ey = 0; ez = -1; L = 1; }
       _bd.set(ex / L, ey / L, ez / L); _bq.setFromUnitVectors(_zAx, _bd);
       var len = clamp(L * 0.5, 0.04, 0.32);   // its streak trails back over the step it took (a tracer)
-      _bp.set(p.x - _bd.x * len, p.y - _bd.y * len, -(p.z - S.zBase) - _bd.z * len); _bs.set(P.boltWidth, P.boltWidth, len);
+      curveDeltaAt(p.z, _curveA); _bp.set(p.x - _bd.x * len + _curveA.x, p.y - _bd.y * len + _curveA.y, -(p.z - S.zBase) - _bd.z * len); _bs.set(P.boltWidth, P.boltWidth, len);
       _bm.compose(_bp, _bq, _bs); M.setMatrixAt(n++, _bm);
     }
     M.count = n; if(n) M.instanceMatrix.needsUpdate = true;
@@ -99731,7 +99742,7 @@ var RUNNER = (function(){
       var o = R.obs[i];
       if(!o.foe || o.foe.kind !== 'dart' || o.foe.dead) continue;
       var a = P.apothem - 0.05;
-      _bp.set(Math.sin(o.phi) * a, -Math.cos(o.phi) * a, -(o.z - S.zBase));
+      curveDeltaAt(o.z, _curveA); _bp.set(Math.sin(o.phi) * a + _curveA.x, -Math.cos(o.phi) * a + _curveA.y, -(o.z - S.zBase));
       _bq.setFromAxisAngle(_zAx, o.phi); _bs.set(0.034, 0.02, 0.075);
       _bm.compose(_bp, _bq, _bs); M.setMatrixAt(n++, _bm);
     }
