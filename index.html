@@ -94429,7 +94429,7 @@ var RUNNER = (function(){
     cornerBand: 0.35,     // share of a wall's angle, centred on each corner, over which the ship rolls onto the next wall
     rollHz: 6.0,          // the ship's up following that (and righting onto a new floor after a cling)
     camRollHz: 5.0,       // the camera's roll with your angle round the tube
-    camFollowHz: 5.0,     // the camera's chase across the tube's cross-section
+    camFollowHz: 12.5,    // the camera's chase across the tube's cross-section (12.5: the user's number, 11-15)
     camPolarMix: 0.5,     // camera roll: 0 = the ship's up (level on every wall, turning only at corners), 1 = the
                           // ship's angle round the tube (one even turn rate — but on a square that tilts the floor
                           // 45° on screen at a wall's edge). Half and half: continuous, never more than ~22° off.
