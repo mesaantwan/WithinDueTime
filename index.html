@@ -110599,6 +110599,7 @@ var RUNNER = (function(){
                                                                  // dissolve, nozzle flare, the floor light, heat haze, embers (all ×)                    // THE MOTES: how many ×, motion-blur length ×, share outside the glass
     fxBlur: 1, fxCA: 1, fxFlash: 1, fxHurt: 1,                   // the frame's pass
     fxHaptic: 1,
+    fxPerf: 0, fxPerfAB: 0, fxPerfLast: 0,   // THE METER (pause → PERF TEST): the readout on; the two buttons (never kept)
     fxSfxVol: 1, fxMusicVol: 0.6, fxEngine: 1,                    // THE SOUND: effects, music (the planet game's own defaults), the engine's pitch swing
     fxJWind: 1,   // (THE JET: the start-up's length × — the wait between the tap and the beam; 0 = the beam at once)
     fxJShake: 1, fxJPull: 1,   // (THE JET: the boost's own camera shake × — the gather's tremble, the blast's kick, the burn's shudder — and its start-up's pull-back ×)
@@ -110663,6 +110664,10 @@ var RUNNER = (function(){
       ['fxMusicVol', 'MUSIC', 0, 1, 0.05, 'pct'],
       ['fxEngine', 'ENGINE PITCH', 0, 2, 0.05, 'x'],
       ['fxHaptic', 'HAPTICS', 0, 2, 0.05, 'x'] ] },
+    { name: 'PERF TEST', rows: [   // (THE METER)
+      ['fxPerf', 'FRAME METER', 0, 1, 1, 'onoff'],
+      ['fxPerfAB', 'RUN THE A/B TEST  ·  2 MIN OF PLAY', 0, 1, 1, 'go'],
+      ['fxPerfLast', 'SHOW THE LAST RESULT', 0, 1, 1, 'go'] ] },
     { name: 'FINE TUNING', rows: [
       ['fxDevSkips', 'SKIP BUTTONS IN PLAY', 0, 1, 1, 'onoff'],
       ['fxJet', 'PLASMA TRAIL', 0, 1, 1, 'onoff'],   // (THE JET; off: THE TRAIL of rev 3)
@@ -111498,7 +111503,7 @@ var RUNNER = (function(){
       fxSave();
     }
   }
-  function fxExit(){ JET.exit(); fxAudioOff(); R.fxPause = false; R.fxPauseAmt = 0; R.fxStopT = 0; R.fxDrag = null; try { if(navigator.vibrate) navigator.vibrate(0); } catch(e){} }
+  function fxExit(){ JET.exit(); fxAudioOff(); R.fxPause = false; R.fxPauseAmt = 0; R.fxStopT = 0; R.fxDrag = null; try { if(navigator.vibrate) navigator.vibrate(0); } catch(e){} fxPerfABDone(true, true); FXPF.last = 0; if(FXPF.elOn){ FXPF.elOn = false; FXPF.el.style.display = 'none'; } }   // (THE METER: a test under way is called off, what it changed put back)
 
   // ── THE SETTINGS PAGES (frost plates — the shared glass — in CSS px; the words and the slider's marks are the HUD) ──
   function fxSettingsOn(){ return (R.fxPause && !S.dead) || (S.dead && R.settingsOpen); }
@@ -111552,6 +111557,7 @@ var RUNNER = (function(){
     if(a === 'fx-resume') return 'RESUME';
     if(a.indexOf('fx:') !== 0) return null;
     var k = a.slice(3), r = FX_ROW[k]; if(!r) return null;
+    if(r[5] === 'go') return '<div style="position:absolute;left:0;right:0;top:50%;margin-top:-7px;text-align:center;font-size:11px;letter-spacing:0.2em;color:rgb(6,116,106);">' + r[1] + '</div>';   // (THE METER: a button, not a slider)
     var v = fxGet(k), hh = h || 46, f = clamp((v - r[2]) / (r[3] - r[2]), 0, 1), d0 = clamp((FX_BASE[k] - r[2]) / (r[3] - r[2]), 0, 1);
     var ty = Math.round(hh * 0.2), on = R.fxDrag && R.fxDrag.k === k, vc = v !== FX_BASE[k] ? 'rgb(6,116,106)' : 'rgba(27,32,41,0.62)';
     var head = '<div style="position:absolute;left:18px;top:' + ty + 'px;font-size:11px;letter-spacing:0.2em;color:#1b2029;">' + r[1] + '</div>' +
@@ -111576,6 +111582,7 @@ var RUNNER = (function(){
   function fxSliderPress(b, x){
     var p = R.plates[b]; if(!p || !p.act || p.act.indexOf('fx:') !== 0) return false;
     var k = p.act.slice(3), r = FX_ROW[k]; if(!r) return false;
+    if(r[5] === 'go'){ R.press = -1; fxPerfGo(k); return true; }   // (THE METER)
     if(r[5] === 'onoff'){ fxSet(k, fxGet(k) > 0.5 ? 0 : 1); fxSave(); R.press = -1; return true; }
     R.fxDrag = { k: k, r: p.r }; R.press = b;
     fxSliderMove(x);
@@ -111709,10 +111716,241 @@ var RUNNER = (function(){
     if(R.fxSfx0 != null){ sfx.sfxVol = R.fxSfx0; sfx.musicVol = R.fxMus0; R.fxSfx0 = R.fxMus0 = null; }
     if(typeof stopGameAudio === 'function') stopGameAudio();
   }
+  // ── THE METER (11-15, the phone pass's instrument — pause → PERF TEST). Desktop numbers did not show what a phone drops
+  // frames on, so the game measures itself where it runs:
+  //   • FRAME METER: a small readout over the last 3 s — the mean frame, the worst, the share of long frames (over 1.5 of
+  //     the display's own period), the CPU's part (steps + draw + HUD, timed inside frame()) and, where the browser has a
+  //     GPU timer (EXT_disjoint_timer_query_webgl2), the GPU's time for render().
+  //   • THE A/B TEST: while you play, each row of FX_PF_CFG is the game with ONE thing off (or cheaper) for a few seconds —
+  //     a second to settle, a boost (start-up and burn), then cruise — with BASE windows at the start, the middle and the
+  //     end (their spread is the noise). No deaths under it (a life is kept in hand, as TEST LAB's own switch does it); a
+  //     run that ends anyway starts again and that window is taken again. At the end: the game pauses and the table is
+  //     shown (COPY puts it on the clipboard; it is kept in localStorage chrysolin_runner_perf — SHOW THE LAST RESULT).
+  // Nothing here runs unless the meter or a test is on: fxPerfBegin leaves at its first line. ──
+  var FXPF = { last: 0, iv: 0, t0: 0, t1: 0, t2: 0, fr: [], gp: [], shown: 0, el: null, elOn: false, box: null, ab: null, gl: null, ext: undefined, q: [], qOn: null };
+  var FX_PF_KEY = 'chrysolin_runner_perf';
+  var FX_PF_OFF = { fxMotes: 0, fxRipple: 0, fxGlow: 0, fxReticle: 0, fxSparks: 0, fxBlur: 0, fxCA: 0, fxHaze: 0, fxTrail: 0 };
+  var FX_PF_CFG = [
+    ['BASE', null],
+    ['FRAME PASS: NO MSAA', { msaa: 0 }],
+    ['FRAME PASS: OFF', { noRT: 1 }],
+    ['HALF THE PIXELS', { px: 0.7071 }],
+    ['CLOUDS OFF', { sky: 0 }],
+    ['PARTICLES OFF', { P: { fxMotes: 0 } }],
+    ['RIPPLES + GLOW OFF', { P: { fxRipple: 0, fxGlow: 0, fxReticle: 0 } }],
+    ['BASE', null],
+    ['SPARKS OFF', { P: { fxSparks: 0 } }],
+    ['BLUR + SPLIT OFF', { P: { fxBlur: 0, fxCA: 0 } }],
+    ['HEAT RIPPLE OFF', { P: { fxHaze: 0 } }],
+    ['BOOST TRAIL OFF', { P: { fxTrail: 0 } }],
+    ['HUD WRITES OFF', { noDom: 1 }],
+    ['ALL NEW EFFECTS OFF', { P: FX_PF_OFF, noRT: 1 }],
+    ['BASE', null]
+  ];
+  function fxPerfCut(k){ var A = FXPF.ab; return !!(A && A.cut && A.cut[k]); }
+  function fxPerfBegin(){
+    var Q = FXPF;
+    if(!(P.fxPerf > 0.5 || Q.ab)){ Q.last = 0; return; }
+    var now = performance.now();
+    Q.iv = Q.last ? now - Q.last : 0; Q.last = now; Q.t0 = now; Q.t1 = Q.t2 = now;
+  }
+  function fxPerfMark(k){
+    var Q = FXPF; if(!Q.last) return;
+    if(k === 0){ Q.t1 = performance.now(); fxPerfGpuBegin(); } else { fxPerfGpuEnd(); Q.t2 = performance.now(); }
+  }
+  function fxPerfEnd(){
+    var Q = FXPF;
+    if(!Q.last){ if(Q.elOn){ Q.elOn = false; Q.el.style.display = 'none'; } return; }
+    var now = performance.now(), iv = Q.iv;
+    fxPerfGpuPoll(now);
+    if(iv > 0 && iv < 500){
+      var f = { t: now, iv: iv, st: Q.t1 - Q.t0, dr: Q.t2 - Q.t1, hud: now - Q.t2 };
+      Q.fr.push(f);
+      if(Q.ab) fxPerfABTick(f);
+    }
+    while(Q.fr.length && now - Q.fr[0].t > 3000) Q.fr.shift();
+    while(Q.gp.length && now - Q.gp[0].t > 3000) Q.gp.shift();
+    if(now - Q.shown > 500){ Q.shown = now; fxPerfDraw(); }
+  }
+  // the GPU's own time for render(), where the browser will say (results come back a few frames late)
+  function fxPerfGpuBegin(){
+    var Q = FXPF;
+    if(Q.ext === undefined){
+      Q.ext = null;
+      try { var g = renderer.getContext(); if(typeof WebGL2RenderingContext !== 'undefined' && g instanceof WebGL2RenderingContext){ Q.gl = g; Q.ext = g.getExtension('EXT_disjoint_timer_query_webgl2') || null; } } catch(e){}
+    }
+    if(!Q.ext || Q.qOn || Q.q.length > 8) return;
+    try { var q = Q.gl.createQuery(); Q.gl.beginQuery(Q.ext.TIME_ELAPSED_EXT, q); Q.qOn = q; } catch(e){ Q.ext = null; Q.qOn = null; }
+  }
+  function fxPerfGpuEnd(){
+    var Q = FXPF; if(!Q.qOn) return;
+    try { Q.gl.endQuery(Q.ext.TIME_ELAPSED_EXT); Q.q.push(Q.qOn); } catch(e){ Q.ext = null; }
+    Q.qOn = null;
+  }
+  function fxPerfGpuPoll(now){
+    var Q = FXPF, gl = Q.gl, X = Q.ext; if(!X || !Q.q.length) return;
+    try {
+      var dj = gl.getParameter(X.GPU_DISJOINT_EXT);
+      while(Q.q.length){
+        var q = Q.q[0]; if(!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) break;
+        var ms = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6; gl.deleteQuery(q); Q.q.shift();
+        if(!dj && ms > 0 && ms < 500){ Q.gp.push({ t: now, ms: ms }); Q.gpuSeen = true; if(Q.ab && Q.ab.rec){ Q.ab.rec.gpu += ms; Q.ab.rec.gpuN++; } }
+      }
+    } catch(e){ Q.ext = null; }
+  }
+  // the display's own frame period, from the quick end of what was measured (a steady 30 is still a 60 Hz screen)
+  function fxPfPeriod(fr){
+    if(!fr || fr.length < 20) return 1000 / 60;
+    var a = fr.map(function(f){ return f.iv; }).sort(function(x, y){ return x - y; }), p = a[Math.floor(a.length * 0.1)], hz = [144, 120, 90, 60];
+    for(var i = 0; i < hz.length; i++) if(Math.abs(p - 1000 / hz[i]) < 100 / hz[i]) return 1000 / hz[i];
+    return p > 1000 / 60 ? 1000 / 60 : Math.max(4, p);
+  }
+  function fxPfStat(fr, per, gpu, gpuN){
+    var n = fr.length; if(!n) return null;
+    var s = 0, w = 0, lg = 0, st = 0, dr = 0, hud = 0;
+    for(var i = 0; i < n; i++){ var f = fr[i]; s += f.iv; if(f.iv > w) w = f.iv; if(f.iv > per * 1.5) lg++; st += f.st; dr += f.dr; hud += f.hud; }
+    return { n: n, ms: s / n, worst: w, lg: 100 * lg / n, st: st / n, dr: dr / n, hud: hud / n, cpu: (st + dr + hud) / n, gpu: gpuN ? gpu / gpuN : -1 };
+  }
+  function fxPfN(v, w, d){ var s = v == null || v < 0 || !isFinite(v) ? '-' : v.toFixed(d == null ? 1 : d); while(s.length < w) s = ' ' + s; return s; }
+  function fxPfPad(s, w){ while(s.length < w) s += ' '; return s; }
+  function fxPerfDraw(){
+    var Q = FXPF, e = Q.el;
+    if(!e) e = Q.el = el('div', 'position:absolute;left:8px;bottom:calc(10px + env(safe-area-inset-bottom, 0px));pointer-events:none;font:700 10px/1.45 Menlo,Consolas,monospace;letter-spacing:0.03em;white-space:pre;color:rgba(242,245,250,0.97);background:rgba(8,12,20,0.6);padding:5px 8px;border-radius:7px;display:none;', R.layer, '');
+    if(!Q.elOn){ Q.elOn = true; e.style.display = 'block'; }
+    var per = fxPfPeriod(Q.fr), gs = 0, i;
+    for(i = 0; i < Q.gp.length; i++) gs += Q.gp[i].ms;
+    var s = fxPfStat(Q.fr, per, gs, Q.gp.length), A = Q.ab, t;
+    if(!s) t = 'FRAME …';
+    else t = 'FRAME ' + s.ms.toFixed(1) + ' MS  ' + Math.round(1000 / s.ms) + ' FPS  WORST ' + Math.round(s.worst) + '  LONG ' + Math.round(s.lg) + '%\n' +
+             'CPU ' + s.cpu.toFixed(1) + ' = STEP ' + s.st.toFixed(1) + ' + DRAW ' + s.dr.toFixed(1) + ' + HUD ' + s.hud.toFixed(1) + '\n' +
+             (s.gpu >= 0 ? 'GPU ' + s.gpu.toFixed(1) + ' MS' : (Q.ext ? 'GPU …' : 'GPU TIMER: NONE HERE'));
+    if(A) t += '\nA/B ' + (A.i + 1) + '/' + FX_PF_CFG.length + '  ' + FX_PF_CFG[Math.min(A.i, FX_PF_CFG.length - 1)][0] + '  · KEEP PLAYING';
+    if(e._t !== t){ e._t = t; e.textContent = t; }
+  }
+  // ── the A/B ──
+  function fxPerfApply(c){
+    var A = FXPF.ab, k; A.cut = c || {}; A.saveP = {};
+    if(!c) return;
+    if(c.P) for(k in c.P){ A.saveP[k] = P[k]; P[k] = c.P[k]; }
+    if(c.msaa != null){ A.msaa0 = P.fxMSAA; P.fxMSAA = c.msaa; if(R.rt){ R.rt.dispose(); R.rt = null; } }
+    if(c.px){ A.px0 = renderer.getPixelRatio(); renderer.setPixelRatio(A.px0 * c.px); }
+    if(c.sky === 0 && R.skyOn){ A.sky0 = true; skyOff(); }
+  }
+  function fxPerfUndo(){
+    var A = FXPF.ab; if(!A) return;
+    for(var k in A.saveP) P[k] = A.saveP[k];
+    A.saveP = {};
+    if(A.msaa0 != null){ P.fxMSAA = A.msaa0; A.msaa0 = null; if(R.rt){ R.rt.dispose(); R.rt = null; } }
+    if(A.px0){ renderer.setPixelRatio(A.px0); A.px0 = 0; }
+    if(A.sky0){ A.sky0 = false; skyOn(); }
+    A.cut = {};
+  }
+  function fxPerfNext(){
+    var A = FXPF.ab; fxPerfUndo(); A.i++;
+    if(A.i >= FX_PF_CFG.length){ fxPerfABDone(false); return; }
+    fxPerfApply(FX_PF_CFG[A.i][1]);
+    A.t = 0; A.bst = 0; A.off = 0; A.rec = null;
+    A.cr = { fr: [], gpu: 0, gpuN: 0 }; A.bo = { fr: [], gpu: 0, gpuN: 0 };
+  }
+  function fxPerfABStart(){
+    if(FXPF.ab || !api.active || R.studio || R.shop) return;
+    if(S.dead || S.won){ R.settingsOpen = false; restart(); } else if(R.fxPause) fxPauseSet(false);
+    FXPF.ab = { i: -1, t: 0, rows: [], cut: {}, saveP: {}, rs: false, restarts: 0 };
+    fxPerfNext();
+  }
+  function fxPerfABTick(f){
+    var A = FXPF.ab;
+    if(R.fxPause || R.studio || R.shop){ fxPerfABDone(true); return; }
+    if(S.dead || S.won){ if(!A.rs){ A.rs = true; A.restarts++; A.rec = null; fxPerfUndo(); restart(); } return; }   // (the run ended under the test: a new one, and this window again)
+    if(A.rs){ A.rs = false; A.i--; fxPerfNext(); return; }
+    A.rec = null;
+    if(S.sl && S.sl.phase === 'aim') return;   // (sitting in the slingshot: the window's clock waits)
+    if(S.lives < 1) S.lives = 1;               // (no deaths under the test)
+    A.t += f.iv / 1000;
+    var T = A.t;
+    if(T < 1) return;                           // (a second to settle on the change)
+    if(!A.bst){ A.bst = T; G.boostReadyAt = 0; if(!boostStart(performance.now())) A.off = T; return; }
+    if(S.boostOn){ A.rec = A.bo; A.off = 0; }
+    else {
+      if(!A.off) A.off = T;
+      if(T - A.off > 0.8) A.rec = A.cr;         // (the flame-out is neither)
+      if(T - A.off > 3.8 || T > 14){ A.rows.push({ name: FX_PF_CFG[A.i][0], cr: A.cr, bo: A.bo }); fxPerfNext(); return; }
+    }
+    if(A.rec) A.rec.fr.push(f);
+  }
+  function fxPerfABDone(early, quiet){
+    var A = FXPF.ab; if(!A) return;
+    fxPerfUndo(); FXPF.ab = null;
+    if(quiet) return;
+    var txt = fxPerfReport(A, early);
+    if(A.rows.length) try { localStorage.setItem(FX_PF_KEY, txt); } catch(e){}   // (a test called off before its first window keeps the last result)
+    if(api.active && S && !S.dead && !R.fxPause) fxPauseSet(true);
+    fxPerfBox(txt);
+  }
+  function fxPerfReport(A, early){
+    var rows = A.rows, L = [], i, gpuName = '?', per = 1000 / 60;
+    for(i = 0; i < rows.length; i++) if(rows[i].name === 'BASE' && rows[i].cr.fr.length >= 20){ per = fxPfPeriod(rows[i].cr.fr); break; }
+    rows.forEach(function(r){ r.c = fxPfStat(r.cr.fr, per, r.cr.gpu, r.cr.gpuN); r.b = fxPfStat(r.bo.fr, per, r.bo.gpu, r.bo.gpuN); });
+    try { var g = renderer.getContext(), d = g.getExtension('WEBGL_debug_renderer_info'); gpuName = d ? g.getParameter(d.UNMASKED_RENDERER_WEBGL) : g.getParameter(g.RENDERER); } catch(e){}
+    renderer.getDrawingBufferSize(_db);
+    var low = typeof GAME_LOW_FX !== 'undefined' && !!GAME_LOW_FX, saved = '';
+    try { saved = localStorage.getItem(FX_KEY) || ''; } catch(e){}
+    L.push('CHRYSOLIN RUNNER FRAME TEST  ' + new Date().toISOString().slice(0, 16).replace('T', ' ') + (early ? '  (STOPPED EARLY)' : ''));
+    L.push(navigator.userAgent);
+    L.push('GPU: ' + gpuName);
+    L.push('SCREEN ' + window.innerWidth + 'x' + window.innerHeight + ' CSS  DPR ' + (window.devicePixelRatio || 1).toFixed(2) + '  DRAWN AT ' + renderer.getPixelRatio().toFixed(2) + ' = ' + _db.x + 'x' + _db.y);
+    L.push('FRAME PASS MSAA ' + (R.rt && R.rt.isWebGLMultisampleRenderTarget ? R.rt.samples : (R.rt ? 0 : P.fxMSAA + '?')) + '  DISPLAY ~' + Math.round(1000 / per) + ' HZ  GPU TIMER ' + (FXPF.gpuSeen ? 'YES' : 'NO') + '  PHONE FLAG ' + (low ? 'ON' : 'OFF') + (A.restarts ? '  RESTARTS ' + A.restarts : ''));
+    if(saved) L.push('SETTINGS CHANGED: ' + saved);
+    L.push('');
+    L.push('EACH ROW = THE GAME WITH THAT ONE THING OFF.');
+    L.push('MS mean frame, L% long frames, G gpu ms, C cpu ms');
+    L.push(fxPfPad('', 20) + '  CRUISE             | BOOST');
+    L.push(fxPfPad('', 20) + '   MS  L%    G    C |   MS  L%    G    C');
+    function cell(s){ return s ? fxPfN(s.ms, 5) + fxPfN(s.lg, 4, 0) + fxPfN(s.gpu, 5) + fxPfN(s.cpu, 5) : '    -   -    -    -'; }
+    rows.forEach(function(r){ L.push(fxPfPad(r.name, 20) + cell(r.c) + ' |' + cell(r.b)); });
+    // what each row saved against the BASE windows' mean; the BASE windows' own spread is the noise
+    var B = { c: { ms: 0, gpu: 0, n: 0, gn: 0, lo: 1e9, hi: 0, glo: 1e9, ghi: 0 }, b: { ms: 0, gpu: 0, n: 0, gn: 0, lo: 1e9, hi: 0, glo: 1e9, ghi: 0 } };
+    rows.forEach(function(r){ if(r.name !== 'BASE') return; ['c', 'b'].forEach(function(k){ var s = r[k], q = B[k]; if(!s) return; q.ms += s.ms; q.n++; q.lo = Math.min(q.lo, s.ms); q.hi = Math.max(q.hi, s.ms); if(s.gpu >= 0){ q.gpu += s.gpu; q.gn++; q.glo = Math.min(q.glo, s.gpu); q.ghi = Math.max(q.ghi, s.gpu); } }); });
+    if(B.c.n){
+      function sv(s, q, key){ if(!s || !q.n) return '     -'; if(key === 'gpu'){ if(!(s.gpu >= 0) || !q.gn) return '     -'; var dg = q.gpu / q.gn - s.gpu; return fxPfPad('', 6 - ((dg >= 0 ? '+' : '') + dg.toFixed(1)).length) + (dg >= 0 ? '+' : '') + dg.toFixed(1); } var dm = q.ms / q.n - s.ms, t = (dm >= 0 ? '+' : '') + dm.toFixed(1); return fxPfPad('', 6 - t.length) + t; }
+      L.push('');
+      L.push('MS SAVED A FRAME VS BASE (+ = FASTER WITH IT OFF)');
+      L.push('NOISE = BASE RUNS DIFFER BY: CRUISE ' + (B.c.hi - B.c.lo).toFixed(1) + (B.c.gn ? ' (GPU ' + (B.c.ghi - B.c.glo).toFixed(1) + ')' : '') + (B.b.n ? '  BOOST ' + (B.b.hi - B.b.lo).toFixed(1) + (B.b.gn ? ' (GPU ' + (B.b.ghi - B.b.glo).toFixed(1) + ')' : '') : ''));
+      L.push(fxPfPad('', 20) + ' CRUISE   GPU | BOOST   GPU');
+      rows.forEach(function(r){ if(r.name !== 'BASE') L.push(fxPfPad(r.name, 20) + sv(r.c, B.c) + sv(r.c, B.c, 'gpu') + ' |' + sv(r.b, B.b) + sv(r.b, B.b, 'gpu')); });
+    }
+    return L.join('\n');
+  }
+  // the result, over everything: its own layer on the page (the run's layer takes every touch for the game)
+  function fxPerfBox(txt){
+    var Q = FXPF, b = Q.box;
+    if(!b){
+      b = Q.box = document.createElement('div');
+      b.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483647;background:rgba(8,12,20,0.97);color:#e8eef8;overflow:auto;-webkit-overflow-scrolling:touch;touch-action:pan-x pan-y;box-sizing:border-box;padding:calc(12px + env(safe-area-inset-top, 0px)) 10px calc(24px + env(safe-area-inset-bottom, 0px));';
+      var bt = 'font:700 12px Arial,Helvetica,sans-serif;letter-spacing:0.18em;padding:12px 18px;border-radius:22px;border:0;background:#10c4b2;color:#06222a;';
+      b.innerHTML = '<div style="display:flex;gap:10px;margin-bottom:12px;"><button type="button" style="' + bt + '">COPY</button><button type="button" style="' + bt + 'background:#e8eef8;">CLOSE</button></div>' +
+        '<pre style="margin:0;font:9px/1.45 Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all;-webkit-user-select:text;user-select:text;"></pre>';
+      document.body.appendChild(b);
+      var bs = b.querySelectorAll('button');
+      bs[0].addEventListener('click', function(){
+        var t = b.lastChild.textContent, done = function(){ bs[0].textContent = 'COPIED'; setTimeout(function(){ bs[0].textContent = 'COPY'; }, 1600); };
+        var old = function(){ try { var ta = document.createElement('textarea'); ta.value = t; ta.style.cssText = 'position:fixed;left:0;top:0;opacity:0;'; b.appendChild(ta); ta.focus(); ta.select(); document.execCommand('copy'); b.removeChild(ta); done(); } catch(e){ bs[0].textContent = 'SELECT THE TEXT'; } };
+        try { if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done, old); else old(); } catch(e){ old(); }
+      });
+      bs[1].addEventListener('click', function(){ b.style.display = 'none'; });
+    }
+    b.lastChild.textContent = txt; b.style.display = 'block'; b.scrollTop = 0;
+  }
+  function fxPerfGo(k){
+    if(k === 'fxPerfAB') fxPerfABStart();
+    else if(k === 'fxPerfLast'){ var t = null; try { t = localStorage.getItem(FX_PF_KEY); } catch(e){} fxPerfBox(t || 'NO RESULT YET. RUN THE A/B TEST FIRST.'); }
+  }
+
   // test surface (api._feel)
   var FX_API = {
     jet: function(){ return JET.api(); },   // (THE JET's test surface)
     P: function(){ var o = {}; for(var k in FX_DEF) o[k] = P[k]; return o; },
+    perf: function(){ return { Q: FXPF, cfg: FX_PF_CFG, start: fxPerfABStart, stop: function(){ fxPerfABDone(true); }, last: function(){ try { return localStorage.getItem(FX_PF_KEY); } catch(e){ return null; } } }; },   // (THE METER)
     state: function(){ var F = fxState(); return { stop: +(R.fxStopT || 0).toFixed(3), pause: !!R.fxPause, sy: +F.sy.toFixed(5), sp: +F.sp.toFixed(4), yaw: +F.yaw.toFixed(4), bank: +(F.bank - F.bank0).toFixed(4),
       k: [+F.k.x.toFixed(4), +F.k.y.toFixed(4), +F.k.z.toFixed(4), +F.k.f.toFixed(3)], ca: +F.ca.toFixed(3), hurt: +F.hurt.toFixed(3), blur: +F.blur.toFixed(3), rips: F.rip.map(function(r){ return +(r.a * Math.exp(-r.t * P.fxRipDecay)).toFixed(3); }),
       motes: R.fxM ? R.fxM.live : 0, rip: (R.tubeMat.uniforms.uRipN || {}).value || 0, zone: fxZone(), trail: R.fxTr ? { n: R.fxTr.geo.drawRange.count / 6, heat: +(fxState().trHeat || 0).toFixed(2), ign: +(fxState().ign || 0).toFixed(2), haze: +(fxState().haze || 0).toFixed(2), flare: R.fxTr.flare.visible } : null, sparks: R.fxP ? Array.prototype.filter.call(R.fxP.life, function(l){ return l > 0; }).length : 0, fh: +F.fh.toFixed(4), post: fxPostOn(), rt: R.rt ? (R.rt.isWebGLMultisampleRenderTarget ? 'msaa' + R.rt.samples : 'plain') : null }; },
@@ -111724,6 +111962,7 @@ var RUNNER = (function(){
   // ════════════════════════════════════════ FRAME ════════════════════════════════════════
   function frame(dt){
     if(!api.active) return;
+    fxPerfBegin();   // (THE FEEL: THE METER — the frame's clock; nothing unless the meter or its test is on)
     R.acc += dt; if(R.acc > 0.25) R.acc = 0.25;
     var n = 0;
     if(R.studio){ R.acc = 0; studioTick(dt); studioRead(dt); }   // (THE CLOUD STUDIO: the run frozen, its camera)
@@ -111740,8 +111979,9 @@ var RUNNER = (function(){
     R.tierToast = Math.max(0, R.tierToast - dt);
     for(var rk in R.rowShake) R.rowShake[rk] = Math.max(0, R.rowShake[rk] - dt * 2.2);
     R.dt = dt;
-    render();
-    dom();
+    fxPerfMark(0); render(); fxPerfMark(1);   // (THE FEEL: THE METER)
+    if(!fxPerfCut('noDom')) dom();
+    fxPerfEnd();
   }
   function cardAmt(){
     if(!S.dead) return 0;
@@ -111813,7 +112053,7 @@ var RUNNER = (function(){
     bendScene();
     renderer.autoClear = true;
     layout(W, H);
-    if(R.plates.length || fxPostOn()){   // (THE FEEL: the frame's pass — blur, split, red — goes through the copy too)
+    if((R.plates.length || fxPostOn()) && !fxPerfCut('noRT')){   // (THE FEEL: the frame's pass — blur, split, red — goes through the copy too)   (THE METER: its test draws one window without the pass)
       renderer.getDrawingBufferSize(_db);
       if(!R.rt) R.rt = fxMakeRT(_db.x, _db.y);   // (THE FEEL: multisampled — the frame keeps its antialiasing through the copy)
       else if(R.rt.width !== _db.x || R.rt.height !== _db.y) R.rt.setSize(_db.x, _db.y);
