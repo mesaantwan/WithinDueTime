@@ -111769,9 +111769,17 @@ var RUNNER = (function(){
     if(!(P.fxPerf > 0.5 || Q.ab)){ Q.last = 0; return; }
     var now = performance.now();
     Q.iv = Q.last ? now - Q.last : 0; Q.last = now;
+    Q.idF = Q.idle || 0; Q.idle = 0; if(!Q.ping){ Q.ping = true; Q.pt = now; setTimeout(fxPerfPing, 0); }
     fxPerfSync();   // (what the last frame left behind — its presentation — is not this frame's)
     Q.tb = Q.tf = performance.now(); Q.pre = Q.tb - now;
     for(var i = 0; i < 7; i++) Q.ps[i] = 0;
+  }
+  // THE IDLE CLOCK: a timer chain (a few ms a link). Between two frames, the links that came on time are time the page was
+  // IDLE — waiting to be given a frame; what is neither the frame's cost nor idle is OTHER work on the page's thread.
+  function fxPerfPing(){
+    var Q = FXPF, n = performance.now(), g = n - Q.pt; Q.pt = n;
+    if(g < 9) Q.idle = (Q.idle || 0) + g;
+    if(Q.last && api.active) setTimeout(fxPerfPing, 0); else Q.ping = false;
   }
   // the end of pass k (nosync: a CPU-only stretch, nothing new was sent)
   function fxPerfFence(k, nosync){
@@ -111786,7 +111794,7 @@ var RUNNER = (function(){
     fxPerfFence(6, true);
     var now = Q.tf, iv = Q.iv;
     if(iv > 0 && iv < 2000){
-      var f = { t: now, iv: iv, cost: now - Q.tb, pre: Q.pre, ps: Q.ps.slice() };
+      var f = { t: now, iv: iv, cost: now - Q.tb, pre: Q.pre, idle: Math.min(Q.idF || 0, iv), ps: Q.ps.slice() };
       Q.fr.push(f);
       if(Q.ab) fxPerfABTick(f);
     }
@@ -111804,10 +111812,11 @@ var RUNNER = (function(){
     var fr = Q.fr, n = fr.length, A = Q.ab, t, i, k;
     if(!n) t = 'FRAME …';
     else {
-      var iv = 0, w = 0, c = 0, pr = 0, ps = [0, 0, 0, 0, 0, 0, 0];
-      for(i = 0; i < n; i++){ iv += fr[i].iv; if(fr[i].iv > w) w = fr[i].iv; c += fr[i].cost; pr += fr[i].pre; for(k = 0; k < 7; k++) ps[k] += fr[i].ps[k]; }
+      var iv = 0, w = 0, c = 0, pr = 0, idl = 0, hb = [0, 0, 0, 0, 0], ps = [0, 0, 0, 0, 0, 0, 0];
+      for(i = 0; i < n; i++){ var fi = fr[i].iv; iv += fi; if(fi > w) w = fi; c += fr[i].cost; pr += fr[i].pre; idl += fr[i].idle; hb[fi < 21 ? 0 : fi < 38 ? 1 : fi < 55 ? 2 : fi < 72 ? 3 : 4]++; for(k = 0; k < 7; k++) ps[k] += fr[i].ps[k]; }
       t = 'FRAME ' + (iv / n).toFixed(1) + ' MS  ' + (1000 * n / iv).toFixed(iv / n > 25 ? 1 : 0) + ' FPS  WORST ' + Math.round(w) + '\nCOST ' + (c / n).toFixed(1) + ' MS FENCED  (BEFORE ' + (pr / n).toFixed(1) + ')\n';
       for(k = 0; k < 7; k++) t += (k === 4 ? '\n' : k ? '  ' : '') + FX_PF_PASS[k] + ' ' + (ps[k] / n).toFixed(1);
+      t += '\nIDLE ' + (idl / n).toFixed(1) + '  OTHER ' + Math.max(0, (iv - c - pr - idl) / n).toFixed(1) + '\nFRAMES AT 16:' + hb[0] + ' 33:' + hb[1] + ' 50:' + hb[2] + ' 66:' + hb[3] + ' MORE:' + hb[4];
     }
     if(A) t += '\nA/B  ' + (A.mode ? 'BOOST' : 'CRUISE') + '  CYCLE ' + (A.cyc + 1) + '  ' + Math.round((performance.now() - A.t00) / 1000) + ' S  · KEEP PLAYING';
     if(e._t !== t){ e._t = t; e.textContent = t; }
@@ -111865,10 +111874,10 @@ var RUNNER = (function(){
     A.hold = 0;
     A.f++; A.bt += f.iv;
     if(A.f <= 3) return;                       // (the change's own first frames: a target made again, a program first drawn)
-    A.cost.push(f.cost); A.ivs.push(f.iv); if(A.k === 0) A.pss.push(f.ps);
+    A.cost.push(f.cost); A.ivs.push(f.iv); if(A.k === 0) A.pss.push(f.ps.concat([f.idle, Math.max(0, f.iv - f.cost - f.pre - f.idle)]));
     if((A.cost.length >= 10 && A.bt >= 600) || A.bt > 4000){
       A.res[A.k][A.mode].push({ c: A.cyc, cost: fxPfMed(A.cost), iv: fxPfMed(A.ivs), n: A.cost.length });
-      if(A.k === 0){ var m = [0, 0, 0, 0, 0, 0, 0]; A.pss.forEach(function(p){ for(var i = 0; i < 7; i++) m[i] += p[i] / A.pss.length; }); A.pass[A.mode].push(m); }
+      if(A.k === 0){ var m = [0, 0, 0, 0, 0, 0, 0, 0, 0]; A.pss.forEach(function(p){ for(var i = 0; i < 9; i++) m[i] += p[i] / A.pss.length; }); A.pass[A.mode].push(m); }
       A.pos++; fxPerfBlock();
     }
   }
@@ -111898,7 +111907,7 @@ var RUNNER = (function(){
       var bc = base.map(function(b){ return b.cost; }), bi = base.map(function(b){ return b.iv; });
       L.push('');
       L.push((md ? 'BOOST' : 'CRUISE') + ': ' + base.length + ' CYCLES. BASE COST ' + fxPfMean(bc).toFixed(1) + ' MS (' + Math.min.apply(null, bc).toFixed(0) + '..' + Math.max.apply(null, bc).toFixed(0) + '), FRAME ' + fxPfMean(bi).toFixed(1) + ' MS');
-      if(A.pass[md].length){ var pm = [0, 0, 0, 0, 0, 0, 0]; A.pass[md].forEach(function(p){ for(var i = 0; i < 7; i++) pm[i] += p[i] / A.pass[md].length; }); L.push('PASSES ' + FX_PF_PASS.map(function(nm, i){ return nm + ' ' + pm[i].toFixed(1); }).join('  ')); }
+      if(A.pass[md].length){ var pm = [0, 0, 0, 0, 0, 0, 0, 0, 0]; A.pass[md].forEach(function(p){ for(var i = 0; i < 9; i++) pm[i] += p[i] / A.pass[md].length; }); L.push('PASSES ' + FX_PF_PASS.map(function(nm, i){ return nm + ' ' + pm[i].toFixed(1); }).join('  ')); L.push('OUTSIDE THE FRAME: IDLE ' + pm[7].toFixed(1) + '  OTHER ' + pm[8].toFixed(1)); }
       L.push(fxPfPad('ONE THING OFF', 20) + '  COST  SAVED (LO..HI)   FRAME');
       FX_PF_CFG.forEach(function(cf, k){
         var rs = A.res[k][md]; if(!rs.length){ L.push(fxPfPad(cf[0], 20) + '     -'); return; }
