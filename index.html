@@ -112392,13 +112392,23 @@ var RUNNER = (function(){
     }
     return (a && b) ? { d: Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY), a: Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX) } : null;
   }
+  // (THE TOUCH FIX 11-18: what the run believes is on the glass, checked against the event's own list. A touch whose end never
+  // arrived — the app left mid-touch, a system gesture took it — used to lock every later touch out.)
+  function touchHas(e, id){ for(var i = 0; i < e.touches.length; i++) if(e.touches[i].identifier === id) return true; return false; }
+  function touchSane(e){
+    if(R.pinch && !(touchHas(e, R.pinch.i1) && touchHas(e, R.pinch.i2))){ if(R.pinch.live) R.zoomTgt = R.zoom > 0.5 ? 1 : 0; R.pinch = null; }
+    if(G.id !== null && !touchHas(e, G.id)){ G.id = null; R.press = -1; if(R.fxDrag) fxSliderEnd(); if(G.on){ gEnd(); G.tapT = -1e9; } }
+  }
   function tStart(e){
     e.preventDefault(); e.stopPropagation();
+    touchSane(e);
     if(e.touches.length >= 2 && !S.dead && !R.fxPause){
       var t1 = e.touches[0], t2 = e.touches[1];
-      R.pinch = { i1: t1.identifier, i2: t2.identifier, z0: R.zoom, r0: R.roll, d0: 1, a0: 0 };
+      // (THE TOUCH FIX: beside a thumb that is steering, the second finger is a pinch only once it MOVES — a resting thumb, the heel of a hand, steer on)
+      var held = G.on && G.id !== null && (t1.identifier === G.id || t2.identifier === G.id), o2 = held ? (t1.identifier === G.id ? t2 : t1) : null;
+      R.pinch = { i1: t1.identifier, i2: t2.identifier, z0: R.zoom, r0: R.roll, d0: 1, a0: 0, live: !held, oid: o2 ? o2.identifier : -1, ox: o2 ? o2.clientX : 0, oy: o2 ? o2.clientY : 0 };
       var q = pinchPts(e); R.pinch.d0 = Math.max(20, q.d); R.pinch.a0 = q.a;
-      G.on = false; G.id = null; G.boost = false; G.tapT = -1e9;
+      if(!held){ G.on = false; G.id = null; G.boost = false; G.tapT = -1e9; }
       return;
     }
     if(R.pinch || (G.id !== null && !S.dead)) return;
@@ -112409,7 +112419,12 @@ var RUNNER = (function(){
   function findT(e){ for(var i = 0; i < e.changedTouches.length; i++) if(e.changedTouches[i].identifier === G.id) return e.changedTouches[i]; return null; }
   function tMove(e){
     e.preventDefault(); e.stopPropagation();
-    if(R.pinch){
+    if(R.pinch && !R.pinch.live){   // (THE TOUCH FIX: not a pinch yet — has the second finger moved?)
+      var PP = R.pinch, qq = null;
+      for(var pi = 0; pi < e.touches.length; pi++) if(e.touches[pi].identifier === PP.oid && Math.hypot(e.touches[pi].clientX - PP.ox, e.touches[pi].clientY - PP.oy) > 14) qq = pinchPts(e);
+      if(qq){ PP.live = true; PP.d0 = Math.max(20, qq.d); PP.a0 = qq.a; PP.z0 = R.zoom; PP.r0 = R.roll; if(G.on) gEnd(); G.on = false; G.id = null; G.boost = false; G.tapT = -1e9; }
+    }
+    if(R.pinch && R.pinch.live){
       var q = pinchPts(e);
       if(q){
         R.zoom = R.zoomTgt = clamp(R.pinch.z0 + (1 - q.d / R.pinch.d0) * P.pinchGain, 0, 1); R.zoomV = 0;
@@ -112421,8 +112436,13 @@ var RUNNER = (function(){
   }
   function tEnd(e){
     e.preventDefault(); e.stopPropagation();
+    if(R.pinch && !R.pinch.live) R.pinch = null;   // (THE TOUCH FIX: it never became a pinch — whichever finger this is, the stroke goes on as one finger's)
     if(R.pinch){
-      if(e.touches.length < 2){ R.zoomTgt = R.zoom > 0.5 ? 1 : 0; R.pinch = null; }
+      if(e.touches.length < 2){
+        R.zoomTgt = R.zoom > 0.5 ? 1 : 0; R.pinch = null;
+        // (THE TOUCH FIX: the finger left on the glass steers again, as a new stroke — it used to do nothing until it lifted)
+        if(e.touches.length === 1 && e.type === 'touchend' && !S.dead && !R.fxPause && !R.shop && !R.studio && !(S.sl && S.sl.phase === 'aim')){ var lt = e.touches[0]; G.id = lt.identifier; G.tapT = -1e9; gStart(lt.clientX, lt.clientY); G.boost = false; }
+      }
       return;
     }
     var t = findT(e); if(!t) return; G.id = null; release(t.clientX, t.clientY);
