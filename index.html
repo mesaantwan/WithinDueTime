@@ -111667,36 +111667,98 @@ var RUNNER = (function(){
   // gameAudioActive() counts the run as in-game (patched), so the shared players are allowed to play. The hover loop's
   // pitch and volume ride the speed (and the boost); the boost loop and its fade-out follow S.boostOn; the events above
   // fire one-shots off the shared pools. A lifted finger (release) is a gesture: on iOS that is where sound may start. ──
+  // (11-17: THE SOUND rev 2 — WEB AUDIO. The first version drove GAME AUDIO's <audio> elements: the hover loop's volume
+  // and playbackRate were written EVERY FRAME, twenty-odd elements were loaded up front, and every impact did
+  // pause + seek + play on one. On an iPhone each of those is a message to the media player — the user's phone ran at
+  // 22 fps with 17 ms of real work a frame, and smooth with the sound off. An engine whose pitch glides is not what a
+  // media element is for. Now the run's own sounds are DECODED ONCE into buffers and played through one AudioContext:
+  // the hover and the boost are looping buffer sources whose gain and rate are audio parameters (written only when they
+  // change — a number handed to the audio thread), the impacts are one-shot sources. Only the music stays an element (a
+  // whole song is streamed, not decoded), and it is touched only when its volume really changes. No Web Audio (or the
+  // files will not decode): the elements as before, but written only on a change and the pitch at most 8 times a second.)
+  var FXA = { ctx: null, master: null, buf: {}, fail: false, hov: null, bst: null, susp: false, w: 0, ew: 0, shots: 0 };
+  var FXA_FILES = { hover: 'ship_hover.wav', boost: 'ship_boost.wav', boostEnd: 'boost_fadeout_better.wav', land: 'bounce_new.wav', hit: 'take_damage.wav', kill: 'enemy_dies.wav', smash: 'enemyishit_crit.wav' };
+  var FXA_VOL = { boost: 0.5, boostEnd: 0.5, land: 0.45, hit: 0.5, kill: 0.55, smash: 0.6 };   // (GAME AUDIO's own levels)
+  var FXA_KIND = { land: 'land', slam: 'land', hit: 'hit', crash: 'hit', kill: 'kill', smash: 'smash' };
+  function fxaOn(){ return !!FXA.ctx && !FXA.fail; }
+  // on a gesture: the context (made once, woken if the browser holds it), the files fetched and decoded
+  function fxaGesture(){
+    var A = FXA;
+    if(!A.ctx && !A.fail){
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if(!AC || typeof fetch !== 'function' || typeof sfxUrl !== 'function'){ A.fail = true; return; }
+      try { A.ctx = new AC(); A.master = A.ctx.createGain(); A.master.connect(A.ctx.destination); } catch(e){ A.ctx = null; A.fail = true; return; }
+      Object.keys(FXA_FILES).forEach(function(k){
+        fetch(sfxUrl(FXA_FILES[k])).then(function(r){ if(!r.ok) throw new Error('http ' + r.status); return r.arrayBuffer(); })
+          .then(function(ab){ return new Promise(function(res, rej){ A.ctx.decodeAudioData(ab, res, rej); }); })
+          .then(function(b){ A.buf[k] = b; })
+          .catch(function(){ if(k === 'hover') A.fail = true; });   // (no engine sound this way: the elements, as before)
+      });
+    }
+    if(A.ctx && A.ctx.state !== 'running' && !R.fxPause && !document.hidden){ A.susp = false; try { A.ctx.resume(); } catch(e){} }   // (a touch is where a phone lets it wake)
+  }
+  function fxaSet(p, v, eps){ if(p._fxV == null || Math.abs(p._fxV - v) > eps){ p._fxV = v; p.value = v; FXA.w++; } }
+  function fxaLoop(name, key){
+    var A = FXA, b = A.buf[key]; if(A[name] || !b) return A[name];
+    var s = A.ctx.createBufferSource(), g = A.ctx.createGain(); s.buffer = b; s.loop = true; g.gain.value = 0; g.gain._fxV = 0;
+    s.connect(g); g.connect(A.master); s.start();
+    return A[name] = { src: s, g: g };
+  }
+  function fxaStop(name){ var L = FXA[name]; if(!L) return; FXA[name] = null; try { L.src.stop(); } catch(e){} try { L.src.disconnect(); L.g.disconnect(); } catch(e){} }
+  function fxaShot(key, vol){
+    var A = FXA, b = A.buf[key]; if(!b || !(vol > 0) || A.ctx.state !== 'running') return;
+    var s = A.ctx.createBufferSource(), g = A.ctx.createGain(); s.buffer = b; g.gain.value = clamp(vol, 0, 1);
+    s.connect(g); g.connect(A.master); s.onended = function(){ try { s.disconnect(); g.disconnect(); } catch(e){} }; s.start(); A.shots++;
+  }
+  // an element's volume, only when it has really changed
+  function fxElVol(a, v){ if(a._fxV == null || Math.abs(a._fxV - v) > 0.01){ a._fxV = v; a.volume = v; FXA.ew++; } }
   function fxAudioOn(){ return typeof sfx !== 'undefined' && sfx._loaded; }
   function fxAudioGesture(){
     if(typeof sfx === 'undefined' || !api.active) return;
     if(!sfx._loaded && typeof initAudio === 'function'){ initAudio(); sfx._unlocked = true; }
+    fxaGesture();
     fxAudioTick();
   }
   function fxAudioTick(){
     if(!fxAudioOn()) return;
     if(R.fxSfx0 == null){ R.fxSfx0 = sfx.sfxVol; R.fxMus0 = sfx.musicVol; }   // (the planet game's dials, handed back on exit)
-    if(!R.fxWarm){ R.fxWarm = true; [sfx.hover, sfx.boost, sfx.boostFadeout].concat(sfx._bouncePool, sfx._pdmgPool, sfx._ediesPool, sfx._ecritPool).forEach(function(a){
-      if(a && a.preload !== 'auto' && a.paused && !a._pendingPlay){ a.preload = 'auto'; try { a.load(); } catch(e){} } }); }   // (fetched now, not on the first landing)
     sfx.sfxVol = P.fxSfxVol; sfx.musicVol = P.fxMusicVol;
-    var live = api.active && !R.fxPause && !document.hidden && !R.studio, now = performance.now();
+    var A = FXA, wa = fxaOn(), live = api.active && !R.fxPause && !document.hidden && !R.studio, now = performance.now();
+    if(!wa && !R.fxWarm){ R.fxWarm = true; [sfx.hover, sfx.boost, sfx.boostFadeout].concat(sfx._bouncePool, sfx._pdmgPool, sfx._ediesPool, sfx._ecritPool).forEach(function(a){
+      if(a && a.preload !== 'auto' && a.paused && !a._pendingPlay){ a.preload = 'auto'; try { a.load(); } catch(e){} } }); }   // (the elements' way only: fetched now, not on the first landing)
+    // the engine: louder and higher with the speed and the boost
+    var sp = clamp(S.v / Math.max(1e-6, baseSpeed()), 0, 3), bk = S.boostK || 0, hOn = live && !S.dead && P.fxSfxVol > 0;
+    var hVol = clamp((0.05 + 0.06 * Math.min(sp, 2) + 0.06 * bk) * P.fxSfxVol, 0, 1), hRate = clamp(1 + ((sp - 1) * 0.18 + bk * 0.28) * P.fxEngine, 0.6, 2);
     var hv = sfx.hover;
-    if(hv){
-      if(live && !S.dead && P.fxSfxVol > 0){
+    if(wa){
+      if(hv && (!hv.paused || hv._pendingPlay)) hv.pause();
+      var H = fxaLoop('hov', 'hover');
+      if(H){ fxaSet(H.g.gain, hOn ? hVol : 0, 0.003); fxaSet(H.src.playbackRate, hRate, 0.002); }
+    } else if(hv){
+      if(hOn){
         if(hv.paused && !hv._pendingPlay && now >= hv._retryAt) hv.play().catch(function(){});
-        var sp = clamp(S.v / Math.max(1e-6, baseSpeed()), 0, 3), bk = S.boostK || 0;
-        hv.volume = clamp((0.05 + 0.06 * Math.min(sp, 2) + 0.06 * bk) * P.fxSfxVol, 0, 1);
-        try { hv.preservesPitch = hv.mozPreservesPitch = hv.webkitPreservesPitch = false; hv.playbackRate = clamp(1 + ((sp - 1) * 0.18 + bk * 0.28) * P.fxEngine, 0.6, 2); } catch(e){}
+        fxElVol(hv, hVol);
+        if(hv._fxR == null || (Math.abs(hv._fxR - hRate) > 0.02 && now - (hv._fxRT || 0) > 120)){
+          hv._fxR = hRate; hv._fxRT = now; FXA.ew++;
+          try { if(!hv._fxPP){ hv._fxPP = true; hv.preservesPitch = hv.mozPreservesPitch = hv.webkitPreservesPitch = false; } hv.playbackRate = hRate; } catch(e){}
+        }
       } else if(!hv.paused || hv._pendingPlay) hv.pause();
     }
     var mu = sfx.bgMusic;
     if(mu){
-      if(live && P.fxMusicVol > 0){ mu.volume = clamp(mu._baseVol * P.fxMusicVol, 0, 1); if(mu.paused && !mu._pendingPlay && now >= mu._retryAt) mu.play().catch(function(){}); }
+      if(live && P.fxMusicVol > 0){ fxElVol(mu, clamp(mu._baseVol * P.fxMusicVol, 0, 1)); if(mu.paused && !mu._pendingPlay && now >= mu._retryAt) mu.play().catch(function(){}); }
       else if(!mu.paused || mu._pendingPlay) mu.pause();
     }
     var b = sfx.boost, bOn = live && !!S.boostOn && JET.go() && !S.dead && P.fxSfxVol > 0;   // (THE JET: the boost's sound starts with the beam)
-    if(b){
-      b.volume = clamp(b._baseVol * P.fxSfxVol, 0, 1);
+    if(wa){
+      if(bOn){ if(!R.fxBoostSnd) fxaStop('bst'); var B = fxaLoop('bst', 'boost'); if(B) fxaSet(B.g.gain, clamp(FXA_VOL.boost * P.fxSfxVol, 0, 1), 0.003); }
+      else if(R.fxBoostSnd){ fxaStop('bst'); if(live) fxaShot('boostEnd', FXA_VOL.boostEnd * P.fxSfxVol); }
+      else if(A.bst) fxaStop('bst');
+      // the context sleeps while nothing is to be heard (paused, the app in the background)
+      if(!live && !A.susp && A.ctx.state === 'running'){ A.susp = true; try { A.ctx.suspend(); } catch(e){} }
+      else if(live && A.susp){ A.susp = false; try { A.ctx.resume(); } catch(e){} }
+    } else if(b){
+      fxElVol(b, clamp(b._baseVol * P.fxSfxVol, 0, 1));
       if(bOn && !R.fxBoostSnd){ b.currentTime = 0; b.play().catch(function(){}); }
       else if(!bOn && R.fxBoostSnd){ b.pause(); var fo = sfx.boostFadeout; if(live && fo && P.fxSfxVol > 0){ fo.volume = clamp(fo._baseVol * P.fxSfxVol, 0, 1); fo.currentTime = 0; fo.play().catch(function(){}); } }
     }
@@ -111704,15 +111766,21 @@ var RUNNER = (function(){
   }
   var FX_SND = { land: ['_bouncePool', '_bounceIdx'], slam: ['_bouncePool', '_bounceIdx'], hit: ['_pdmgPool', '_pdmgIdx'], crash: ['_pdmgPool', '_pdmgIdx'], kill: ['_ediesPool', '_ediesIdx'], smash: ['_ecritPool', '_ecritIdx'] };
   function fxSnd(kind, k){
-    if(!fxAudioOn() || !(P.fxSfxVol > 0) || R.fxPause || typeof _shotFrom !== 'function') return;
-    var q = FX_SND[kind], now = performance.now(); if(!q || !sfx[q[0]] || !sfx[q[0]].length) return;
+    if(!fxAudioOn() || !(P.fxSfxVol > 0) || R.fxPause) return;
+    var q = FX_SND[kind], now = performance.now(); if(!q) return;
     if(kind === 'land' && now - (R.fxSndT || 0) < 120) return; R.fxSndT = now;
-    var a = _shotFrom(q[0], q[1]), v = kind === 'land' ? 0.3 + 0.3 * clamp(k || 1, 0, 1.5) : 1;
+    var v = kind === 'land' ? 0.3 + 0.3 * clamp(k || 1, 0, 1.5) : 1;
+    if(fxaOn()){ var key = FXA_KIND[kind]; fxaShot(key, FXA_VOL[key] * v * P.fxSfxVol); return; }
+    if(typeof _shotFrom !== 'function' || !sfx[q[0]] || !sfx[q[0]].length) return;
+    var a = _shotFrom(q[0], q[1]);
     a.volume = clamp(a._baseVol * v * P.fxSfxVol, 0, 1); a.play().catch(function(){});
   }
   function fxAudioOff(){
     R.fxBoostSnd = false;
+    fxaStop('hov'); fxaStop('bst');
+    if(FXA.ctx && !FXA.susp && FXA.ctx.state === 'running'){ FXA.susp = true; try { FXA.ctx.suspend(); } catch(e){} }
     if(typeof sfx === 'undefined') return;
+    [sfx.hover, sfx.boost, sfx.bgMusic].forEach(function(a){ if(a){ a._fxV = null; a._fxR = null; } });   // (the planet game writes them its own way)
     if(R.fxSfx0 != null){ sfx.sfxVol = R.fxSfx0; sfx.musicVol = R.fxMus0; R.fxSfx0 = R.fxMus0 = null; }
     if(typeof stopGameAudio === 'function') stopGameAudio();
   }
@@ -111952,6 +112020,7 @@ var RUNNER = (function(){
   var FX_API = {
     jet: function(){ return JET.api(); },   // (THE JET's test surface)
     P: function(){ var o = {}; for(var k in FX_DEF) o[k] = P[k]; return o; },
+    audio: function(){ var A = FXA; return { wa: fxaOn(), state: A.ctx ? A.ctx.state : null, bufs: Object.keys(A.buf), hov: A.hov ? { gain: A.hov.g.gain.value, rate: A.hov.src.playbackRate.value } : null, bst: !!A.bst, w: A.w, ew: A.ew, shots: A.shots, susp: A.susp }; },   // (THE SOUND rev 2)
     perf: function(){ return { Q: FXPF, cfg: FX_PF_CFG, start: fxPerfABStart, stop: function(){ fxPerfABDone(true); }, last: function(){ try { return localStorage.getItem(FX_PF_KEY); } catch(e){ return null; } } }; },   // (THE METER)
     state: function(){ var F = fxState(); return { stop: +(R.fxStopT || 0).toFixed(3), pause: !!R.fxPause, sy: +F.sy.toFixed(5), sp: +F.sp.toFixed(4), yaw: +F.yaw.toFixed(4), bank: +(F.bank - F.bank0).toFixed(4),
       k: [+F.k.x.toFixed(4), +F.k.y.toFixed(4), +F.k.z.toFixed(4), +F.k.f.toFixed(3)], ca: +F.ca.toFixed(3), hurt: +F.hurt.toFixed(3), blur: +F.blur.toFixed(3), rips: F.rip.map(function(r){ return +(r.a * Math.exp(-r.t * P.fxRipDecay)).toFixed(3); }),
