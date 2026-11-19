@@ -98967,7 +98967,7 @@ var RUNNER = (function(){
     var T = 'position:absolute;pointer-events:none;font-family:Arial,Helvetica,sans-serif;font-weight:700;white-space:nowrap;';
     // Readouts, not controls: tracked caps, top centre, clear of the notch. Distance in the accent;
     // coins in their own gold, with a gold dot for the coin, under it.
-    R.elDist = el('div', T + 'left:0;right:0;top:calc(14px + env(safe-area-inset-top, 0px));text-align:center;font-size:13px;' +
+    R.elDist = el('div', T + 'left:0;right:0;top:calc(14px + env(safe-area-inset-top, 0px));text-align:center;font-size:13px;contain:layout size style;' +   // (HUD: its text changes every frame — contained, that is its own small layout, not the layer's)
       'letter-spacing:0.24em;color:rgba(16,196,178,0.95);text-shadow:0 0 10px rgba(16,196,178,0.45);transition:opacity .25s;', L, '0 M');
     R.elCoins = el('div', T + 'left:0;right:0;top:calc(34px + env(safe-area-inset-top, 0px));text-align:center;font-size:12px;' +
       'letter-spacing:0.2em;color:rgba(255,205,90,0.95);text-shadow:0 0 10px rgba(255,190,60,0.45);transition:opacity .25s;', L);
@@ -98975,7 +98975,7 @@ var RUNNER = (function(){
       'background:radial-gradient(circle at 35% 35%,#fff3c4,#ffc94a 55%,#b07a12);box-shadow:0 0 8px rgba(255,190,60,0.6);', R.elCoins);
     R.elCoinN = el('span', 'display:inline-block;', R.elCoins, '0');
     R.boostPos = new THREE.Vector3();
-    R.elBoost = el('div', T + 'left:0;top:0;opacity:0;transform:translateX(-50%);padding:6px 11px;border-radius:999px;' +
+    R.elBoost = el('div', T + 'left:0;top:0;opacity:0;transform:translateX(-50%);will-change:transform;contain:layout style;padding:6px 11px;border-radius:999px;' +
       'border:1px solid rgba(197,150,255,0.8);background:rgba(28,14,48,0.78);color:#ead8ff;font-size:10px;letter-spacing:0.2em;' +
       'text-shadow:0 0 8px rgba(185,115,255,0.9);box-shadow:0 0 14px rgba(155,75,255,0.55);transition:opacity .08s;', L, 'BOOST  2.0s');
     R.elCard = el('div', T + 'left:0;right:0;text-align:center;opacity:0;', L);
@@ -112224,12 +112224,12 @@ var RUNNER = (function(){
       R.boostPos.set(S.x, S.y, -(S.z - S.zBase)).project(R.cam);
       var bw = window.innerWidth, bh = window.innerHeight;
       if(R.boostPos.z > -1 && R.boostPos.z < 1 && Math.abs(R.boostPos.x) < 1 && Math.abs(R.boostPos.y) < 1){
-        R.elBoost.textContent = 'BOOST  ' + boostLeft.toFixed(1) + 's';
-        R.elBoost.style.left = ((R.boostPos.x + 1) * bw / 2) + 'px';
-        R.elBoost.style.top = Math.max(8, Math.min(bh - 34, (1 - R.boostPos.y) * bh / 2 + 28)) + 'px';
-        R.elBoost.style.opacity = '1';
-      } else R.elBoost.style.opacity = '0';
-    } else R.elBoost.style.opacity = '0';
+        // (HUD 11-18: the words written when they change — a text write is a layout — and the pill moved by transform, which is not)
+        var btx = 'BOOST  ' + boostLeft.toFixed(1) + 's'; if(R.elBoost._t !== btx){ R.elBoost._t = btx; R.elBoost.textContent = btx; }
+        R.elBoost.style.transform = 'translate3d(' + ((R.boostPos.x + 1) * bw / 2).toFixed(1) + 'px,' + Math.max(8, Math.min(bh - 34, (1 - R.boostPos.y) * bh / 2 + 28)).toFixed(1) + 'px,0) translateX(-50%)';
+        if(R.elBoost._o !== 1){ R.elBoost._o = 1; R.elBoost.style.opacity = '1'; }
+      } else if(R.elBoost._o !== 0){ R.elBoost._o = 0; R.elBoost.style.opacity = '0'; }
+    } else if(R.elBoost._o !== 0){ R.elBoost._o = 0; R.elBoost.style.opacity = '0'; }
     var card = cardAmt();
     if(S.dead && !R.cardShown && card > 0){
       R.cardShown = true;
